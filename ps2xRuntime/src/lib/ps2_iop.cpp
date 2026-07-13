@@ -2,6 +2,7 @@
 #include "runtime/ps2_iop_audio.h"
 #include "runtime/ps2_iop_cl.h"
 #include "runtime/ps2_iop_dbcman.h"
+#include "runtime/ps2_iop_mcman.h"
 #include "runtime/ps2_iop_sdrdrv.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_runtime.h"
@@ -97,6 +98,14 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                         rpcNum, sendBufAddr,
                                         sendSize, recvBufAddr,
                                         recvSize, resultPtr))
+    {
+        return true;
+    }
+
+    if (ps2_iop_mcman::handleMcServRpc(m_rdram, sid,
+                                       rpcNum, sendBufAddr,
+                                       sendSize, recvBufAddr,
+                                       recvSize, resultPtr))
     {
         return true;
     }
