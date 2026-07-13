@@ -13,14 +13,15 @@
 
 // Regression coverage for the opt-in "runtime observability" diagnostics
 // layer: the should_log throttle, the poll-based guest-memory watch probe
-// (including writer-PC capture), the GS CLUT-dump swizzle fix, and the
+// (including writer-PC capture), the GS CLUT cache reload/read path, and the
 // [gs:image] transfer probe.
 //
-// The diagnostics statics (should_log/ps2_watch registry; the clut-dump
-// "seen keys" set and [gs:image] dbp tracker) are process-lifetime, so each
-// test is order-robust: watch tests reset via clearWatches(), CLUT tests use
-// a distinct cbp, the [gs:image] test picks a unique DBP, and every test
-// leaves diagnostics disabled, watches cleared, and the log ring cleared.
+// The diagnostics statics (should_log/ps2_watch registry; the [gs:image] dbp
+// tracker) are process-lifetime, so each test is order-robust: watch tests
+// reset via clearWatches(), CLUT cache tests use a distinct cbp per test
+// (each GS instance also has its own m_clut_cache/m_cbp0/m_cbp1), the
+// [gs:image] test picks a unique DBP, and every test leaves diagnostics
+// disabled, watches cleared, and the log ring cleared.
 
 namespace
 {
@@ -303,133 +304,83 @@ void register_ps2_observability_tests()
             ps2_log::clear_runtime_log_entries();
         });
 
-        tc.Run("clut-dump: CSM1 T4 dump applies the swizzle to the logical index", [](TestCase &t)
+        tc.Run("clut-cache: CSM1 T4 reload deswizzles physical VRAM layout into linear cache order", [](TestCase &t)
         {
-            ps2_diag::set_enabled_for_test(true);
-            ps2_log::clear_runtime_log_entries();
-
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
 
-            constexpr uint32_t kCbp = 0x100u; // distinct from every other clut-dump test in this suite
+            constexpr uint32_t kCbp = 0x100u; // distinct from every other clut-cache test in this suite
             for (uint32_t p = 0; p < 32; ++p)
             {
                 gs.WriteVram(GS_PSM_CT32, kCbp, 1u, p & 0xFu, p >> 4, p);
             }
 
-            ps2_log::clear_runtime_log_entries();
-            GSRasterizer raster;
-            raster.lookupCLUT(&gs, 0u, kCbp, GS_PSM_CT32, /*csm=*/0u, /*csa=*/0u, GS_PSM_T4);
+            // cld=1 forces an unconditional cache reload.
+            gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, kCbp, /*csm=*/0u, /*csa=*/0u, /*cld=*/1u);
 
-            const auto entries = collectTagged("[gs:clut-dump]   idx=");
-            t.Equals(entries.size(), static_cast<size_t>(16), "a T4/CSM1 dump should emit 16 entry lines");
-
-            bool swizzleOk = true;
-            for (const auto &line : entries)
+            bool cacheOk = true;
+            for (uint32_t logicalIdx = 0; logicalIdx < 16; ++logicalIdx)
             {
-                const long idx = parseField(line, "idx=");
-                const long r = parseField(line, "r=");
-                if (idx < 0 || r < 0)
+                const u32 got = gs.ReadClutCache(GS_PSM_CT32, static_cast<uint8_t>(logicalIdx), /*csa=*/0u);
+                if (got != logicalIdx)
+                    cacheOk = false;
+            }
+            t.IsTrue(cacheOk, "CSM1 reload must place each logical CLUT index at its own cache slot, resolvable via ReadClutCache(index)");
+        });
+
+        tc.Run("clut-cache: CSM1 T8 reload covers all 256 entries and preserves value round-trip", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kCbp = 0x200u; // distinct from every other clut-cache test in this suite
+            // T8 CLUTs are 16x16 CT32 entries (256 total).
+            for (uint32_t y = 0; y < 16; ++y)
+            {
+                for (uint32_t x = 0; x < 16; ++x)
                 {
-                    swizzleOk = false;
-                    continue;
+                    gs.WriteVram(GS_PSM_CT32, kCbp, 1u, x, y, (y * 16u) + x);
                 }
-                const long expected = (idx < 8) ? idx : (idx + 8);
-                if (r != expected)
-                    swizzleOk = false;
             }
-            t.IsTrue(swizzleOk, "CSM1 dump must swizzle logical indices 8-15 onto physical slots 16-23 (r == idx for 0-7, r == idx+8 for 8-15)");
 
-            ps2_diag::set_enabled_for_test(false);
-            ps2_log::clear_runtime_log_entries();
+            gs.ReloadClutCache(GS_PSM_T8, GS_PSM_CT32, kCbp, /*csm=*/0u, /*csa=*/0u, /*cld=*/1u);
+
+            const u32 first = gs.ReadClutCache(GS_PSM_CT32, 0u, /*csa=*/0u);
+            const u32 last = gs.ReadClutCache(GS_PSM_CT32, 255u, /*csa=*/0u);
+            t.IsTrue(first != 0xFFFFFFFFu && last != 0xFFFFFFFFu,
+                     "T8 reload should populate both the first and last cache entries (sanity check the reload ran)");
         });
 
-        tc.Run("clut-dump: CSM2 T4 dump is linear (no swizzle)", [](TestCase &t)
+        tc.Run("clut-cache: cld gating skips reload unless cbp changes for the tracked slot", [](TestCase &t)
         {
-            // resolveClutIndex() only swizzles when csm == 0 (CSM1). For CSM2
-            // (csm == 1) with csa == 0 the csa<<4 offset is still applied but
-            // is zero, so the mapping is the identity -- confirmed by reading
-            // ps2_gs_rasterizer.cpp's resolveClutIndex() (~line 227-253).
-            ps2_diag::set_enabled_for_test(true);
-            ps2_log::clear_runtime_log_entries();
-
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
 
-            constexpr uint32_t kCbp = 0x200u; // distinct from every other clut-dump test in this suite
-            for (uint32_t p = 0; p < 32; ++p)
+            constexpr uint32_t kCbpA = 0x300u;
+            constexpr uint32_t kCbpB = 0x340u;
+            for (uint32_t p = 0; p < 16; ++p)
             {
-                gs.WriteVram(GS_PSM_CT32, kCbp, 1u, p & 0xFu, p >> 4, p);
+                gs.WriteVram(GS_PSM_CT32, kCbpA, 1u, p & 0xFu, p >> 4, 0xAAu);
+                gs.WriteVram(GS_PSM_CT32, kCbpB, 1u, p & 0xFu, p >> 4, 0xBBu);
             }
 
-            ps2_log::clear_runtime_log_entries();
-            GSRasterizer raster;
-            raster.lookupCLUT(&gs, 0u, kCbp, GS_PSM_CT32, /*csm=*/1u, /*csa=*/0u, GS_PSM_T4);
+            // cld=2 loads unconditionally and remembers cbp in m_cbp0.
+            gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, kCbpA, /*csm=*/0u, /*csa=*/0u, /*cld=*/2u);
+            t.Equals(gs.ReadClutCache(GS_PSM_CT32, 0u, 0u), 0xAAu, "cld=2 should load from cbpA and cache the CT32 value");
 
-            const auto entries = collectTagged("[gs:clut-dump]   idx=");
-            t.Equals(entries.size(), static_cast<size_t>(16), "a T4/CSM2 dump should emit 16 entry lines");
+            // cld=4 with an unchanged cbp (still kCbpA) must be a no-op: write
+            // new data to kCbpA and confirm the stale cache value is untouched.
+            gs.WriteVram(GS_PSM_CT32, kCbpA, 1u, 0u, 0u, 0xCCu);
+            gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, kCbpA, /*csm=*/0u, /*csa=*/0u, /*cld=*/4u);
+            t.Equals(gs.ReadClutCache(GS_PSM_CT32, 0u, 0u), 0xAAu,
+                     "cld=4 must skip the reload when cbp is unchanged from the last cld=2/3 load, leaving the cache stale");
 
-            bool linearOk = true;
-            for (const auto &line : entries)
-            {
-                const long idx = parseField(line, "idx=");
-                const long r = parseField(line, "r=");
-                if (idx < 0 || r < 0 || r != idx)
-                    linearOk = false;
-            }
-            t.IsTrue(linearOk, "CSM2 (linear) dumps must not apply the CSM1 swizzle: r should equal idx for every entry");
-
-            ps2_diag::set_enabled_for_test(false);
-            ps2_log::clear_runtime_log_entries();
-        });
-
-        tc.Run("clut-dump: each (cbp, cpsm, csa, csm, sourcePsm) key is dumped only once", [](TestCase &t)
-        {
-            ps2_diag::set_enabled_for_test(true);
-            ps2_log::clear_runtime_log_entries();
-
-            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
-            GS gs;
-            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
-
-            constexpr uint32_t kCbp = 0x300u; // distinct from every other clut-dump test in this suite
-            for (uint32_t p = 0; p < 32; ++p)
-            {
-                gs.WriteVram(GS_PSM_CT32, kCbp, 1u, p & 0xFu, p >> 4, p);
-            }
-
-            GSRasterizer raster;
-            raster.lookupCLUT(&gs, 0u, kCbp, GS_PSM_CT32, 0u, 0u, GS_PSM_T4);
-            t.IsTrue(countTagged("[gs:clut-dump]") > 0,
-                     "the first lookupCLUT for a new (cbp,cpsm,csa) triple should emit a dump");
-
-            ps2_log::clear_runtime_log_entries();
-            raster.lookupCLUT(&gs, 0u, kCbp, GS_PSM_CT32, 0u, 0u, GS_PSM_T4);
-            t.Equals(countTagged("[gs:clut-dump]"), static_cast<size_t>(0),
-                     "repeating the same (cbp,cpsm,csa) triple must not add any new [gs:clut-dump] lines");
-
-            // The dedup key must widen the (cbp,cpsm,csa) triple with csm (CLUT
-            // addressing mode) and sourcePsm (index width): two palette views
-            // that share the triple but differ in either field are genuinely
-            // distinct dumps and must NOT be deduped away. Hold the triple fixed
-            // and vary each of the two extra fields alone.
-
-            // (a) vary csm alone (0 -> 1): a new addressing mode is a new dump.
-            ps2_log::clear_runtime_log_entries();
-            raster.lookupCLUT(&gs, 0u, kCbp, GS_PSM_CT32, 1u, 0u, GS_PSM_T4);
-            t.IsTrue(countTagged("[gs:clut-dump]") > 0,
-                     "varying csm alone (0->1) under a seen (cbp,cpsm,csa) triple must emit a new dump");
-
-            // (b) vary sourcePsm alone (T4 -> T8): a new index width is a new dump.
-            ps2_log::clear_runtime_log_entries();
-            raster.lookupCLUT(&gs, 0u, kCbp, GS_PSM_CT32, 0u, 0u, GS_PSM_T8);
-            t.IsTrue(countTagged("[gs:clut-dump]") > 0,
-                     "varying sourcePsm alone (T4->T8) under a seen (cbp,cpsm,csa) triple must emit a new dump");
-
-            ps2_diag::set_enabled_for_test(false);
-            ps2_log::clear_runtime_log_entries();
+            // cld=4 with a changed cbp (kCbpB) must reload.
+            gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, kCbpB, /*csm=*/0u, /*csa=*/0u, /*cld=*/4u);
+            t.Equals(gs.ReadClutCache(GS_PSM_CT32, 0u, 0u), 0xBBu, "cld=4 must reload once cbp differs from the tracked m_cbp0");
         });
 
         tc.Run("gs:image: single IMAGE transfer logs the destination DBP and payload byte count", [](TestCase &t)

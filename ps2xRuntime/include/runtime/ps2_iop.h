@@ -16,6 +16,12 @@ constexpr uint32_t IOP_SID_FATAL_FRAME_SDRDRV = 0x19740512u;
 // through sceSifCallRpc rather than the direct syscall-style stubs.
 constexpr uint32_t IOP_SID_MCSERV = 0x80000080u;
 
+// cdvdman S-command RPC server. EE libcdvd routes sceCdReadDvdDualInfo (and other
+// S-commands) through this server; the result buffer's first word is the success flag.
+// Only used as a legacy HLE fallback for games that don't route through the real IRX
+// interpreter's own cdvdman RPC service.
+constexpr uint32_t IOP_SID_CDVD_SCMD = 0x80000593u;
+
 class ps2_iop
 {
 public:
