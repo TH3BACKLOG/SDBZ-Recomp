@@ -23,6 +23,9 @@
 ```
 (Always use build.ps1 — never raw cmake/MSBuild)
 
+## Upstream Sync (2026-07-17)
+WIP checkpointed as commit `9957294f`. Checked all 7 new upstream commits vs HEAD — #149/#153/#155/#158/#167/#168 already present in tree (functional content confirmed via `git apply --reverse --check`); only `#170` (IOP refactor) remains deliberately held. Tree is current with upstream/main modulo #170.
+
 ## Current Phase
 **Phase 5 — Boot to and pass the memory card loading prompt (in progress, started 2026-05-27; goal changed 2026-07-07 — was "boot to title screen/main menu", now targets the memory card prompt; main menu deferred to a later phase)**
 
