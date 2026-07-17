@@ -10,8 +10,9 @@
 
 ## Active Runner Command
 ```
-& "F:\SDBZ Recomp\PS2Recomp\out\build\ps2xRuntime\Debug\ps2EntryRunner.exe" "F:\SDBZ Recomp\ELF\SLUS_214.42"
+& "F:\SDBZ Recomp\build\ps2xRuntime\Debug\ps2EntryRunner.exe" "F:\SDBZ Recomp\ELF\SLUS_214.42"
 ```
+(corrected 2026-07-13c — `PS2Recomp\out\build\...` no longer exists; build.ps1's real output tree is `F:\SDBZ Recomp\build\...`)
 
 ## Agent Runner Script
 `F:\SDBZ Recomp\run_game_agent.bat` (generated 2026-06-22, paths verified against above) — usage: `run_game_agent.bat [timeoutSec] [logName]`, logs to `F:\SDBZ Recomp\logs\`.
@@ -24,6 +25,377 @@
 
 ## Current Phase
 **Phase 5 — Boot to and pass the memory card loading prompt (in progress, started 2026-05-27; goal changed 2026-07-07 — was "boot to title screen/main menu", now targets the memory card prompt; main menu deferred to a later phase)**
+
+## Current Status (2026-07-17h) — ✅ SIF PACKET-POOL SENTINEL FIX CONFIRMED (0x20561900 loop GONE). Game now runs a stable main loop (furthest ever). New blocker: **ARKD DVD-read RPCs get NO result data** — the SIF.cpp echo path never invokes handleRPC, and ARKD SID isn't handled in ps2_iop.cpp.
+
+**SENTINEL FIX CONFIRMED (run log 07-17h):**
+- `SIF.cpp` BIND branch `pkt[10] = 0xFFFFFFFF` fix WORKED. The `No exact recompiled function for guest PC 0x20561900` loop is GONE. Outbound packets no longer carry string garbage in w[3]. Boot advanced well past the corruption point.
+- All 5 IRX still load OK. Then the game issued its post-ARKD service binds (clients 0x5a9330/0x5a9358/0x5a9380/0x5a93a8, SIDs 0x500 etc.) and entered a **stable main loop** — watchdog PC varies (0x11e3b0/0x11f240/0x175210 vblank/0x104c74) and stuckSecs resets, i.e. alive, not hung. Reaches 0x175210 (INTC VBLANK) now.
+
+**NEW BLOCKER (07-17h): ARKD service RPCs return no data**
+- The game repeatedly issues CALL packets to ARKD client **0x5a9358** (seq incrementing 0x1a→0x36+, ~1-2/sec = timeout-retry), waiting for DVD data that never arrives.
+- Root cause (confirmed by code read): ARKD CALLs travel the **SIF.cpp `deliverSifRpcReply` echo path** (captured via sceSifSetDma, cid=0x8000000a), which synthesizes an empty completion and **never calls `ps2_iop().handleRPC`**. Separately, ps2_iop.cpp `handleRPC` has **no handler for the ARKD SID (0x500)** — the C++ HLE chain (SoundDriver/DbcMan/LibSd/Sound/ClFile/Sdrdrv/McServ/LOADFILE/CDVD) doesn't cover it.
+- Per no-IOP-faking rule ([[feedback_no_iop_faking]]): route ARKD CALLs through the embedded **R3000 interpreter running the real ARKD_DVD.IRX** (already loaded), not hand-written C++ outputs. Needs a plan pass — decide the wiring: SIF.cpp CALL branch → handleRPC/R3000, fill recv buf, echo back before dispatcher runs.
+- Secondary/non-blocking: `-104` (0x68) @0x174f50 ra=0x105000 and `107` (0x6B) @0x174f70 ra=0x17e238 fire periodically but do NOT hang the loop (thunk array verified correct vs ELF; dispatcher keys GsPutIMR/SetSyscall at 0x71/0x74 — these are genuinely different syscalls in the 0x65-0x6F RFU range, not GsIMR). Leave as no-op unless proven to gate the ARKD loop.
+
+---
+
+## Prior Status (2026-07-17g) — ✅ SYSCALL THUNK TABLE REGISTERED & CONFIRMED (0x1748a0 class GONE). ✅ ALL 5 IRX loadfile RPCs complete. Sentinel fix for 0x20561900 coded [CONFIRMED WORKING 07-17h].
+
+**THUNK FIX CONFIRMED (run log 07-17g):**
+- `game_overrides.cpp` `applySdbzKernelThunkFixes` now registers all **120** EE kernel syscall thunks (`0x174880..0x174FF0`, 16B stride, `li $v1,N; syscall; jr $ra`) via `replaceFunction` + template-per-index handler (sets $v1 sign-extended, calls 2-arg `handleSyscall`, returns via $ra). `No exact recompiled function for guest PC 0x1748a0` is gone; thunks appear live in traces.
+- Boot then ran the FULL loadfile chain: bind ping-pong, func-255 "3000" handshake, then `Load Module cdrom0:\{MCMAN,MCSERV,LIBSD,CRI_ADXI,ARKD_DVD}.IRX OK!` — furthest boot ever.
+- Non-fatal unimplemented syscalls seen (follow-ups, game continued past both): `0x6b` (107) @pc=0x174f70 ra=0x17e238; `-104` (0xffffff98) @pc=0x174f50 ra=0x105000 (new async-stack thread).
+
+**NEW BLOCKER (07-17g): jump to guest PC 0x20561900 (SIF packet-pool corruption) — FIX CODED, UNVERIFIED**
+- Root cause: `SIF.cpp` BIND-completion echoed the request's WORD[5] (EE packet-pool buffer `0x20561900`) into `pkt[10]` → guest `_request_end` (0x178560) stores it as `client[5]` = "IOP server receive buffer". `rpc_call` (0x178BE8) uses client[5] as the DEST of every send-payload DMA → our `sceSifSetDma` saw a copyable EE dest and copied payloads (0x200-byte module-path strings etc.) over the game's own SIF packet pool at 0x561900. Evidence: later outbound packets carried string garbage (`w[3]=0x5c3a306d` "m0:\"); pool link word at buffer+20 holds `0x20561900`, which the dispatcher (0x178068, post-ARKD binds rpcNum 0xf–0x12, clients 0x5a9330/0x5a9380) eventually jumped to. Infinite `No exact recompiled function for guest PC 0x20561900` loop.
+- Fix: `SIF.cpp` BIND branch now sets `pkt[10] = 0xFFFFFFFF` (established IOP-bound sentinel; DMA copy path skips non-copyable dests; our RPC HLE reads payloads from src). One-line + comment.
+- Next expected after fix: the post-ARKD service calls (mode=3 async, clients 0x5a9330/0x5a9380, likely ARKD_DVD/CRI driver RPC) currently get NO result data from HLE loopback — may become the next blocker; route through embedded R3000 IOP interpreter per no-IOP-faking rule.
+
+---
+
+## Prior Status (2026-07-17f) — ✅ -65540 SIGNATURE GATE CLEARED & CONFIRMED. Boot advanced to a NEW, different blocker: missing recompiled function entry at EE 0x1748a0. [RESOLVED 07-17g via 120-thunk registration]
+
+**FIX CONFIRMED WORKING (run log):**
+- **Seed — `game_overrides.cpp:381` `applySdbzLoadfileSeed`**: writes EE `0x461C30 = -1` at ELF-load. Log: `[loadfile-seed] 0x461C30 <- -1 ... readback=0xffffffff`. REQUIRED (not redundant) — it arms d4a0's real path.
+- **LOADFILE HLE — `SIF.cpp` `deliverSifRpcReply` (kSifCmdRpcCall branch)**: tracks the client object BIND'd to sid `0x80000006` (LOADFILE, a PS2 ROM/kernel service — NOT a game IRX), then on its func-255 CALL writes the fixed protocol version `0x30303033` ("3000") into the recv buffer (`w[10]`, =`0x564b40`) BEFORE dispatcher 0x178068 runs. Log: `[SifRpcReply:LOADFILE] func255 recv=0x564b40 <- 0x30303033 ("3000")`.
+- **Result:** gate d5a0 passes → the `Can't load module cdrom0:\SIO2MAN.IRX;1, ret = -65540` retry loop is GONE. Game then issued the real func-0 loadfile RPC for `"cdrom0:\SIO2MAN.IRX;1"` (path decoded from packet bytes) and proceeded.
+
+**NEW BLOCKER (2026-07-17f):** after SIO2MAN loadfile, execution hits an indirect-dispatch jump with no recompiled function:
+```
+Error: No exact recompiled function for guest PC 0x1748a0 tableBase=0x100008 tableEnd=0x4e6c84 codeRegion=yes
+[guest-branch:missing-target] kind=IndirectJump op=dispatch source=0x0 target=0x1748a0 pc=0x1748a0 ra=0x1057fc sp=0x1ffbd40 a0=0x1 a1=0x2 policy=1
+trace=... -> 0x171fd8 -> 0x172168 -> 0x174fe0 -> 0x1748a0
+```
+- **DECODED from raw ELF (offset 0x74920):** `0x1748a0` = `addiu $v1,$zero,2; syscall; jr $ra` — a tiny **syscall trampoline**, one of a contiguous series the recompiler folded into `hw_timer_update_x @0x174808` and never emitted as exact entries: `0x174890`(li $v1,1) `0x1748a0`(#2) `0x1748b0`(#3) `0x1748c0`(#4) … up to the `syscall_stub @0x1748F0` block IDA *did* recognize. NOT garbage — a real missed entry point.
+- The game takes each trampoline's address and calls it **indirectly**, so each needs its own exact recompiled function entry; the dispatcher cannot jump into the middle of `0x174808`'s single C++ body. Class = **recompiler missing-entry** (cf. [[project_dispatch_table_unpopulated]], PR #150 entry discovery), NOT SIF HLE.
+- Caller returns to `0x1057fc`; `a0=1 a1=2`. Preceding: unimplemented EE `syscall 0x6b` @pc=0x174f74 (separate concern; these trampolines carry small $v1=1..N, likely game-installed SetSyscall handlers per [[reference_ee_syscalls]]).
+
+**NEXT (needs a fresh look, user to decide direction — pivot to recompiler-entry domain):**
+1. Two fix routes: (A) add the trampoline addresses (0x174890, 0x1748a0, 0x1748b0, …) as function entries via the manifest/entry-discovery mechanism used by [[project_dispatch_table_unpopulated]] (which added entries WITHOUT a full recompiler rerun) — preferred; (B) runtime override that emulates the trampoline (set $v1=N, invoke the syscall dispatcher) in game_overrides.cpp — allowed layer, no rebuild, but needs one override per address.
+2. First confirm how many trampolines the game actually calls (0x1748a0 is the one that faulted; siblings may fault next) and what syscall $v1=2 maps to in our Dispatcher.
+3. Check whether a runtime dispatch fallback exists for `policy=1` "No exact recompiled function" — if it can be taught to run a mid-function guest address, that generalizes the fix.
+
+---
+
+## Prior Status (2026-07-17d) — ROOT CAUSE PINNED: -65540 is a PRE-RPC signature gate that short-circuits BEFORE any loadfile RPC. Not missing IRX, not Deci2 drain. `[loadgate]` dump decoded the exact gate words.
+
+**`[loadgate]` dump (run_log.txt):** `initFlag@461C30=0x0 sigA@461B5C=0x30303033("3000") ptr@461C34=0x4c07b0 sigB@*461C34=0x2e2e2e2e("....") fetched@564D68=0x0`
+
+**Chain (source-confirmed):**
+- SIO2MAN loads first via the infinite-retry wrapper (decompile ~line 2718-2727) → dies before `AudioSysInit`@0x422170 (mcman/mcserv/libsd/criadxi/arkddvd).
+- `noop_sub_dc78`@0x17DC78 → `noop_sub_d4a0`@0x17D4A0 → gate `wrap_mem_compare_n_c_0`@0x17D5A0.
+- **d4a0: `if (dword_461C30 >= 0) return 0;`** — 461C30=0 → short-circuits, NEVER runs the bind+func-255 RPC → 564D68 stays 0 (this is why the `[iop:LOADFILE]` sid-0x80000006 hook never fired).
+- Gate returns -65540 unless `564D68 == "3000"(461B5C)` OR `== "...."(*461C34)`. 564D68=0 → -65540 forever.
+- 461C30 must be -1 at first call. Only setter `wrap_mem_set_u`@0x17D630 has NO caller (SDK loadfile-init glue our runtime skips); ELF genuinely has 0 there (nearby .data 461B5C="3000" read correctly).
+- RPC plumbing READY: `mem_fill_z_18`@0x178A08=sceSifBindRpc, `mem_fill_z_369`@0x178BE8=sceSifCallRpc, both issue SIF DMA cmd 0x80000009 our runtime already intercepts.
+
+**FIX (allowed layer):** (1) seed EE 0x461C30=-1 once before first loadfile (enables game's own d4a0 — not faking); (2) HLE loadfile RPC sid 0x80000006 func 0xFF → return "3000" (0x30303033) → gate passes. Part 2 = legitimized entry for the parked IRX-loader work.
+
+**NEXT (cheap validating experiment):** seed 461C30=-1 only, one-time guarded, rebuild/run → expect `[iop:LOADFILE]` to fire + reveal func-255 request. Awaiting user go-ahead (pivot; /compact after).
+
+---
+
+### [SUPERSEDED 2026-07-17c] blocker framed as SIO2MAN.IRX load returning -65540 (correct value, wrong mechanism — it's a signature-gate short-circuit, not a load-RPC failure)
+
+**Diagnostics run result (recomp, run_log.txt):**
+- First TTY line printed ONCE, boot continued: `CMemory::Init memsize : 0173fc00 block:00000800`
+- Then ~20 SIF-RPC exchanges (game's own SoundDriver services, cid 0x80000009/0x8000000a), NO CD module loads.
+- Then boot spins FOREVER re-printing ONE fatal line:
+  `Can't load module cdrom0:\SIO2MAN.IRX;1, ret = -65540`
+- No SIF/DMA traffic between the repeats → it is a fatal-error spin, NOT a printf-flush drain bug. printf worked fine for CMemory::Init (printed once, moved on).
+
+**Root cause (confirmed by source read):**
+- The game's `sceSifLoadModule("cdrom0:\SIO2MAN.IRX;1")` returned **-65540** (=0xFFFEFFFC) and the game treats it as fatal.
+- Our EE-syscall stub `SifLoadModule` (RPC.cpp:1510) + `trackSifModuleLoad` (Loader.h:78) ALWAYS return a positive fake id — they can NEVER produce -65540. So the game is NOT using our EE syscall path.
+- The game issues the **IOP LOADFILE RPC itself (sid 0x80000006)**. Our runtime has **NO LOADFILE handler** (grep: zero hits for 0x80000006/LOADFILE) → SifBindRpc hands it a dummy server → the call returns garbage/-65540.
+- Aggravating fact: we boot from the **ELF directly, no ISO mounted**, so even a real LOADFILE couldn't read `cdrom0:\SIO2MAN.IRX;1`.
+
+**Deci2 drain theory (07-17b, below) is SUPERSEDED.** The Deci2 Poll/latch is the messenger printing the error, not the disease. IPC-frozen "live read at 0x176508" gate is moot. Deci2.cpp still holds Step-1 diagnostics (case 3/-7 TTY-text log, case 4 handle dump) — no behavioral change; leave or trim later.
+
+**FORK (decision needed before code) — how to satisfy the SIO2MAN.IRX load:**
+1. **HLE the LOADFILE RPC** (sid 0x80000006) to return a success module id for the CD IRX modules — fastest, but conflicts with [[feedback_no_iop_faking]] (no hand-faked IOP values).
+2. **Load SIO2MAN.IRX into the embedded IOP interpreter** on demand (the philosophically-correct path per [[reference_iop_interpreter]] + [[feedback_no_iop_faking]]); needs the IRX bytes reachable (ISO mount or bundled file) and import-timing care [[reference_irx_import_resolution_timing]].
+3. Verify FIRST which EE function issues the load and how it forms -65540 (disasm the sceSifLoadModule caller) before choosing 1 vs 2.
+
+---
+
+### Prior Status (2026-07-17b, SUPERSEDED by 07-17c above) — CLEAN PCSX2 A/B; Deci2 Poll descriptor-drain theory.
+
+**Clean PCSX2 A/B obtained** (SDBZ booted on real PCSX2, cycles=630M, paused at fn_1763F8). Full disasm + live-memory captured. Ground truth in memory [[reference_ps2_sif_boot]] §2026-07-17b.
+
+**The blocker (real model):** boot hangs in the CALLER's descriptor-drain loop at `0x176508`:
+```
+loop: lw v0,0xC(s0)  ; s0=socket handle (0x460000 on real HW)
+      beqz -> exit
+      jal  sceDeci2Poll(a0=4)   ; fn_176020 -> fn_1750D0 -> syscall 0x7C
+      lw v0,0xC(s0); bnez -> loop
+```
+Game polls `sceDeci2Poll` until socket descriptor count `0xC(handle)` drains to 0. On real HW each Poll advances DMA + decrements it. **Our Poll never does → spins forever.**
+
+**Two words were being conflated (now separated):**
+- `0x5612DC` (0xC of state-block s3=0x5612D0) = send-busy latch. fn_1763F8 (sceDeci2Send builder) RAISES it (`sw v1=1,0xC(s3)`), never clears it; cleared by poll/receive path. My Deci2.cpp case-4 clear of this word is **semantically CORRECT** — the 07-17a "clear-fix is WRONG / re-entrancy guard" claim is **RETRACTED** (it rode on a mis-sampled s3=0x4B72A7, caught before the `addiu s3,s5,0x12D0`).
+- `0x46000C` (0xC of socket handle s0) = descriptor count = the word the hang loop ACTUALLY reads. Case-4 never touches it → incomplete.
+
+**Helper identities:** fn_175FF0=sceDeci2Send(a0=3), fn_176020=sceDeci2Poll(a0=4), both via fn_1750D0=syscall 0x7C. D_STAT/0x175170 is NOT involved — dropped as a suspect.
+
+**Fix target (Deci2.cpp case 4 / sceDeci2Poll):** keep clearing latch 0x5612DC AND decrement/zero socket descriptor count at 0xC(handle) so the 0x176508 loop exits. Behavioral only — no hand-faked constant.
+
+**Next: START HERE (NO CODE until step 1 passes):**
+1. **Recomp-side live read** — launch recomp, let it reach the spin, read recomp's live `s0` at the 0x176508 loop, confirm which handle word it reads (real HW=0x46000C; recomp may differ). Gate.
+2. Only then edit Deci2.cpp case 4 as above. Give user the build command (`.\build.ps1`), don't build.
+3. Run exe → parse run_log.txt for next blocker.
+- Optional trace shortcut (user offered IDA/PCSX2): break at 0x176508, dump socket-handle struct (0x00–0x20) BEFORE and AFTER one Poll on real HW — the diff at 0xC = exact spec for the fix.
+
+---
+
+## Prior Status (2026-07-16k, STALE — superseded by 07-17b A/B above) — 0x79 FIX VERIFIED. Boot advanced (2nd full RPC round now runs). New/real blocker = idle scheduler churn at `0x100008` (`ra=0x0`); threads loop through **string-lib / path-parse** code (strchr @0x18e0d8, char-fetch @0x18e0a0) — game appears to retry a file/module load that never succeeds. 0x6b is COSMETIC (result discarded), not the blocker.
+
+**Verify run (2026-07-16k, build w/ 0x79 fix — note: linked with `/FORCE`, LNK4088 "image may not run" warning, but ran fine):**
+- ✅ **`v1=0x79` TODO warnings GONE.** 0x79/0x7E alias fix confirmed working.
+- ✅ **Boot ADVANCED past the fix:** a SECOND full SIF-RPC bind/call round now runs (sid 13–19) that did NOT happen pre-fix. 0x79 was a real gate.
+- **`v1=0x6b` @ pc=0x174f74 = COSMETIC.** Disasm proof: 0x174f74 is `syscall_stub_z_16` (bare `syscall` thunk); caller = `sub_17E200(char*, int)` @ ra=0x17e238. That fn builds a 104-byte SIF cmd block (`byte_564D80`, size=104=0x68, id=`0x80000003`), cache-writes-back, sends via SIF. The 0x6b return value is **discarded** — the fn's `if(!v7) return 0` gates on `syscall_stub_z_21`, a DIFFERENT syscall, not 0x6b. Log confirms: `pkt[0x68 0x0 0x80000003 ...]` fires right after, boot continues. **Do NOT route 0x6b — leave as harmless TODO.**
+- **REAL blocker:** after both RPC rounds, EE goes idle: `watchdog pc=0x100008 ra=0x0`, stuckSecs climbs indefinitely. Trace rotates through STRING-LIBRARY fns (verified via decompile): `sub_18e0a0`=1-char fetch, `0x18e0d8`=strchr/memchr (SIMD `pcpyh`/`pxor` byte-scan), plus `sub_195f38`/`sub_18cf68`. Game is busy-looping in **path/string parsing** — consistent with retrying a file or `rom0:`/mc load that returns empty/error every pass.
+- `[Deci2Call:poll]` fires a handful of times early then STOPS (not the terminal spinner). Its `+C` clear is ineffective (`+C` stays 0x1) but that loop is no longer where the game is stuck; `+4` (0x3d→0x43) is a self-incremented counter, not a completion gate.
+
+**Next: START HERE (2026-07-16k):**
+1. Identify WHAT file/module the string-parse retry loop is trying to load. Candidates: the `sub_17E200` "rom0:"/SIF-cmd string (`0x306d6f72 0x4e44553a` = "rom0"/":SUD"→ likely "rom0:SDUN..." or a boot module path), or a memory-card path. Grep the ELF decompile for callers of `sub_17E200` and the string const at its `a1`.
+2. Check whether an SIF-RPC *reply/callback* the parse loop waits on is never delivered — the 2nd RPC round (sid 13–19) ends with `[Sema:Wait] sid=19` and no matching signal; a missing reply could leave the loader spinning.
+3. Trace the idle-loop entry: find who calls `sub_195f38`/`sub_18cf68` and what condition breaks the loop.
+4. Log is UTF-16 — grep/sed see spaced chars.
+
+---
+
+## Prior status (2026-07-16j) — 0x79 fix APPLIED (now verified above)
+RE-BASELINED on FRESH log. `sceSifCheckInit -1` loop is GONE. Blocker was = boot thread churns at `0x100008` because EE syscall **0x79 (GetOsdConfigParam alias)** fell through to TODO→0. FIX APPLIED (dispatcher aliases 0x79→GetOsdConfigParam, 0x7E→SetOsdConfigParam @ Dispatcher.cpp:186-195).
+
+**Fresh run (2026-07-16j, current build, `run_log.txt` now UTF-16, Jul-16 23:38):**
+- **No `[sifman]`/`[thevent]`/`[IRX-stub]`/`sceSifCheckInit` anywhere.** The entire 07-16h blocker is confirmed dead — it was the stale July-8 build. Stale-premise finding (below, 07-16i) validated.
+- **SIF-RPC now fully works via HLE:** bind (`cid=0x80000009`) + call (`cid=0x8000000a`) ping-pong completes, `[SifRpcReply] deliver → run dispatcher 0x178068`, semaphores signal/wake. Two full RPC init cycles run (sid 4–6, then 13–19).
+- **New blocker:** after RPC init, EE settles into a scheduler churn — `watchdog pc=0x100008 ra=0x0`, `stuckSecs` climbs 0→7+, trace cycles the `0x17xxxx`–`0x19xxxx` kernel/thread range without forward progress. `[Deci2Call:poll]` spins with `+4=0x43`.
+- **Root cause found:** log shows `[Syscall TODO] ... v1=0x79` (repeated) and `v1=0x6b` (once). `handleSyscall` switches on `$v1`. Dispatcher.cpp had cases for **0x4A/0x4B** (Set/GetOsdConfigParam) and 0x6E/0x6F (…Param2) but **NOT the 0x79/0x7E aliases** the SDBZ crt0 actually calls. 0x79 (GetOsdConfigParam) fell to `TODO`→returned 0 and left the OSD-config buffer unfilled; boot loop that branches on language/video-mode config never satisfied → stalls at 0x100008.
+- **FIX (applied, NOT yet build-verified):** `Dispatcher.cpp:186-195` — added `case 0x79` → `GetOsdConfigParam` and `case 0x7E` → `SetOsdConfigParam` (route aliases to existing handlers; no new logic, no faked values). `src/lib` file, legal.
+- **Held back:** `0x6b` (called ONCE @ pc=0x174f74) — not in db-syscalls.md, identity ambiguous, blind-routing risky. Only add if 0x79 fix proves insufficient.
+
+**Next: START HERE:**
+1. User runs `.\build.ps1` then `.\launch_recomp.ps1`.
+2. Confirm `[Syscall TODO] ... v1=0x79` warnings are GONE and whether PC moves off `0x100008` / `stuckSecs` stops climbing.
+3. If still stalled → investigate `0x6b` @ pc=0x174f74 (disasm that fn to ID what it expects) and the `[Deci2Call:poll] +4=0x43` spin.
+4. Note log is now UTF-16 — read with tools that handle it (grep/sed see spaced chars).
+
+---
+
+## Prior finding (2026-07-16i) — stale-premise alert (VALIDATED by 07-16j fresh run above)
+
+**Verified this session (2026-07-16i) — do not skip:**
+- The `[sifman]`, `[thevent]`, `[IRX-stub]`, `[IopRuntime]` log tags that ALL of 07-16h is based on appear in **ZERO `.cpp`/`.h` in the repo or the pr137/pr-fix worktrees** — only inside log files. Grep-confirmed.
+- `run_log.txt` (root) is dated **Jul 8** — its producing binary was built from a source generation containing a full **IRX-loader + import-stub interpreted-IOP** (`[IRX-stub] lib='sifman' funcIdx=7/8 ... patched→tramp`, `[sifman] sceSifCheckInit -> -1`, `[thevent] SetEventFlag`). That source is **GONE** from the current tree.
+- The ONLY interpreted-IOP code present now is `ps2xRuntime/src/lib/ps2_iop_cpu.cpp` (`IopCpu`), which is **untracked (`??`)** and instantiated in exactly ONE place — `ps2_runtime.cpp:2277` — inside a `PS2_IOP_CPU_SELFTEST` env-gated self-test (sum(1..10), discarded). **No IRX loaded, no sifman/thevent stubs registered, `setImportHook` never called.**
+- Current IOP RPC handling = C++ HLE dispatcher in `ps2_iop.cpp::handleRPC` (dbcman/libsd/cl/sdrdrv/mcman/cdvd by SID), NOT interpreted IRX.
+- **Net:** diagnosing "why interpreted sifman CheckInit returns -1" = chasing code that isn't compiled anymore. The whole 07-16h front line is against a build that no longer exists in this tree.
+
+**Decision (user, 2026-07-16i):** re-run the CURRENT build first, capture a fresh run_log, re-baseline the blocker to what the current HLE-IOP tree actually does. User is compacting before continuing ([[feedback_compact_after_plan]]).
+
+**Next session — START HERE:**
+1. User runs `.\build.ps1` then `.\launch_recomp.ps1` on the CURRENT tree.
+2. Read the FRESH `run_log.txt` (NOT the Jul-8 one). Confirm whether `[sifman]`/`[IRX-stub]` tags even appear anymore — if they don't, the interpreted-sifman blocker is fully moot.
+3. Identify the REAL current boot blocker from the fresh log + watchdog trace, then re-baseline this doc.
+4. Open question to resolve if it matters: where did the IRX-loader/sifman-stub interpreted-IOP source go (reverted? stashed? uncommitted-then-lost between Jul 8 and now)? `git reflog`/`git stash list`/backup search. Only pursue if the HLE path turns out insufficient and the interpreted path needs restoring.
+
+---
+
+## Current Status (2026-07-16h) — [SUPERSEDED by 07-16i above — premise is stale, see the alert] BIG JUMP: CdInit CLEARED, GS RENDERING, RPC ring converged. New blocker = `sceSifCheckInit` returns -1 forever (IOP-side sifman.irx)
+
+Fresh live run via `.\launch_recomp.ps1` (now tees stdout+stderr to `run_log.txt` automatically — Tee-Object). The boot advanced **far past** every prior-session blocker. The whole 07-16d..g SIF-RPC-bind + CdInit-recv analysis below is now HISTORICAL.
+
+**What completed this run (run_log.txt, in order):**
+- **CdInit CALL sid=0x80000592 rpcno=0 COMPLETED** (L779–780, `done result=0x0`); 0x80000593 rpcno=34 done (L786). The 07-16g "empty recv starve" blocker is GONE. **Option B (recv-fill) is MOOT — do NOT implement it.**
+- ARKD RPC services 0x500–0x503 bound + serviced (rpcno 1/2/17/18/258 via `[IopRuntime] ARKD handled RPC`); memory-card RPC bound (sid 0x80000100, `[McBindPatch]`); threads 20/21 spawned; semas created.
+- **GS IS RENDERING** — `[gif:submit]`/`[gif:drain]` path3, `[gs:FRAME]`, `[gs:AD]` draw regs flowing. First real draw activity ever observed.
+
+**NEW terminal blocker — a 5-line loop repeating forever (run_log tail, from L1233):**
+```
+[sifman] sceSifCheckInit -> -1 (clear poll flag)
+[sifman] iSifSetDma list=0x000A8050 count=1
+[sifman]   DMA iop=0x000A8160 -> ee=0x00502E80 / 0x00502F00 (alternating) size=128
+[thevent] SetEventFlag id=3 bits=0x00000001 -> pattern=0x00000101
+[thevent] SetEventFlag id=3 bits=0x00000100 -> pattern=0x00000101
+```
+- **All 86 `sceSifCheckInit` returns are `-1`, never success.** SIF reports "not initialized" forever; the EE guest's CheckInit poll never clears → hang.
+- The `[sifman]`+`iSifSetDma`+`sceSifCheckInit` strings are **NOT in our C++ stubs** (ours are `[sceSifSetDma:...]`/`[SifCallRpc]`). They are printed by the **interpreted IOP sifman.irx running in the R3000 interpreter** — genuine IOP code, consistent with the no-faking rule. So the -1 originates IOP-side; the IOP<->EE SIF init handshake never converges on the IOP side.
+
+**Next session — START HERE:** find, in the interpreted sifman path, where `sceSifCheckInit`'s return / the SIF-init flag it reads is computed, and WHY it never flips to "initialized." Likely a missing EE→IOP SIF register/DMA-completion signal the interpreted sifman waits on. Fix must stay behavioral (`game_overrides.cpp` / `src/lib/*.cpp`) or be an interpreter-side correction — NOT a hand-faked return value ([[feedback_no_iop_faking]]). Ground truth in memory [[reference_ps2_sif_boot]] 2026-07-16h. Rebuild incremental: `.\build.ps1` then `.\launch_recomp.ps1`.
+
+## Current Status (2026-07-16d) — RAN the built exe: VBLANK/magenta re-baseline was WRONG; game never reaches 0x175210. Real live blocker (re-confirmed) = SIF-RPC bind ping-pong that never converges; v3 fix RAN and STILL storms
+
+First live run of the linked exe (`.\launch_recomp.ps1 -NoDebugger`). Upstream check done: only new item is #170 (IOP refactor to ps2xIOP/) — HOLD; all other recent upstream PRs already in tree. All 5 INTC_STAT VBLANK edits confirmed present in the linked sources before running.
+
+**Result — the 07-16b/c magenta=VBLANK-poll re-baseline is REFUTED by our port's own trace:**
+- PC pinned `0x100008`, `lastCall=0x174cb0` (DeleteSema), stuck permanently. Game **never reaches `0x175210`** — the INTC_STAT VBLANK poll is downstream code it never gets to. The 5-edit VBLANK fix is valid code but unvalidatable from here; **PARKED**, not the front line. ([[reference_intc_stat_vblank_gap]] updated.)
+- **Actual blocker = the SIF-RPC bind ping-pong from 07-15**, and the v3 `deliverSifRpcReply` fix (WORD[8]-forcing) RAN LIVE and did **NOT** converge. Guest sends BIND `[0x40,0,0x80000009,0,0x5,0x20561900,SEQ,0x564980]` + END `[...0x80000008...]` every iteration; SEQ (word[6]) climbs `0x2..0x21+` forever, fresh sema each time (sid 4→34+). `_request_bind`(0x178938) runs each iteration but the bind never sticks — guest re-binds with next seq.
+- **Log-cap trap noted:** `[SifRpcReply] deliver` lines going silent is just the `s_replyLogs < 24` cap (SIF.cpp:251), NOT the depth cap (SIF.cpp:193) and NOT delivery stopping. Don't misread it.
+
+**Next session — START HERE (diagnosis first, NO blind v4):** v1/v2/v3 have all failed blind. Before any code: dump the FULL 16-word (64-byte) BIND packet + the reply packet + the client-side "server registered" flag the bind loop polls (the 8-word log dump hides words 8..15, where WORD[8] router + IOP-return fields live). Determine WHY the client re-binds after `_request_bind` runs — missing registered-flag field in the reply (word[9..15]), an undelivered `_request_rdata`(0x8000000C)/`_request_call`(0x8000000A) path, or a legit per-frame heartbeat masking a different block. Fix in `src/lib/*.cpp` only, no faked IOP data ([[feedback_no_iop_faking]]). Full ground truth in memory [[reference_ps2_sif_boot]] 2026-07-16d. Rebuild = incremental (SIF.cpp in ps2_runtime lib): `.\build.ps1` then `.\launch_recomp.ps1 -NoDebugger`.
+
+## Current Status (2026-07-16c) — INTC_STAT VBLANK boot-blocker FIX IMPLEMENTED + compiles clean (ps2_runtime.lib built); full ps2EntryRunner link + run verification PENDING (user was mid-build at session close)
+
+The magenta-screen stall (2026-07-16b, below) is now root-caused and fixed in `src/lib` only. Game spins forever at `0x175210` polling INTC_STAT `0x1000F000` bit2 (VBLANK-start); runtime never raised that MMIO bit on the vsync tick → infinite spin = magenta screen. Dual-confirmed vs real PCSX2. Full root-cause detail in memory [[reference_intc_stat_vblank_gap]].
+
+**Fix (5 edits, all `src/lib`/one header — NO recompiler run, NO fn_*/runner edits):**
+- `ps2_memory.cpp` writeIORegister: add W1C case for `0x1000F000` (game's `sw 4` ack clears bit2, matching D_STAT 0x1000E010 W1C precedent).
+- `ps2_memory.cpp` initialize(): pre-seed `m_ioRegisters[0x1000F000u]=0` after clear() so the vsync worker's OR only ever assigns to an existing node (avoids unordered_map rehash-vs-find race; residual torn-word race is benign).
+- `ps2_memory.cpp`: new `orIORegister(addr,bits)` definition (`m_ioRegisters[address] |= bits;`).
+- `ps2_memory.h`: declare `void orIORegister(uint32_t,uint32_t);`.
+- `Interrupt.cpp` interruptWorkerMain per-tick: `orIORegister(0x1000F000u, 1u<<2)` before kIntcVblankStart dispatch, `1u<<3` before kIntcVblankEnd.
+
+**Build scope (learned):** header edit fans `ps2_memory.h` into 17 TUs + the whole unity `fn_*` corpus (`unity_NNNN_cxx.cxx`) → wide recompile, but still NOT a recompiler run (output/ sync = 0 files, fwd decls unchanged). Long compile, bounded.
+
+**Status at session close:** `ps2_runtime.lib` built with NO errors (ps2_memory.cpp + Interrupt.cpp compiled clean, 9/12 targets); final `ps2EntryRunner` unity link was still in progress when the session ended. NOT yet run.
+
+**Next session — START HERE:** confirm the build linked `ps2EntryRunner.exe` (watch for any `error [A-Z]` / build_errors.txt). If clean, run `.\launch_recomp.ps1 -NoDebugger`, capture the PC watchdog trace, and confirm the `0x175210` VBLANK-poll loop now EXITS each frame (magenta replaced by a rendered frame). Then read the next boot blocker from the new trace. If verified, mark [[reference_intc_stat_vblank_gap]] as fixed. Do NOT resume the RecompDebugger register-parse plan (`snazzy-crunching-fairy.md`) — parked, not the front line.
+
+## Current Status (2026-07-16b) — CORRECTION: 0x175220 is the interactive mem-card prompt wait on PCSX2, NOT a deadlock; our port dies far EARLIER (magenta screen, never reaches PCSX2's black screen)
+
+Free-run diagnostic on **real PCSX2** (real ISO + scph39001, DebugServer) settled: EE PC pinned at `0x00175220` across ~876M+ cycles of *real* execution, `0x1000F000`=0 and all SIF mailboxes 0. Earlier sessions read this as a lost-wakeup / SIF-DMA deadlock. **That framing is WRONG.**
+
+- **User ground truth:** `0x175220` is the **memory-card check** — an *interactive, input-gated* prompt. Real PCSX2 shows **black screen → mem-card check (press X) → game**. The SIF spin is the prompt's normal poll loop waiting on card status + the user's button press. Not a hang. (Consistent with the 2026-07-07 note at line ~342.)
+- **Our port's actual behavior:** **only a magenta screen — no black screen, no prompt.** The magenta screen is a boot stage *earlier* than PCSX2's black screen. **Our port never reaches 0x175220 at all** — it dies before the black-screen stage that precedes the mem-card check.
+- **Implication:** the entire 07-15 SIF-RPC bind-reply investigation (0x174ce0 WaitSema, `deliverSifRpcReply` v1/v2/v3) was chasing a blocker *downstream* of where our port is actually stuck. The real first failure is whatever keeps our port on the magenta screen and prevents the black screen from ever appearing. **Re-baseline the boot investigation to the magenta→black-screen transition, not the SIF-RPC bind.**
+- User skipped the mem-card check + paused the continue-race on PCSX2 to establish the above.
+
+**Next session — START HERE:** determine what our port renders/executes at the magenta-screen stall (what is the EE actually doing in *our runtime* — is it looping, faulting, or stalled on an IOP/GS init that PCSX2 completes before its black screen). Do NOT resume SIF-RPC bind-reply work until the magenta-stage blocker is characterized. The SIF-RPC status entries below (07-15 / 07-15e) are preserved for reference but are NOT the current front line.
+
+## Current Status (2026-07-16) — RecompDebugger: PCSX2 breakpoints armed, unified BP panel, real-time disasm under DebugServer; build+verify pending
+
+RecompDebugger-only work (plan `snazzy-crunching-fairy.md`, all 4 parts implemented). No runtime/boot-logic changes. Purpose: make RecompDebugger a reliable capture tool for the real IOP SIF-RPC bind-ack packet (the 07-15 SIF blocker below).
+
+- **Part 1 — PCSX2 gutter breakpoints now arm the server.** `tab_codetrace.cpp` disasm-gutter "Set/Remove Breakpoint" mutated only local `g_breakpoints`; now also calls `PCSX2SetBreakpoint`/`PCSX2RemoveBreakpoint` when `g_cpu_source==CPU_PCSX2 && PCSX2DebugServerConnected()`. Gutter BPs actually HALT PCSX2 server-side now (matched the Markers-panel path).
+- **Part 2 — one unified "Breakpoints" panel.** `tab_breakpoints.cpp`: the two CPU-gated blocks merged into a single `CollapsingHeader("Breakpoints")` branching on `g_cpu_source` — Recomp shared-mem slots (with GPR conditions + Resume/HIT banner) in Recomp mode, PCSX2 server BPs in PCSX2 mode. Presentation merge only; both backends' add/remove/clear + server mirroring preserved.
+- **Part 3 (main fix) — real-time disasm under DebugServer.** `main_gui.cpp` `SyncFromPCSX2` DebugServer branch early-returned BEFORE `ee_ram_base` discovery, so `ee_ram_window` (RPM-filled disasm bytes) never loaded → disasm only populated on a coincidental socket drop (what user saw as "pause to populate"). Now discovers `ee_ram_base` (`FindEERAM`) + calls `ReadEEWindow` (follow-PC/pinned) before the return. JSON reg path + RPM memory-window path are orthogonal, so disasm streams live while regs stream from JSON — no pause needed.
+- **Part 4 — flicker.** `tab_codetrace.cpp` `ShowCodeTrace`/`ShowEERegisters` use `static bool s_had_first_snapshot`; keep last-good frame instead of blanking to "Waiting for PCSX2 CPU data..." on transient `regs_valid` dips. Placeholder shows only before the first snapshot.
+
+**Files:** `ps2xRuntime/src/tab_codetrace.cpp` (P1,P4), `tab_breakpoints.cpp` (P2), `main_gui.cpp` (P3,P4). Brace balance verified. NO build run yet (user runs all builds).
+
+**Build (hand to user):** `.\build.ps1 -Debugger`. Verify vs real PCSX2 + SDBZ ISO + scph39001.bin + DebugServer: (1) disasm streams live while game runs unpaused; (2) gutter Set Breakpoint HALTS PCSX2; (3) single Breakpoints panel correct per CPU mode; (4) no Waiting/Scanning flicker; (5) Recomp-mode disasm+BP no regression.
+
+## Current Status (2026-07-15e) — SIF-RPC bind-reply loopback FIX v3 written (WORD[8] router correction); build+run pending
+
+Continues the 0x174ce0 WaitSema blocker below. The game self-hosts its own EE-side libsifrpc: a receive dispatcher `sub_178068` (@0x178068) that polls the pending byte at `0x561600`, and issues raw `sceSifSetDma` BIND/END packets to the IOP, then parks in WaitSema@0x174ce0 awaiting the reply. Our HLE `SifBindRpc` is never called (off this path).
+
+**Fix approach (SIF.cpp `deliverSifRpcReply`, anon ns):** on an outbound RPC system-command `sceSifSetDma`, loop the game's OWN 64-byte packet back into RX queue `0x561600` and run its dispatcher inline via `runtime->lookupFunction(0x178068)`. No invented IOP data — client ptr/server fields echoed verbatim.
+
+**v1/v2 failed, v3 is the correction:**
+- v2 echoed verbatim → SignalSema DID fire (trace `0x178560 -> 0x174cd0`) but binds ping-ponged forever (seq `0x2 -> 0x21+`).
+- ROOT CAUSE (source-level): the dispatcher routes on packet **WORD[8]** (offset 0x20) `& 0x7FFFFFFF` → system handler table `dword_5616E4` slot. Correct slot map (was SWAPPED in old notes): slot **8** `0x80000008` = `sub_178560` **_request_end** (SignalSema+teardown = the WAKE); slot **9** `0x80000009` = `sub_178938` **_request_bind** (registers server, re-sends END). The game's outbound END packet carries WORD[8]=0x80000009 (set by _request_bind:95282), so a verbatim echo re-routes it to _request_bind → re-send → infinite loop.
+- **v3 fix:** force reply WORD[8] to the completion discriminator the IOP return would carry — BIND reply → `0x80000009` (registration), END reply → `0x80000008` (wake). Fixed libsifrpc protocol constants, not faked IOP data. New consts `kSifDiscWordIdx=8`, `kSifRpcEndDiscriminator`; re-entrancy capped depth 8. See [[reference_ps2_sif_boot]] 2026-07-15e.
+
+**Build (hand to user):** `cmake --build "F:\SDBZ Recomp\build" --config Debug --target ps2EntryRunner`. Run: `.\launch_recomp.ps1 -NoDebugger`. SUCCESS = deliver lines STOP after a couple iterations (no seq storm) + pc/lastCall leaves `0x174ce0`. If still storming → client re-binds for another reason; capture log. After boot advances, strip temp `[sceSifSetDma:DTX/OK/FAIL]` + `[SifRpcReply]` cerr diagnostics.
+
+## Current Status (2026-07-15) — sceSifSetDma EE→IOP reject FIXED; boot advanced from DeleteSema spin to WaitSema (0x174ce0) — new blocker: IOP never produces SIF-RPC bind reply
+
+Boot is downstream of the 0x100008 dispatch fix (14f). Live spin surfaced via watchdog `lastCall`, not PC.
+
+**Fix landed & confirmed working (runtime lib only — `ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp`):**
+- **Root cause:** `sceSifSetDma` was range-checking the descriptor's `dest` against EE RAM. For EE→IOP SIF DMA, `dest` is an IOP-side address / sentinel (`0xffffffff`), NOT EE RAM → all transfers rejected → returned 0 → guest tore down semaphores (DeleteSema 0x174cb0) and retried the SIF-RPC bind forever (11-PC spin).
+- **Fix (2 edits, ~SIF.cpp:708 + :729):** validate/copy only the EE-side `src`. If `dest` is copyable EE RAM → EE→EE loopback copy; else treat as IOP-bound → skip EE-side copy but still accept + return nonzero id.
+- **Confirmed:** output flipped `[sceSifSetDma:FAIL] why=rangeUncopyable` → `[sceSifSetDma:OK] -> nonzero id` (×2); DeleteSema spin (0x174cb0) gone.
+- Diagnostic descriptor that cracked it: `src=0x20561900` (valid EE uncached mirror), `dest=0xffffffff`, `size=0x40`, `attr=0x44`, `ra=0x177fc4`.
+
+**NEW blocker (identified, NOT fixed):**
+- Guest now blocks in **WaitSema (syscall 0x44) at `0x174ce0`** (bare trampoline; Dispatcher.cpp:172; WaitSema is a proper blocking Mesa-monitor wait, Sync.cpp:283 — not a busy-spin).
+- Guest sends the SIF-RPC **bind request** via its OWN recompiled raw SIF-DMA path (`0x177fe8` → `func_177EB0`), NOT our `SifBindRpc` HLE (RPC.cpp:1578 — off this path). Then WaitSemas for the IOP's **bind acknowledgment**, which never arrives → re-loops the whole bind.
+- Anchor fns mapped: `0x174ce0`=WaitSema trampoline; `0x174cb0`=DeleteSema trampoline; `0x177de8`=RPC request-queue ENQUEUE helper (table base `0x5616d8`, NOT a wait loop, 4× repeat is normal); `0x177fe8`=sceSifBindRpc-family wrapper→jal func_177EB0.
+
+**Next session — START HERE (diagnosis, no code yet):** trace whether the accepted EE→IOP SIF-DMA packet actually reaches the embedded R3000 IOP interpreter for servicing (which would generate the reply that durably signals WaitSema@0x174ce0), or lands in a void. Start at `noteDtxSifDmaTransfer` (SIF.cpp) → `ps2_iop.cpp` delivery path. Candidate files from last grep: SIF.cpp, RPC.cpp, ps2_memory.cpp, ps2_iop.cpp, ps2_iop_mcman.cpp, RPC.h, SIF.h, Support.h. Fix must land in `src/lib/*.cpp` only and must NOT hand-write/fake IOP output (run real IRX in interpreter — [[feedback_no_iop_faking]]). After boot advances, remove temp SIF.cpp `[GUARD]`/`[FAIL]`/`[OK]` diagnostic logs.
+- Rebuild command (hand to user): `cmake --build "f:\SDBZ Recomp\build" --target ps2EntryRunner` (SIF.cpp is in the `ps2_runtime` static lib → incremental, minutes — NOT the 30h runner rebuild). Re-run: `.\run_watchdog.ps1`. Boot success = EE `0x5e6b3c` GameMode → `0x00` = MainMenu.
+
+## Current Status (2026-07-14g) — RecompDebugger.exe file-browse dialog focus bug fixed (2nd attempt); NOT YET rebuilt/verified
+
+Continuation of the RecompDebugger revival (plan `sharded-zooming-avalanche.md`, target restored + build-verified in a prior session). User reported two UI bugs against the running exe:
+
+- **Config fields empty / Backend=PCSX2:** `symbols.map`, `ps2EntryRunner.exe` etc. already exist on disk (`ps2xRuntime/symbols.map`, `build/ps2xRuntime/Debug/ps2EntryRunner.exe`) — user just needed to fill Settings→Paths fields manually and switch Backend to Recomp. Not a code bug.
+- **Browse dialog opens behind main window:** `tab_filedialogs.cpp`'s `ShowFileDialogs()` had zero focus-forcing calls; `ImGuiFileDialog::Display()` only calls `Begin()` for the currently-open key.
+- **1st fix (WRONG, caused regression):** added unconditional `ImGui::SetNextWindowFocus()` before all 6 `Display()` calls. Broke both dialog visibility AND paste-into-path-fields — `SetNextWindowFocus()` sets a *global* pending flag consumed by the *next* `Begin()` of ANY window that frame, not scoped to the dialog; when no dialog was open it stole focus from the next window/widget (e.g. an `InputText`), breaking paste.
+- **2nd fix (applied, awaiting verify):** added `FocusIfOpen(const char* key)` helper gated on `ImGuiFileDialog::Instance()->IsOpened(key)`, only calling `SetNextWindowFocus()` in the exact frame the matching dialog key is actually open. Replaces the 6 unconditional calls in `ps2xRuntime/src/tab_filedialogs.cpp`.
+
+**Next session / user action — START HERE:** run `.\build.ps1 -Debugger`, relaunch `RecompDebugger.exe`, confirm (a) Browse dialog appears on top/visible, (b) paste into path fields still works (no regression). Then continue the original plan: confirm connect to `Local\RecompDebugState` v10 with Backend=Recomp, launch `ps2EntryRunner.exe` on SLUS_214.42, confirm PC advances live with resolved function name — this is the still-unmet verification criterion for the whole debugger-revival effort, separate from the dispatch-table fix below.
+
+## Current Status (2026-07-14f) — dispatch-table fix APPLIED via format conversion; awaiting user build + boot test. Corrects errors in the 2026-07-14e diagnosis below
+
+Proofing pass over the 2026-07-14e diagnosis found it partly wrong; a much cheaper fix was applied:
+
+- **Correction 1:** `PS2Runtime::registerFunction` is NOT dead code — it exists (`ps2_runtime.cpp:984`) and forwards to `replaceFunction` (`:968`), which writes directly into `g_ps2RecompiledFunctionTable[slot]`. Game overrides installed via it at runtime still win over static init.
+- **Correction 2:** No recompiler re-run needed. `output/register_functions.cpp` (legacy format, June 14, 375,485 `runtime.registerFunction(addr, name)` entries) matches the current runner generation — every referenced symbol exists verbatim as a `runner\*.cpp` file.
+- **New finding — THREE coexisting generations in `runner\`** (~2 files per guest address, 33,956 files / 16,990 unique addresses): `sub_*` (May 17), IDA-labeled `entry_*`/`GameMain_*`/`CApp*` (May 28), and `fn_*`/`start_*` (**June 14 — newest**, same recompiler run as the legacy register file, identical timestamps). The June-14 set is the internally consistent one to dispatch. All generations compile into the exe; only the table decides which executes.
+- **Trap avoided:** pr137-test's populated table (41.5 MB, July 12) is INCOMPATIBLE with main (`sub_00XXXXXX` naming, 26,934-file generation) — never copy it.
+- **Header gap:** `fn_forward_decls.h`/`ps2_recompiled_functions.h` only declare `fn_*`-pattern names, so the generated table file carries its own forward declarations for all 16,970 referenced symbols.
+
+**Fix applied:** `convert_register_functions.ps1` (scratchpad, one-shot) parsed the legacy file and regenerated `output\register_functions.cpp` (31.4 MB) in the dense-table `GeneratedFunctionTableInitializer` format: base `0x100008`, end `0x4e6c84`, 1,022,751 slots, 375,485 entries in 8 chunked init structs, 0 unmapped. Original legacy file preserved at `output\register_functions.cpp.legacy-bak`. Fresh timestamp means `build.ps1`'s newer-wins sync WILL overwrite the runner-side stub on next build (no hand-edit of `runner\`). Spot-checks pass: slot 0 = `start_0x100008`, `0x422630` = `fn_422630_0x422630`, tail alias `0x4e6c80` = `fn_4E68C0_0x4e68c0`.
+
+**Next:** user runs `.\build.ps1` then `& "F:\SDBZ Recomp\build\ps2xRuntime\Debug\ps2EntryRunner.exe" "F:\SDBZ Recomp\ELF\SLUS_214.42"`. Expect the 0x100008 loop gone; new "No exact recompiled function" errors at OTHER PCs would be genuine coverage gaps (e.g. the 3 known stub addresses 0x151830/0x170268/0x11aba0, absent from the legacy file too) — separate triage, not a regression.
+
+## Current Status (2026-07-14e, SUPERSEDED by 14f — contains errors, see corrections above) — dense function-dispatch table (`g_ps2RecompiledFunctionTable`) is never populated — boot hangs immediately at PC 0x100008, unrelated to the C3861/regex fix
+
+Boot-tested `ps2EntryRunner.exe` after the 2026-07-14d build success. Immediately hangs: `dispatchLoop` fails to resolve guest PC `0x100008` on the very first lookup (`Error: No exact recompiled function for guest PC 0x100008 tableBase=0x0 tableEnd=0x1000000`), then spins forever re-trying the same failing lookup (the `missingFunction` stub doesn't advance `ctx->pc`).
+
+**Root cause, traced fully:**
+- `ps2xRuntime/src/lib/ps2_runtime.cpp`'s `dispatchLoop`/`lookupFunction` dispatch exclusively via a dense array `g_ps2RecompiledFunctionTable[]` (declared in `ps2xRuntime/src/runner/register_functions.cpp`), indexed by `(address - tableBase) >> 2`.
+- The live `ps2xRuntime/src/runner/register_functions.cpp` is only 6 lines — declares the table (`tableBase=0x0`, all slots null) but never populates a single entry. No self-registration macro or bulk-populate call exists anywhere in the codebase (confirmed via full-repo grep).
+- The recompiler (`ps2xRecomp/src/lib/function_table_emitter.cpp`, class `FunctionTableEmitter`) is fully capable of emitting the correct file — a `GeneratedFunctionTableInitializer` static-init struct that fills every slot from the function list, with `tableBase` derived from the real address range. This is clearly the intended mechanism.
+- `output/register_functions.cpp` (the recompiler's actual output directory) DOES exist but is dated **2026-06-14** and is in an **old, incompatible format**: a `registerAllFunctions(PS2Runtime&)` function calling `runtime.registerFunction(addr, fn)` per entry (375K lines) — this populates a different/legacy registration path, not `g_ps2RecompiledFunctionTable`, and `registerAllFunctions` isn't called anywhere in current `ps2_runtime.cpp`. It's dead code from a prior architecture generation.
+- `build.ps1`'s sync step (`Syncing output\ -> src\runner\`) only copies a file if the `output\` source is *newer* than the destination. Since someone hand-replaced `ps2xRuntime/src/runner/register_functions.cpp` with the 6-line stub on **2026-07-11** (newer than the June 14 `output/` copy, and the file is untracked/`??` in git), the sync step correctly-but-unhelpfully skips it every time, leaving the broken stub in place.
+- **Net effect:** the dense function table architecture (current `lookupFunction`) and the actual generated output on disk (`output/register_functions.cpp`, legacy `registerAllFunctions` format) are from two different, incompatible generations of the recompiler pipeline. Neither the old output nor the current stub can populate the table `lookupFunction` needs.
+
+**What's needed to fix (not yet done — scope/risk requires user awareness before proceeding):**
+1. `ps2_recomp.exe` is not currently built (`build/ps2xRecomp/Debug/` only has the lib, `.dir`, `.vcxproj` — no exe). Needs a real build of the `ps2_recomp` target.
+2. `config.toml` does not exist at `F:\SDBZ Recomp\config.toml` (the path this file itself documents) — needs locating/regenerating the real recompiler config for SLUS_214.42.
+3. Re-running `ps2_recomp.exe <config.toml>` would regenerate ALL `output/*.cpp` (30,000+ files) in the CURRENT `FunctionTableEmitter` format, including a correct `register_functions.cpp`.
+4. `build.ps1`'s sync step should then correctly pick up the newer `output/register_functions.cpp` and copy it over the stale stub (or the stub should just be deleted first so sync always wins).
+5. Full recompile after that will be a large rebuild (many/most `.cpp` under `runner/` may be regenerated) — per ps2-recomp skill guardrails, this is NOT a quick incremental rebuild; get explicit user go-ahead on timing before starting.
+
+**Next session / user action — START HERE:** decide whether to (a) locate/regenerate `config.toml` and build `ps2_recomp.exe` to properly regenerate `output/`, accepting a large rebuild, or (b) hand-write a stopgap `register_functions.cpp` (small, targeted — e.g. only registering the handful of functions needed to get past the current boot blocker) as a bridge, matching the `GeneratedFunctionTableInitializer` format `lookupFunction` expects. Do NOT resume "fix stub function C3861 errors" work — that thread (regex bug in build.ps1) is fully resolved and unrelated to this new blocker.
+
+## Current Status (2026-07-14d) — Build succeeded: build.ps1 regex fix confirmed working end-to-end, ps2EntryRunner.exe linked
+
+Re-ran `& "F:\SDBZ Recomp\build.ps1"` after the 2026-07-14c regex fix. Build completed successfully (+14:42, 10/12 targets, exe linked): the three C3861 errors (`fn_170268_0x170268`, `fn_151830_0x151830`, `fn_11ABA0_0x11aba0`) are gone. Confirms the build.ps1 line 135 regex fix (`uint8_t\s*\*\s*rdram`) is durable, not just correct in isolation.
+
+Link-stage warnings present but non-blocking (exe still produced): `LNK4075` (`/INCREMENTAL` ignored due to `/FORCE`), `LNK4006` x2 (raylib's `rcore.obj` `CloseWindow`/`ShowCursor` colliding with `user32.lib`, second definition ignored), `LNK4088` (image built via `/FORCE`, may not run — needs actual boot-test to confirm). The raylib/user32 symbol collision is the same NOUSER issue tracked in [F1 Debug Panel Build Fix](project_f1_debug_panel_build_fix.md) — that fix may not be applied to this target, or `/FORCE` is masking it.
+
+**Next session — START HERE:** boot-test `ps2EntryRunner.exe` via the Active Runner Command above to confirm the `/FORCE`-linked exe actually runs (LNK4088 explicitly warns it may not). If it runs, resume the Phase 5 boot-progress chain (verify PC advances past prior blockers, check `0x5e6b3c == 0x00`). If it crashes/fails to start, investigate the raylib/user32 symbol collision as a likely cause — do NOT touch `runner/*.cpp`, fix belongs in the raylib link config or a `NOUSER`-style define per the referenced memory.
+
+## Current Status (2026-07-14b) — Recompiler boundary-detection gap: 3 missing `fn_*` symbols stubbed in game_overrides.cpp; fn_forward_decls.h confirmed auto-regenerated every build (manual header edits are non-durable)
+
+A build attempt (+26:45, failed exit 1) hit three C3861 "identifier not found" errors: `fn_170268_0x170268`, `fn_151830_0x151830` (both previously stubbed in a prior session by editing `fn_forward_decls.h` directly), and a new one, `fn_11ABA0_0x11aba0`.
+
+**Root cause:** `ps2xRuntime/include/fn_forward_decls.h` is marked "Auto-generated by build.ps1 - do not edit" and is in fact rewritten on every `build.ps1` run (see `build.ps1` lines 110-209). It scans `runner/fn_*.cpp` files (lines 117-126) AND separately regex-scans `ps2xRuntime/src/lib/game_overrides.cpp` (lines 128-145, pattern `void\s+(fn_[0-9A-Fa-f]+_0x[0-9a-fA-F]+)\s*\(uint8_t\*\s*rdram`) for fold-extracted stub definitions with no matching runner file, auto-declaring those too. The prior session's direct edit to the header was silently wiped by the next build run — that's why the fix "didn't hold."
+
+**Correct durable fix (now applied):** define missing `fn_*` symbols directly in `game_overrides.cpp` matching the exact signature `void fn_X(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)` — build.ps1's regex auto-declares them every run, no header edits ever needed. All 3 stubs (`fn_151830_0x151830`, `fn_170268_0x170268`, `fn_11ABA0_0x11aba0`) are now present as diagnostic log-and-return stubs in `game_overrides.cpp` (lines ~27-46), all matching the pattern.
+
+**RESOLVED — actual root cause found (2026-07-14c):** the "open/unexplained" gap above was real and now explained. The build.ps1 regex-scan of `game_overrides.cpp` (line 135) was `'void\s+(fn_[0-9A-Fa-f]+_0x[0-9a-fA-F]+)\s*\(uint8_t\*\s*rdram'` — it required `uint8_t*rdram` with NO space between `uint8_t` and `*`. The actual code style in this repo is `uint8_t *rdram` (space before the `*`, not after). So the regex NEVER matched, for any of the three stubs, on any prior run — the auto-scan mechanism was silently broken from the start, not "working but overwritten." Verified via direct PowerShell regex test against the live file: 0 matches with the old pattern, 3/3 matches after the fix. **Fixed:** `build.ps1` line 135 changed to `'void\s+(fn_[0-9A-Fa-f]+_0x[0-9a-fA-F]+)\s*\(uint8_t\s*\*\s*rdram'` (added `\s*` between `uint8_t` and `\*`).
+
+**Next session / user action — START HERE:** run `& "F:\SDBZ Recomp\build.ps1"` again. The header should now report N declarations written (not "unchanged") and include all 3 stub symbols — verify with a quick grep on `fn_forward_decls.h` for `151830|170268|11ABA0` if the build still fails on these. If it fails on a *new* undefined `fn_*` symbol, same durable fix pattern applies — add a matching stub to `game_overrides.cpp`; the regex is now confirmed working.
+
+## Current Status (2026-07-14) — CORRECTION to 2026-07-13c below: PR #168's fix was ALREADY in main (commit `b7d9e17b`, 2026-07-11 21:43, "fix(recomp): advance ctx->pc on fallthrough functions with no terminating branch") — the 2026-07-13c claim "the fix has NOT been applied to this main tree" was never verified against git and was wrong. This is more concerning than it sounds: the 2026-07-13c boot-test ran with the fix already present and STILL hit the `0x100008` infinite loop — meaning the fallthrough-pc fix alone did not resolve this hang, or something since regressed it. Also found: `function_emitter.cpp` currently has a separate uncommitted change on top (mid-asm hook injection — `m_midAsmHooksBeforeByAddress`/`AfterByAddress`, lets generated runner code call user C++ hooks before/after a specific instruction). Unclear if this is related.
+
+**Next session — START HERE:** a build is in progress (user-run, 2026-07-14). Once done: (1) boot-test via the Active Runner Command, check whether PC still hangs at `0x100008`; (2) if it still hangs, do NOT re-diagnose PR #168 again — that's confirmed present and confirmed insufficient. Instead check whether `74359c8f` (the actual PR #168 commit content) matches what's in `b7d9e17b`, since PR branch and main-tree fix may differ; (3) evaluate whether the uncommitted mid-asm-hook diff affects this at all (temporarily stash it and retest if needed). **Standing rule: before writing "fix not yet applied"/"not yet done" into this file, verify with `git log`/`git diff` on the actual file — this entry was wrong for a full day because that wasn't done.**
+
+## Current Status (2026-07-13c) — SUPERSEDED, KEY CLAIM WAS WRONG (see 2026-07-14 above) — Boot-test path fixed; main-tree build now confirmed to hit the SAME dispatch-fallthrough dead loop as pr137-test (PR #168 fix not yet applied to main)
+
+Resolved the 4a.4 boot-test blocker from the entry below: `F:\SDBZ Recomp\ELF\SLUS_214.42` exists; the real current build output tree is `F:\SDBZ Recomp\build\ps2xRuntime\Debug\ps2EntryRunner.exe` (built 2026-07-13 18:32) — `PS2Recomp\out\build\...` (the old documented path) no longer exists on disk. "Active Runner Command" section above corrected accordingly.
+
+Ran the corrected boot command (30s timeout). Result: raylib/GL/audio init all succeed cleanly, then the process hard-loops forever at `pc=0x100008` — log shows `[guest-branch:missing-target] kind=IndirectJump ... source=0x0 target=0x100008 pc=0x100008` followed by ~16,000 repeats of `Error: No exact recompiled function for guest PC 0x100008` in 30s. **This is the identical root cause already diagnosed and fixed in the pr137-test sandbox (see 2026-07-11b below) and submitted as [PR #168](https://github.com/ran-j/PS2Recomp/pull/168)** (`fix/dispatch-fallthrough-pc`, commit `74359c8f`): `FunctionEmitter::emit` doesn't advance `ctx->pc` past a function's last instruction when that instruction isn't a branch/jump, so the ELF-entry-point pseudo-functions (1-2 instruction no-op splits with no terminating branch) spin on their own address forever. **The fix has NOT been applied to this main tree** — it currently only exists in the PR #168 branch.
+
+**Next session — START HERE:** apply the same `function_emitter.cpp` fix from PR #168 (or wait for it to merge upstream and re-sync) to `ps2xRecomp/src/lib/function_emitter.cpp` in this main tree, rebuild via `build.ps1`, then re-run the corrected boot command above and confirm PC progresses past `0x100008`. Once boot progresses, resume the original 4a.4/4a.5 verification chain from the entry below (confirm `0x5e6b3c == 0x00`, then IRX loader chain `5d2856fb → c25428d1 → 52205a65 → 1a49fa58 → 68326c3b`).
+
+## Current Status (2026-07-13b) — Stage 4a (pr135 port) through sub-stage 4a.4 verified; boot-test blocked on missing guest ELF at runtime
+
+Sub-stages 4a.1–4a.4 of the `pr135` IOP-subsystem port (plan: `C:\Users\mwlab\.claude\plans\the-test-directory-has-mighty-mango.md`) are landed and "trust but verify" reviewed clean, including `ps2_memory.cpp` (IOP RAM/SIF-DMA layer, bounds-checked, self-test covered; SPR-DMA-bypasses-DMAE behavior correctly scoped to channels 8/9 for Freekstyle; EE Timer/COP0 Count generalization is a clean parameterization with no behavior change for T0).
+
+Attempted the plan's verification item 6 (boot-test `ps2EntryRunner.exe` after 4a.4). Command run: `.\build\ps2xRuntime\Debug\ps2EntryRunner.exe` (no args) → fatal exception `Unable to determine executable path. Pass the guest ELF as argv[1] or define PS2X_DEFAULT_BOOT_ELF.` Root cause confirmed by reading `ps2xRuntime/src/main.cpp` `getExecutablePath()`: the exe requires the guest ELF path as `argv[1]`; no `PS2X_DEFAULT_BOOT_ELF` macro is defined in this build config. Correct invocation per this file's own "Active Runner Command" section above is `& "F:\SDBZ Recomp\PS2Recomp\out\build\ps2xRuntime\Debug\ps2EntryRunner.exe" "F:\SDBZ Recomp\ELF\SLUS_214.42"` — note the build output path in that command (`PS2Recomp\out\build\...`) differs from the path actually used this session (`.\build\ps2xRuntime\Debug\...`); this discrepancy was not resolved before session end.
+
+**Next session — START HERE:** (1) verify which build output path is currently correct (`F:\SDBZ Recomp\ELF\SLUS_214.42` per this doc, vs. the `.\build\...` relative path used this session) and confirm `F:\SDBZ Recomp\ELF\SLUS_214.42` actually exists; (2) hand the user the corrected boot-test command with the ELF path included; (3) once boot confirmed (`0x5e6b3c == 0x00`), close out 4a.4 and proceed to sub-stage 4a.5 (IRX loader/module-execution chain: `5d2856fb` → `c25428d1` → `52205a65` → `1a49fa58` → `68326c3b`, reconcile step 3a/3c against main's existing `ps2_iop_audio.cpp`).
+
+Also this session: redefined memory `feedback_update_memory_vs_end_session.md`'s "end session protocol" — the old definition referenced `sync.ps1`, which no longer exists in the repo (build_scripts/helper-script staleness was independently confirmed via `command_log.md` and repo-tree globs this session too). New definition: update memory files + update this project-state doc (`BUG_LOG.md` does not exist in this repo, despite being referenced in some memory files — that reference is itself stale and should be corrected/removed next time it's touched) + write a pass-on note. No zip, no git commit, unless separately requested.
 
 ## Current Status (2026-07-11b) — pr137-test "silent crash" root-caused as a non-crashing infinite dispatch loop; fix implemented and PR #168 opened upstream; NOT YET build-verified
 
@@ -458,6 +830,12 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - ALL behavioral fixes go in game_overrides.cpp ONLY (no fn_*.cpp patches, no runner/ edits)
 - NEVER hand-write IOP output values; run actual ARKD_DVD.IRX via R3000 interpreter
 - When jr $ra has register-op delay slot: emit delay slot SET_GPR first, THEN `ctx->pc = GPR(31)`, drop delay addr line
+- Raw guest MMIO poll loops that never exit = a hardware bit the runtime never raises; fix = add the W1C/set path in ps2_memory.cpp writeIORegister + raise the bit on the driving tick (e.g. INTC_STAT 0x1000F000 bit2 VBLANK-start raised in interruptWorkerMain). Pattern: `lw MMIO; andi bit; bnez exit; ...; beqz loop` waiting on a bit == the missing set path.
+- Vsync worker OR-ing an unordered_map slot races the map's rehash-vs-find; pre-seed the key (=0) in initialize() so the worker only ever assigns to an existing node (residual torn-word race is benign).
+- A `ps2_memory.h` edit is NOT cheap: fans into 17 TUs + the whole unity fn_* corpus → wide recompile (but still no recompiler run, no output/ sync). Header changes = long build, budget for it.
+- Log tag `[sifman]`/`[cdvdman]`/`[libsd]` (with lowercase sce* fn names) = the REAL IRX running in the R3000 interpreter, NOT our C++ stubs (ours use `[SifCallRpc]`/`[sceSifSetDma:...]` CamelCase-tag style). When such a tag returns a stuck value, the bug is IOP-side or an EE→IOP signal the interpreted IRX waits on — fix behaviorally, never fake the return.
+- Multi-session summaries can go STALE: always re-run + read a fresh `run_log.txt` before acting on a documented blocker — this session's boot had already jumped past 3 documented blockers (SIF-RPC bind, CdInit recv-starve) with GS rendering, making the planned "Option B" fix moot before a line was written.
+- `sceSifCheckInit -> -1` forever = SIF init handshake never completes; guest polls CheckInit and never proceeds. IOP-side sifman never flags "initialized" (likely a missing EE→IOP DMA-completion/register signal). [open blocker 2026-07-16h]
 
 ## Key Files
 - `PS2Recomp/ps2xRuntime/src/lib/iop/iop_kernel.cpp` — IOP module registry

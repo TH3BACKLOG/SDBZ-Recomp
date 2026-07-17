@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "recomp": {
+      "command": "C:\\Python314\\python.exe",
+      "args": ["F:\\SDBZ Recomp\\build_scripts\\recomp_mcp_server.py"]
+    },
+    "pcsx2": {
+      "command": "node",
+      "args": ["F:\\SDBZ Recomp\\PCSX2\\PCSX2-MCP-v1.0.0-win64\\pcsx2-mcp-server\\dist\\index.js"]
+    }
+  }
+}

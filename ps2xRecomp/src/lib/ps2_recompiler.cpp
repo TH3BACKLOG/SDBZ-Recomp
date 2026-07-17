@@ -915,6 +915,7 @@ namespace ps2recomp
             m_codeGenerator->setRelocationCallNames(relocationCallNames);
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+            m_codeGenerator->setMidAsmHooks(m_config.midAsmHooks);
             m_codeGenerator->setEmitInstructionComments(true);
             m_codeGenerator->setGiantFunctionInstructionThreshold(m_config.giantFunctionInstructionThreshold);
 

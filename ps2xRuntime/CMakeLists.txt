@@ -116,6 +116,38 @@ else()
     )
     target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
     target_link_libraries(rlImGui PUBLIC raylib imgui)
+
+    # --- Standalone RecompDebugger GUI dependencies (SDL2 + ImGui's SDL2/
+    # OpenGL backend + a file dialog widget). Distinct from the imgui/rlImGui
+    # pair above, which backs the in-game raylib overlay panel; the
+    # standalone debugger is a separate windowed app so it can stay open
+    # (and keep breakpoints armed) independently of ps2EntryRunner.
+    # Restored 2026-07-14 for the RecompDebugger revival (dropped when the
+    # repo was flattened; see ps2x_imgui_lib below).
+    if(WIN32)
+        FetchContent_Declare(
+            SDL2
+            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+            GIT_TAG        release-2.32.10
+            GIT_SHALLOW    TRUE
+        )
+        set(SDL_SHARED ON  CACHE BOOL "" FORCE)
+        set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(SDL2)
+
+        FetchContent_Declare(
+            imgui_file_dialog
+            GIT_REPOSITORY https://github.com/aiekick/ImGuiFileDialog.git
+            GIT_TAG        d0e97b2adc3d3452d72c750c7305dc0291acd052 # master, pinned to avoid refetch/rebuild on every configure
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_GetProperties(imgui_file_dialog)
+        if(NOT imgui_file_dialog_POPULATED)
+            FetchContent_Populate(imgui_file_dialog)
+        endif()
+
+        find_package(OpenGL REQUIRED)
+    endif()
 endif()
 
 if(PS2X_SANITIZE STREQUAL "thread" AND NOT PS2X_FIBER_PTHREAD)
@@ -225,6 +257,36 @@ if(PS2X_IS_VITA)
     )
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
+endif()
+
+# Standalone RecompDebugger GUI's ImGui build: SDL2 + OpenGL3 backends plus
+# the embedded file-dialog widget, as a separate static lib from the `imgui`
+# target above (which only carries the core+raylib-backend sources rlImGui
+# needs). Restored 2026-07-14 for the RecompDebugger revival.
+if(WIN32 AND NOT PS2X_IS_VITA)
+    if(NOT TARGET ps2x_imgui_lib)
+        add_library(ps2x_imgui_lib STATIC
+            ${imgui_SOURCE_DIR}/imgui.cpp
+            ${imgui_SOURCE_DIR}/imgui_draw.cpp
+            ${imgui_SOURCE_DIR}/imgui_tables.cpp
+            ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+            ${imgui_file_dialog_SOURCE_DIR}/ImGuiFileDialog.cpp
+        )
+        target_include_directories(ps2x_imgui_lib PUBLIC
+            ${imgui_SOURCE_DIR}
+            ${imgui_SOURCE_DIR}/backends
+            ${imgui_file_dialog_SOURCE_DIR}
+        )
+        # ImGuiFileDialog only compiles its embedded stb_image implementation
+        # (stbi_load/stbi_image_free/stbi_failure_reason) under USE_THUMBNAILS.
+        # main_gui.cpp calls these directly for the file dialog thumbnail preview,
+        # so the symbols must exist inside this lib itself -- RecompDebugger does
+        # not link raylib (which is the only other source of these symbols).
+        target_compile_definitions(ps2x_imgui_lib PRIVATE USE_THUMBNAILS)
+        target_link_libraries(ps2x_imgui_lib PUBLIC SDL2::SDL2 OpenGL::GL)
+    endif()
 endif()
 
 if(WIN32)
@@ -359,6 +421,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_rasterizer.cpp
     src/lib/ps2_iop.cpp
     src/lib/ps2_iop_audio.cpp
+    src/lib/ps2_iop_cpu.cpp
     src/lib/ps2_iop_dbcman.cpp
     src/lib/ps2_iop_mcman.cpp
     src/lib/ps2_iop_sdrdrv.cpp
@@ -373,6 +436,15 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+# RecompDebugger IPC writer -- publishes live CPU/GS/pad/thread state into the
+# Local\RecompDebugState shared-memory segment the standalone RecompDebugger.exe
+# reads. Windows-only (uses CreateFileMappingA); a no-op inline shim in
+# recomp_debug_writer.h covers other platforms. Restored 2026-07-14 for the
+# RecompDebugger revival (writer was fully stripped when the repo was flattened).
+if(WIN32)
+    target_sources(ps2_runtime PRIVATE src/lib/recomp_debug_writer.cpp)
+endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
@@ -522,6 +594,130 @@ endif()
 # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+endif()
+
+# ---------------------------------------------------------------------------
+# Build info header ("Build N-hash (date)" shown in RecompDebugger's title
+# bar). Runs git at build time, not configure time, so it re-stamps on every
+# build without forcing a reconfigure. Restored 2026-07-14 for the
+# RecompDebugger revival (dropped when the repo was flattened).
+# ---------------------------------------------------------------------------
+set(BUILD_INFO_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/build_info.h")
+string(TIMESTAMP BUILD_DATE "%Y-%m-%d")
+# Git root is two levels above ps2xRuntime/ -- <repo>\.git
+get_filename_component(GIT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(GIT_HEAD_FILE  "${GIT_ROOT}/.git/HEAD")
+set(GIT_INDEX_FILE "${GIT_ROOT}/.git/index")
+set(BUILD_NUMBER_OFFSET 133)  # commits before repo rename/reset
+add_custom_command(
+    OUTPUT "${BUILD_INFO_OUTPUT}"
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${GIT_ROOT}
+        -DOUTPUT_FILE=${BUILD_INFO_OUTPUT}
+        -DBUILD_DATE=${BUILD_DATE}
+        -DBUILD_NUMBER_OFFSET=${BUILD_NUMBER_OFFSET}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildInfo.cmake
+    DEPENDS
+        "${GIT_HEAD_FILE}"
+        "${GIT_INDEX_FILE}"
+    COMMENT "Generating build_info.h"
+    VERBATIM
+)
+add_custom_target(ps2_build_info DEPENDS "${BUILD_INFO_OUTPUT}")
+
+# ---------------------------------------------------------------------------
+# RecompDebugger -- standalone debugger GUI. Reads the RecompDebugState shm
+# (Local\RecompDebugState) written by ps2EntryRunner (see
+# src/lib/recomp_debug_writer.cpp); never links ps2_runtime or the generated
+# game stubs, so it can be built/started/closed independently of the game
+# process. Restored verbatim (mod minor include-path fixes) from commit
+# edfe0e16 on 2026-07-14 -- the target was dropped along with the rest of
+# the debugger scaffolding when the repo was flattened.
+# ---------------------------------------------------------------------------
+set(DEBUGGER_SRC_FILES "")
+foreach(_DBG_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main_debugger.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/main_gui.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/debugger_state.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_callstack.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_memoryviewer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_framelogger.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_graphicslogger.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_runtimelog.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_symbolsynctool.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_labelqueue.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_inputlogger.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_settings.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_filedialogs.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/function_db.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp_backend.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/pcsx2_debugserver_client.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_codetrace.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_breakpoints.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/tab_regwatch.cpp"
+)
+    if(WIN32 AND NOT PS2X_IS_VITA AND EXISTS "${_DBG_SRC}")
+        list(APPEND DEBUGGER_SRC_FILES "${_DBG_SRC}")
+    endif()
+endforeach()
+
+if(WIN32 AND NOT PS2X_IS_VITA AND TARGET ps2x_imgui_lib AND DEBUGGER_SRC_FILES)
+    add_executable(RecompDebugger
+        ${DEBUGGER_SRC_FILES}
+        "${CMAKE_CURRENT_SOURCE_DIR}/app.rc"
+        "${BUILD_INFO_OUTPUT}"
+    )
+    add_dependencies(RecompDebugger ps2_build_info)
+
+    target_include_directories(RecompDebugger PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    if(MSVC)
+        target_compile_options(RecompDebugger PRIVATE /FS /utf-8 /MP /Z7)
+    endif()
+
+    target_link_libraries(RecompDebugger PRIVATE ps2x_imgui_lib SDL2::SDL2main)
+    target_link_options(RecompDebugger PRIVATE "/INCLUDE:stbi_load" "/INCLUDE:stbi_image_free" "/INCLUDE:stbi_failure_reason")
+
+    add_custom_command(TARGET RecompDebugger POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:SDL2::SDL2>
+            $<TARGET_FILE_DIR:RecompDebugger>
+        COMMENT "Copying SDL2 DLL to output directory"
+    )
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+        add_custom_command(TARGET RecompDebugger POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+                "$<TARGET_FILE_DIR:RecompDebugger>/assets"
+            COMMENT "Copying controller assets to output directory"
+        )
+    endif()
+
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        EnableFastReleaseMode(RecompDebugger)
+        if(MSVC AND WIN32)
+            target_link_options(RecompDebugger PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>
+            )
+        elseif(MINGW AND WIN32)
+            target_link_options(RecompDebugger PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-mwindows>
+            )
+        endif()
+    endif()
+
+    if(MSVC)
+        target_link_options(RecompDebugger PRIVATE "/FORCE:MULTIPLE")
+    endif()
+
+    install(TARGETS RecompDebugger
+        RUNTIME DESTINATION bin
+    )
 endif()
 
 install(TARGETS ps2_runtime ps2EntryRunner

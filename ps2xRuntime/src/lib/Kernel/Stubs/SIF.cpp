@@ -123,6 +123,245 @@ namespace ps2_stubs
             return id;
         }
 
+        // --- SIF-RPC bind-reply delivery (unblocks WaitSema@0x174ce0 boot spin) ---
+        //
+        // SDBZ hosts its own EE-side SIF-RPC client. It issues the RPC BIND request as
+        // an IOP-bound packet through sceSifSetDma (cid 0x80000009, sid 0x5), then parks
+        // in WaitSema (trampoline 0x174ce0) waiting for the IOP's bind acknowledgement.
+        // Nothing in our runtime ever delivered that reply, so the game's EE-side SIF
+        // receive queue at 0x561600 stayed empty and the WaitSema never woke.
+        //
+        // Layout pinned from the game's own code (decompiles_SLUS_214_42.txt):
+        //   * dword_5616D8 = 0x20561600  -> receive-queue base; *(u8*)0x561600 is the
+        //     "packet pending / size" byte the dispatcher sub_178068 polls (returns
+        //     immediately while zero -> the spin).
+        //   * sub_178068 copies the queued packet into a local and, for cid<0, indexes
+        //     system handler table dword_5616E4 (=0x561700, 32 slots x 12B: fn/arg/gp)
+        //     by (cid & 0x7FFFFFFF); slot 9 holds _request_bind = sub_178938.
+        //   * sub_178938 reads reply words [5]/[7]/[8] (server buf / client buf / rpc id)
+        //     and then re-sends _request_end (cid 0x80000008 -> sub_178560), whose
+        //     LABEL_10 does SignalSema (0x174cd0) on the client sema -> WaitSema wakes.
+        //
+        // We do NOT invent IOP state: every field written back is echoed from the bind
+        // request the EE itself supplied (buf/cbuf/sid). We then drive the game's own
+        // dispatcher sub_178068 (0x178068) so its real callbacks run and signal the sema.
+        constexpr uint32_t kSifRxQueueAddr = 0x561600u;    // physical EE address
+        constexpr uint32_t kSifCmdRpcBind = 0x80000009u;   // outbound: transport cid for BIND
+        constexpr uint32_t kSifCmdRpcEnd = 0x80000008u;    // outbound: transport cid for END re-send
+        constexpr uint32_t kSifCmdRpcCall = 0x8000000Au;   // outbound: transport cid for RPC CALL
+        constexpr uint32_t kSifDispatcherFn = 0x00178068u; // game EE SIF RX dispatcher
+
+        // The dispatcher (sub_178068) routes on packet WORD[8] (byte offset 0x20),
+        // masked with 0x7FFFFFFF -> a slot in the system handler table dword_5616E4.
+        // Registrations (state_sub_unk_b):
+        //   slot 8  (0x80000008) -> sub_178560 _request_end  (SignalSema + client teardown)
+        //   slot 9  (0x80000009) -> sub_178938 _request_bind (re-sends 0x80000008 to the IOP)
+        // A real IOP RPC reply lands with WORD[8] == 0x80000008 so it routes to
+        // _request_end and wakes the parked WaitSema@0x174ce0. Echoing the game's own
+        // outbound packet verbatim leaves WORD[8] == 0x80000009 -> re-routes to
+        // _request_bind -> another re-send -> infinite bind loop. So on delivery we set
+        // WORD[8] to the request-completion discriminator (a fixed libsifrpc protocol
+        // constant, identical for every PS2 title -- not an invented IOP data value).
+        constexpr uint32_t kSifDiscWordIdx = 8u;             // WORD[8] == byte offset 0x20
+        constexpr uint32_t kSifRpcEndDiscriminator = 0x80000008u;
+
+        // One captured outbound RPC system-command packet (0x8000000x). We echo the game's
+        // OWN packet back into its RX queue and let its dispatcher route it -- no invented
+        // IOP state, just the loopback the real IOP would have produced.
+        struct SifRpcReplyPacket
+        {
+            uint32_t words[16] = {0}; // 64-byte packet as the game built it
+            uint32_t cid = 0u;        // words[2]
+            bool valid = false;
+        };
+
+        // Copy the reply packet verbatim into the EE RX queue and run the game's dispatcher
+        // so its registered callbacks fire. 0x80000009 -> _request_bind (re-sends 0x80000008);
+        // 0x80000008 -> _request_end -> SignalSema on the parked WaitSema.
+        void deliverSifRpcReply(uint8_t *rdram,
+                                R5900Context *ctx,
+                                PS2Runtime *runtime,
+                                const SifRpcReplyPacket &req)
+        {
+            if (!runtime || !req.valid)
+            {
+                return;
+            }
+
+            // Bound re-entrancy: BIND -> (re-send) END is 2 levels; cap generously so a
+            // pathological RPC storm can't blow the host stack.
+            static thread_local uint32_t s_deliverDepth = 0u;
+            if (s_deliverDepth >= 8u)
+            {
+                static std::atomic<uint32_t> s_depthLogs{0u};
+                if (s_depthLogs.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                {
+                    std::cerr << "[SifRpcReply] re-entrancy cap hit (cid=0x" << std::hex
+                              << req.cid << std::dec << "), dropping reply" << std::endl;
+                }
+                return;
+            }
+
+            uint8_t *q = getMemPtr(rdram, kSifRxQueueAddr);
+            if (!q)
+            {
+                return;
+            }
+
+            // Start from the game's own 64-byte packet so client ptr (word[7]) and
+            // server fields survive verbatim -- we invent no IOP data. Word[0] low byte
+            // doubles as the pending/size byte the dispatcher reads first; force it
+            // non-zero.
+            uint32_t pkt[16];
+            std::memcpy(pkt, req.words, sizeof(pkt));
+            if ((pkt[0] & 0xFFu) == 0u)
+            {
+                pkt[0] = (pkt[0] & ~0xFFu) | 0x40u;
+            }
+
+            // v4 (source-grounded, decompiles_SLUS_214_42.txt). Two discriminator words:
+            //   * dispatcher sub_178068 routes on WORD[2] (byte offset 8);
+            //   * handler _request_end sub_178560 (0x178560) routes on WORD[8].
+            // The retry loop sub_17CF50 breaks ONLY when dword_5649A4 (= client_block[9])
+            // becomes nonzero, and the SOLE writer is _request_end's register branch:
+            //   WORD[8]==0x80000009 -> v3[9]=WORD[9]; v3[5]=WORD[10]; then SignalSema.
+            // (v3 = WORD[7] = client control block = 0x20564980.)
+            //
+            // The real IOP, after registering the bind, returns exactly one completion
+            // packet routed to _request_end carrying the register sub-discriminator and a
+            // NONZERO server id. v3's bug: an outbound BIND was routed to _request_bind
+            // (which only re-sends END, never sets the flag) and an outbound END carried
+            // WORD[8]=0x80000008 (hits NEITHER branch of _request_end -> flag stays 0).
+            //
+            // Synthesize that single completion reply for the outbound BIND. Every field
+            // is echoed from the request the guest itself sent -- no invented IOP data:
+            //   WORD[2] = 0x80000008  -> dispatcher routes to _request_end
+            //   WORD[7] = req WORD[7] -> client control block (survives from memcpy)
+            //   WORD[8] = 0x80000009  -> _request_end register branch
+            //   WORD[9] = req WORD[4] -> the bind sid the client asked for (the server
+            //                            id; nonzero, opaque token the guest just echoes
+            //                            back to the IOP in later sceSifCallRpc via +52).
+            //   WORD[10]= req WORD[5] -> the client rpc buffer ptr (v3[5], echoed).
+            // The guest's own outbound END packets are then redundant -- they no longer
+            // need a loopback because the flag is already set by this BIND completion.
+            // Track the client object bound to the system LOADFILE service (sid
+            // 0x80000006) so its version-handshake CALL (func 255) is recognisable
+            // below. In a BIND packet the sid rides in WORD[8] and the client object
+            // in WORD[7] -- both read from the guest's own packet, nothing invented.
+            static std::atomic<uint32_t> s_loadfileClientObj{0u};
+            if (req.cid == kSifCmdRpcBind && req.words[kSifDiscWordIdx] == 0x80000006u)
+            {
+                s_loadfileClientObj.store(req.words[7], std::memory_order_relaxed);
+            }
+
+            if (req.cid == kSifCmdRpcCall)
+            {
+                // Outbound RPC CALL (0x8000000A) -> synthesize the IOP's call completion.
+                // _request_end (sub_178560) callback branch: WORD[8]==0x8000000A reads
+                // v3=WORD[7] (client block); if v3[7] (completion callback) set, invokes
+                // v3[7](v3[8]); then LABEL_10 SignalSema iff v3[2] >= 0 -> wakes the sync
+                // WaitSema inside rpc_call (0x178BE8). We deliver NO result data (the IOP
+                // server's output is not invented here); this only unblocks the wait.
+                pkt[2] = kSifCmdRpcEnd;                 // dispatcher -> _request_end
+                pkt[kSifDiscWordIdx] = kSifCmdRpcCall;  // WORD[8] -> callback branch
+                // WORD[7] (client block ptr) survives verbatim from the memcpy.
+
+                // System LOADFILE (sid 0x80000006) version handshake. sub_17D4A0
+                // (d4a0) issues sceSifCallRpc(clientObj, 255, ...) then copies its
+                // 4-byte recv buffer dword_564B40 -> dword_564D68; the gate at
+                // sub_17D5A0 (d5a0) compares 564D68 against dword_461B5C ("3000" =
+                // 0x30303033) and boot spins on -65540 until it matches. The loadfile
+                // module is a PS2 ROM/kernel service (NOT a game IRX), so the runtime
+                // supplies its fixed protocol version string -- same category as the
+                // libsifrpc discriminator constants above, not invented game-IOP data.
+                // recv buffer = req WORD[10] (0x00564B40), size = req WORD[11] (4);
+                // both taken from the guest's own CALL packet, matching the decompile.
+                const uint32_t loadfileObj =
+                    s_loadfileClientObj.load(std::memory_order_relaxed);
+                if (loadfileObj != 0u && req.words[7] == loadfileObj &&
+                    req.words[kSifDiscWordIdx] == 0xFFu)
+                {
+                    const uint32_t recvAddr = req.words[10];
+                    const uint32_t recvSize = req.words[11];
+                    if (recvAddr != 0u && recvSize >= sizeof(uint32_t))
+                    {
+                        if (uint8_t *recvPtr = getMemPtr(rdram, recvAddr))
+                        {
+                            const uint32_t kLoadfileVersion = 0x30303033u; // "3000"
+                            std::memcpy(recvPtr, &kLoadfileVersion, sizeof(kLoadfileVersion));
+
+                            static std::atomic<uint32_t> s_sigLogs{0u};
+                            if (s_sigLogs.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                            {
+                                std::cerr << "[SifRpcReply:LOADFILE] func255 recv=0x"
+                                          << std::hex << recvAddr
+                                          << " <- 0x30303033 (\"3000\")" << std::dec
+                                          << std::endl;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (req.cid == kSifCmdRpcEnd)
+            {
+                // Outbound END re-send: mirror it back to _request_end unchanged so any
+                // in-flight teardown/SignalSema still runs. Its register branch won't fire
+                // (WORD[8] already 0x80000009 in the request), but the flag is set by the
+                // BIND completion above, so this is harmless bookkeeping.
+                pkt[2] = kSifCmdRpcEnd;
+            }
+            else
+            {
+                // Outbound BIND -> synthesize the IOP's register completion.
+                pkt[2] = kSifCmdRpcEnd;          // dispatcher -> _request_end
+                pkt[kSifDiscWordIdx] = kSifCmdRpcBind; // WORD[8] -> register branch
+                pkt[9] = req.words[4];           // client_block[9] = sid (nonzero flag)
+                // client_block[5] is the IOP server's receive buffer: rpc_call
+                // (0x178BE8) uses it as the DEST of every send-payload DMA. On real
+                // hardware the IOP returns its own IOP-side buffer here. Echoing the
+                // request's WORD[5] (the EE packet-pool buffer 0x20561900) made the
+                // guest DMA its payloads over its OWN SIF packet pool -- corrupting
+                // pool link words (later packets carried string garbage in w[3]) and
+                // eventually dispatching to the poisoned pointer 0x20561900. Use the
+                // IOP-bound sentinel instead: the DMA path skips the EE-side copy for
+                // non-copyable dests, and our RPC HLE reads payloads from src anyway.
+                pkt[10] = 0xFFFFFFFFu;           // client_block[5] = IOP-bound sentinel
+            }
+            std::memcpy(q, pkt, sizeof(pkt));
+            // Ensure the pending byte is set last (dispatcher gate).
+            q[0] = static_cast<uint8_t>(pkt[0] & 0xFFu);
+
+            PS2Runtime::RecompiledFunction dispatcher = runtime->lookupFunction(kSifDispatcherFn);
+            if (!dispatcher)
+            {
+                static std::atomic<uint32_t> s_noDispatchLogs{0u};
+                if (s_noDispatchLogs.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                {
+                    std::cerr << "[SifRpcReply] dispatcher 0x" << std::hex
+                              << kSifDispatcherFn << " not in function table" << std::dec
+                              << std::endl;
+                }
+                return;
+            }
+
+            static std::atomic<uint32_t> s_replyLogs{0u};
+            if (s_replyLogs.fetch_add(1u, std::memory_order_relaxed) < 24u)
+            {
+                std::cerr << "[SifRpcReply] deliver cid=0x" << std::hex << req.cid
+                          << " -> run dispatcher 0x" << kSifDispatcherFn << std::dec
+                          << std::endl;
+            }
+
+            // Run the guest dispatcher on the current context. It reads 0x561600 and routes
+            // by cid. Re-entrancy is fine: if _request_bind re-sends 0x80000008 during this
+            // call, that outbound descriptor is captured and delivered by the nested
+            // sceSifSetDma (bounded by s_deliverDepth).
+            ++s_deliverDepth;
+            dispatcher(rdram, ctx, runtime);
+            --s_deliverDepth;
+        }
+        // --- end SIF-RPC reply delivery ---
+
         uint32_t alignIopHeapSize(uint32_t size)
         {
             return (size + (kIopHeapAlign - 1u)) & ~(kIopHeapAlign - 1u);
@@ -304,6 +543,19 @@ namespace ps2_stubs
         const uint32_t handler = getRegU32(ctx, 5);
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
         g_sifCmdHandlers[cid] = handler;
+        // DIAGNOSTIC (bind-reply investigation): log every system/user SIF command
+        // handler the game registers. These are the cids the IOP must eventually
+        // deliver to wake the sub_178068 dispatcher stuck at WaitSema@0x174ce0.
+        // Bounded, not gated on AGRESSIVE_LOGS. Remove once the delivery pipe lands.
+        {
+            static std::atomic<uint32_t> s_addCmdLogs{0u};
+            if (s_addCmdLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+            {
+                std::cerr << "[SifAddCmdHandler] cid=0x" << std::hex << cid
+                          << " handler=0x" << handler
+                          << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+            }
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -670,13 +922,65 @@ namespace ps2_stubs
 
         if (!dmatAddr || count == 0u || count > 32u)
         {
+            static std::atomic<uint32_t> s_argGuardLogs{0u};
+            if (s_argGuardLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
+            {
+                std::cerr << "[sceSifSetDma:GUARD] reject dmat=0x" << std::hex << dmatAddr
+                          << " count=" << std::dec << count
+                          << " ra=0x" << std::hex << getRegU32(ctx, 31)
+                          << std::dec << " -> 0" << std::endl;
+            }
             setReturnS32(ctx, 0);
             return;
+        }
+
+        // DIAGNOSTIC (bind-reply investigation): unconditional bounded dump of every
+        // transfer descriptor so we can see whether the SIF-RPC bind request travels
+        // through this DMA path during the WaitSema@0x174ce0 spin, and read the RPC
+        // control-packet contents (to decode the game's registered bind sema id).
+        // Remove once the bind-reply hook is placed. Not gated on AGRESSIVE_LOGS (that
+        // would need a header edit + full rebuild).
+        {
+            static std::atomic<uint32_t> s_dtxDiagLogs{0u};
+            if (s_dtxDiagLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+            {
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    const uint32_t eAddr = dmatAddr + (i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer)));
+                    const uint8_t *e = getConstMemPtr(rdram, eAddr);
+                    Ps2SifDmaTransfer x{};
+                    if (e) std::memcpy(&x, e, sizeof(x));
+                    const uint32_t sz = static_cast<uint32_t>(x.size);
+                    std::cerr << "[sceSifSetDma:DTX] i=" << i
+                              << " src=0x" << std::hex << x.src
+                              << " dest=0x" << x.dest
+                              << " size=0x" << sz
+                              << " attr=0x" << static_cast<uint32_t>(x.attr);
+                    // First 8 words of the EE-side src payload (the RPC control packet).
+                    const uint8_t *sp = getConstMemPtr(rdram, x.src);
+                    if (sp && sz >= 4u)
+                    {
+                        std::cerr << " pkt[";
+                        const uint32_t words = (sz < 32u ? sz : 32u) / 4u;
+                        for (uint32_t w = 0; w < words; ++w)
+                        {
+                            uint32_t v{};
+                            std::memcpy(&v, sp + w * 4u, 4u);
+                            std::cerr << (w ? " " : "") << "0x" << v;
+                        }
+                        std::cerr << "]";
+                    }
+                    std::cerr << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
+                }
+            }
         }
 
         std::array<Ps2SifDmaTransfer, 32u> pending{};
         uint32_t pendingCount = 0u;
         bool ok = true;
+        Ps2SifDmaTransfer failXfer{};
+        const char *failWhy = "none";
+        SifRpcReplyPacket rpcReply{}; // set if an outbound RPC system command is seen this call
         for (uint32_t i = 0; i < count; ++i)
         {
             const uint32_t entryAddr = dmatAddr + (i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer)));
@@ -684,6 +988,7 @@ namespace ps2_stubs
             if (!entry)
             {
                 ok = false;
+                failWhy = "entryPtr";
                 break;
             }
 
@@ -698,12 +1003,78 @@ namespace ps2_stubs
             if (sizeBytes > PS2_RAM_SIZE)
             {
                 ok = false;
+                failXfer = xfer;
+                failWhy = "sizeTooBig";
                 break;
             }
-            if (!canCopyGuestByteRange(rdram, xfer.dest, xfer.src, sizeBytes))
+
+            // SIF DMA to the IOP: `dest` is an IOP-side address (or a sentinel
+            // like 0xffffffff), NOT EE RAM. Only require the EE-side `src` to be
+            // readable. If `dest` is a copyable EE address we perform the copy
+            // (EE->EE / loopback); otherwise the transfer is IOP-bound and the
+            // EE-side copy is skipped, but the transfer is still accepted so the
+            // guest receives a valid nonzero id and advances. Rejecting these
+            // caused the SIF-RPC bind spin loop at 0x100008.
+            if (!isCopyableGuestAddress(xfer.src) || !getConstMemPtr(rdram, xfer.src))
             {
                 ok = false;
+                failXfer = xfer;
+                failWhy = "srcUnreadable";
                 break;
+            }
+
+            // Detect an outbound SIF-RPC system command (cid word[2] == 0x80000008 END or
+            // 0x80000009 BIND) so we can loop the game's own packet back into its RX queue
+            // as the reply the real IOP would have returned. Capture the whole 64-byte
+            // packet verbatim -- no invented IOP state.
+            if (!rpcReply.valid && sizeBytes >= 0x20u)
+            {
+                if (const uint8_t *sp = getConstMemPtr(rdram, xfer.src))
+                {
+                    uint32_t w[16]{};
+                    const uint32_t copyBytes =
+                        (sizeBytes < sizeof(w)) ? sizeBytes : static_cast<uint32_t>(sizeof(w));
+                    std::memcpy(w, sp, copyBytes);
+                    if (w[2] == kSifCmdRpcBind || w[2] == kSifCmdRpcEnd ||
+                        w[2] == kSifCmdRpcCall)
+                    {
+                        std::memcpy(rpcReply.words, w, sizeof(w));
+                        rpcReply.cid = w[2];
+                        rpcReply.valid = true;
+
+                        // DIAGNOSTIC (v5): dump the full 16-word outbound RPC system
+                        // packet verbatim so we can read the real reply field layout.
+                        // Two goals here:
+                        //   * find the sid-0x80000006 (LOADFILE) BIND: a BIND packet
+                        //     carries the target server sid in WORD[8].
+                        //   * find the func-255 CALL that follows it and locate its recv
+                        //     buffer word. d4a0 passes recv=&dword_564B40 (0x00564B40)
+                        //     with the client data at dword_564D40 (0x00564D40), so any
+                        //     packet word equal to one of those pinpoints the layout.
+                        // Tag such packets [SifRpcPkt:SIG] and never rate-limit them; the
+                        // generic dump stays bounded so the log doesn't flood.
+                        bool sigRelated = (w[8] == 0x80000006u);
+                        for (uint32_t k = 0; k < 16u && !sigRelated; ++k)
+                        {
+                            if (w[k] == 0x00564B40u || w[k] == 0x00564D40u)
+                            {
+                                sigRelated = true;
+                            }
+                        }
+                        static std::atomic<uint32_t> s_pktLogs{0u};
+                        if (sigRelated || s_pktLogs.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                        {
+                            std::cerr << (sigRelated ? "[SifRpcPkt:SIG] src=0x" : "[SifRpcPkt] src=0x")
+                                      << std::hex << xfer.src
+                                      << " cid=0x" << w[2] << std::dec;
+                            for (uint32_t k = 0; k < 16u; ++k)
+                            {
+                                std::cerr << " w[" << k << "]=0x" << std::hex << w[k] << std::dec;
+                            }
+                            std::cerr << std::endl;
+                        }
+                    }
+                }
             }
 
             pending[pendingCount++] = xfer;
@@ -714,10 +1085,23 @@ namespace ps2_stubs
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const Ps2SifDmaTransfer &xfer = pending[i];
-                if (!copyGuestByteRange(rdram, xfer.dest, xfer.src, static_cast<uint32_t>(xfer.size)))
+                const uint32_t xferSize = static_cast<uint32_t>(xfer.size);
+
+                // Only copy when the destination is a real EE address (EE->EE
+                // loopback). IOP-bound transfers (non-copyable dest, e.g.
+                // 0xffffffff) skip the EE-side copy — the SIF/RPC layer delivers
+                // the packet to the IOP — but are still treated as delivered.
+                const bool destIsEeRam =
+                    isCopyableGuestAddress(xfer.dest) &&
+                    canCopyGuestByteRange(rdram, xfer.dest, xfer.src, xferSize);
+
+                if (destIsEeRam)
                 {
-                    ok = false;
-                    break;
+                    if (!copyGuestByteRange(rdram, xfer.dest, xfer.src, xferSize))
+                    {
+                        ok = false;
+                        break;
+                    }
                 }
 
                 ps2_syscalls::noteDtxSifDmaTransfer(
@@ -730,15 +1114,18 @@ namespace ps2_stubs
 
         if (!ok)
         {
-            static uint32_t warnCount = 0;
-            if (warnCount < 32u)
+            static std::atomic<uint32_t> s_failLogs{0u};
+            if (s_failLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
             {
-                PS2_IF_AGRESSIVE_LOGS({
-                    std::cerr << "sceSifSetDma failed dmat=0x" << std::hex << dmatAddr
-                              << " count=0x" << count
-                              << std::dec << std::endl;
-                });
-                ++warnCount;
+                std::cerr << "[sceSifSetDma:FAIL] why=" << failWhy
+                          << " dmat=0x" << std::hex << dmatAddr
+                          << " count=" << std::dec << count
+                          << " src=0x" << std::hex << failXfer.src
+                          << " dest=0x" << failXfer.dest
+                          << " size=0x" << static_cast<uint32_t>(failXfer.size)
+                          << " attr=0x" << static_cast<uint32_t>(failXfer.attr)
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << std::dec << " -> 0" << std::endl;
             }
             setReturnS32(ctx, 0);
             return;
@@ -746,7 +1133,30 @@ namespace ps2_stubs
 
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
 
-        setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
+        {
+            static std::atomic<uint32_t> s_okLogs{0u};
+            if (s_okLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
+            {
+                std::cerr << "[sceSifSetDma:OK] dmat=0x" << std::hex << dmatAddr
+                          << " count=" << std::dec << count
+                          << " pending=" << pendingCount
+                          << " ra=0x" << std::hex << getRegU32(ctx, 31)
+                          << std::dec << " -> nonzero id" << std::endl;
+            }
+        }
+        const int32_t dmaId = static_cast<int32_t>(allocateSifDmaTransferId());
+        setReturnS32(ctx, dmaId);
+
+        // If this call carried an outbound SIF-RPC system command, loop the reply back now
+        // so the chain advances: 0x80000009 (BIND) -> _request_bind re-sends 0x80000008,
+        // whose own sceSifSetDma captures + delivers it (re-entrant) -> _request_end ->
+        // SignalSema wakes WaitSema@0x174ce0. The dispatcher runs guest callbacks inline on
+        // this ctx (may clobber $v0/args), so re-establish the DMA id return afterwards.
+        if (rpcReply.valid)
+        {
+            deliverSifRpcReply(rdram, ctx, runtime, rpcReply);
+            setReturnS32(ctx, dmaId);
+        }
     }
 
     void sceSifSetIopAddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

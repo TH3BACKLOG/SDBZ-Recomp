@@ -184,9 +184,13 @@ namespace ps2_syscalls
             iReferSemaStatus(rdram, ctx, runtime);
             return true;
         case 0x4A:
+        case 0x7E: // ps2tek alias of SetOsdConfigParam (0x4A). SDBZ crt0 calls the 0x7E form.
             SetOsdConfigParam(rdram, ctx, runtime);
             return true;
         case 0x4B:
+        case 0x79: // ps2tek alias of GetOsdConfigParam (0x4B). SDBZ boot thread polls the 0x79 form
+                   // for language/video-mode config; without it the syscall fell through to TODO
+                   // (returned 0, left the param buffer unfilled) and the boot loop stalled at 0x100008.
             GetOsdConfigParam(rdram, ctx, runtime);
             return true;
         case 0x50:
@@ -299,6 +303,31 @@ namespace ps2_syscalls
         case static_cast<uint32_t>(-0x7C):
             Deci2Call(rdram, ctx, runtime);
             return true;
+        case 0x7A:
+        case static_cast<uint32_t>(-0x7A):
+        {
+            // EE kernel syscall 0x7A: SIF/DMA completion-status poll used by the
+            // crt0 SIF-RPC bring-up (runner fn_177B00). The guest spins in
+            // fn_177B00 @ 0x177cf8->0x177d04 issuing 0x7A($a0=4) and masking the
+            // result with 0x20000, waiting for that bit to become set. It then
+            // re-reads via 0x7A(2)/0x7A(0x80000000)/0x7A(0x80000001).
+            //
+            // There is no real SIF DMA engine here; transfers applied by the SIF
+            // stubs complete synchronously, so every status the guest polls for is
+            // already "done". Returning all-ones satisfies any bitmask the guest
+            // ANDs against (0x20000 and others) and reads as "complete", matching
+            // how SifDmaStat reports completion with all high bits set.
+            {
+                static std::atomic<uint32_t> s_sys7aLogs{0u};
+                if (s_sys7aLogs.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                {
+                    std::cerr << "[syscall:0x7A] a0=0x" << std::hex << getRegU32(ctx, 4)
+                              << " -> 0xFFFFFFFF (complete)" << std::dec << std::endl;
+                }
+            }
+            setReturnU32(ctx, 0xFFFFFFFFu);
+            return true;
+        }
         case 0x83:
             FindAddress(rdram, ctx, runtime);
             return true;

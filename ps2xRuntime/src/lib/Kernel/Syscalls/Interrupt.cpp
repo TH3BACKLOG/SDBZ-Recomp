@@ -469,8 +469,18 @@ namespace ps2_syscalls
             {
                 const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
                 ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
+
+                // Raise INTC_STAT VBLANK-start (bit2). The game's VBLANK wait at
+                // 0x175210 spins on `lw 0x1000F000; andi 4` until this asserts;
+                // it W1C-acks it via `sw 4,(0x1000F000)` and loops for the next
+                // frame. Without this the raw MMIO poll never advances (magenta
+                // screen). Set before dispatching the VBon handler list.
+                runtime->memory().orIORegister(0x1000F000u, 1u << 2);
                 dispatchAndCountIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
+
+                // Raise INTC_STAT VBLANK-end (bit3) for the VBoff handler list.
+                runtime->memory().orIORegister(0x1000F000u, 1u << 3);
                 dispatchAndCountIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
                 drainPendingIntc(rdram, runtime);
             }

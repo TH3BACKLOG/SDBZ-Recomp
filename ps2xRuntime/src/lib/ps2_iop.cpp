@@ -1,4 +1,7 @@
+#include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "runtime/ps2_iop.h"
 #include "runtime/ps2_iop_audio.h"
@@ -110,6 +113,65 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                        recvSize, resultPtr))
     {
         return true;
+    }
+
+    if (sid == 0x80000006u) // LOADFILE (IOP loadfile module SIF RPC service)
+    {
+        // Phase 0 diagnostics ONLY: the game's sceSifLoadModule binds to this
+        // service and calls it; we have no handler, so the EE lib returns
+        // -65540 and the boot spins. Log the exact packet (rpc function number,
+        // send-buffer bytes, and the embedded module path) so the IRX loader can
+        // be built against the real arg layout. Still returns false -> no
+        // behavioral change this phase.
+        static std::atomic<uint32_t> s_loadfileLogs{0u};
+        if (s_loadfileLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+        {
+            std::fprintf(stderr,
+                         "[iop:LOADFILE] rpcNum=%u sendBuf=0x%08X sendSize=%u recvBuf=0x%08X recvSize=%u\n",
+                         rpcNum, sendBufAddr, sendSize, recvBufAddr, recvSize);
+
+            const uint8_t *snd = sendBufAddr ? getConstMemPtr(m_rdram, sendBufAddr) : nullptr;
+            if (snd && sendSize > 0u)
+            {
+                const uint32_t dumpLen = sendSize < 96u ? sendSize : 96u;
+                std::fprintf(stderr, "[iop:LOADFILE] send[");
+                for (uint32_t i = 0; i < dumpLen; i++)
+                {
+                    std::fprintf(stderr, "%02X", snd[i]);
+                    if ((i & 3u) == 3u)
+                    {
+                        std::fprintf(stderr, " ");
+                    }
+                }
+                std::fprintf(stderr, "]\n");
+
+                // Extract the first printable ASCII run (>=3 chars) as the path.
+                std::string path;
+                for (uint32_t i = 0; i < sendSize; i++)
+                {
+                    const char c = static_cast<char>(snd[i]);
+                    if (c >= 0x20 && c < 0x7F)
+                    {
+                        path.push_back(c);
+                        if (path.size() >= 128u)
+                        {
+                            break;
+                        }
+                    }
+                    else if (path.size() >= 3u)
+                    {
+                        break;
+                    }
+                    else
+                    {
+                        path.clear();
+                    }
+                }
+                std::fprintf(stderr, "[iop:LOADFILE] path=\"%s\"\n", path.c_str());
+            }
+        }
+
+        // Intentionally fall through (return false) -- Phase 0 is diagnostics only.
     }
 
     if (sid == IOP_SID_CDVD_SCMD)

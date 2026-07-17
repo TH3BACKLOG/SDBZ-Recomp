@@ -7,13 +7,18 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_iop_cpu.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Stubs/Pad.h"
+#include "Kernel/Syscalls/Thread.h"
 #include "ps2_host_backend.h"
 #include "runtime/ps2_diag.h"
 #include "runtime/ps2_guestwatch.h"
+#include "recomp_debug_ipc.h"
+#include "recomp_debug_writer.h"
 
 #include <iostream>
 #include <fstream>
@@ -160,8 +165,31 @@ namespace
         return ps2sched::current_dispatch_history();
     }
 
+    // Diagnostic-only (PS2_PC_WATCHDOG): the most recent guest PC handed to
+    // lookupFunction(), globally across all threads. The outer-dispatch snapshot
+    // (m_debugPc) freezes at a function's entry PC while that function's whole
+    // call tree runs, so it cannot reveal WHERE inside the tree a spin lives.
+    // This atomic keeps advancing on every table-dispatched call, so the last
+    // value observed before a freeze names the deepest function reached.
+    std::atomic<uint32_t> g_lastDispatchPc{0u};
+
+    // Cross-thread snapshot ring (diagnostic-only, PS2_PC_WATCHDOG). The per-thread
+    // DispatchHistory above is fiber/OS-thread-owned, so the watchdog (its own OS
+    // thread) reads its own empty history. This global ring keeps the last N
+    // table-dispatched PCs written by ANY thread so the watchdog can print the
+    // guest's actual spin loop body. Racy by design (approximate ordering is fine
+    // for a stuck-loop trace); relaxed atomics, no locking on the hot path.
+    constexpr uint32_t kGlobalDispatchRingSize = 32u;
+    std::array<std::atomic<uint32_t>, kGlobalDispatchRingSize> g_globalDispatchRing{};
+    std::atomic<uint32_t> g_globalDispatchNext{0u};
+
     void pushDispatchPc(uint32_t pc)
     {
+        g_lastDispatchPc.store(pc, std::memory_order_relaxed);
+
+        const uint32_t slot = g_globalDispatchNext.fetch_add(1u, std::memory_order_relaxed);
+        g_globalDispatchRing[slot % kGlobalDispatchRingSize].store(pc, std::memory_order_relaxed);
+
         DispatchHistory &h = currentDispatchHistory();
         h.pcs[h.next] = pc;
         h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
@@ -169,6 +197,31 @@ namespace
         {
             h.wrapped = true;
         }
+    }
+
+    // Reads the cross-thread ring (see above). Safe to call from the watchdog
+    // thread; formatDispatchHistory() is NOT (it reads per-thread state).
+    std::string formatGlobalDispatchHistory()
+    {
+        const uint32_t total = g_globalDispatchNext.load(std::memory_order_relaxed);
+        if (total == 0u)
+        {
+            return "(empty)";
+        }
+        const uint32_t count = std::min(total, kGlobalDispatchRingSize);
+        const uint32_t start = total - count; // absolute index of oldest kept entry
+
+        std::ostringstream oss;
+        for (uint32_t i = 0u; i < count; ++i)
+        {
+            if (i != 0u)
+            {
+                oss << " -> ";
+            }
+            const uint32_t pc = g_globalDispatchRing[(start + i) % kGlobalDispatchRingSize].load(std::memory_order_relaxed);
+            oss << "0x" << std::hex << pc;
+        }
+        return oss.str();
     }
 
     std::string formatDispatchHistory()
@@ -1916,6 +1969,32 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
         m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
 
+        // RecompDebugger IPC: publish this thread's pc/gpr/hi/lo into the
+        // shared-memory RecompDebugState once per outer dispatch-loop
+        // iteration, and service any armed breakpoint for this thread.
+        // Restored 2026-07-14 (writer was fully stripped when the repo was
+        // flattened; see recomp_debug_writer.h/.cpp). No-ops on non-Windows
+        // and when RecompDebugger isn't attached (Init() never called or the
+        // shm couldn't be opened).
+        {
+            uint32_t dbg_gpr[32];
+            for (int i = 0; i < 32; ++i)
+                dbg_gpr[i] = static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[i]));
+            RecompDbg::Update(g_currentThreadId, pc, dbg_gpr,
+                               static_cast<uint32_t>(ctx->hi),
+                               static_cast<uint32_t>(ctx->lo),
+                               ctx->insn_count,
+                               rdram, PS2_RAM_SIZE);
+            if (RecompDbg::CheckBreakpoint(g_currentThreadId, pc & 0x1FFFFFFFu, dbg_gpr))
+            {
+                // Breakpoint/step handling may have edited dbg_gpr (a debugger-armed
+                // register write); mirror only the low 32-bit lane back into the live
+                // 128-bit MMI register so the other lanes are left untouched.
+                for (int i = 1; i < 32; ++i)
+                    ctx->r[i] = _mm_insert_epi32(ctx->r[i], static_cast<int>(dbg_gpr[i]), 0);
+            }
+        }
+
         RecompiledFunction fn = lookupFunction(pc);
         const uint32_t dispatchedPc = pc;
         const uint32_t dispatchedRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
@@ -2156,6 +2235,29 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
+    RecompDbg::Init();
+
+    // Ground-truth dump of every function address actually registered by the
+    // recompiler, so RecompDebugger (a separate process with no PS2Runtime
+    // pointer) can diff it against the ELF symbol table to flag functions
+    // that were never translated. Restored 2026-07-14; rewritten against the
+    // dense-table function-registry format (g_ps2RecompiledFunctionTable[])
+    // that replaced the old std::map<uint32_t, RecompiledFunction> table.
+    {
+        std::ofstream dumpFile("recomp_function_table.txt", std::ios::trunc);
+        if (dumpFile.is_open())
+        {
+            for (uint32_t slot = 0; slot < g_ps2RecompiledFunctionTableSlotCount; ++slot)
+            {
+                if (g_ps2RecompiledFunctionTable[slot] != nullptr)
+                {
+                    const uint32_t addr = g_ps2RecompiledFunctionTableBase + (slot << 2);
+                    dumpFile << std::hex << addr << "\n";
+                }
+            }
+        }
+    }
+
     // [watch] env hook: PS2X_WATCH=ADDR[:SIZE][:LABEL][,...] arms guest-memory
     // watches before guest code starts. Arming a watch also enables the
     // diagnostics gate -- this turns on the FULL diagnostics stream, i.e. ALL
@@ -2166,6 +2268,14 @@ void PS2Runtime::run()
     {
         ps2_diag::set_enabled(true);
         RUNTIME_LOG("[watch] armed " << armed << " guest-memory watch(es) from PS2X_WATCH");
+    }
+
+    // Optional R3000A IOP-core self-test (env PS2_IOP_CPU_SELFTEST=1): runs a
+    // hand-assembled program in (still-zeroed) IOP RAM before the guest starts.
+    if (const char *st = std::getenv("PS2_IOP_CPU_SELFTEST"); st && *st && *st != '0')
+    {
+        IopCpu iopCpu(&m_memory);
+        iopCpu.selfTest();
     }
 
     // A blank image to use as a framebuffer
@@ -2187,6 +2297,36 @@ void PS2Runtime::run()
     }
 
     ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
+
+    // Optional PC watchdog (enable with env PS2_PC_WATCHDOG=1): logs the guest PC
+    // once a second so an external observer can tell whether execution is
+    // advancing or spinning on a wait loop. Diagnostic only; off by default.
+    std::thread watchdogThread;
+    {
+        const char *wdEnv = std::getenv("PS2_PC_WATCHDOG");
+        if (wdEnv && *wdEnv && *wdEnv != '0')
+        {
+            watchdogThread = std::thread([&]()
+                                         {
+                ThreadNaming::SetCurrentThreadName("PcWatchdog");
+                uint32_t last = 0xFFFFFFFFu;
+                int stuck = 0;
+                int t = 0;
+                while (!isStopRequested())
+                {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    const uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
+                    const uint32_t ra = m_debugRa.load(std::memory_order_relaxed);
+                    const uint32_t lastCall = g_lastDispatchPc.load(std::memory_order_relaxed);
+                    stuck = (pc == last) ? (stuck + 1) : 0;
+                    last = pc;
+                    std::cerr << "[watchdog] t=" << (++t) << "s pc=0x" << std::hex << pc
+                              << " ra=0x" << ra << " lastCall=0x" << lastCall
+                              << std::dec << " stuckSecs=" << stuck
+                              << " trace=" << formatGlobalDispatchHistory() << std::endl;
+                } });
+        }
+    }
 
     uint64_t tick = 0;
     while (!isStopRequested())
@@ -2376,6 +2516,62 @@ void PS2Runtime::run()
         }
         EndDrawing();
 
+        // RecompDebugger IPC: once-per-video-frame extended telemetry (GS
+        // regs, pad state, runtime log ring, guest thread scheduler snapshot).
+        // Restored 2026-07-14. NOTE: the debugger's Input-tab pad-injection
+        // (RecompDbg::GetPadOverride -> ps2_stubs::setPadOverrideState) is
+        // deliberately NOT wired back in here -- the current
+        // setPadOverrideState()/clearPadOverrideState() are single-port
+        // (no `port` parameter), unlike the per-port overrides this call
+        // expected when it was dropped. Re-plumbing Pad.cpp to be per-port
+        // was out of scope for this restore; read-only telemetry (PC/GPR,
+        // breakpoints, GS/pad/thread/log display) is unaffected.
+        {
+            const GSRegisters &gsRegs = m_memory.gs();
+            DbgGsSnapshot dbgGs{gsRegs.pmode, gsRegs.smode2, gsRegs.dispfb1,
+                                gsRegs.display1, gsRegs.dispfb2, gsRegs.display2,
+                                gsRegs.csr.load(std::memory_order_relaxed)};
+
+            const ps2_stubs::PadDebugSnapshot padSnap = ps2_stubs::getPadDebugSnapshot();
+            DbgPadSnapshot dbgPad[2];
+            for (int p = 0; p < 2; ++p)
+            {
+                const ps2_stubs::PadDebugPortSnapshot &row = padSnap.ports[p][0];
+                dbgPad[p] = DbgPadSnapshot{row.lastButtons, row.lx, row.ly, row.rx, row.ry};
+            }
+
+            const std::vector<ps2_log::RuntimeLogEntry> logSnap = ps2_log::snapshot_runtime_log_entries();
+            const uint32_t logCount = static_cast<uint32_t>(
+                std::min<size_t>(logSnap.size(), kDbgMaxLogEntries));
+            std::array<DbgLogEntry, kDbgMaxLogEntries> dbgLogs{};
+            for (uint32_t i = 0; i < logCount; ++i)
+            {
+                const ps2_log::RuntimeLogEntry &src = logSnap[logSnap.size() - logCount + i];
+                dbgLogs[i].seq = src.seq;
+                std::snprintf(dbgLogs[i].text, kDbgLogTextSize, "%s", src.text.c_str());
+            }
+            const uint64_t nextSeq = logSnap.empty() ? 1 : (logSnap.back().seq + 1);
+            RecompDbg::UpdateExtended(dbgGs, dbgPad, dbgLogs.data(), logCount, nextSeq);
+
+            const std::vector<ps2_syscalls::ThreadDebugSnapshot> threadSnap = ps2_syscalls::getThreadDebugSnapshot();
+            const uint32_t threadCount = static_cast<uint32_t>(
+                std::min<size_t>(threadSnap.size(), kDbgMaxThreads));
+            std::array<DbgThreadInfo, kDbgMaxThreads> dbgThreads{};
+            for (uint32_t i = 0; i < threadCount; ++i)
+            {
+                const ps2_syscalls::ThreadDebugSnapshot &src = threadSnap[i];
+                dbgThreads[i].tid             = src.tid;
+                dbgThreads[i].entry           = src.entry;
+                dbgThreads[i].currentPc       = src.currentPc;
+                dbgThreads[i].stack           = src.stack;
+                dbgThreads[i].status          = src.status;
+                dbgThreads[i].waitType        = src.waitType;
+                dbgThreads[i].waitId          = src.waitId;
+                dbgThreads[i].currentPriority = src.currentPriority;
+            }
+            RecompDbg::UpdateThreads(dbgThreads.data(), threadCount);
+        }
+
         if (WindowShouldClose())
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
@@ -2386,6 +2582,11 @@ void PS2Runtime::run()
 
     requestStop();
 
+    if (watchdogThread.joinable())
+    {
+        watchdogThread.join();
+    }
+
     // Signal all guest fibers to stop and join the pool threads.
     ps2sched::scheduler_shutdown();
     ps2sched::scheduler_set_stop_callback(nullptr, nullptr);
@@ -2395,6 +2596,8 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+
+    RecompDbg::Shutdown();
     UnloadTexture(frameTex);
     CloseWindow();
 }

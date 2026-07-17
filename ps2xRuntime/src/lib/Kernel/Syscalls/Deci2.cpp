@@ -125,7 +125,6 @@ namespace ps2_syscalls
 {
     void Deci2Call(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-#if defined(_DEBUG) || defined(RUNTIME_DECI2CALL)
         const int32_t code = static_cast<int32_t>(getRegU32(ctx, 4));
         const uint32_t argsAddr = getRegU32(ctx, 5);
 
@@ -153,9 +152,121 @@ namespace ps2_syscalls
         }
         // WE dont need to do thouses
         case 3:  // sceDeci2ReqSend(socket, dest)
-        case 4:  // sceDeci2Poll(socket)
         case -7: // sceDeci2ExReqSend(socket, dest)
         {
+            // Diagnostic: this is the boot TTY flush path. Log the handle the
+            // game passes and the packet text sitting in the Deci2 TTY buffer
+            // (0x2056130C per IDA putbuf @0x1763F8) so we can see WHAT the game
+            // is trying to print and confirm the loop is the printf flush.
+            {
+                static std::atomic<uint32_t> s_reqSendLogs{0u};
+                if (s_reqSendLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+                {
+                    constexpr uint32_t kDeci2TtyBuffer = 0x2056130Cu;
+                    std::string text;
+                    text.reserve(128u);
+                    for (uint32_t byteIndex = 0; byteIndex < 128u; byteIndex++)
+                    {
+                        const uint8_t ch = rdram[(kDeci2TtyBuffer + byteIndex) & PS2_RAM_MASK];
+                        if (ch == 0u)
+                        {
+                            break;
+                        }
+                        text.push_back(static_cast<char>(ch));
+                    }
+                    std::cerr << "[Deci2Call:reqsend] code=" << code
+                              << " a0=0x" << std::hex << args[0]
+                              << " a1=0x" << args[1] << std::dec << std::endl;
+                    logDeci2Text("[Deci2Call:reqsend:tty] ", text);
+
+                    // When the TTY line is the loadmodule-failure message, dump the
+                    // four EE words that drive the pre-RPC signature gate in
+                    // noop_sub_dc78 (0x17DC78) -> wrap_mem_compare_n_c_0 (0x17D5A0).
+                    // The gate REJECTS (returns -65540) iff:
+                    //   [0x564D68] != [0x461B5C] && [0x564D68] != *[0x461C34] &&
+                    //   [0x461B5C] != *[0x461C34]. dword_564D68 is the loadfile
+                    // module signature fetched via sid 0x80000006 rpc func 0xFF in
+                    // noop_sub_d4a0; it is BSS-zero here because that RPC never ran
+                    // (d4a0 short-circuits on dword_461C30 >= 0). Confirm empirically.
+                    if (text.rfind("Can't load module", 0) == 0)
+                    {
+                        static std::atomic<uint32_t> s_gateLogs{0u};
+                        if (s_gateLogs.fetch_add(1u, std::memory_order_relaxed) < 4u)
+                        {
+                            uint32_t initFlag = 0, sigA = 0, ptrC34 = 0, sigBVal = 0, fetched = 0;
+                            readDeci2U32(rdram, 0x00461C30u, initFlag); // d4a0 init guard
+                            readDeci2U32(rdram, 0x00461B5Cu, sigA);     // expected sig A
+                            readDeci2U32(rdram, 0x00461C34u, ptrC34);   // off_461C34 (pointer)
+                            readDeci2U32(rdram, ptrC34, sigBVal);       // *off_461C34 = expected sig B
+                            readDeci2U32(rdram, 0x00564D68u, fetched);  // fetched loadfile signature
+                            std::cerr << std::hex
+                                      << "[loadgate] initFlag@461C30=0x" << initFlag
+                                      << " sigA@461B5C=0x" << sigA
+                                      << " ptr@461C34=0x" << ptrC34
+                                      << " sigB@*461C34=0x" << sigBVal
+                                      << " fetched@564D68=0x" << fetched
+                                      << std::dec << std::endl;
+                        }
+                    }
+                }
+            }
+
+            setReturnS32(ctx, KE_OK);
+            return;
+        }
+        case 4: // sceDeci2Poll(socket)
+        {
+            // No host DECI2 channel is attached. On real hardware the DECI2
+            // driver's completion ISR clears the per-socket "request pending"
+            // word once the async send finishes; here that ISR never runs, so
+            // the crt0 poll loop (runner fn_1763F8 @ 0x176518->0x176528) spins
+            // forever waiting on that word to return to 0.
+            //
+            // The driver state block is at a fixed BSS address: $s5 = lui 0x56 =>
+            // 0x00560000, $s0 = $s5 + 0x12D0 = 0x005612D0, and the pending word
+            // the loop reloads is 0xC($s0) = 0x005612DC. Mark the request complete
+            // by clearing it so the poll loop can exit.
+            constexpr uint32_t kDeci2StateBlock = 0x005612D0u;
+            constexpr uint32_t kDeci2PendingWord = kDeci2StateBlock + 0x0Cu;
+
+            // Diagnostic: log the state block once so we can confirm the offset
+            // empirically on the same run that applies the fix.
+            {
+                static std::atomic<uint32_t> s_pollFlagLogs{0u};
+                if (s_pollFlagLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+                {
+                    uint32_t w0 = 0, w4 = 0, w8 = 0, wc = 0, w10 = 0;
+                    readDeci2U32(rdram, kDeci2StateBlock + 0x00u, w0);
+                    readDeci2U32(rdram, kDeci2StateBlock + 0x04u, w4);
+                    readDeci2U32(rdram, kDeci2StateBlock + 0x08u, w8);
+                    readDeci2U32(rdram, kDeci2StateBlock + 0x0Cu, wc);
+                    readDeci2U32(rdram, kDeci2StateBlock + 0x10u, w10);
+                    std::cerr << "[Deci2Call:poll] block@0x" << std::hex << kDeci2StateBlock
+                              << " +0=0x" << w0 << " +4=0x" << w4 << " +8=0x" << w8
+                              << " +C=0x" << wc << " +10=0x" << w10 << std::dec << std::endl;
+
+                    // Also dump the handle the game actually passes (args[0]) so we
+                    // can tell whether the drain word lives at 0xC(handle) (~0x46000C
+                    // per 07-17b) rather than the fixed BSS latch above.
+                    const uint32_t handle = args[0];
+                    uint32_t h0 = 0, h4 = 0, h8 = 0, hc = 0, h10 = 0;
+                    readDeci2U32(rdram, handle + 0x00u, h0);
+                    readDeci2U32(rdram, handle + 0x04u, h4);
+                    readDeci2U32(rdram, handle + 0x08u, h8);
+                    readDeci2U32(rdram, handle + 0x0Cu, hc);
+                    readDeci2U32(rdram, handle + 0x10u, h10);
+                    std::cerr << "[Deci2Call:poll] handle@0x" << std::hex << handle
+                              << " +0=0x" << h0 << " +4=0x" << h4 << " +8=0x" << h8
+                              << " +C=0x" << hc << " +10=0x" << h10 << std::dec << std::endl;
+                }
+            }
+
+            if (uint8_t *pending = getMemPtr(rdram, kDeci2PendingWord))
+            {
+                const uint32_t zero = 0u;
+                std::memcpy(pending, &zero, sizeof(zero));
+            }
+
             setReturnS32(ctx, KE_OK);
             return;
         }
@@ -230,6 +341,5 @@ namespace ps2_syscalls
             return;
         }
         }
-#endif
     }
 }

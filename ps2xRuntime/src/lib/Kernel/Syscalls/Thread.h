@@ -1,9 +1,31 @@
 #pragma once
 
 #include "ps2_syscalls.h"
+#include <vector>
 
 namespace ps2_syscalls
 {
+    // Plain-data snapshot of one PS2 thread's scheduler state, safe to copy
+    // out from under g_thread_map_mutex without exposing ThreadInfo (which
+    // holds a std::mutex/condition_variable) to callers outside Kernel/.
+    // Restored 2026-07-14 for the RecompDebugger revival (was dropped along
+    // with the rest of the debug IPC layer when the repo was flattened).
+    struct ThreadDebugSnapshot
+    {
+        int tid = 0;
+        uint32_t entry = 0;
+        uint32_t currentPc = 0;
+        uint32_t stack = 0;
+        int status = 0;
+        int waitType = 0;
+        int waitId = 0;
+        int currentPriority = 0;
+    };
+
+    // Snapshots g_threads under g_thread_map_mutex. Safe to call from any
+    // thread; used by the debug IPC layer once per video frame.
+    std::vector<ThreadDebugSnapshot> getThreadDebugSnapshot();
+
     void FlushCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void iFlushCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void EnableCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

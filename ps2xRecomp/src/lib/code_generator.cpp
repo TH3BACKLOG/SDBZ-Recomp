@@ -140,6 +140,27 @@ namespace ps2recomp
         }
     }
 
+    void CodeGenerator::setMidAsmHooks(const std::vector<MidAsmHook> &hooks)
+    {
+        m_midAsmHooksBeforeByAddress.clear();
+        m_midAsmHooksAfterByAddress.clear();
+        for (const auto &hook : hooks)
+        {
+            if (hook.name.empty())
+            {
+                continue;
+            }
+            if (hook.after)
+            {
+                m_midAsmHooksAfterByAddress[hook.address] = hook.name;
+            }
+            else
+            {
+                m_midAsmHooksBeforeByAddress[hook.address] = hook.name;
+            }
+        }
+    }
+
     void CodeGenerator::setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner)
     {
         m_resumeEntryTargetsByOwner = resumeTargetsByOwner;

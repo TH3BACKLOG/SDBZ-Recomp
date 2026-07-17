@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "RPC.h"
+#include <cstdlib>
 
 namespace ps2_syscalls
 {
@@ -119,6 +120,83 @@ namespace ps2_syscalls
             }
             std::memcpy(ptr, &value, sizeof(value));
             return true;
+        }
+
+        // ---- SIF SET_SREG (cid 0x80000001) round-trip bridge -----------------
+        // The EE writes a soft-register destined for the IOP; on real hardware an
+        // IRX driver replies by writing the EE-side libsifcmd _sif_sreg[] mirror,
+        // which EE code then polls (e.g. Freekstyle's audio-init wait loop). With
+        // no IOP CPU yet, echo the written value straight into that EE mirror so
+        // the poll loops progress. The mirror base is game-specific (the address
+        // of libsifcmd's _sif_sreg[]); it is supplied via the env var
+        // PS2_SIF_EE_SREG_BASE (hex, 0/unset = disabled, the default). This is a
+        // deliberate temporary bridge that running the real IRX modules replaces.
+        uint32_t eeSregMirrorBase()
+        {
+            static const uint32_t base = []() -> uint32_t {
+                const char *s = std::getenv("PS2_SIF_EE_SREG_BASE");
+                if (!s || !*s)
+                {
+                    return 0u;
+                }
+                return static_cast<uint32_t>(std::strtoul(s, nullptr, 0));
+            }();
+            return base;
+        }
+
+        // Locate the 24-byte SET_SREG packet among the candidate argument
+        // registers (calling conventions vary per game) and read {index, value}
+        // from packet+0x10 / packet+0x14.
+        bool decodeSetSregPacket(const uint8_t *rdram,
+                                 const uint32_t *candidates, size_t count,
+                                 uint32_t &index, uint32_t &value)
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                const uint32_t cand = candidates[i];
+                if (cand < 0x1000u || cand >= PS2_RAM_SIZE)
+                {
+                    continue; // not a plausible RAM pointer
+                }
+                uint32_t idx = 0u;
+                if (!readGuestU32(rdram, cand + 0x10u, idx) || idx >= 0x40u)
+                {
+                    continue; // sreg indices are 0..31
+                }
+                uint32_t val = 0u;
+                readGuestU32(rdram, cand + 0x14u, val);
+                index = idx;
+                value = val;
+                return true;
+            }
+            return false;
+        }
+
+        void handleSifSetSreg(uint8_t *rdram, uint32_t a1, uint32_t a2, uint32_t a3)
+        {
+            const uint32_t base = eeSregMirrorBase();
+            if (base == 0u)
+            {
+                return; // disabled unless a mirror base is configured
+            }
+            uint32_t index = 0u;
+            uint32_t value = 0u;
+            const uint32_t cands[3] = {a2, a1, a3};
+            if (!decodeSetSregPacket(rdram, cands, 3, index, value))
+            {
+                return;
+            }
+            writeGuestU32(rdram, base + index * 4u, value);
+
+            static int logCount = 0;
+            if (logCount < 32)
+            {
+                std::cerr << "[sif:set_sreg] index=0x" << std::hex << index
+                          << " value=0x" << value
+                          << " -> EEmirror[0x" << (base + index * 4u) << "]"
+                          << std::dec << std::endl;
+                ++logCount;
+            }
         }
 
         bool normalizeGuestLinearAddr(uint32_t addr, uint32_t &out)
@@ -1518,6 +1596,12 @@ namespace ps2_syscalls
             return;
         }
 
+        // The game's libsifrpc client registers the semaphore it will WaitSema on
+        // into client->hdr.sema_id BEFORE issuing the bind. Capture it now, before
+        // we overwrite the field below — that sid is the one we must SignalSema so
+        // the game's own bind-reply wait (WaitSema@0x174ce0) wakes and boot proceeds.
+        const int32_t gameBindWaitSema = client->hdr.sema_id;
+
         client->command = 0;
         client->buf = 0;
         client->cbuf = 0;
@@ -1580,6 +1664,25 @@ namespace ps2_syscalls
         event.result = 0;
         pushSifRpcDebugEvent(event);
         setReturnS32(ctx, 0);
+
+        // The HLE bind above completed synchronously, but the game's own libsifrpc
+        // client still parks on the sema it registered (client->hdr.sema_id, captured
+        // before the clobber), expecting a SIF command interrupt to deliver the reply
+        // + SignalSema. No such interrupt fires in the recomp runtime (sceSifCmdIntrHdlr
+        // is a stub), so deliver the wake here via the same validated path SifCallRpc's
+        // Nowait completion uses. Bounded log so we can confirm which sid was signalled.
+        if (gameBindWaitSema > 0)
+        {
+            const bool signalled = signalRpcCompletionSema(static_cast<uint32_t>(gameBindWaitSema));
+            static std::atomic<uint32_t> s_bindSignalLogs{0u};
+            if (s_bindSignalLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
+            {
+                std::cerr << "[SifBindRpc:SIGNAL] client=0x" << std::hex << clientPtr
+                          << " sid=0x" << rpcId << std::dec
+                          << " waitSema=" << gameBindWaitSema
+                          << " signalled=" << (signalled ? 1 : 0) << std::endl;
+            }
+        }
     }
 
     void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2883,6 +2986,13 @@ namespace ps2_syscalls
         if (sizeExtra > 0 && srcExtra && destExtra)
         {
             rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
+        }
+
+        // SIF_CMD_SET_SREG: drive the EE-side sreg mirror so EE poll loops that
+        // await an IOP reply can progress (see handleSifSetSreg).
+        if (cid == 0x80000001u)
+        {
+            handleSifSetSreg(rdram, packetAddr, packetSize, srcExtra);
         }
 
         static int logCount = 0;

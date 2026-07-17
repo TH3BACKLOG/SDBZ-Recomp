@@ -13,6 +13,7 @@ namespace ps2recomp
 {
 	struct JumpTableEntry;
     struct JumpTable;
+    struct MidAsmHook;
 	struct Instruction;
     struct MemoryAccessHint;
 	struct Function;
@@ -52,6 +53,7 @@ namespace ps2recomp
         void setBootstrapInfo(const BootstrapInfo &info);
         void setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames);
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
+        void setMidAsmHooks(const std::vector<MidAsmHook> &hooks);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
         void setGiantFunctionInstructionThreshold(uint32_t threshold);
@@ -66,6 +68,8 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> m_renamedFunctions;
         std::unordered_map<uint32_t, std::string> m_relocationCallNames;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_configJumpTableTargetsByAddress;
+        std::unordered_map<uint32_t, std::string> m_midAsmHooksBeforeByAddress;
+        std::unordered_map<uint32_t, std::string> m_midAsmHooksAfterByAddress;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;

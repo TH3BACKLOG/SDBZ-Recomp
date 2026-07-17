@@ -1,6 +1,8 @@
 #include "game_overrides.h"
+#include "ps2_recompiled_functions.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_calls.h"
+#include "ps2_runtime_macros.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "ps2_log.h"
@@ -12,7 +14,38 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
+
+// Recompiler boundary-detection gap: neither the recompiler nor an
+// independent IDA analysis of the EE ELF places a function boundary at
+// these addresses; both are unconditional-jump ("j") targets that land
+// between two recognized functions. A direct MIPS jump cannot cross into
+// IOP address space, so these are EE-side, not IOP. Defined here as
+// diagnostic stubs (log once, return) until the real function bodies are
+// recovered. If/when the correct owning function is identified, prefer
+// ps2_game_overrides::bindAddressHandler / PS2Runtime::replaceFunction to
+// redirect the dispatch table instead of editing runner output.
+void fn_151830_0x151830(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram;
+    (void)runtime;
+    RUNTIME_LOG("[game_overrides] fn_151830_0x151830 stub hit at pc=0x" << std::hex << ctx->pc << std::dec);
+}
+
+void fn_170268_0x170268(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram;
+    (void)runtime;
+    RUNTIME_LOG("[game_overrides] fn_170268_0x170268 stub hit at pc=0x" << std::hex << ctx->pc << std::dec);
+}
+
+void fn_11ABA0_0x11aba0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram;
+    (void)runtime;
+    RUNTIME_LOG("[game_overrides] fn_11ABA0_0x11aba0 stub hit at pc=0x" << std::hex << ctx->pc << std::dec);
+}
 
 namespace
 {
@@ -307,7 +340,104 @@ namespace
         ps2_syscalls::setSoundDriverCompatLayout(layout);
     }
 
+    // Kernel store-word/eret thunk at 0x17F5D0 — recompiler truncated it to one
+    // instruction (mfc0) with no pc advance, livelocking the dispatch loop.
+    // Real body (recovered from raw ELF bytes + sibling wrapper thunks at
+    // 0x17F640/17F650/17F660): di-guarded Status dance, sw $a1,0($a0),
+    // mtc0 $ra,ErrorEPC, eret. Net semantics: *(u32*)a0 = a1; return to ra.
+    void sdbzKernelStoreWordEret(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        WRITE32(GPR_U32(ctx, 4), GPR_U32(ctx, 5));
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // EE kernel syscall thunk table (0x174880..0x174FF0, 120 stubs, 16 bytes
+    // each): "addiu $v1,$zero,N; syscall; jr $ra; nop". The recompiler folded
+    // most of them into the preceding function body with no dense-table entry
+    // of their own, so an indirect call (jalr) into one dies with "No exact
+    // recompiled function for guest PC 0x1748a0" (first hit: trace
+    // 0x171fd8 -> 0x172168 -> 0x174fe0 -> 0x1748a0, ra=0x1057fc). Register the
+    // whole table so any thunk reached through the dispatch loop works.
+    // Negative entries are the from-interrupt-context variants; addiu
+    // sign-extends, so $v1 must carry the sign-extended value — the numeric
+    // dispatcher already has static_cast<uint32_t>(-N) cases for them.
+    // Semantics mirror the generated code for a bare syscall stub exactly:
+    // set $v1, handleSyscall (2-arg form == encoded id 0 == read $v1),
+    // then jr $ra.
+    constexpr uint32_t kSdbzSyscallThunkBase = 0x00174880u;
+    constexpr int16_t kSdbzSyscallThunkNums[] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        16, 16, 17, 18, 18, 19, 20, 21, 22, 23, 252, 253, -26, -27, -28, -29,
+        -254, -255, 32, 33, 34, 35, 36, 37, -38, 39, 40, 41, -42, 43, -44, 45,
+        -46, 47, 48, -49, 50, 51, -52, 53, -54, 55, -56, 57, -58, 59, 60, 61,
+        62, 63, 64, 65, 66, -67, 68, 69, -70, 71, -72, 73, 74, 75, 76, 77,
+        78, 79, 80, 81, 82, -83, 84, -85, 86, 87, -88, 89, -90, 91, 92, -92,
+        93, -93, 94, -94, 95, -95, 96, 97, 98, 99, 100, 102, -103, -104, -106, 107,
+        108, 109, 110, 111, 112, -112, 113, -113};
+    constexpr size_t kSdbzSyscallThunkCount =
+        sizeof(kSdbzSyscallThunkNums) / sizeof(kSdbzSyscallThunkNums[0]);
+
+    template <size_t I>
+    void sdbzSyscallThunk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SET_GPR_S64(ctx, 3, static_cast<int64_t>(kSdbzSyscallThunkNums[I]));
+        runtime->handleSyscall(rdram, ctx);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    template <size_t... Is>
+    void registerSdbzSyscallThunks(PS2Runtime &runtime, std::index_sequence<Is...>)
+    {
+        (runtime.replaceFunction(kSdbzSyscallThunkBase + static_cast<uint32_t>(Is) * 16u,
+                                 &sdbzSyscallThunk<Is>),
+         ...);
+    }
+
+    void applySdbzKernelThunkFixes(PS2Runtime &runtime)
+    {
+        runtime.replaceFunction(0x0017F5D0u, &sdbzKernelStoreWordEret);
+        registerSdbzSyscallThunks(runtime, std::make_index_sequence<kSdbzSyscallThunkCount>{});
+    }
+
+    // --- Loadfile signature-gate seed (2026-07-17e) ---------------------------
+    // noop_sub_d4a0 @0x17D4A0 (the game's loadfile-init) opens with
+    //   if (dword_461C30 >= 0) return 0;
+    // so with 461C30 at its BSS-0 default it returns immediately, skipping the
+    // real path: sceSifBindRpc(sid 0x80000006) then a func-255 signature fetch
+    // (callRpc) that populates dword_564D68. The only writer of 461C30 = -1
+    // (wrap_mem_set_u @0x17D630, SDK loadfile-init glue) has NO caller in our
+    // decompile, so 461C30 stays 0 and 564D68 stays 0. The gate
+    // wrap_mem_compare_n_c_0 @0x17D5A0 then rejects (564D68 != "3000") and
+    // sceSifLoadModule returns -65540, spinning forever on SIO2MAN.IRX.
+    //
+    // The 2026-07-17d wrapper (replaceFunction on d4a0) never fired: d4a0 is
+    // reached by a direct jal from its callers (generated fn_0017D4A0 call), so
+    // it bypasses the dense function table entirely — replaceFunction only
+    // intercepts jalr/dispatch-loop calls. Confirmed by the run: no
+    // [loadfile-seed] line, 461C30 still 0, yet d4a0 present in the trace.
+    //
+    // Fix: seed the flag directly at override-apply time. applyMatching() runs
+    // at the end of loadELF, after BSS is zeroed and before the entry point
+    // executes; nothing writes 461C30 before d4a0's first call, so this -1
+    // persists into that call and makes d4a0 run its own real bind + func-255
+    // RPC through our SIF handleRPC path. No hand-faked values — d4a0 itself
+    // sets 461C30 = 0 after one pass, so the real init runs exactly once.
+    void applySdbzLoadfileSeed(PS2Runtime &runtime)
+    {
+        runtime.memory().write32(0x00461C30u, 0xFFFFFFFFu); // dword_461C30 = -1
+        // RUNTIME_LOG is a compiled-out no-op in this build (PS2_RUNTIME_LOGS
+        // undefined), so report through the always-on std::cerr channel and read
+        // the value straight back to prove the write landed at apply time.
+        const uint32_t readback = runtime.memory().read32(0x00461C30u);
+        const uint32_t fetched = runtime.memory().read32(0x00564D68u);
+        std::cerr << std::hex
+                  << "[loadfile-seed] 0x461C30 <- -1 at ELF-load; readback=0x" << readback
+                  << " 564D68=0x" << fetched << std::dec << std::endl;
+    }
+
     PS2_REGISTER_GAME_OVERRIDE("RECVX sound-driver compat", "slus_201.84", 0u, 0u, &applyRecvxSoundDriverCompat);
     PS2_REGISTER_GAME_OVERRIDE("RECVX DTX compat", "slus_201.84", 0u, 0u, &applyRecvxDtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("LotR sound RPC compat", "SLUS_205.78", 0u, 0u, &applyLotrSoundRpcCompat);
+    PS2_REGISTER_GAME_OVERRIDE("SDBZ kernel thunk fixes", "SLUS_214.42", 0u, 0u, &applySdbzKernelThunkFixes);
+    PS2_REGISTER_GAME_OVERRIDE("SDBZ loadfile signature-gate seed", "SLUS_214.42", 0u, 0u, &applySdbzLoadfileSeed);
 }

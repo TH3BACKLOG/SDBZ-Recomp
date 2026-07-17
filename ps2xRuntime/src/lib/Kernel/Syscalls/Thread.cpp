@@ -4,6 +4,29 @@
 
 namespace ps2_syscalls
 {
+    // Restored 2026-07-14 for the RecompDebugger revival (see Thread.h).
+    std::vector<ThreadDebugSnapshot> getThreadDebugSnapshot()
+    {
+        std::vector<ThreadDebugSnapshot> out;
+        std::lock_guard<std::mutex> lock(g_thread_map_mutex);
+        out.reserve(g_threads.size());
+        for (const auto &entry : g_threads)
+        {
+            const ThreadInfo &info = *entry.second;
+            ThreadDebugSnapshot snap;
+            snap.tid             = entry.first;
+            snap.entry           = info.entry;
+            snap.currentPc       = info.currentPc.load(std::memory_order_relaxed);
+            snap.stack           = info.stack;
+            snap.status          = info.status;
+            snap.waitType        = info.waitType;
+            snap.waitId          = info.waitId;
+            snap.currentPriority = info.currentPriority;
+            out.push_back(snap);
+        }
+        return out;
+    }
+
     static void applySuspendStatusLocked(ThreadInfo &info)
     {
         if (info.waitType != TSW_NONE)

@@ -131,6 +131,14 @@ namespace ps2_syscalls
 
         if (availableWords < 3u)
         {
+            static std::atomic<uint32_t> s_csParamLogs{0u};
+            if (s_csParamLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
+            {
+                std::cerr << "[CreateSema:FAIL] param block unreadable addr=0x" << std::hex << paramAddr
+                          << " words=" << std::dec << availableWords
+                          << " ra=0x" << std::hex << getRegU32(ctx, 31)
+                          << std::dec << " -> KE_ERROR" << std::endl;
+            }
             setReturnS32(ctx, KE_ERROR);
             return;
         }
@@ -228,6 +236,19 @@ namespace ps2_syscalls
     void SignalSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
+
+        // DIAGNOSTIC (bind-reply investigation): dump sid + caller ra so we can
+        // tell whether _request_end's SignalSema targets the same sema the boot
+        // WaitSema@0x174ce0 is parked on. Bounded; remove once bind-reply lands.
+        {
+            static std::atomic<uint32_t> s_sigLogs{0u};
+            if (s_sigLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            {
+                std::cerr << "[Sema:Signal] sid=" << sid << " ra=0x" << std::hex
+                          << getRegU32(ctx, 31) << std::dec << std::endl;
+            }
+        }
+
         auto sema = lookupSemaInfo(sid);
         if (!sema)
         {
@@ -275,6 +296,22 @@ namespace ps2_syscalls
     void WaitSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int sid = static_cast<int>(getRegU32(ctx, 4));
+
+        // DIAGNOSTIC (bind-reply investigation): dump sid + caller ra + current
+        // count so we can compare the boot WaitSema@0x174ce0's sema against the
+        // one _request_end's SignalSema targets. Bounded; remove once fixed.
+        {
+            static std::atomic<uint32_t> s_waitLogs{0u};
+            if (s_waitLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            {
+                auto dbgSema = lookupSemaInfo(sid);
+                std::cerr << "[Sema:Wait] sid=" << sid << " ra=0x" << std::hex
+                          << getRegU32(ctx, 31) << std::dec << " count="
+                          << (dbgSema ? static_cast<int>(dbgSema->count) : -1)
+                          << std::endl;
+            }
+        }
+
         auto sema = lookupSemaInfo(sid);
         if (!sema)
         {

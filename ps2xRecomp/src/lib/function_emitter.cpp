@@ -6,6 +6,8 @@
 #include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
@@ -133,6 +135,16 @@ namespace ps2recomp
                 ss << "label_" << std::hex << inst.address << std::dec << ":\n";
             }
 
+            if (auto hookIt = cg.m_midAsmHooksBeforeByAddress.find(inst.address); hookIt != cg.m_midAsmHooksBeforeByAddress.end())
+            {
+                // [midasm hook] run a user C++ function before this instruction. The hook may
+                // modify ctx/memory; if it sets ctx->pc away from this address it redirects
+                // control flow (we return so the dispatcher resumes at the new pc).
+                ss << fmt::format("    ctx->pc = 0x{:X}u;\n", inst.address);
+                ss << fmt::format("    {{ extern void {0}(uint8_t*, R5900Context*, PS2Runtime*); {0}(rdram, ctx, runtime); }}\n", hookIt->second);
+                ss << fmt::format("    if (ctx->pc != 0x{:X}u) {{ return; }}\n", inst.address);
+            }
+
             if (cg.m_emitInstructionComments)
             {
                 ss << "    // 0x" << std::hex << inst.address << ": 0x" << inst.raw << std::dec;
@@ -226,6 +238,12 @@ namespace ps2recomp
                         ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
                     }
                     ss << "\n";
+
+                    if (auto hookIt = cg.m_midAsmHooksAfterByAddress.find(inst.address); hookIt != cg.m_midAsmHooksAfterByAddress.end())
+                    {
+                        // [midasm hook, after] run a user C++ function after this (non-branch) instruction.
+                        ss << fmt::format("    {{ extern void {0}(uint8_t*, R5900Context*, PS2Runtime*); {0}(rdram, ctx, runtime); }}\n", hookIt->second);
+                    }
 
                     updateConstantRegisters(inst, constantRegisters);
                 }

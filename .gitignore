@@ -19,6 +19,7 @@ ps2xRuntime/src/runner/ps2_recompiled_functions.cpp
 ps2xRuntime/src/runner/register_functions.cpp
 ps2xRuntime/outputbuild-*/
 build_scripts/
+!build_scripts/recomp_mcp_server.py
 STUDIO_BUG_LOG.md
 
 # Local tooling, dumps, and workspace clutter (not part of the recomp source tree)
