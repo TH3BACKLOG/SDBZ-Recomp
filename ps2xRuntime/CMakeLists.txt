@@ -422,6 +422,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_iop.cpp
     src/lib/ps2_iop_audio.cpp
     src/lib/ps2_iop_cpu.cpp
+    src/lib/ps2_iop_irx_loader.cpp
     src/lib/ps2_iop_dbcman.cpp
     src/lib/ps2_iop_mcman.cpp
     src/lib/ps2_iop_sdrdrv.cpp
@@ -560,6 +561,17 @@ if(NOT PS2X_IS_VITA)
 endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
+
+# ---- iop_harness: headless standalone driver for the embedded IOP + real
+# ARKD_DVD.IRX (no EE game boot). Links ps2_runtime (which contains the loader
+# and ps2_iop_runArkdService). Not built for Vita. See src/tools/iop_harness.cpp.
+if(NOT PS2X_IS_VITA)
+    add_executable(iop_harness src/tools/iop_harness.cpp)
+    target_link_libraries(iop_harness PRIVATE ps2_runtime)
+    if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+        ps2x_stage_ffmpeg_runtime_dlls(iop_harness)
+    endif()
+endif()
 
 if(PS2X_IS_VITA)
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")

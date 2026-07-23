@@ -5,6 +5,23 @@
 #include "runtime/ps2_address.h"
 
 #include <map>
+#include <string>
+#include <cstdlib>
+
+// S2.1: real ARKD_DVD.IRX loader (ps2_iop_irx_loader.cpp). The game loads its
+// IRX modules through its OWN embedded loadfile RPC client, which is serviced by
+// the echo path below -- NOT ps2_iop::handleRPC and NOT the sceSifLoadModule
+// syscall. So the ONLY place the module path "cdrom0:\ARKD_DVD.IRX;1" flows
+// through our code is the loadfile CALL send buffer in deliverSifRpcReply. We
+// trigger the loader there. Declared here (no header touched).
+extern bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath);
+// S2.2d-1: run one registered ARKD RPC service func in the persistent IopCpu and
+// copy its reply into the guest recv buffer. Returns true iff it delivered real
+// data (defined in ps2_iop_irx_loader.cpp; no header touched, per project rules).
+extern bool ps2_iop_runArkdService(PS2Runtime *runtime,
+                                   uint32_t sid, uint32_t rpcNum,
+                                   const uint8_t *sendData, uint32_t sendSize,
+                                   uint8_t *recvOut, uint32_t recvSize);
 
 namespace ps2_stubs
 {
@@ -149,7 +166,9 @@ namespace ps2_stubs
         constexpr uint32_t kSifCmdRpcBind = 0x80000009u;   // outbound: transport cid for BIND
         constexpr uint32_t kSifCmdRpcEnd = 0x80000008u;    // outbound: transport cid for END re-send
         constexpr uint32_t kSifCmdRpcCall = 0x8000000Au;   // outbound: transport cid for RPC CALL
-        constexpr uint32_t kSifDispatcherFn = 0x00178068u; // game EE SIF RX dispatcher
+        constexpr uint32_t kSifDispatcherFn = 0x00178068u;  // game EE SIF RX dispatcher
+        constexpr uint32_t kSifDispatcherEnd = 0x001781B0u; // one past its last instruction
+        constexpr uint32_t kSifDispatcherMaxResume = 64u;   // bound on mid-body resumes
 
         // The dispatcher (sub_178068) routes on packet WORD[8] (byte offset 0x20),
         // masked with 0x7FFFFFFF -> a slot in the system handler table dword_5616E4.
@@ -174,6 +193,126 @@ namespace ps2_stubs
             uint32_t cid = 0u;        // words[2]
             bool valid = false;
         };
+
+        // --- Stage 1 ARKD DVD-read RPC trace (observe-only) ---------------------
+        // The game boots to a stable main loop but hangs waiting on ARKD DVD-read
+        // RPC results that never arrive. ARKD's CALLs ride this echo path (they
+        // never reach ps2_iop::handleRPC). Stage 1 does NOT synthesize any result
+        // (honors no-IOP-faking): it only OBSERVES -- forces a full packet dump for
+        // ARKD traffic and, in the CALL branch, invokes handleRPC in a throwaway
+        // capacity to log whether any handler exists yet. Everything is gated behind
+        // PS2_ARKD_TRACE so it is zero-cost and cannot regress the boot when unset.
+        inline bool arkdTraceEnabled()
+        {
+            static const bool s_on = (std::getenv("PS2_ARKD_TRACE") != nullptr);
+            return s_on;
+        }
+
+        // Known ARKD SIF-RPC client control blocks + DVD cmd/reply buffers (EE
+        // physical, from PS2_PROJECT_STATE.md). Clients appear as WORD[7] of a
+        // packet; the 48-byte cmd buffer is 0x5A97D0 and the 16-byte reply buffer
+        // is 0x5AA7D0. A packet touching any of these is ARKD-related.
+        inline bool isArkdPacket(const uint32_t w[16])
+        {
+            const uint32_t client = w[7];
+            if (client == 0x005A9330u || client == 0x005A9358u ||
+                client == 0x005A9380u || client == 0x005A93A8u)
+            {
+                return true;
+            }
+            for (uint32_t k = 0; k < 16u; ++k)
+            {
+                if (w[k] == 0x005A97D0u || w[k] == 0x005AA7D0u)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Track clientObj(WORD[7]) -> bound sid(WORD[8]) captured at BIND time, so a
+        // later CALL on the same client can be routed to handleRPC with its real sid
+        // (a CALL packet carries the rpc func in WORD[8], not the sid). Lock-free
+        // small linear table; only written under PS2_ARKD_TRACE.
+        struct ArkdBindSlot
+        {
+            std::atomic<uint32_t> clientObj{0u};
+            std::atomic<uint32_t> sid{0u};
+        };
+        ArkdBindSlot g_arkdBinds[16];
+
+        // --- RPC CALL send-payload capture -----------------------------------
+        // sceSifCallRpc does NOT put the send-data pointer in the call packet.
+        // It emits the payload as a SEPARATE DMA entry in the same list, ahead
+        // of the 0x40-byte control packet, e.g. for ARKD sid 0x503 fno 0x102:
+        //     i=0 src=0x5a97d0 size=0x30   <- payload
+        //     i=1 src=0x20561900 size=0x40 <- SifRpcCallPkt
+        // The packet's own layout is (confirmed empirically against this game,
+        // NOT the older WORD[5]/WORD[6] guess):
+        //     w[5] = pkt_addr   (the packet's OWN address -- self-referential)
+        //     w[6] = rpc_id     (per-call sequence counter: 0x1a, 0x1b, ...)
+        //     w[9] = send_size  (0x30 here; 0 when the call sends nothing)
+        // So we record each list's entries and let the CALL handler match the
+        // entry whose size == w[9] to recover the real payload address.
+        struct SifDmaListEntry { uint32_t src; uint32_t size; };
+        thread_local SifDmaListEntry g_sifListEntries[32];
+        thread_local uint32_t        g_sifListCount = 0u;
+
+        // Returns the EE address of the payload for a CALL with send_size
+        // `want`, or 0 if this list carried no matching entry. `pktSrc` is
+        // excluded so the control packet can never be mistaken for payload.
+        inline uint32_t sifFindSendPayload(uint32_t want, uint32_t pktSrc)
+        {
+            if (want == 0u) { return 0u; }
+            for (uint32_t i = 0; i < g_sifListCount; ++i)
+            {
+                if (g_sifListEntries[i].size == want &&
+                    g_sifListEntries[i].src  != pktSrc)
+                {
+                    return g_sifListEntries[i].src;
+                }
+            }
+            return 0u;
+        }
+
+        inline void arkdRecordBind(uint32_t clientObj, uint32_t sid)
+        {
+            if (clientObj == 0u)
+            {
+                return;
+            }
+            for (auto &slot : g_arkdBinds)
+            {
+                if (slot.clientObj.load(std::memory_order_relaxed) == clientObj)
+                {
+                    slot.sid.store(sid, std::memory_order_relaxed);
+                    return;
+                }
+            }
+            for (auto &slot : g_arkdBinds)
+            {
+                uint32_t expect = 0u;
+                if (slot.clientObj.compare_exchange_strong(
+                        expect, clientObj, std::memory_order_relaxed))
+                {
+                    slot.sid.store(sid, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        }
+
+        inline uint32_t arkdLookupSid(uint32_t clientObj)
+        {
+            for (auto &slot : g_arkdBinds)
+            {
+                if (slot.clientObj.load(std::memory_order_relaxed) == clientObj)
+                {
+                    return slot.sid.load(std::memory_order_relaxed);
+                }
+            }
+            return 0u;
+        }
+        // --- end Stage 1 ARKD trace helpers -------------------------------------
 
         // Copy the reply packet verbatim into the EE RX queue and run the game's dispatcher
         // so its registered callbacks fire. 0x80000009 -> _request_bind (re-sends 0x80000008);
@@ -254,6 +393,46 @@ namespace ps2_stubs
                 s_loadfileClientObj.store(req.words[7], std::memory_order_relaxed);
             }
 
+            // --- S2.1: real ARKD_DVD.IRX load trigger ------------------------
+            // Fire off the FIRST ARKD service BIND (sid 0x500..0x503 in WORD[8]).
+            // By the time the game binds an ARKD service it has already "loaded"
+            // the module (echo path faked the loadfile completion), so this is a
+            // reliable, trace-independent trigger that does NOT depend on parsing
+            // a path out of a send buffer. The module path is a fixed ISO
+            // constant (reference_iso_layout); the loader strips cdrom0:/;ver.
+            // Idempotent: the loader itself guards against a second load.
+            if (req.cid == kSifCmdRpcBind)
+            {
+                const uint32_t bindSid = req.words[kSifDiscWordIdx];
+                if (bindSid >= 0x500u && bindSid <= 0x503u)
+                {
+                    static std::atomic<bool> s_arkdIrxTried{false};
+                    bool expected = false;
+                    if (s_arkdIrxTried.compare_exchange_strong(expected, true))
+                    {
+                        const std::string modPath = "cdrom0:\\ARKD_DVD.IRX;1";
+                        std::cerr << "[iop:irx] ARKD BIND sid=0x" << std::hex << bindSid
+                                  << std::dec << " -> loading real ARKD_DVD.IRX ("
+                                  << modPath << ")" << std::endl;
+                        ps2_iop_loadArkdIrx(runtime, modPath);
+                    }
+                }
+            }
+            // --- end S2.1 load trigger ---------------------------------------
+
+            // Stage 1: record clientObj->sid for every BIND so a later CALL can be
+            // routed to handleRPC with its real bound sid (see arkdRecordBind).
+            if (arkdTraceEnabled() && req.cid == kSifCmdRpcBind)
+            {
+                arkdRecordBind(req.words[7], req.words[kSifDiscWordIdx]);
+                if (isArkdPacket(req.words))
+                {
+                    std::cerr << "[ARKD:BIND] client=0x" << std::hex << req.words[7]
+                              << " sidW8=0x" << req.words[kSifDiscWordIdx]
+                              << " sidW4=0x" << req.words[4] << std::dec << std::endl;
+                }
+            }
+
             if (req.cid == kSifCmdRpcCall)
             {
                 // Outbound RPC CALL (0x8000000A) -> synthesize the IOP's call completion.
@@ -265,6 +444,134 @@ namespace ps2_stubs
                 pkt[2] = kSifCmdRpcEnd;                 // dispatcher -> _request_end
                 pkt[kSifDiscWordIdx] = kSifCmdRpcCall;  // WORD[8] -> callback branch
                 // WORD[7] (client block ptr) survives verbatim from the memcpy.
+
+                // --- Stage 1 observe-only bridge to handleRPC (ARKD only) --------
+                // We do NOT apply any result here (no IOP faking) -- the existing
+                // echo synthesis below stays authoritative so the stable main loop
+                // is preserved. This only LOGS the real runtime contract so Stage 2
+                // (real ARKD_DVD.IRX in R3000) knows exactly what to satisfy.
+                if (arkdTraceEnabled() && isArkdPacket(req.words))
+                {
+                    const uint32_t client = req.words[7];
+                    const uint32_t rpcNum = req.words[kSifDiscWordIdx]; // func number
+                    const uint32_t recvAddr = req.words[10];
+                    const uint32_t recvSize = req.words[11];
+                    uint32_t sid = arkdLookupSid(client);              // bound at BIND
+                    // Send payload. The old WORD[5]/WORD[6] guess is WRONG and was
+                    // feeding ARKD the control packet instead of the real payload:
+                    // w[5] is the packet's own address and w[6] is a per-call
+                    // sequence counter (observed 0x1a then 0x1b on consecutive
+                    // calls). The true size is w[9], and the data itself rides a
+                    // separate DMA entry in the same list -- see
+                    // sifFindSendPayload. sendAddr stays 0 for calls that send
+                    // nothing (w[9]==0), which is correct: fno=0x2 has w[9]==0 and
+                    // emits no companion entry.
+                    const uint32_t sendSize = req.words[9];
+                    const uint32_t sendAddr =
+                        sifFindSendPayload(sendSize, req.words[5]);
+
+                    static std::atomic<uint32_t> s_arkdCallLogs{0u};
+                    const uint32_t n =
+                        s_arkdCallLogs.fetch_add(1u, std::memory_order_relaxed);
+                    if (n < 64u)
+                    {
+                        std::cerr << "[ARKD:CALL] client=0x" << std::hex << client
+                                  << " sid=0x" << sid << " func=0x" << rpcNum
+                                  << " send=0x" << sendAddr << " ssz=0x" << sendSize
+                                  << " recv=0x" << recvAddr << " rsz=0x" << recvSize
+                                  << std::dec;
+                        for (uint32_t k = 0; k < 16u; ++k)
+                        {
+                            std::cerr << " w[" << k << "]=0x" << std::hex
+                                      << req.words[k] << std::dec;
+                        }
+                        std::cerr << std::endl;
+
+                        // Hexdump first 48 bytes of the send buffer (classic ARKD
+                        // 48-byte DVD cmd) if it points at readable EE memory.
+                        if (const uint8_t *sb = getConstMemPtr(rdram, sendAddr))
+                        {
+                            std::cerr << "[ARKD:CALL] send[0..48]=";
+                            for (uint32_t b = 0; b < 48u; ++b)
+                            {
+                                std::cerr << std::hex << static_cast<int>(sb[b]) << " "
+                                          << std::dec;
+                            }
+                            std::cerr << std::endl;
+                        }
+
+                        // Observe-only handleRPC: throwaway out-params, result never
+                        // written back to the guest. Logs whether ANY handler claims
+                        // this sid today (expected: false -> the Stage 2 gap).
+                        uint32_t obsResult = 0u;
+                        bool obsSignal = false;
+                        runtime->iop().init(rdram);
+                        const bool handled = runtime->iop().handleRPC(
+                            runtime, sid, rpcNum, sendAddr, sendSize, recvAddr,
+                            recvSize, obsResult, obsSignal);
+                        std::cerr << "[ARKD:CALL] handleRPC -> "
+                                  << (handled ? "TRUE" : "false")
+                                  << " result=0x" << std::hex << obsResult
+                                  << std::dec << " signal=" << (obsSignal ? 1 : 0)
+                                  << std::endl;
+                    }
+                }
+                // --- end Stage 1 observe-only bridge -----------------------------
+
+                // --- S2.2d-2: real service bridge (gated PS2_ARKD_SERVICE=1) -----
+                // For a bound ARKD DVD-read CALL (sid 0x503), run the real service
+                // func 0x042700 in the embedded R3000 and drop its reply into the
+                // guest recv buffer BEFORE the echo synthesis below signals the
+                // waiter. Requires PS2_ARKD_IRX_RUN=1 (so the services are
+                // registered). ps2_iop_runArkdService only writes recvPtr on a
+                // clean, data-delivering run; on any failure it is a no-op, so
+                // today's observe-only behavior is preserved (no IOP faking) and
+                // the boot cannot regress.
+                {
+                    static const bool s_svc =
+                        (std::getenv("PS2_ARKD_SERVICE") != nullptr);
+                    if (s_svc && isArkdPacket(req.words))
+                    {
+                        const uint32_t client = req.words[7];
+                        const uint32_t sid    = arkdLookupSid(client);
+                        // The EE's RPC exchange begins at sid 0x500 (observed live
+                        // 2026-07-19), not 0x503, so a 0x503-only gate never fires
+                        // and the EE stalls on the unanswered 0x500 CALL. Service
+                        // all four registered ARKD sids (0x500..0x503): runArkdService
+                        // is sid-generic (looks up svc.func by sid) and no-ops on any
+                        // failure, so it cannot regress boot / fake data.
+                        if (sid >= 0x500u && sid <= 0x503u)
+                        {
+                            const uint32_t rpcNum   = req.words[kSifDiscWordIdx];
+                            // Real send payload -- w[9] size + companion DMA entry.
+                            // This is the copy that reaches the IOP service buffer,
+                            // so the old w[5]/w[6] read was handing ARKD the control
+                            // packet: its first word became dword_BF50, the SIF DMA
+                            // destination, which is why the TOC was being written to
+                            // EE address 0.
+                            const uint32_t sendSize = req.words[9];
+                            const uint32_t sendAddr =
+                                sifFindSendPayload(sendSize, req.words[5]);
+                            const uint32_t recvAddr = req.words[10];
+                            const uint32_t recvSize = req.words[11];
+                            const uint8_t *sendPtr =
+                                sendAddr ? getConstMemPtr(rdram, sendAddr) : nullptr;
+                            uint8_t *recvPtr =
+                                recvAddr ? getMemPtr(rdram, recvAddr) : nullptr;
+                            // Fire on service identity, not reply size. ARKD's
+                            // init calls (sid 0x500 fno 0x12/0x11 = max-files,
+                            // pitch) carry a send payload but request rsize=0,
+                            // so gating on recvSize silently dropped them and
+                            // left the driver unconfigured for the later 0x503
+                            // read. recvSize==0 is handled downstream: it only
+                            // skips the reply copy-out.
+                            ps2_iop_runArkdService(runtime, sid, rpcNum,
+                                                   sendPtr, sendSize,
+                                                   recvPtr, recvSize);
+                        }
+                    }
+                }
+                // --- end S2.2d-2 real service bridge -----------------------------
 
                 // System LOADFILE (sid 0x80000006) version handshake. sub_17D4A0
                 // (d4a0) issues sceSifCallRpc(clientObj, 255, ...) then copies its
@@ -352,13 +659,121 @@ namespace ps2_stubs
                           << std::endl;
             }
 
+            // --- Phase 1 diagnostic (env-gated PS2_SIF_DIAG, instrumentation only) ---
+            // Dumps the queue packet, the RPC_SERVER_DATA struct (0x5616D8), and the
+            // head of both dispatch tables so the slot that decodes to 0x20561900 is
+            // named. Also arms a derail detector after the dispatcher returns. No field
+            // is written; boot behavior is unchanged when PS2_SIF_DIAG is unset.
+            static const bool s_sifDiag = (std::getenv("PS2_SIF_DIAG") != nullptr);
+            if (s_sifDiag)
+            {
+                static std::atomic<uint32_t> s_diagLogs{0u};
+                if (s_diagLogs.fetch_add(1u, std::memory_order_relaxed) < 24u)
+                {
+                    auto rdW = [rdram](uint32_t addr) -> uint32_t {
+                        const uint8_t *p = getConstMemPtr(rdram, addr);
+                        uint32_t v = 0u;
+                        if (p) { std::memcpy(&v, p, sizeof(v)); }
+                        return v;
+                    };
+                    std::cerr << std::hex << "[SIF_DIAG] cid=0x" << req.cid << " pkt=";
+                    for (int i = 0; i < 16; ++i) { std::cerr << "0x" << pkt[i] << ((i < 15) ? "," : ""); }
+                    std::cerr << std::endl;
+                    constexpr uint32_t kServerData = 0x5616D8u;
+                    const uint32_t sysBase = rdW(kServerData + 0x0Cu);
+                    const uint32_t sysCnt = rdW(kServerData + 0x10u);
+                    const uint32_t usrBase = rdW(kServerData + 0x14u);
+                    const uint32_t usrCnt = rdW(kServerData + 0x18u);
+                    std::cerr << "[SIF_DIAG] rx=0x" << rdW(kServerData + 0x00u)
+                              << " sysBase=0x" << sysBase << " sysCnt=0x" << sysCnt
+                              << " usrBase=0x" << usrBase << " usrCnt=0x" << usrCnt << std::endl;
+                    // The old 4-slot cap hid the tail of a 0x20-entry table, which is
+                    // where the derail target has to live -- sys[0..3] are all sane.
+                    // Walk the whole table, but print only slots that carry something:
+                    // a non-zero fn, or anything already inside the packet-pool window
+                    // that the derail detector below watches for.
+                    auto dumpTable = [&](const char *name, uint32_t base, uint32_t cnt) {
+                        const uint32_t n = (cnt > 64u) ? 64u : cnt; // sanity bound only
+                        for (uint32_t s = 0u; s < n; ++s) {
+                            const uint32_t e  = base + s * 12u;
+                            const uint32_t fn = rdW(e);
+                            const bool poisoned = (fn >= 0x20560000u && fn < 0x20570000u);
+                            if (fn == 0u && !poisoned) { continue; }
+                            std::cerr << "[SIF_DIAG] " << name << "[" << std::dec << s << std::hex
+                                      << "] fn=0x" << fn << " arg=0x" << rdW(e + 4u)
+                                      << " gp=0x" << rdW(e + 8u)
+                                      << (poisoned ? "  <== POISONED" : "") << std::endl;
+                        }
+                    };
+                    dumpTable("sys", sysBase, sysCnt);
+                    dumpTable("usr", usrBase, usrCnt);
+                    std::cerr << std::dec;
+                }
+            }
+
             // Run the guest dispatcher on the current context. It reads 0x561600 and routes
             // by cid. Re-entrancy is fine: if _request_bind re-sends 0x80000008 during this
             // call, that outbound descriptor is captured and delivered by the nested
             // sceSifSetDma (bounded by s_deliverDepth).
+            //
+            // The recompiled dispatcher is a resumable coroutine: its copy loop yields via
+            // `if (runtime->shouldPreemptGuestExecution()) { return; }` with ctx->pc parked
+            // mid-body and its 0xA0 stack frame still allocated. The real dispatch loop would
+            // re-enter it through its entry switch; we are not the dispatch loop, so a single
+            // plain call let that yield unwind out through handleSyscall with $sp permanently
+            // shifted by -0xa0. Drive it in a bounded mini dispatch loop instead, and enter
+            // with ctx->pc at the function start rather than the caller's syscall pc.
+            const uint32_t savedPc = ctx ? ctx->pc : 0u;
+            if (ctx)
+            {
+                ctx->pc = kSifDispatcherFn;
+            }
+
             ++s_deliverDepth;
-            dispatcher(rdram, ctx, runtime);
+            uint32_t resumes = 0u;
+            for (;;)
+            {
+                dispatcher(rdram, ctx, runtime);
+
+                // Outside the function body => it ran to its `jr $ra` (or derailed). Done.
+                if (!ctx || ctx->pc < kSifDispatcherFn || ctx->pc >= kSifDispatcherEnd)
+                {
+                    break;
+                }
+
+                if (++resumes >= kSifDispatcherMaxResume)
+                {
+                    static std::atomic<uint32_t> s_resumeLogs{0u};
+                    if (s_resumeLogs.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                    {
+                        std::cerr << "[SifRpcReply] dispatcher resume cap hit at pc=0x"
+                                  << std::hex << ctx->pc << " (cid=0x" << req.cid << ")"
+                                  << std::dec << std::endl;
+                    }
+                    break;
+                }
+            }
             --s_deliverDepth;
+
+            // Phase 1 derail detector: if the dispatcher's jalr landed in the EE SIF
+            // packet-pool staging window, lookupFunction failed and the runner's jalr
+            // wrapper returned with ctx->pc parked at the derail target.
+            if (s_sifDiag && ctx)
+            {
+                const uint32_t pc = ctx->pc;
+                if (pc >= 0x20560000u && pc < 0x20570000u)
+                {
+                    std::cerr << "[SIF_DIAG:DERAIL] pc=0x" << std::hex << pc
+                              << " cid=0x" << req.cid << std::dec << std::endl;
+                }
+            }
+
+            // Delivery is transparent to the interrupted guest flow: hand the caller's pc
+            // back so the syscall stub resumes at its own `jr $ra`.
+            if (ctx)
+            {
+                ctx->pc = savedPc;
+            }
         }
         // --- end SIF-RPC reply delivery ---
 
@@ -975,6 +1390,25 @@ namespace ps2_stubs
             }
         }
 
+        // Record this list's entries before processing any of them, so that when
+        // the RPC control packet is delivered (which happens from inside the loop
+        // below) the CALL handler can still see the payload entry that preceded
+        // it. Unbounded -- the DTX dump above is diagnostic-only and caps at 64.
+        g_sifListCount = 0u;
+        for (uint32_t i = 0; i < count && i < 32u; ++i)
+        {
+            const uint32_t eAddr =
+                dmatAddr + (i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer)));
+            if (const uint8_t *e = getConstMemPtr(rdram, eAddr))
+            {
+                Ps2SifDmaTransfer x{};
+                std::memcpy(&x, e, sizeof(x));
+                g_sifListEntries[g_sifListCount].src  = x.src;
+                g_sifListEntries[g_sifListCount].size = static_cast<uint32_t>(x.size);
+                ++g_sifListCount;
+            }
+        }
+
         std::array<Ps2SifDmaTransfer, 32u> pending{};
         uint32_t pendingCount = 0u;
         bool ok = true;
@@ -1060,6 +1494,11 @@ namespace ps2_stubs
                             {
                                 sigRelated = true;
                             }
+                        }
+                        // Stage 1: never rate-limit ARKD DVD-read packets when tracing.
+                        if (arkdTraceEnabled() && isArkdPacket(w))
+                        {
+                            sigRelated = true;
                         }
                         static std::atomic<uint32_t> s_pktLogs{0u};
                         if (sigRelated || s_pktLogs.fetch_add(1u, std::memory_order_relaxed) < 8u)

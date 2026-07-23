@@ -38,6 +38,14 @@ namespace ps2_stubs
     void resetSifState();
 }
 
+namespace
+{
+    // Defined further down in this TU's anonymous namespace; forward-declared
+    // here so the ps2_watch value trap below can tag each hit with the calling
+    // chain.
+    std::string formatDispatchHistory();
+}
+
 namespace ps2_watch
 {
     // Out-of-line definitions for the forward decls in ps2_runtime.h. Kept
@@ -46,10 +54,66 @@ namespace ps2_watch
     // runtime/ps2_guestwatch.h -- that header is included only by this .cpp.
     std::atomic<bool> g_writeWatchActive{false};
 
+    // [trapval] value-triggered store trap. Armed from PS2X_TRAPVAL (see
+    // PS2Runtime::run). Unlike the address-keyed Watch registry above, this
+    // fires on the VALUE being stored, so it can find a writer whose
+    // destination address is not known in advance (e.g. a clobbered $ra slot
+    // on a stack frame whose address moves run-to-run).
+    //
+    // Accuracy note: ctx->pc is set at function entry / midasm hooks /
+    // control-flow points, NOT per instruction. A hit therefore names the
+    // writing FUNCTION (usually the basic block), not the exact store.
+    std::atomic<uint32_t> g_trapValue{0};
+    std::atomic<uint32_t> g_trapAddrLo{0};
+    std::atomic<uint32_t> g_trapAddrHi{0xFFFFFFFFu};
+    std::atomic<bool> g_trapArmed{false};
+    std::atomic<uint32_t> g_trapHits{0};
+    static constexpr uint32_t kTrapHitLimit = 256u;
+
     void onGuestWrite(uint32_t addr, uint32_t size, uint64_t lo, uint64_t hi, uint32_t pc) noexcept
     {
-        (void)lo;
-        (void)hi;
+        if (g_trapArmed.load(std::memory_order_relaxed))
+        {
+            const uint32_t want = g_trapValue.load(std::memory_order_relaxed);
+            const uint64_t lanes[4] = {lo & 0xFFFFFFFFu, lo >> 32, hi & 0xFFFFFFFFu, hi >> 32};
+            const uint32_t laneCount = (size + 3u) / 4u;
+            for (uint32_t i = 0; i < laneCount && i < 4u; ++i)
+            {
+                if (static_cast<uint32_t>(lanes[i]) != want)
+                {
+                    continue;
+                }
+
+                const uint32_t laneAddr = addr + (i * 4u);
+                if (laneAddr < g_trapAddrLo.load(std::memory_order_relaxed) ||
+                    laneAddr >= g_trapAddrHi.load(std::memory_order_relaxed))
+                {
+                    continue;
+                }
+
+                const uint32_t hit = g_trapHits.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (hit > kTrapHitLimit)
+                {
+                    break;
+                }
+
+                std::cerr << "[trapval] hit#" << std::dec << hit
+                          << " addr=0x" << std::hex << laneAddr
+                          << " size=" << std::dec << size
+                          << " lane=" << i
+                          << " pc=0x" << std::hex << pc
+                          << " trace=" << formatDispatchHistory()
+                          << std::dec << std::endl;
+                break;
+            }
+        }
+
+        // Bail before the mutex when no address-keyed watch is registered --
+        // otherwise arming the value trap alone would serialize every store.
+        if (watchCountRef().load(std::memory_order_relaxed) == 0u)
+        {
+            return;
+        }
 
         std::lock_guard<std::mutex> lock(registryMutex());
         const uint32_t writeEnd = addr + size;
@@ -62,6 +126,116 @@ namespace ps2_watch
                 w.hasWriterPc = true;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// [frametrace] bounded call-frame ring.
+//
+// The recompiler registers interior ("resume") addresses of a function as
+// their own dispatch-table slots aliasing back to the same function, and the
+// generated entry `switch (ctx->pc)` then goto's PAST the prologue while the
+// epilogue still runs unconditionally. On a legitimate resume that is correct
+// -- $sp is still the already-decremented frame. If dispatch reaches one of
+// those slots OUTSIDE a legitimate resume, the epilogue's `ld $ra, N($sp)`
+// reads the CALLER's frame instead.
+//
+// Mid-body resume entries are normal and frequent (every `jal` returns through
+// one), so per-call logging would flood the log. Instead we keep a bounded ring
+// and dump it once, at fault time, next to the [gpr]/[stack] windows.
+//
+// Symbols are intentionally non-static: game_overrides.cpp declares them
+// `extern` (the sanctioned cross-TU pattern -- touching a header would force a
+// 30+ hour rebuild of every generated runner TU).
+// ---------------------------------------------------------------------------
+namespace
+{
+    struct FrameTraceEntry
+    {
+        uint32_t funcStart;
+        uint32_t entryPc;
+        uint32_t entrySp;
+        uint32_t exitPc;
+        uint32_t exitSp;
+        uint32_t exitRa;
+    };
+
+    constexpr uint32_t kFrameTraceCount = 64u;
+    FrameTraceEntry g_frameTraceRing[kFrameTraceCount] = {};
+    std::atomic<uint32_t> g_frameTraceWrite{0};
+    std::atomic<uint32_t> g_frameTraceAlarms{0};
+    constexpr uint32_t kFrameTraceAlarmLimit = 16u;
+}
+
+std::atomic<bool> g_ps2FrameTraceArmed{false};
+
+void ps2FrameTraceRecord(uint32_t funcStart, uint32_t entryPc, uint32_t entrySp,
+                         uint32_t exitPc, uint32_t exitSp, uint32_t exitRa) noexcept
+{
+    if (!g_ps2FrameTraceArmed.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
+    const uint32_t slot = g_frameTraceWrite.fetch_add(1, std::memory_order_relaxed) % kFrameTraceCount;
+    g_frameTraceRing[slot] = FrameTraceEntry{funcStart, entryPc, entrySp, exitPc, exitSp, exitRa};
+
+    // The derail signature itself: control leaving into the SIF packet-pool
+    // base. Report immediately (bounded) so the line survives even if the run
+    // never reaches reportMissingFunction.
+    if (exitPc == 0x20561900u || exitRa == 0x20561900u)
+    {
+        const uint32_t n = g_frameTraceAlarms.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n <= kFrameTraceAlarmLimit)
+        {
+            std::cerr << "[frametrace:ALARM] #" << std::dec << n
+                      << " func=0x" << std::hex << funcStart
+                      << " entryPc=0x" << entryPc
+                      << " entrySp=0x" << entrySp
+                      << " exitPc=0x" << exitPc
+                      << " exitSp=0x" << exitSp
+                      << " exitRa=0x" << exitRa
+                      << (entryPc != funcStart ? " MIDBODY" : "")
+                      << (exitSp != entrySp ? " SPDELTA" : "")
+                      << std::dec << std::endl;
+        }
+    }
+}
+
+namespace
+{
+    // Chronological dump of the ring (oldest surviving entry first).
+    void dumpFrameTrace(std::ostringstream &oss)
+    {
+        if (!g_ps2FrameTraceArmed.load(std::memory_order_relaxed))
+        {
+            return;
+        }
+
+        const uint32_t written = g_frameTraceWrite.load(std::memory_order_relaxed);
+        if (written == 0u)
+        {
+            oss << "\n[frametrace] ring empty -- no wrapped function was entered before the fault";
+            return;
+        }
+
+        const uint32_t live = (written < kFrameTraceCount) ? written : kFrameTraceCount;
+        const uint32_t first = written - live;
+        oss << "\n[frametrace] " << std::dec << live << " of " << written << " calls (oldest first)";
+        for (uint32_t i = 0; i < live; ++i)
+        {
+            const FrameTraceEntry &e = g_frameTraceRing[(first + i) % kFrameTraceCount];
+            oss << "\n[frametrace] #" << std::dec << (first + i)
+                << " func=0x" << std::hex << e.funcStart
+                << " entryPc=0x" << e.entryPc
+                << " entrySp=0x" << e.entrySp
+                << " exitPc=0x" << e.exitPc
+                << " exitSp=0x" << e.exitSp
+                << " exitRa=0x" << e.exitRa
+                << (e.entryPc != e.funcStart ? " MIDBODY" : "")
+                << (e.exitSp != e.entrySp ? " SPDELTA" : "");
+        }
+        oss << std::dec;
     }
 }
 
@@ -994,6 +1168,14 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
+    // Optional override: point the pseudo-disc root at a full flat disc extraction
+    // (SLUS + IRX + INFO.DAT/GAME.DAT + MOVIE) so ARKD's sceCdSearchFile/read and
+    // later asset loads resolve against real disc files instead of the ELF-only dir.
+    if (const char *cdRootEnv = std::getenv("PS2_CD_ROOT"); cdRootEnv && *cdRootEnv)
+    {
+        paths.cdRoot = std::filesystem::path(cdRootEnv);
+    }
+
     setIoPaths(paths);
 }
 
@@ -1211,6 +1393,47 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " policy=" << static_cast<uint32_t>(policy)
             << " trace=" << formatDispatchHistory()
             << std::dec;
+
+        // Full GPR set + a window of the current stack frame. Cross-referenced
+        // with any [trapval] addr=, this gives the byte offset of the clobbered
+        // slot relative to sp.
+        static const char *const kGprNames[32] = {
+            "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+            "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"};
+
+        oss << "\n[gpr]";
+        for (int i = 0; i < 32; ++i)
+        {
+            oss << ' ' << kGprNames[i] << "=0x" << std::hex
+                << static_cast<uint32_t>(_mm_extract_epi32(ctx->r[i], 0));
+        }
+
+        const uint32_t stackLo = (sp >= 0x40u) ? (sp - 0x40u) : 0u;
+        for (uint32_t off = 0; off < 0x100u; off += 0x10u)
+        {
+            const uint32_t rowAddr = stackLo + off;
+            oss << "\n[stack] 0x" << std::hex << rowAddr << " (sp";
+            if (rowAddr >= sp)
+            {
+                oss << "+0x" << (rowAddr - sp);
+            }
+            else
+            {
+                oss << "-0x" << (sp - rowAddr);
+            }
+            oss << ")";
+            for (uint32_t w = 0; w < 4u; ++w)
+            {
+                uint32_t word = 0u;
+                const bool ok = readGuestU32At(rowAddr + (w * 4u), word);
+                oss << ' ' << (ok ? "" : "?") << "0x" << word;
+            }
+        }
+        oss << std::dec;
+
+        dumpFrameTrace(oss);
 
         static std::mutex s_missingFunctionLogMutex;
         {
@@ -2268,6 +2491,42 @@ void PS2Runtime::run()
     {
         ps2_diag::set_enabled(true);
         RUNTIME_LOG("[watch] armed " << armed << " guest-memory watch(es) from PS2X_WATCH");
+    }
+
+    // [trapval] env hook: PS2X_TRAPVAL=VALUE[:ADDRLO:ADDRHI] arms a
+    // value-triggered store trap (see ps2_watch::onGuestWrite). Diagnostic
+    // only; unset => zero behavioural change and the per-store residual cost
+    // stays exactly one relaxed bool load.
+    if (const char *tv = std::getenv("PS2X_TRAPVAL"); tv && *tv && std::strcmp(tv, "0") != 0)
+    {
+        char *end = nullptr;
+        const uint32_t value = static_cast<uint32_t>(std::strtoull(tv, &end, 0));
+        uint32_t lo = 0u;
+        uint32_t hi = 0xFFFFFFFFu;
+        if (end && *end == ':')
+        {
+            lo = static_cast<uint32_t>(std::strtoull(end + 1, &end, 0));
+            hi = (end && *end == ':') ? static_cast<uint32_t>(std::strtoull(end + 1, &end, 0)) : 0xFFFFFFFFu;
+        }
+
+        ps2_watch::g_trapValue.store(value, std::memory_order_relaxed);
+        ps2_watch::g_trapAddrLo.store(lo, std::memory_order_relaxed);
+        ps2_watch::g_trapAddrHi.store(hi, std::memory_order_relaxed);
+        ps2_watch::g_trapArmed.store(true, std::memory_order_relaxed);
+        ps2_watch::g_writeWatchActive.store(true, std::memory_order_relaxed);
+
+        RUNTIME_LOG("[trapval] armed value=0x" << std::hex << value
+                                               << " range=[0x" << lo << ",0x" << hi << ")" << std::dec);
+    }
+
+    // [frametrace] env hook: PS2X_FRAMETRACE=1 arms the bounded call-frame ring
+    // (see ps2FrameTraceRecord above). The wrappers that feed it are installed
+    // in game_overrides.cpp. Unset => zero behavioural change: the wrappers
+    // still pass through, and each records exactly one relaxed bool load.
+    if (const char *ft = std::getenv("PS2X_FRAMETRACE"); ft && *ft && *ft != '0')
+    {
+        g_ps2FrameTraceArmed.store(true, std::memory_order_relaxed);
+        std::cerr << "[frametrace] armed" << std::endl;
     }
 
     // Optional R3000A IOP-core self-test (env PS2_IOP_CPU_SELFTEST=1): runs a

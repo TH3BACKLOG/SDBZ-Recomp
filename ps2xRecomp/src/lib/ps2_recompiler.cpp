@@ -7,6 +7,7 @@
 #include "ps2_runtime_calls.h"
 #include <iostream>
 #include <fstream>
+#include <iterator> // std::istreambuf_iterator (writeToFile content-compare guard)
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -2197,6 +2198,29 @@ namespace ps2recomp
 
     bool PS2Recompiler::writeToFile(const std::string &path, const std::string &content)
     {
+        // Content-compare guard. A regeneration re-emits ~30,000 translation units,
+        // the overwhelming majority byte-identical to what is already on disk. An
+        // unconditional truncate-and-rewrite bumps every timestamp, so the build
+        // system then recompiles all of them -- 30+ hours -- to produce the same
+        // objects. Skipping identical writes leaves those timestamps alone, so only
+        // genuinely new/changed files rebuild.
+        //
+        // The read below MUST be text mode, matching the ofstream write below it.
+        // On Windows the write translates '\n' -> "\r\n"; a binary read would see
+        // those CRs, never match `content`, and silently disable this guard.
+        {
+            std::ifstream existing(path);
+            if (existing)
+            {
+                std::string current((std::istreambuf_iterator<char>(existing)),
+                                    std::istreambuf_iterator<char>());
+                if (current == content)
+                {
+                    return true;
+                }
+            }
+        }
+
         std::ofstream file(path);
         if (!file)
         {

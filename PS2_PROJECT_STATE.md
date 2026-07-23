@@ -26,16 +26,685 @@
 ## Upstream Sync (2026-07-17)
 WIP checkpointed as commit `9957294f`. Checked all 7 new upstream commits vs HEAD — #149/#153/#155/#158/#167/#168 already present in tree (functional content confirmed via `git apply --reverse --check`); only `#170` (IOP refactor) remains deliberately held. Tree is current with upstream/main modulo #170.
 
+**#170 conflict re-check (2026-07-19):** now hard-conflicts — 15 conflicts on dry-run merge (`git merge-tree HEAD upstream/pr/170`). It **moves all IOP logic into a new `ps2xIOP/` module** — deletes `ps2_iop.cpp` and `include/runtime/ps2_iop.h` (modify/delete conflicts) plus content conflicts in SIF.cpp, ps2_runtime.cpp, RPC.cpp, game_overrides.cpp, ps2_debug_panel.cpp, Common.h, ps2_runtime.h, ps2_syscalls.h, CMakeLists.txt. These are exactly the files our live ARKD/`sceCdSearchFile` blocker work sits in. **Verdict: keep HELD** until the disc-driver blocker is closed; porting it now would rebase all in-flight IOP work onto a different module layout mid-fix.
+
+**#179 landed upstream (2026-07-22, merged as `f3687c5a`) — scope assessed:** `Feature/random fixes platform support`. Adds memcard IOP + Interrupt/GS/MPEG tweaks + Android/Vita platform scaffolding. **#179 alone is small (~1,132 ins / 145 del)** but is structurally welded to #170 — it edits `ps2xIOP/include/ps2x/iop/iop_host.h` and depends on the `ps2xIOP/` module, so **taking #179 requires taking #170 first**. Real cost = #170 (9,658 ins / 3,955 del, full IOP re-architecture) + re-homing our ARKD bridge into the new plugin API.
+- Our live work sits precisely in what #170 removes/rewrites: `ps2_iop_irx_loader.cpp` (1,138 lines, **ours only — not upstream**: the whole ARKD bridge + `ps2_iop_runArkdService` + `[ARKD:diag]`), modified `ps2_iop.cpp` (244 lines; upstream deletes the 105-line original), modified `SIF.cpp` (1,690 lines; upstream rewrites +53/−53, #179 +2 more). Upstream has **no** real-R3000-interpreter ARKD path — they stub/reimplement modules as plugins. So it's not a merge, it's a **re-port of our interpreter bridge into a new plugin architecture**.
+- **Effort estimate ≈ 5–8 days:** merge #170 + resolve ~15 conflicts (1–2d) · re-home ARKD bridge into `ps2xIOP` plugin model (3–5d, risky — rewrites the code path we're one measurement run from cracking) · layer #179 on top (~1d; memcard IOP useful @ stage 5.5, Android/Vita/`.suprx` binaries = skip).
+- **Verdict: keep BOTH HELD.** Close the ARKD `eeDest=0x0` blocker on the current architecture first, then take #170+#179 together at **stage 5.5** when memcard IOP (#179's payoff) actually becomes relevant. #176 (test-only sema determinism) can be ported anytime, independent of this.
+
+## Deferred Build-Config Items
+- **Static CRT (`/MT`) for a portable exe — deferred to ship/packaging time (noted 2026-07-19).** Not enabled now: our ffmpeg static libs are almost certainly built against the dynamic CRT (`/MD`); mixing `/MT` exe with `/MD` libs risks LNK warnings + heap-corruption crashes that would masquerade as game bugs mid-blocker. When packaging: set `CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"` AND rebuild ffmpeg to match, together. Not the current blocker.
+- **Opt-in ASan flag on the IOP interpreter** — considered as a debugging aid for the hand-written R3000 memory code (out-of-bounds/UAF). Only wire it if the cdRoot re-run still spins with no clear cause; make it a CMake flag, off by default.
+
 ## Current Phase
 **Phase 5 — Boot to and pass the memory card loading prompt (in progress, started 2026-05-27; goal changed 2026-07-07 — was "boot to title screen/main menu", now targets the memory card prompt; main menu deferred to a later phase)**
 
-## Current Status (2026-07-17h) — ✅ SIF PACKET-POOL SENTINEL FIX CONFIRMED (0x20561900 loop GONE). Game now runs a stable main loop (furthest ever). New blocker: **ARKD DVD-read RPCs get NO result data** — the SIF.cpp echo path never invokes handleRPC, and ARKD SID isn't handled in ps2_iop.cpp.
+### Sub-phase tracker (established 2026-07-20g)
+
+**🔵 ACTIVE: 5.3**
+
+| # | Stage | State | Exit test |
+|---|---|---|---|
+| 5.1 | Clear the EE stack-frame derail | ✅ **CLEARED** (built + run 2026-07-22): zero `[frametrace:ALARM]`/`[frametrace:TABLE]` — no escape to packet-pool `0x20561900`. Exit test as written was **mis-keyed**: the surviving `IMBAL delta=-0xa0` lines are normal recompiler `jal`-split dispatch (entry `0x178068` → exit mid-body `0x1780c0` → next slot resumes + restores), NOT corruption. | ~~No `IMBAL delta=-0xa0`~~ → superseded by: no ALARM/TABLE escape to `0x20561900` |
+| 5.2 | Prologue-skip class (`fn_178428` + `fn_178068` jalr paths) | ⚫ **ABSORBED / N/A** — the imbalances that would have triggered this are now proven to be benign jal-split false positives (see 5.1). No separate derail class exists to fix. | (moot) |
+| 5.3 | ARKD RPC returns real data | 🔵 **ACTIVE** — live blocker. Stage-2 bridge BUILT (real IRX in R3000); `0x102` SUBMIT reaches service + worker completes, but TOC DMA lands `eeDest=0x0`. `[ARKD:diag]` instrumentation added, **measurement run pending** (see Session end 2026-07-22). | `func=0x2` reply (`0x10` bytes) lands at `recv=0x5aa7d0` and `AudioSysInit` proceeds to `GSInit` (`0x422480`) |
+| 5.3.1 | AudioSysInit ARKD `func=0x2` completion | 🔵 first concrete instance of 5.3: no real reply → poll never completes | `AudioSysInit` returns; watchdog pc leaves `0x422454` |
+| 5.4 | Game data load chain | ⚪ unmapped — risk bucket | Game proceeds past whatever it does with GAME.DAT contents |
+| 5.5 | Memory card IOP stack responds | ⚪ MCMAN/MCSERV load, HLE handlers exist, never exercised. **Planned pivot point: take upstream #170+#179 here** — #179 ships a memcard IOP stack that supersedes our HLE handlers; the re-architecture is worth doing once the ARKD blocker is closed and memcard IOP is the active target (see Upstream Sync #179 note). | Memcard init RPCs complete without error |
+| 5.6 | Prompt renders + accepts input | ⚪ not reached | Prompt on screen, X press advances it |
+
+Legend: 🔵 active · ⚪ not started · ✅ passed exit test · ⛔ blocked
+
+**Notes on the tracker:**
+- 5.1 CLOSED 2026-07-22: the real derail (escape to `0x20561900`) is gone; the `IMBAL` exit test was a false-positive signal (normal jal-split dispatch). Do not re-chase `delta=-0xa0` — it is expected.
+- 5.2 CLOSED as N/A: the imbalances proved benign, so there is no prologue-skip derail class to fix. Reopen only if an ALARM/TABLE escape reappears.
+- 5.6: stalling **at** the prompt is SUCCESS. It is input-gated on real hardware (X press), not a hang.
+- **5.4–5.6 are named destinations, not mapped routes.** Real PCSX2 has 31 IOP modules loaded by that screen; we load 7. That gap may hide sub-phases only discoverable by reaching them. Expect 5.4 to split.
+
+**Tracker maintenance rules (user-directed 2026-07-20g):**
+1. **Notify the user when a stage passes its exit test** — state the stage number and the evidence.
+2. **Notify the user when a stage needs to extend.** If new information subdivides a stage, add decimal children (`5.1.1`, `5.1.2`) and break down further as needed. Do not silently widen a stage's scope.
+3. Update the State column and the `🔵 ACTIVE` marker as work moves.
+4. A stage is only ✅ when its exit test is verified against real build/run output — never on code-complete alone.
+
+## Current Status (2026-07-22) — ✅ 5.1 DERAIL CLEARED (built+run); live blocker moved to 5.3: AudioSysInit ARKD `func=0x2` RPC never completes
+
+Built exe (`build/ps2xRuntime/Debug/ps2EntryRunner.exe`, 2026-07-21 06:11) run via `launch_recomp.ps1`,
+`run_log.txt` analyzed. The 5.1 SIF fix **held**.
+
+**What the run proves:**
+- **Derail gone.** Zero `[frametrace:ALARM]` / `[frametrace:TABLE]` — control never escapes to the SIF
+  packet-pool base `0x20561900`. The stale-frame `$ra` derail that 5.1 targeted is not happening.
+- **`IMBAL delta=-0xa0` lines are false positives.** They fire on *any* `sp` mismatch, which includes
+  the recompiler's normal `jal`-boundary function splits: entry at func `0x178068` runs prologue + first
+  chunk, exits mid-body at the `jal` site `0x1780c0` with `sp` decremented; the next dispatch resumes at
+  slot `0x1780c0` and runs the epilogue (`delta` wraps to `-0xffffff60` = `+0xa0`). Matched pairs, net
+  stack balanced. Not corruption. → 5.1's written exit test was mis-keyed; use ALARM/TABLE instead.
+- **SIF RPC is alive & advancing.** `[SifRpcReply] deliver cid=0x80000009/0x8000000a -> run dispatcher
+  0x178068`; `[SifRpcPkt:SIG]` `w[6]` sequence counter climbs (`0x84 → 0x85`). Boot got past SIF.
+
+**Live blocker (5.3): `AudioSysInit` spins at `0x422454`.**
+- Funcmap: `0x422454` ∈ `AudioSysInit` (`0x422170`–`0x422480`, size `0x310`); `lastCall = sub_172998`
+  (SIF-RPC poll helper). Boot order: `AudioSysInit` → `GSInit 0x422480` → `MemSysInit 0x422570` →
+  `GameMain 0x422630`. Stuck in the first.
+- 4 ARKD binds OK (sid `0x500`–`0x503`). The spin **actively re-issues** `[ARKD:CALL] sid=0x503
+  func=0x2 recv=0x5aa7d0 rsz=0x10` (t=15→18s burst, then quiet spin) → every one returns
+  `handleRPC -> false result=0x0 signal=0`.
+- Root cause is **by design / documented in code**: [`SIF.cpp:448-518`](ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp)
+  is a **Stage-1 observe-only bridge** — the echo path unblocks the sync `WaitSema` but delivers **no
+  result data** (no-IOP-faking rule), and `ps2_iop::handleRPC` returns `false` because no handler claims
+  the ARKD sid yet. Comment literally calls this "the Stage 2 gap." So `AudioSysInit` wakes, reads an
+  unwritten `0x10`-byte reply at `0x5aa7d0`, sees the op didn't complete, and re-issues `func=0x2` forever.
+
+**Fix = Stage 2 (per no-IOP-faking rule):** route ARKD `sid=0x503 func=0x2` to the actual interpreted
+`ARKD_DVD.IRX` in the R3000 core so it produces the real `0x10`-byte reply into `recv=0x5aa7d0`. Do NOT
+hand-synthesize the reply in `game_overrides.cpp`. Next diagnostic step: identify what `func=0x2` is in
+`ARKD_DVD.IRX`'s export/dispatch table and why `handleRPC` isn't dispatching to it (module loaded? sid
+mapped to the IRX's RPC server? export index resolved?).
+
+### Session end (2026-07-22, later) — Stage-2 bridge BUILT; `[ARKD:diag]` instrumentation added, MEASUREMENT RUN PENDING
+
+Advanced past the "func=0x2 has no handler" framing above. Stage-2 IS wired: `PS2_ARKD_SERVICE` +
+`PS2_ARKD_IRX_RUN` route ARKD CALLs into the **real** interpreted `ARKD_DVD.IRX` via
+`ps2_iop_runArkdService` ([ps2_iop_irx_loader.cpp](ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp)). The
+`0x102` DVD-read SUBMIT reaches the service, the SIF DMA physically runs, and the worker completes
+(`B300` ends `0x30000000`).
+
+**Pinned defect:** the TOC/directory DMA lands on **`eeDest=0x00000000`** (clobbers EE low memory,
+derails EE toward PC=0x1). Chain: `eeDest = desc[1] = dword_BF50`; `sub_2410` sets `BF50 = buff[0]` via
+`sub_AE24` **only** if the `B300` band is idle/complete. Send payload `word[0]=0x01652400` is confirmed
+correct and `buff=0x054e50` valid — yet `BF50`/eeDest reads `0`. Static contradiction (sub_1DA4 provably
+ran → B310 was 1 → sub_2410 pass-branch should have latched BF50=buff[0]) means it's **runtime-only**.
+
+**✅ MEASURED 2026-07-22 — cause pinned, fix applied (build/verify pending).** Run `run_log.txt`,
+`fno=0x102` (line 2735-2743):
+- `pre-func`: `sendData=nonnull ssz=0x30`, `hostBuff[0]=0x01652400`, `cpuBuff[0]=0x01652400`
+- `post-func`: `BF50=0x00000000`
+- `[ARKD:sifdma] … eeDest=0x00000000 size=0x18000` (the derail)
+
+| Observation | Cause | Status |
+|---|---|---|
+| `sendData=NULL` | Stage-2 payload lookup failed | ✗ eliminated (nonnull) |
+| `hostBuff[0]=0x01652400`, `cpuBuff[0]=0x0` | IOP aliasing/copy | ✗ eliminated (cpuBuff=0x01652400) |
+| **both `0x01652400`, `post-func BF50=0x0`** | **sub_2410 latch never ran** | **✅ CONFIRMED — Row 3** |
+| `post-func BF50=0x01652400` | descriptor zeroed later | ✗ eliminated (BF50=0 post) |
+
+**ROOT CAUSE (measured, not theorized):** ARKD's `sub_2410` latches the EE-dest into `dword_BF50` by
+calling the resident **`sysclib memcpy`** (log line 2737: `sysclib fid=12 @0x04ae24`, off `0xAE24`,
+`a0=&BF50 a1=&request a2=0x24`). The import hook had **no handler for `0xAE24`**, so it hit the
+`$v0=0 → $ra` no-op default — the 36-byte request→BF50 copy silently never happened. Identical failure
+mode to the strcmp/strtol miss recorded at loader.cpp:673-677.
+
+**FIX APPLIED (`ps2_iop_irx_loader.cpp`, after the strtol thunk):** real bounds-checked IOP→IOP
+`memmove` for off `0xAE24`, returns `dest` in `$v0`. Lib-only, no faking (does exactly the copy the
+driver requested). NOT yet build-verified.
+
+**✅ eeDest=0x0 RESOLVED + VERIFIED 2026-07-22.** Second run (`run_log.txt`):
+- L2727 `[ARKD:diag] post-func BF50=0x01652400` (was `0x0`)
+- L2731 `[ARKD:sifdma] … eeDest=0x01652400 size=0x18000 -> copied` (was `0x00000000`)
+- ARKD now services **more** RPCs than ever: `fno=0x102` (L2737 retired=85 halted=1 ✓), then `fno=0x2`
+  (L2814), `fno=0x12` (L3177). Genuine forward progress past the multi-session wall.
+
+**HARD GATE (SOP, satisfied this round):** the `eeDest=0x0` fix landed only after the `fno=0x102`
+row was filled from a real run. Keep this gate for the next `eeDest`-class bug.
+
+---
+
+### 🔴 NEW LIVE BLOCKER (2026-07-22) — EE SIF-RPC-client `rpc_call` (0x178be8) returns to `$ra=0x1`
+
+The eeDest fix pushed the boot into the **EE-side SIF RPC client**. Boot now dies here:
+
+- `0x178be8` = **`rpc_call`** / `sceSifCallRpc` (funcmap `0x00178be8–0x00178de8`). Decompile: fetches
+  server-data via `sub_178428(&dword_563100)`, sends the call packet via `sub_177FE8`, waits completion.
+- Frametrace (`run_log.txt` #158…#216): `rpc_call` is invoked in a loop, `entrySp` climbing
+  `0x1ffbdb0 → 0x1ffbec0` (unwinding to shallower depth). Calls #158–#210 return **cleanly** to valid
+  callers (`0x1bd0c4`, `0x189158`, …). Call **#216** (outermost, `entrySp=0x1ffbec0`) exits with
+  **`exitPc=exitRa=0x1`** → dispatch `No exact recompiled function for guest PC 0x1` → watchdog spins.
+- Derail GPRs (L3217): `a0=0x20561900` (**`a0Readable=no`** — RPC client struct never populated),
+  `a1=0x563100`, `a2=0x178560` (end-fn ptr), `v1=0x4`, `ra=0x1`, `sp=0x1ffbec0`, `gp=0x503070`.
+- **NOT** the truncated-body bug (none of the `0x178xxx` cluster is in `truncated_functions.txt`).
+- This is the resurfaced, previously-PARKED `0x178xxx` SIF-RPC-client cluster — same neighborhood as the
+  stale-frame `$ra` blocker (`0x178068`). Demoted while eeDest was live; now the live wall.
+
+**DO NOT GUESS THE FIX.** Per the stale-frame note, the mechanism is unmeasured. The fork to decide:
+- (A) `$ra=0x1` already present at rpc_call **entry** for iter #216 → a *caller* passed bad `$ra`
+  (RPC client struct `a0=0x20561900`@phys `0x561900` uninitialized → bad continuation). Fix upstream
+  (the bind/init that should populate the client struct).
+- (B) `$ra` valid at entry but clobbered **mid-body** (frame-save slot overwritten) → recompiled
+  `rpc_call` prologue/epilogue or a callee stomps the saved-`$ra` slot. Fix = the stomping function.
+
+**FORK ROW FILLED (2026-07-23) → (B) CONFIRMED — mid-body clobber.** Measured via SLOTWATCH/RAFORK
+probes in `game_overrides.cpp` (`sdbzFrameTraceWrapper`):
+- RAFORK #1: `func=0x178be8 entryRa=0x1bb0b0 entrySp=0x1ffbec0 exitPc=0x1`. **$ra is VALID (0x1bb0b0)
+  at rpc_call entry, 0x1 at exit** ⇒ not caller garbage ⇒ **fork B**.
+- `rpc_call` saves `$ra` at guest **0x1ffbeb0** (`= entrySp 0x1ffbec0 − 0x10`). That slot is stomped
+  `0x1bb0b0 → 0x1`.
+- SLOTWATCH bracketed the writer to **at/below the innermost `fn_178068`** (deepest-returning callee;
+  post-blocks fire in return order, #1 = first to see slot=0x1 = 0x178068).
+- `fn_178068` frame `0xA0`, only store to `+0x90` is `sd $ra,0x90($sp)` at **0x178074** →
+  target `= entrySp − 0x10`. **Hits 0x1ffbeb0 iff `fn_178068` enters with `entrySp=0x1ffbec0`** — i.e.
+  the 8-deep call chain produced **ZERO net stack descent** (the [[stale_frame_ra_read]] "0xA0 sp shift").
+- Nesting (innermost last): rpc(178be8)→178428→17ed60→17edb0→177fe8→177eb0→1781b0→175060→178068→178068.
+
+**PROBE BUG FOUND + FIXED (2026-07-23).** First SLOTWATCH2 (blind `n≤12` counter) spent its whole
+budget on **healthy/idle** 178068 calls (idle thread `entrySp=0x1f00000`, worker `0x1ffbcXX`; storeTargets
+`0x1effff0/0x1ffbcd0/…`, none near `0x1ffbeb0`) and **missed the derail** at log line ~3201. Those samples
+also **refute frame-overlap for NORMAL 178068** (clean descent to ~`0x1ffbce0`, entryRa `0x177fc4`).
+Re-gated SLOTWATCH2 to emit ONLY on derail signatures:
+`interesting = (storeTarget == slotAddr) || (slotAfter != slotBefore)`, budget 24. **Written to
+`game_overrides.cpp` only — NOT yet built/run.**
+
+**TOOLING FIXED (2026-07-23b).** Two blockers in the probe pipeline resolved:
+- **Analyzer false-STALE fixed + verified.** `analyze_slotwatch.ps1` was reporting "STALE LOG" on a
+  VALID run. Root cause: `[frametrace:SLOTWATCH]` records were emitted via chained `std::cerr << … <<
+  std::endl`, and concurrent "guest PC 0x1" watchdog output interleaved a newline mid-record, pushing
+  `before=/expected=/now=` onto the next physical line; the analyzer matched `before=` per-line and
+  missed it. Now pre-joins split records (`Select-String -Context 0,1`), parses the real `#N` ordinal,
+  and picks the writer bracket by KNOWN chain depth (not print order — SLOTWATCH fires inner-first at
+  exit). **Verified against the existing log: no STALE; VERDICT = writer bracket `0x177eb0`** (deepest
+  clean-in/dirty-out; `0x177fe8` also clean-in/dirty-out but outer; `0x178068` #1/#2 entered
+  already-dirty → exonerated). No rebuild needed for the analyzer.
+- **Probe emits atomic records now.** All 5 probe blocks (SLOTWATCH2/SLOTWATCH/RAFORK/TABLE/IMBAL) in
+  `game_overrides.cpp` rewritten to build the whole line in a `std::ostringstream` and emit with ONE
+  `std::cerr << oss.str();` (trailing `\n` inside), so a shared stream can never split a record again.
+  Added `#include <sstream>`. Pure output-format change — probe logic/gates/addresses UNCHANGED.
+  **Written to `game_overrides.cpp` only — NOT yet built/run.**
+
+**NEXT ACTION (resume here):** user builds + runs the re-gated probe, then re-greps
+`SLOTWATCH2|SLOTWATCH|RAFORK`. The captured derail SLOTWATCH2 line answers:
+(1) does the derail `fn_178068` enter with `entrySp=0x1ffbec0` (`storeTarget==slotAddr==0x1ffbeb0`) ⇒
+frame-overlap **confirmed**; and (2) is the writer its own `0x178074` store (`slotAfter=0x1`) **or** a
+leaf callee (`func_175090` @0x1780dc / the `jalr $a2` @0x178180)?
+- If own store → trace WHY the 8-deep chain gives zero net descent / why the chain's `$ra`→`0x1`.
+- If leaf callee → probe `0x175090` / the `0x178180` jalr next.
+Commands: `.\build.ps1 Debug` → `.\launch_recomp.ps1` →
+`Select-String -Path run_log.txt -Encoding unicode -Pattern 'SLOTWATCH2|SLOTWATCH|RAFORK'` →
+`.\build_scripts\analyze_slotwatch.ps1` for the verdict.
+
+**AUTHORITATIVE CROSS-CHECK — PCSX2 write-watchpoint (no rebuild, deterministic).** "Which instruction
+stores `0x1` to guest `0x1ffbeb0`" is a DATA-WATCHPOINT question; the print-probe ladder is the fallback.
+`0x1ffbeb0` is below `0x02000000` ⇒ already physical, maps 1:1 to PCSX2 (no `& 0x1FFFFFFF`).
+Procedure:
+1. Boot real PCSX2 + SDBZ ISO (DebugServer build), `pcsx2_connect`. Confirm target first
+   (Verify-PCSX2-Target rule) via `pcsx2_game_info`.
+2. `pcsx2_set_watchpoint(address=0x1ffbeb0, type=write, condition=<value==0x1>, action=break)`.
+   Fallback: plain `type=write` with no condition if the value-compare expr is rejected.
+3. On break: `pcsx2_pause` (if needed) → `pcsx2_get_backtrace` + `pcsx2_read_registers` +
+   `pcsx2_disassemble(pc)`. The breaking PC IS the storing instruction — the writer, named directly.
+4. Cross-check that PC against the recomp bracket (`0x177eb0` subtree). Agreement ⇒ writer confirmed →
+   fix in `game_overrides.cpp`. If PCSX2 does NOT reproduce the clobber, THAT is the finding: the bug is
+   recomp-specific (translation/dispatch artifact) and we stay in the recomp probe path.
+
+**★ CROSS-CHECK EXECUTED (2026-07-23c) — PCSX2 IS CLEAN ⇒ BUG IS RECOMP-SPECIFIC (STACK/SP DIVERGENCE, not a `0x1` writer).**
+Ran the procedure live on PCSX2 (SLUS-21442, DebugServer). Broke rpc_call `0x178be8` conditional on the
+SAME boot call the recomp instrumented (`ra==0x1bb0b0`). Findings:
+- Ground truth: rpc_call frame = `addiu sp,-0xC0`; ra saved by `sd ra,0xB0(sp)` @ `0x178c30`. ✅ matches recomp model.
+- **entry `sp` DIVERGES:** PCSX2 `sp=0x1FFEC20` vs recomp RAFORK `entrySp=0x1FFBEC0` — **0x2D60 (~11.6 KB) deeper in the recomp.**
+  ⇒ real ra-slot = `0x1FFEC10`, NOT the `0x1ffbeb0` we were watching. We were watching the wrong address because the recomp's SP is already wrong on arrival.
+- Armed a write-watch on the REAL slot `0x1FFEC10` (held `0x1bb0b0` after the store) and ran the whole body incl. the `0x178428` subtree:
+  **0 hits.** rpc_call reached its epilogue with ra intact and **returned cleanly to `0x1bb0b0`.**
+- ⇒ On correct hardware there is **NO `0x1` store anywhere near the slot.** The recomp's `exitPc=0x1` / "fork B" is a DOWNSTREAM symptom
+  of a corrupted stack, not a rogue guest store. The whole SLOTWATCH/writer-bracket hunt (0x177eb0 / widen-the-wrap) was chasing a phantom.
+- Consistent with [[project_stale_frame_ra_read]] (0xa0 sp shift, frames not restoring sp): a 0x2D60 accumulated drift = many un-restored frames.
+
+**NEXT ACTION (redirected):** stop hunting a `0x1` writer. Find WHERE the recomp SP first diverges from PCSX2 on the boot path.
+Method (deterministic, both live): pick matching call sites on the boot chain, break the SAME logical call in both (PCSX2 conditional BP +
+recomp probe), compare `sp`. Bisect down the chain until the first frame whose entry `sp` differs — that frame (or its caller's epilogue)
+fails to restore/allocate stack correctly. Fix goes in `game_overrides.cpp`. The `0x178428` subtree is the innermost known-good bracket
+(PCSX2 ran it with sp balanced), so the divergence is ABOVE rpc_call, on the path that reaches it.
+
+**Codex continuation note (2026-07-23d — diagnostic only; awaiting user build/run):**
+
+- Re-read the 2026-07-23c PCSX2 cross-check before changing behavior. Its `0x2D60` entry-SP gap is decisive: the `0x1` seen at
+  recomp `rpc_call` exit is an *effect* of prior stack drift, not evidence for a guest-memory writer. Do **not** resume the
+  SLOTWATCH/`0x177eb0` writer hunt unless a future matched-PC comparison contradicts this result.
+- Identified the immediate, direct measured parent: `sub_1BAF90` (`0x1BAF90–0x1BB0BC`) performs `jal 0x178BE8` at `0x1BB0A8`, with
+  return/resume at `0x1BB0B0`. The failing `rpc_call` entry RA is exactly `0x1BB0B0`; therefore this is the nearest boundary that can
+  distinguish “SP was already wrong before the direct call” from “SP first drifted in the RPC subtree.”
+- Added **non-behavioral frametrace wrappers only** in `ps2xRuntime/src/lib/game_overrides.cpp` for `0x1BAF90` and all registered
+  resume PCs (`0x1BB000`, `0x1BB00C`, `0x1BB020`, `0x1BB02C`, `0x1BB040`, `0x1BB04C`, `0x1BB060`, `0x1BB06C`, `0x1BB0B0`). This
+  deliberately covers every dispatcher entry used by the generated function; a resume must not be mistaken for a new prologue.
+  No generated `runner/*.cpp` file was touched. `git diff --check` passed. **Not built or run by Codex** (user owns builds).
+- After the next run, read the `0x1BAF90` frametrace record at/near the `RAFORK` failure and compare its entry SP to PCSX2 at the
+  matching `0x1BAF90` / `0x1BB0A8` call. If it is already lower by `0x2D60` (or an earlier multiple), move one parent upward on the
+  known chain (`0x171C30` / `0x171F10` / `0x3007E0`) and repeat. If `0x1BAF90` is matched on entry but SP changes before `rpc_call`,
+  inspect only the direct path between `0x1BAF90` and `0x1BB0A8`; do not broad-search the RPC writer theory.
+- Read UTF-16 `run_log.txt` with `Select-String -Encoding unicode`; tee output can wrap one logical record across physical lines, so
+  use `-Context 0,3` when a record looks incomplete. Suggested first extraction:
+  `Select-String -Path run_log.txt -Encoding unicode -Pattern 'frametrace.*1baf90|RAFORK|No exact recompiled function for guest PC 0x1' -Context 0,3`.
+- A generic generated-entry `default: return;` guard in `function_emitter.cpp` remains only a possible future safety net. It would
+  require regenerating the runner corpus and could hide the true stale-PC source; it was intentionally **not applied**.
+
+**Run-status update (2026-07-23e):** A user launch produced the expected `guest PC 0x1` loop, but the requested
+`frametrace.*1baf90|RAFORK` extraction was empty. This is **not a negative tracer result**: `run_log.txt` was fresh
+(03:21:46) while `build/ps2xRuntime/Debug/ps2EntryRunner.exe` still had the old 01:42:25 timestamp. The executable
+therefore predates the `0x1BAF90` wrapper edit and the run cannot test the new diagnostic. Rebuild must complete
+successfully before interpreting an absent `0x1BAF90` record; no code change is justified from this old-binary run.
+
+**Diag cleanup (deferred, safe):** the two `[ARKD:diag]` blocks + `[ARKD:sifdma]` in
+`ps2_iop_irx_loader.cpp` can be stripped now that eeDest is verified (KEEP the `0xAE24` memcpy thunk) —
+but leaving them one more run is harmless and helps correlate the RPC loop with the ARKD service.
+
+**Uncommitted:** the `0xAE24` memcpy fix + `[ARKD:diag]`/`[ARKD:sifdma]` diag in
+`ps2_iop_irx_loader.cpp` (strip diag after verify; keep the memcpy thunk). Many `??` untracked
+`src/runner/*.cpp` are pre-existing recompiler output, not this session.
+
+---
+
+### ★★ ROOT CAUSE FOUND (2026-07-23d, Opus session) — re-entrant SIF-RPC reply loopback stomps rpc_call's ra-slot. REVERSES the 07-23c "SP-divergence phantom" call.
+
+**The `$ra=0x1` IS a genuine `0x1` store** into recomp's REAL saved-ra slot `0x1ffbeb0`. The 07-23c PCSX2
+cross-check found "0 hits" because it watched HW's slot `0x1ffec10` (real SP is 0x2D60 higher) — a
+**wrong-address** error. The recomp-side SLOTWATCH watches the correct slot and brackets the writer.
+
+**Confirmed end-to-end chain:**
+1. `rpc_call 0x178be8` saves `ra=0x1bb0b0` → `0x1ffbeb0` (`sd ra,0xB0(sp)`; slot = entrySp−0x10).
+2. Down `0x178428 → 0x177fe8 → 0x177eb0`; `0x177eb0` calls the SIF DMA syscall `0x175060/0x175070` (a0=sp)
+   → **`sceSifSetDma`** ([SIF.cpp](ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp)).
+3. No real IOP ⇒ `sceSifSetDma` calls **`deliverSifRpcReply`**, which runs the guest RX dispatcher
+   **`0x178068` NESTED on the caller's ctx/stack** to fake the reply.
+4. It **runs away ~12+ deep** — log: `[SifRpcReply] deliver cid=0x8000000a -> run dispatcher 0x178068` ×12+
+   with NO `sceSifSetDma:OK` between (BIND↔END `cid 0x80000009/0x8000000a` ping-pong).
+5. The nested dispatcher's frames land on the SAME EE stack and **overwrite `0x1ffbeb0` → `0x1`.**
+6. `rpc_call` epilogue `ld ra,0xB0(sp)` → `ra=0x1` → returns to PC `0x1` → spin.
+   Log: `[frametrace:RAFORK] #1 func=0x178be8 entryRa=0x1bb0b0 exitPc=0x1`. **exitSp is BALANCED** (only the
+   value is stomped) ⇒ an sp-restore alone won't undo it; the dispatcher must not write the caller's frame.
+
+**Smoking gun:** `deliverSifRpcReply` (SIF.cpp ~L714-775) saves/restores `ctx->pc` (`savedPc` L726/L775)
+around its mini dispatch loop but **NEVER saves/restores `ctx->sp`.** Constants `kSifDispatcherFn=0x178068`,
+`kSifDispatcherEnd=0x1781B0`, `kSifDispatcherMaxResume=64` (SIF.cpp:169-171). Analyzer verdict
+`Writer bracket (deepest clean-in/dirty-out): 0x177eb0` (`build_scripts/analyze_slotwatch.ps1`).
+
+**FIX (pending user decision — ALL in allowed file SIF.cpp):**
+- **(1) ★ recommended — scratch-stack isolation:** before the mini-loop set `ctx->sp` to a reserved scratch
+  region, restore after (mirror `savedPc`). ~5 lines. Dispatcher's legit buffer writes (0x561600/0x564b40)
+  preserved; incidental stack stomp eliminated.
+- (2) defer reply delivery to a real yield point (IRQ-like) — correct, larger.
+- (3) cap/dedupe re-entrant depth — stops runaway, leaves shared-stack corruption latent.
+
+The 07-23c "SP-divergence" NEXT-ACTION, the 07-23d codex `0x1BAF90`-bisect note above, and the whole
+stale-pc / 0xA0-IMBAL story ([[project_stale_frame_ra_read]]) are **all downstream of this and RETIRED** —
+do NOT resume the SP bisect.
+
+---
+
+## Prior Status (2026-07-21) — ✅ THE LOST GHIDRA FUNCTION MAP IS RECONSTRUCTED, COMMITTED, AND VALIDATED
+
+Session was **tooling/infrastructure only**. No behavioral fix, no build, no run. The live tree
+(`output/`, `ps2xRuntime/src/runner/`, `game_overrides.cpp`) was **not touched**. Sub-phase tracker
+is unchanged — 5.1 is still 🔵 ACTIVE and still UNBUILT.
+
+### What was actually wrong
+
+`ghidra_output` was pointing at the wrong file. The recompiler had been running with **zero
+function-boundary data** while looking perfectly healthy.
+
+- `ghidra_output` requires CSV `name,start,end,size` with a header line the parser discards.
+- **Any line not splitting on exactly 4 commas is skipped SILENTLY** — no warning, no error,
+  exit code 0 (`ps2xRecomp/src/lib/elf_parser.cpp`, `loadGhidraFunctionMap`).
+- Two earlier probe runs were pointed at `ps2xRuntime/symbols.map`, which is space-separated.
+  Both ran with no map at all. **Their results are void.**
+- `symbols.map` is **NOT a recompiler input.** It is a RecompDebugger artifact that
+  `generate_symbols_map.ps1` produces *from* the runner tree.
+- `ELF/SLUS_214.42` is **stripped** (`.symtab` and `.strtab` both size 0) — no names recoverable
+  from the ELF itself.
+
+### How it was rebuilt (join, not guess)
+
+Neither half of the lost export was gone; they were in two different places:
+
+| part | source | provenance |
+|---|---|---|
+| boundaries (`start`/`end`/`size`) | `ELF/SLUS_214.42.i64` via idalib | IDA's own analysis, original |
+| names | `ps2xRuntime/symbols.map` | original Ghidra names, one generation removed |
+
+Validated rather than assumed: **all 12,072 real names in `symbols.map` land exactly on an IDA
+function start — 0 mismatches.**
+
+Final map: **16,916 functions** at `build_scripts/funcmap/sdbz_func_map_merged.csv`.
+
+### Measured effect
+
+|  | no map | merged map | + 4 added |
+|---|---|---|---|
+| worst fallback promotion (one function) | 125,228 | 204 | 204 |
+| dispatch entries | — | 377,270 | **377,274** |
+| lost vs live table | 1,002 | 36 | **32** |
+| reachable regressions | 264 | 10 | **6** |
+| gained vs live | — | 1,821 | 1,821 |
+
+The "promoted N fallback entries" warning is a **function-map symptom**, now understood.
+
+### The 4 added functions — and a method error I made
+
+`0x4dd500 / 0x4dd570 / 0x4dd5b0 / 0x4dd5e0` were added by `patch_func_map.py`. They are the first
+four entries of an **86-entry static-init pointer table** at `0x004e6c90`; the other 82 were already
+defined and map coverage began exactly at the 5th target. One contiguous hole, not scattered gaps.
+
+⚠️ **My first probe used a `jr $ra` end-scan and flagged all four SUSPECT — that scan was wrong.**
+These are tail-call thunks (`j 0x00171f10` + delay slot + padding); they never execute a return of
+their own, so the scan ran past each one into its neighbours and two appeared to "overlap". Trusting
+it would have written garbage boundaries into the map. Boundaries were re-derived from a raw
+instruction dump instead, with padding excluded to match IDA's own convention here
+(`sub_4DE250` ends `0x4de444`, not `0x4de450`). **Do not re-run a naive `jr $ra` scan on this shape.**
+
+### The 6 remaining regressions (open)
+
+All are true **interior addresses** inside functions the table *does* have — code emitted inside a
+neighbour's body, no dispatch entry. They need an **entry guard** (`case 0xADDR:` / `== 0xADDR`),
+not a new function. The manifest mechanism demonstrably does **not** fix them.
+
+```
+0x0017ee48  owner 0x0017ee38 (+0x10)  syscall_stub_z_34_0x17ee38      ref: code @ 0x0017ef20
+0x001a4500  owner 0x001a44bc (+0x44)  singleton_lazy_init_b_0x1a4400  ref: code @ 0x001a4484
+0x001bf2e0  owner 0x001bf2c0 (+0x20)  sub_1BF290_0x1bf290             ref: code @ 0x001bf754
+0x0022c8f0  owner 0x0022c8a4 (+0x4c)  sub_0022C890_0x22c890           ref: code @ 0x0022c670
+0x0022cbe0  owner 0x0022cbd0 (+0x10)  get_field_val____0x22cbd0       ref: code @ 0x0022ca08
+0x00341920  owner 0x00341908 (+0x18)  sub_00341860_0x341860           ref: data @ 0x004f4008
+```
+
+### Committed
+
+`43544eeb` — `tooling: reconstruct the lost Ghidra function map + commit it` on
+`work/laptop-session-0519`. **Not pushed.** 10 files: the CSV, the rebuild scripts
+(`export_func_map.py`, `merge_func_map.py`, `patch_func_map.py`), the probe evidence trail
+(`probe_4dd5xx*.py`, `classify_lost.py`), and a `README.md` recording the whole trap so the loss
+cannot recur.
+
+`.gitignore` fix included: `build_scripts/` excluded the **directory**, so git never descended into
+it and the pre-existing `!build_scripts/recomp_mcp_server.py` negation was **dead**. Changed to
+`build_scripts/*`. Side effect: `build_scripts/recomp_mcp_server.py` now shows as untracked — it was
+meant to be committed and silently never was. **Left unstaged deliberately; user's call.**
+
+### Uncommitted from this session
+
+- **`ps2xRecomp/src/lib/ps2_recompiler.cpp`** — `writeToFile` content-compare guard (user-requested).
+  Skips byte-identical rewrites so a regeneration does not bump ~30,000 timestamps and trigger a
+  30+ hour rebuild. Text-mode read deliberately matches the text-mode write (a binary read would see
+  `\r\n` and silently disable the guard). **Built once as `ps2_recomp`; never exercised on a full
+  regeneration.**
+
+### Caveats that must survive
+
+1. `lost_manifest.txt` derives from the live table's contents, so addresses the *original* manifest
+   had but the live table lacks are **invisible** to this comparison.
+2. The "live" `register_functions.cpp` is the hand-converted legacy file (Jul-14 format conversion of
+   May-28 data), so live-vs-new is a **cross-generation** diff, not a clean before/after.
+3. Whether the 6 interior addresses are actually *called at runtime* is **unmeasured**.
+4. Names are original-but-one-generation-removed; boundaries are IDA's own analysis. Neither is a
+   guess, but they are **two different provenances**.
+5. `ps2xRuntime/src/runner/register_functions.cpp` and `ps2_recompiled_functions.cpp` are
+   **gitignored** (`.gitignore:18-19`) — the live dispatch table is not under version control.
+
+### Next session — highest value first
+
+1. **Body diff pass-2 output vs `output/`** for the ~16,900 shared functions. User already approved
+   this ("actually lets follow your recommendation first") and it was never started. Scratch-only,
+   no build. Would expose what the lost `stubs`/`skip`/`patches` config was doing.
+2. **Re-verify the `sub_00463180` `unhandled-instruction` flood is gone** with the corrected map.
+   Predicted (it was a boundary artifact — walking into `.rodata` and decoding ASCII as MIPS),
+   **not confirmed.**
+3. **Resolve the 6 interior addresses** via entry guards.
+4. **Reconstruct `config.toml`** — `config_manager.cpp:319-338` shows a config *writer* exists.
+   Required before any regeneration that touches the live tree.
+5. **Run the built `ps2EntryRunner.exe`** — the 5:03 build succeeded but has **never been run**.
+6. Consider adding `PS2_ARKD_SERVICE` to `launch_recomp.ps1`'s `$Tracers` (a `.ps1` edit, no build).
+
+## Prior Status (2026-07-20f) — ROOT CAUSE OF THE `0x20561900` DERAIL IS MEASURED
+
+**The derail is a stack-pointer shift, not a corrupted pointer.**
+
+Measured causal chain (frametrace instrumentation, `PS2X_FRAMETRACE=1`, run of 2026-07-20f):
+
+1. `0x177fbc  jal 0x175060` sets `$ra = 0x177fc4`. `0x175060` is a 3-instruction syscall stub; `0x175064` is its `syscall` (`$v1 = 0x77` → `sceSifSetDma`).
+2. The dispatch loop then invokes **slot `0x178068` while `ctx->pc` is still `0x175064`** (stale).
+3. `0x175064` is not a case in `fn_178068`'s entry `switch (ctx->pc)`, so `default: break;` **falls into the prologue** → `sp -= 0xa0`.
+4. The body exits mid-loop at `0x1780c0` without restoring `sp`. Measured: `[frametrace:IMBAL] #1 func=0x178068 entryPc=0x175064 delta=-0xa0`. `0xa0` is exactly `0x178068`'s prologue adjustment.
+5. Every outer frame then runs `ld $ra, N($sp)` / `ld $sN, N($sp)` against a stack shifted by `0xa0`, restoring stack *data* into callee-saved registers.
+
+Fault-dump corroboration (`[gpr]` + `[stack]` in `reportMissingFunction`):
+- `s0=0x20561900  s2=0x177fc4  s3=0x20561900  ra=0x20561900`
+- `$s2` is the small array index in `0x177eb0` (`sll $a1, $s2, 4`) — it should be 0/1/2 and instead holds a **return address**. `$ra` is not specially corrupted; it is one of four casualties of the same bad restore.
+- The stack region is provably `0x177eb0`'s 16-byte entry array: every entry's `+0xc` word is `0x44`, matching `0x177f88 addiu $v0,$zero,0x44 ; sw $v0,0($a0)`.
+- The correct `0x177fc4` sits at `sp-0x40` and `sp+0x10`; `0x20561900` sits at `sp-0x30`, `sp-0x10`, `sp+0x20`, `sp+0x40` — the `0xa0` shift, visible directly.
+- Trace shows `0x178068` twice per cycle: once via the syscall path with stale `pc`, once normally.
+
+### ❌ REFUTED this session (do not revisit)
+- **"`0x20561900` is corruption."** It is the uncached mirror of `0x561900`, a legitimate SIF packet-pool pointer this code passes around normally. `Ps2FastRead8/32` mask with `PS2_RAM_MASK` (`ps2_runtime_macros.h:162,187`), so `0x2xxxxxxx` data reads are valid. The 155 store-traps found nothing because **nothing ever wrote a bad value.**
+- **Copy-loop overrun in `0x178068`.** Measured `[0x5616d8] = 0x20561600`, which matches `[SIF_DIAG] rx=0x20561600` exactly — it is the SIF RX buffer pointer, not a trip count. No oversized count exists.
+- **Syscall routing.** Syscall `0x77` is fully handled in `SIF.cpp:1259` (`sceSifSetDma`) and `return true`s from `Dispatcher.cpp:309`. It never dispatches into `fn_178068`.
+
+### 🔴 THE ONE OPEN ITEM — start here next session
+**Why does the dispatch loop invoke slot `0x178068` while `ctx->pc` still holds `0x175064`?**
+- `0x175064` is **not** in the dispatch table (only `0x175060` is, index 119830) — so this is not a mid-body table alias.
+- Something calls the slot without refreshing `pc` first. **Not guessed. Unmeasured.**
+- Next action is read-only, no build cycle: read the dispatch loop and syscall-return path in `ps2xRuntime/src/lib/ps2_runtime.cpp` and `Kernel/Syscalls/Dispatcher.cpp` and find where `ctx->pc` is left unadvanced after a `syscall`.
+- Fix shape follows the answer: either a `default:` guard in `ps2xRecomp/src/lib/function_emitter.cpp:110-123` (systemic, recompiler-side, affects every emitted entry switch) or a targeted `game_overrides.cpp` override.
+
+### Collateral — this run went materially further than any prior run
+`ARKD_DVD.IRX` loaded (entry `0x04a6bc`, 12 libs, 57 stubs) → `Disk Media TYPE : DVD.` → `INFO.DAT` read ok (`lbn=1048576 sectors=47`) → `GAME.DAT` located (`lbn=1048625 size=0x2ba29000`) → 4 services registered (`sid=0x500/0x501/0x502/0x503`) → `[ARKD:BIND] client=0x5a9330`. Only **3** frame imbalances in a 242 MB log — a specific bug, not an endemic one.
+
+### Instrumentation notes (for whoever picks this up)
+- `PS2X_FRAMETRACE=1` arms a 64-entry ring dumped by `reportMissingFunction`; `PS2X_TRAPVAL=addr:lo:hi` arms the store trap (`ps2_runtime.cpp:2384-2408`).
+- `sdbzFrameTraceWrapper<I>` is a **template per slot**, so each instantiation has its OWN `static` counter — the `#N` in `[frametrace:IMBAL]` is per-slot, not global. Three `#1` lines are three different slots.
+- `run_log.txt` is UTF-16 **and** has console line-wrapping baked in at ~120 chars. `Select-String` needs `-Context 0,3` to recover a full logical record.
+- `RUNTIME_LOG` is a compiled-out no-op here (`PS2_RUNTIME_LOGS` undefined) — diagnostics must use `std::cerr`.
+- `RecompiledFunction` is a **nested** alias: `PS2Runtime::RecompiledFunction` (`ps2_runtime.h:476`). Unqualified use in `game_overrides.cpp` = 12 build errors from one line.
+
+## Previous Status (2026-07-20) — ✅ `0x104bf0` OVERRIDE CONFIRMED WORKING. `0x20561900` derail re-opened and narrowed by measurement to a **stale-frame `$ra` READ**. (Superseded above: the stale-frame read is confirmed as the *surfacing mechanism*, but its cause is the `0x175064` entry-switch fall-through, not a mid-body dispatch of `0x178428`.)
+
+**Standing user constraint this session: "go no guess work please."** Every claim below is backed by a read or a log grep; the one open item is explicitly labelled as unmeasured.
+
+### ✅ Resolved this session — `0x104bf0` truncated-function override
+- `fn_104BF0_0x104bf0.cpp` emitted **1 of 4** real instructions (`lui $v0,0x50` only), no `jr $ra`, no terminal `ctx->pc` → infinite re-dispatch.
+- Fix in `game_overrides.cpp` (`sdbzRegisterHandler104BF0`, registered via `replaceFunction(0x00104BF0u, …)`): stores `$a0` → `0x00503230`, sets `$v0=1`, returns via `$ra`.
+- **Build-verified: `0x104bf0` appears NOWHERE in the post-build `run_log.txt`.** First confirmed forward progress in several sessions.
+
+### ❌ Truncated-function bug is NOT the `0x20561900` cause — DEMOTED
+Grepped `build_scripts/truncated_functions.json` for all six derail-trace addresses (`1540704|1568096|1568176|1631752|1541128|1541672`) → **zero matches**. The bug is real (86 bodies / 76 addrs) but unrelated to this derail. Still open, needs a recompiler run.
+
+### The `0x20561900` derail — write-side is now FULLY excluded
+Fault signature: `pc == ra == target == 0x20561900` (the SIF packet-pool base), `sp=0x1ffbc40`, then 60+ s of watchdog spin.
+Trace: `0x178260 -> 0x17ed60 -> 0x17edb0 -> 0x18e408 -> 0x178a08 -> 0x178428 -> 0x17ed60`.
+
+`PS2X_TRAPVAL` (plan `rippling-swimming-walrus.md`) was armed on `0x20561900`. **155 hits, ALL legitimate SIF pool-pointer stores** (writing PCs clustered `0x177exx`–`0x178cxx`). `0x1780cc` recurs on a strict 7-hit period writing `0x1ffbb84/0x1ffbbd4/0x1ffbc24` — all **below** `sp`, all legitimate.
+
+The suspect slot is `sp+0x20 = 0x01FFBC60`. It holds `0x20561900` at fault time with **no trapval hit ever recorded for that address.**
+
+Every candidate writer eliminated by measurement:
+| Candidate | Verdict | Evidence |
+|---|---|---|
+| Guest store via `WRITE*` macros | ❌ | Zero trapval hits at `0x1ffbc60` across 155 hits |
+| ARKD `sub_ADD4` SIF DMA (`ps2_iop_irx_loader.cpp:710-744`) | ❌ | **Zero `[ARKD:sifdma]` lines** in run_log — never executed |
+| `guestRealloc` memmove (`ps2_runtime.cpp:1945`) | ❌ | `kGuestHeapHardLimit = 0x01F00000` (line 190), clamped at lines 613/981/1628/1634. Fault addr `0x01FFBC60` is **~1 MB ABOVE** the heap ceiling — unreachable |
+| All other runtime `memset`/`memcpy` into rdram | ❌ | Write zeros or small constants (`ps2_runtime.cpp:929/1850`, `ps2_iop.cpp:232/236`, `ps2_iop_cl.cpp:215/495`, `ps2_iop_sdrdrv.cpp:77/189/301`, `ps2_iop_mcman.cpp:292/293`) |
+
+**Plan outcome #3 (runtime-side memcpy) now has ZERO surviving candidates. Nothing wrote that slot.**
+
+### 🔬 SOLE SURVIVING HYPOTHESIS (unmeasured) — stale-frame `$ra` read in `0x178428`
+`fn_178428_0x178428.cpp` (`// Address: 0x178428 - 0x1784d0`, 48-byte frame):
+- Prologue at `0x178428`/`0x178434`: `addiu $sp,$sp,-0x30` then **`sd $ra, 0x20($sp)`** → `sp+0x20` IS its `$ra` save slot. Confirmed by read.
+- **Entry `switch (ctx->pc)`** `goto`s `label_178440/178458/17849c/1784b8` — **skipping the prologue entirely** (no `sp` decrement, no `$ra` save).
+- `label_1784bc` runs the epilogue **unconditionally**: `ld $ra, 0x20($sp)` then `addiu $sp,$sp,0x30`.
+- ⇒ On a prologue-skipped entry, `sp` is the *caller's* `sp`, so `sp+0x20` points into the caller's frame — which legitimately holds SIF packet payload `0x20561900`. `jr $ra` then sets `ctx->pc = 0x20561900`.
+
+This is a **LOAD from an unwritten slot**, which is exactly why 155 store-traps found nothing. It explains all four otherwise-contradictory facts: no trapval hit, the value being exactly the SIF pool base, `pc==ra==target`, and **no `jalr` anywhere in the function**.
+
+Second route (same failure): the duplicate `sub_00178428_0x178428.cpp` (identical body, newer codegen) additionally has a **post-`jr` `switch (jumpTarget)`** that `goto`s back into the body *after* `sp` was popped by +0x30 — re-entry on a dead frame.
+
+⚠️ **The entry switch exists in BOTH variants**, so the prologue-skip route is live regardless of which is registered.
+
+### Excluded as originators (read, confirmed `$ra`-transparent)
+- `0x17ed60` (`cpu_disable_interrupts`) and `0x17edb0`: pure leaves — no prologue, no epilogue, no `$sp` access, no `$ra` save. They *surface* a bad `$ra`, cannot originate one.
+- `0x178260`: intact, 64-byte frame, `$ra` at `$sp+48`, save slot **clean** at fault time.
+
+### Memory is NOT generally corrupt
+`sp+0x10`=`0x177fc4`, `sp+0x30`=`0x564b40`, `sp+0x90`=`0x178018`, `sp+0xa0`=`0x178d1c` — all valid. The `0x20561900` values in-frame are genuine SIF packet-descriptor payload (interleaved with lengths `0x40`/`0x44`, flags `0xffffffff`, buffers `0x5688a8`/`0x5a9380`).
+
+### NEXT (handoff, in order)
+1. **Measure the stale-frame hypothesis — do NOT fix on assumption.** Instrument entry/exit `sp` for `0x178428` from `game_overrides.cpp` or the runtime layer (**never** the runner file — [[feedback-no-runner-file-patches]]). Look for a call that exits with `sp` HIGHER than it entered, or a second pass through `label_1784bc`.
+2. **Determine which `0x178428` variant is dispatch-registered** — `fn_178428_0x178428` vs `sub_00178428_0x178428`. Decides only whether the *second* route is also live. Same question open for `0x17ed60` and `0x178260`.
+3. Narrow `PS2X_TRAPVAL` to `[0x1ffbc00, 0x1ffbd00)` to cut the 155 false positives per run.
+4. Read the two unexamined trace functions: `0x178a08`, `0x18e408`.
+5. Build: `cmake --build "F:\SDBZ Recomp\build"` under vcvars64 (user runs).
+
+### Open minor anomalies
+- **Misaligned `sq`:** trapval logged `addr=0x1ffbb84 size=16` — `0x84 & 0xF = 4`, not 16-byte aligned. Real R5900 `sq` masks the low 4 bits. Either the trap logs a pre-mask effective address, or `WRITE128` in `ps2_runtime_macros.h` is missing the mask. **Unverified.**
+- **Unimplemented syscall**, run_log line 490: `[Syscall TODO] encoded=0x0 v1=0x6b v0=0x503070 a0=0x1 a1=0x0 a2=0x178560 a3=0x20561600 pc=0x174f70` (RA=`0x17e238`).
+- **Duplicate generated files** covering identical address ranges from different recompiler generations, confirmed at `0x178260`, `0x17ed60`, `0x178428`. Which variant is registered is unknown for every one.
+- **Stale comments** referencing `0x20561900` in `Kernel/Stubs/SIF.cpp` lines 247/627/630/662 — dead commentary from the disproven `pkt[5]` hypothesis, no live code. Safe to delete.
+- Run-to-run nondeterminism (boot depth varies on identical logic) — unexplained.
+
+### DISPROVEN — do not resurrect
+Dispatch-table poisoning · unsanitized `pkt[5]` · stack-frame overrun in the `lq`/`sq` packet copy (disproven twice) · a *guest store* clobbering saved `$ra` · the `starts`-set theory for `0x104bf4` · null `eeDest` · worker pump ordering · `sub_1DA4` DMA before `BF50` populated · ARKD `sub_ADD4` SIF DMA · `guestRealloc`.
+
+**Note on the IOP/ARKD thread below (07-19d):** that work is code-complete and unbuilt. It is a *separate* blocker from this EE-side derail; the 07-19c run showed the `0x20561900` derail gone under `PS2_SIF_DIAG`, but it has recurred in the current build. Both threads are live.
+
+---
+
+## Prior Status (2026-07-19d) — ⏳ Phase A + B CODE-COMPLETE, UNBUILT. Plan `hidden-tinkering-rossum.md` in flight. Awaiting user build+run to get Phase B diagnostics.
+
+**Blocker model (unchanged, root-caused 07-19c):** EE sits in a steady SIF-RPC CALL poll (sid `0x503`, func `0x2`, recv `0x5aa7d0` sz `0x10`, send-seq `w[6]` climbing). The real R3000 service func-2 (`sub_42700`, ARKD func `0x042700`) runs clean and faithfully returns `recv=00 00 00 20` = `dword_B300=0x20000000` (**bulk transfer IN PROGRESS**) every poll. `[ARKD:search] "\INFO.DAT;1" -> found` works but `[ARKD:cdread]` never fires and worker queue `dword_B310=0`. **Root cause:** on real HW the transfer runs on ARKD's own IOP thread concurrent with the EE poll; our interpreter only runs the polled func-2, never pumps the in-flight transfer body to completion → B300 frozen mid-transfer → poll spins forever.
+
+**Phase A (done, code) — de-noise syscall 0x68:** `Kernel/Syscalls/Dispatcher.cpp` — added `case 0x68: case (uint32_t)-0x68:` → bounded-logged no-op returning 0 (guest discards the result; `fn_104F20` GS field-flip red herring). Removes the repeating `[Syscall TODO] v1=0xffffff98`.
+
+**Phase B (done, code) — transfer diagnostics in `ps2_iop_irx_loader.cpp`:**
+- `[ARKD:worker] run:` log extended → now prints `off=+0x%06x` (module-relative finalPC) + `<-- INCOMPLETE (mid-transfer)` flag when `B300 & 0xF0000000 == 0x20000000` at halt.
+- New `[ARKD:idle]` diag in the WaitSema `0xAEDC` idle-halt path (fires ≤16×, always-on): logs when the worker declares itself idle (`B310==0`) while B300 is still `0x20000000` — the suspected premature transfer cut-off.
+
+**Hypothesis to test with Phase B output:** the transfer routine clears B310 and loops back to WaitSema BEFORE finishing the read+DMA, so the idle-halt freezes B300 mid-transfer and no cdread ever fires. Phase B output pins the exact stall PC → Phase C wires the pump precisely there.
+
+**Phase C (NOT started):** pump the pending ARKD transfer routine / worker `sub_21B0` in the R3000 so ARKD's own code advances B300 `0x20000000→0x40000000|result` and DMAs read data to the EE recv buffer. No runner edits, no faking. Depends on Phase B run output.
+
+**NEXT (handoff):**
+1. User builds: `cmake --build "F:\SDBZ Recomp\build" --config Debug --target ps2EntryRunner` (RecompDebugger LNK1104 file-lock = harmless).
+2. User runs with `$env:PS2_ARKD_IRX_RUN=1; $env:PS2_ARKD_SERVICE=1; .\launch_recomp.ps1`.
+3. Grep (UTF-16): `Select-String -Path .\run_log.txt -Pattern '\[ARKD:(worker|idle|cdread|sifdma|search|run)\]'` — look for `INCOMPLETE`+`off=`, `[ARKD:idle]`, whether `[ARKD:cdread]`/`[ARKD:sifdma]` fire.
+4. Wire Phase C at the stall point Phase B reveals.
+
+Plan detail: `C:\Users\mwlab\.claude\plans\hidden-tinkering-rossum.md`.
+
+---
+
+## Prior Status (2026-07-19c) — ✅ 0x20561900 SIF DERAIL IS GONE (Phase 1 diagnostic, `PS2_SIF_DIAG`). Boot advanced far past it; new terminal blocker is EE-side.
+
+**Phase 1 (`hidden-tinkering-rossum.md`) ran — instrumentation-only, env-gated `PS2_SIF_DIAG`. Findings from run_log.txt (2522 lines):**
+- ✅ **`[SIF_DIAG:DERAIL]` = 0. "No exact recompiled function for guest PC 0x20561900" = 0.** The 0x20561900 derail the plan targeted **no longer happens** — the 07-17h `pkt[10]=0xFFFFFFFF` sentinel + loopback fixes already cleared it. Every `0x20561900` in the log is just `src=0x20561900` (the *normal* EE packet-pool source addr, never a jump target) — that spam masked the fact the crash was already fixed. **Phase 2 is effectively satisfied; no SIF.cpp behavioral edit needed for the derail.**
+- ✅ SIF_DIAG dump confirms: user/server table is empty (`usrCnt=0`); the synthesized `pkt[2]=0x80000008` (negative) routes the **system** table (`sysBase=0x561700 sysCnt=0x20`, sys[0]=0x177aa8 sys[1]=0x177a88) which is valid. All 24 BIND/CALL deliveries dispatch cleanly. ARKD sids **0x500–0x503 each BIND once**.
+- ✅ Boot now runs the **full** ARKD path: IRX load → `_start` (halt) → 4 SIF-server threads (halt) → InitLoadBuffers → **64 `[ARKD:run]` service CALLs** → 1 worker → 1 sifdma. Furthest ever.
+- ⚠️ **InitLoadBuffers still spins** (`retired=4000000 finalPC=0x00040930 halted=0`) BUT `[ARKD:cdread]`=0 — it spins at module **+0x930 BEFORE issuing any cdvd read**, and the loader **continues past it anyway** (services run afterward). So this is wasteful, **not** the terminal stall. Phase 3 (IOP cdRead completion) is **de-prioritized** — it is not what blocks boot.
+
+**NEW TERMINAL BLOCKER (EE-side steady-state loop, not a hang):**
+- Watchdog `stuckSecs` keeps resetting to 0 — EE is **alive**, cycling the SIF dispatcher (`0x17ed60→0x177eb0→0x1781b0→0x178068→0x178560→0x178de8`) + main loop `0x422454`, `lastCall=0x172998`.
+- EE repeatedly issues **SIF-RPC CALL** (`cid=0x8000000a`, `w[8]=0x2`, send buf `w[10]=0x5aa7d0` sz `0x10`) with **incrementing seq `w[6]=0xa9→0xaa→0xab…`** — a live poll loop (retry/timeout cadence).
+- Between each CALL it hits an **unimplemented EE syscall at `pc=0x174f50`**: `[Syscall TODO] encoded=0x0 v1=0xffffff98` → dispatcher gets raw `0xffffff98` = **-0x68 (syscall 0x68 / 104)**. No `case 0x68` **or** `case -0x68` in `Kernel/Syscalls/Dispatcher.cpp` (it enumerates specific ±cases, e.g. `-0x70`=iGsGetIMR; there is no global negate) → falls to `TODO()` (warns, does nothing). Call chain: `0x104f20 → 0x174f50(syscall) → 0x172e20 → 0x172a90 → 0x172998`. RA=0x105000, v0=0x7000.
+
+**NEXT (Phase 1 done; propose new direction — user to steer, ideally after `/compact`):**
+1. **Identify EE syscall 0x68 / -0x68** authoritatively (ps2tek table or read the generated fn @ 0x174f50 — read-only, never patch). Likely a needed kernel op the poll loop waits on; implement it in `Dispatcher.cpp`/`System.cpp` (a `case 0x68`/`-0x68`), or a game_override if it's a game-specific thunk.
+2. **Determine if the SIF CALL sid `w[8]=0x2` poll is genuine progress or a stall** — is the game waiting on a CALL reply, or on the syscall side effect? The seq-incrementing CALL smells like a timeout-retry around the unhandled syscall.
+3. Parked non-fatal: 16× `No exact recompiled function for guest PC 0x1bfdb0` (unrelated missing EE dispatch entry, recovers).
+
+`PS2_SIF_DIAG` instrumentation left in place (env-gated, ≤24 emissions, zero cost when unset). Full plan detail: `C:\Users\mwlab\.claude\plans\hidden-tinkering-rossum.md`.
+
+---
+
+## Prior Status (2026-07-19b) — SERVICE-DATA HYPOTHESIS DISPROVEN. Real blocker re-root-caused: EE SIF dispatcher `fn_178068` derails into PC `0x20561900` on an ARKD **BIND** loopback. The `PS2_ARKD_SERVICE` bridge is a dead end for these CALLs (they carry `rsz=0`, no reply expected). Widened gate = inert (no regression, no fix).
+
+**07-19b LONGER-RUN RESULT (full run to crash, from run_log.txt, 2.6M lines):**
+- ✅ Disc search + read still clean (`[ARKD:search] "\INFO.DAT;1" -> found`, `cdvdman fid=13` reads fire). All 4 services register.
+- ❌ **IOP-side:** `InitLoadBuffers run: retired=4000000 finalPC=0x00040930 halted=0` — spun the full 4M-instruction cap and **never halted**. It's an async cdvd read-wait poll whose completion flag/sema is never signaled by our `sceCdRead` HLE. (Independent sub-bug; may or may not gate the EE crash.)
+- ❌ **EE-side (the crash):** the ARKD CALLs are **`func=0x0, rsz=0x0`** (log line 411/432: `send=0x20561900 ssz=0x10 recv=0x5aa3d0 rsz=0x0`). rsz=0 ⇒ the `if (recvPtr && recvSize)` guard in the service bridge is **false** ⇒ `ps2_iop_runArkdService` never runs. So delivering reply data is NOT the mechanism the EE waits on. The widened `sid 0x500..0x503` gate (this session's edit) is therefore inert — correct-when-needed, but not this blocker.
+- ❌ After CALL 0x500 → CALL 0x501 → **BIND 0x502**, `[SifRpcReply] deliver cid=0x80000009 -> run dispatcher 0x178068`, then `Error: No exact recompiled function for guest PC 0x20561900` **spins to EOF**. The 0x20561900 loop (thought fixed 07-17h) is **BACK** under the real-IRX-run path.
+
+**ROOT CAUSE (newly pinned, deeper than 07-17h):**
+- `fn_178068` (`ps2xRuntime/src/runner/fn_178068_0x178068.cpp`) is the EE's **RPC-server request dispatcher** (sceSifRpc server loop). `$s1` = an RPC_SERVER_DATA struct: `+0xC`=func-table base, `+0x10`=func count, `+0x14`=2nd table base, `+0x18`=2nd count.
+- Path 0x178150→0x178180: `lw $v1,0x14($s1)` (table base) → index by `rpcnum*12` → `lw $a2,0x0($v0)` (handler ptr) → `jalr $a2`. The loaded handler ptr = **`0x20561900`** (the SIF packet-pool buffer) → EE executes packet data as code.
+- i.e. our loopback of the game's own outbound **BIND** into the EE RX queue makes `fn_178068` treat it as an **incoming EE-server request** and dispatch through a server table that was never validly populated for these sids → garbage func ptr = the packet buffer. The 07-17h `pkt[10]=0xFFFFFFFF` sentinel (client_block[5]) IS still applied (`dest=0xffffffff` in log) — it fixed a *different* field; this crash is via the `+0x14` server-table read.
+
+**NEXT (needs a plan pass — user to decide direction; do NOT blind-edit `fn_178068`, it's a runner file):**
+1. **Decide the seam.** The fix must live in `SIF.cpp` (allowed) or `game_overrides.cpp` (allowed). Question: should a BIND loopback route to `fn_178068`'s server-dispatch path at all? On real HW the IOP registers the server; the EE only holds a client handle. Options: (a) for ARKD BINDs, deliver the register-completion in a way that does NOT re-enter the server-dispatch jalr path (route purely to `_request_end` register branch, verify `fn_178068` doesn't fall through to 0x178150); (b) suppress the loopback-run of `fn_178068` for ARKD BINDs once the WaitSema flag is set directly.
+2. **Separately, the IOP `InitLoadBuffers` 4M-spin:** our `sceCdRead` HLE must signal read-completion (the flag/sema the IOP polls at `finalPC=0x00040930`) so the loop halts cleanly. Check `ps2_iop_cdReadSectors` / cdvdman completion path.
+3. Re-run + grep `0x20561900|ARKD:BIND|InitLoadBuffers|deliver cid`.
+
+**Note:** this is the long-standing "SIF-RPC bind ping-pong" blocker ([[reference_ps2_sif_boot]]), now characterized at instruction level. Prior 07-19 note (below) assumed the EE reaches a 0x503 DVD-read CALL needing service data — **that premise is wrong**; the EE never gets there, it derails on the 0x502 BIND dispatch first.
+
+**(prior 07-18c wiring notes retained below)** S2.2c/d WIRED behind env gates, BUILT clean.
+
+**What was wired this session (all gated `PS2_ARKD_IRX_RUN=1` + `PS2_ARKD_SERVICE=1`, default boot path byte-for-byte unchanged):**
+- **Root cause found:** cdvdman `fid=10` = `sceCdSearchFile` (`sub_ACA8`, off 0xACA8) is a filename→LBN resolver that **gates every read**. ARKD spins `while(!sceCdSearchFile(fp,"\INFO.DAT;1")) delay()`. Default hook returned 0 → infinite spin → `dword_B300` stuck `0x20000000` (reading), game polls fno 0x2 forever. The real read (`sub_AC98`, off 0xAC98) is downstream and was never reached.
+- **Fix (2 edits, both compiled clean):**
+  - `Kernel/Stubs/CD.cpp`: added external-linkage forwarder `ps2_iop_cdSearchFile(name, &lbn, &size)` that calls the existing `registerCdFile(ps2Path, CdFileEntry&)` primitive → search-LBN and read-LBN come from the SAME pseudo-LBN table (honors no-IOP-faking: real ISO table + real sectors).
+  - `ps2_iop_irx_loader.cpp`: new import hook `off==0xACA8u` — reads the filename string from IOP RAM (a1), calls `ps2_iop_cdSearchFile`, writes `{lbn@0, size@4}` into the `sceCdlFILE` struct at IOP RAM (a0), sets `$v0=1` found / `0` miss, returns to `$ra`. Logs `[ARKD:search] "name" -> found/MISS lbn size`.
+- Pre-existing loader hooks (unchanged): `off==0xAC98u` cdvd read→`ps2_iop_cdReadSectors`; `off==0xAEDCu` WaitSema/worker-halt; `off==0xADD4u` SIF DMA IOP→EE.
+
+**BUILD RESULT (user ran `cmake --build`):** `CD.cpp` + `ps2_iop_irx_loader.cpp` compiled clean; `ps2_runtime.lib` + **`ps2EntryRunner.exe` linked successfully** (benign LNK4006/4075/4088 only). The only failure was `RecompDebugger.vcxproj` → `LNK1104: cannot open file ...RecompDebugger.exe` = **harmless file-lock** (that exe was running/open); unrelated to ARKD and unrelated to the runner target used for the game. Close it or ignore.
+
+*(07-18c disco-re-run checklist resolved — see the 2026-07-19 status block above; search + read confirmed working.)*
+
+---
+
+## Prior Status (2026-07-18b) — ✅ S2.2c DISCOVERY COMPLETE. The full ARKD DVD-read worker chain is now mapped end-to-end (live harness trace + IDA decompile of ARKD_DVD.IRX). The three prior unknowns (which sema, which thread waits, which cdvdman fid reads) are resolved.
+
+**S2.2c DISCO RESULT (headless `iop_harness.exe`, real send header, fno 0x0/0x102/0x2):**
+- **The 0x503 dispatcher = `sub_2700`** (func 0x042700). fno→handler map (fno = a1):
+  - fno 4 → `sub_1A10` (SetString "cd_root")
+  - fno 1 → `sub_16A4`; **fno 2 → `sub_1714` (POLL: returns `dword_B300` verbatim)**; fno ≥3 → `sub_1760` (TocLookup+read by name)
+  - **fno 0x102 (258) → `sub_2410` (SUBMIT read)**; fno 0x101 → `sub_250C`; fno 0x103 → `sub_2608`; fno 0x81 → `sub_183C`
+- **SUBMIT `sub_2410`** (live-confirmed): `sysclib memcpy 0x24` bytes (recv buf 0x54e50 → job struct `dword_BF50`=base+0xBF50), sets `dword_B310=1` (job type), `dword_B300=0x10000000`, then **`SignalSema(dword_B318)`**.
+- **THE WORKER = thread `sub_21B0`** — a DEDICATED thread (NOT one of the 4 SIF servers). Loops: `WaitSema(dword_B318)` → dispatch on `dword_B310` (1→`sub_1DA4`, 2→`sub_1A58`, 3→`sub_1EB0`) → the read (`sub_1A58`→`sub_7A4`→**cdvdman read import `sub_AC98(lbn,sectors,dest,mode)`** with 6× retry via `CdReadRetryLoop`/`sub_CCC`) → sets `dword_B300` = `0x30000000` done or `0x40000000|err`. Filename comes from job struct at `byte_BF54` (job+4) via `TocLookup`.
+- **THE INIT = `sub_28AC` (InitLoadBuffers)**, reached via `sub_30`: `CreateSema`→`dword_B314`(mutex)+`dword_B318`(worker wakeup, count 0), `CreateThread(entry=sub_21B0)`+`StartThread` (creates the worker), allocs load buffers, reads INFO.DAT/GAME.DAT TOC (`sub_1870`), sets `dword_B300=0x30000000` ready.
+- **Why disco fired no cdvdman:** the harness runs only `_start` + the 4 SIF-server thread *setups* (each halts at the RpcLoop stub). It NEVER runs the init RPC (`sub_30`/InitLoadBuffers), so `dword_B318`=0 and no worker exists → submit's `SignalSema` went to sema **0** (noop), read never ran. Poll returned the static `dword_B300` (0x30000000).
+
+**S2.2c/d WIRING IMPLICATION (for next steer — NOT yet wired):** our run-to-halt model has no persistent scheduler. To service a real 0x503 read we must (1) run `InitLoadBuffers` once at load (so semas/buffers/TOC/worker exist), and (2) after a submit sets `dword_B310`+signals, DIRECTLY run one worker iteration (`sub_1A58`/`sub_1DA4`/`sub_1EB0` per `B310`) so the cdvdman read (`sub_AC98`) executes inline — then hook `sub_AC98` to `readCdSectors` into IOP RAM. The exact numeric cdvdman fid resolves the instant `sub_AC98` first executes (import hook logs it). **PAUSE for user steer before behavioral wiring** (per plan).
+
+---
+
+## Prior Status (2026-07-18a) — ✅ S2.2a + S2.2b CONFIRMED. Real ARKD_DVD.IRX `_start` now runs to a CLEAN HALT in the embedded R3000, and all 4 SIF-RPC services self-registered. We now have the REAL per-sid dispatch function pointers — the exact Stage 2 targets.
+
+**S2.2a/S2.2b RESULT (run log 07-18a, `PS2_ARKD_IRX_RUN=1`):**
+- `$sp` bug fixed (`setGpr(29, 0x1FFF00)` before `_start`) → the `unhandled write32 @0xffffff**` stack-fault spam is GONE.
+- `_start run: retired=183 finalPC=0x0ffffff0 halted=1 threads=4` — module init ran real R3000 code to a clean sentinel halt; captured 4 CreateThread entries.
+- Real HLE imports serviced: AllocSysMemory (bump), CreateSema, CreateThread (records entry), StartThread (records arg), printf. printf strings prove the real module ran: **"ARIKA IOP Control Driver Version %d.%d.%d (C)ARIKA Co.,Ltd."** + **"TARGET CD/DVD Version."**
+- S2.2b ran each of the 4 server-thread bodies once → each self-registered its RPC. **CONFIRMED dispatch table (sid → service func in IOP RAM, load base 0x040000):**
+
+  | sid    | client   | service func | recv buf | thread entry |
+  |--------|----------|--------------|----------|--------------|
+  | 0x500  | 0x5a9330 | **0x0401d4** | 0x054a50 | 0x04a4dc      |
+  | 0x501  | 0x5a9380 | **0x046708** | 0x055250 | 0x04a554      |
+  | 0x502  | 0x5a93a8 | **0x049d38** | 0x055650 | 0x04a5cc      |
+  | 0x503  | 0x5a9358 | **0x042700** | 0x054e50 | 0x04a644      |
+
+- **The DVD-read blocker = sid 0x503 → func 0x042700.** Stuck CALL packet (steady state): mode=2, send buf, recv buf 0x5aa7d0, size 0x10, rpc_number climbing (timeout retries). handleRPC still → false (S2.2d not wired yet), so the game still hangs at pc=0x422454 / lastCall=0x172998 — EXPECTED, no regression.
+- Parked (non-fatal): `No exact recompiled function for guest PC 0x1bfdb0` (via 0x171c30→0x1bfdb0) spams during the init CALL burst then recovers — missing dispatch-table entry, unrelated to DVD blocker.
+
+**NEXT: S2.2c + S2.2d** — cdvdman sceCdRead → real ISO sectors into IOP RAM (`readCdSectors`); then per-CALL bridge in SIF.cpp (gated `PS2_ARKD_SERVICE=1`) that, for sid 0x503, sets up the R3000 (a0=send buf mapped into IOP RAM, $sp, halt sentinel), calls func 0x042700, and copies the service's recv-buffer output back to the guest recv buf (0x5aa7d0) before the dispatcher runs.
+
+---
+
+## Prior Status (2026-07-17h) — ✅ SIF PACKET-POOL SENTINEL FIX CONFIRMED (0x20561900 loop GONE). Game now runs a stable main loop (furthest ever). New blocker: **ARKD DVD-read RPCs get NO result data** — the SIF.cpp echo path never invokes handleRPC, and ARKD SID isn't handled in ps2_iop.cpp.
 
 **SENTINEL FIX CONFIRMED (run log 07-17h):**
 - `SIF.cpp` BIND branch `pkt[10] = 0xFFFFFFFF` fix WORKED. The `No exact recompiled function for guest PC 0x20561900` loop is GONE. Outbound packets no longer carry string garbage in w[3]. Boot advanced well past the corruption point.
 - All 5 IRX still load OK. Then the game issued its post-ARKD service binds (clients 0x5a9330/0x5a9358/0x5a9380/0x5a93a8, SIDs 0x500 etc.) and entered a **stable main loop** — watchdog PC varies (0x11e3b0/0x11f240/0x175210 vblank/0x104c74) and stuckSecs resets, i.e. alive, not hung. Reaches 0x175210 (INTC VBLANK) now.
 
 **NEW BLOCKER (07-17h): ARKD service RPCs return no data**
+
+**STAGE 1 TRACE CONFIRMED (07-17i, `PS2_ARKD_TRACE=1`) — the Stage 2 contract:**
+- 4 ARKD clients, 4 distinct SIDs (static guess of a single sid 0x500 on 0x5a9358 was WRONG — 0x5a9358 is sid **0x503**):
+
+  | client     | sid (w8) | recv buf  |
+  |------------|----------|-----------|
+  | 0x5a9330   | 0x500    | 0x5aa3d0  |
+  | 0x5a9380   | 0x501    | 0x5aabd0  |
+  | 0x5a93a8   | 0x502    | 0x5aafd0  |
+  | 0x5a9358   | 0x503    | 0x5aa7d0  |
+
+- BIND: w4=0x5 (mode), w8=real sid. CALL: cid=0x8000000a, shared send buf **0x20561900**, recv sizes report **rsz=0** (game reads recv buf by fixed addr, not copy-back).
+- Func numbers seen on sid 0x500: 0x0 (init), then **0x12, 0x11, 0x1** — matches prior R3000-era `rpcno 1/2/17/18/258` servicing (state line ~216), so the real ARKD_DVD.IRX service fn is the Stage 2 target.
+- `handleRPC → false` on every ARKD CALL (expected: no handler) — bridge is observe-only, no regression, main loop preserved.
+- **The hang, now visible:** after the CALLs return nothing, the guest dispatcher (`sub_178068` loop) jumps to PC **0x20561900** = the send-buffer address → "No exact recompiled function for guest PC 0x20561900". The game is executing the RPC packet as code because the reply never delivered a valid function pointer. Stage 2 must service these 4 SIDs so a real reply lands in the recv buf before the dispatcher runs.
+
 - The game repeatedly issues CALL packets to ARKD client **0x5a9358** (seq incrementing 0x1a→0x36+, ~1-2/sec = timeout-retry), waiting for DVD data that never arrives.
 - Root cause (confirmed by code read): ARKD CALLs travel the **SIF.cpp `deliverSifRpcReply` echo path** (captured via sceSifSetDma, cid=0x8000000a), which synthesizes an empty completion and **never calls `ps2_iop().handleRPC`**. Separately, ps2_iop.cpp `handleRPC` has **no handler for the ARKD SID (0x500)** — the C++ HLE chain (SoundDriver/DbcMan/LibSd/Sound/ClFile/Sdrdrv/McServ/LOADFILE/CDVD) doesn't cover it.
 - Per no-IOP-faking rule ([[feedback_no_iop_faking]]): route ARKD CALLs through the embedded **R3000 interpreter running the real ARKD_DVD.IRX** (already loaded), not hand-written C++ outputs. Needs a plan pass — decide the wiring: SIF.cpp CALL branch → handleRPC/R3000, fill recv buf, echo back before dispatcher runs.
@@ -829,6 +1498,26 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - rpc=0x001 WARNING gone
 
 ## Learned Patterns
+
+### 2026-07-21
+- **A silent parser skip is worse than a crash.** `loadGhidraFunctionMap` drops any malformed line with no warning and exits 0, so pointing `ghidra_output` at a space-separated file produces a run with ZERO boundary data that looks completely healthy. When a tool "succeeds" but the numbers are absurd, verify the INPUT was parsed, not just that the tool ran.
+- **A `jr $ra` scan cannot find the end of a tail-call thunk.** Tail calls (`j target` + delay slot + padding) never execute their own return, so the scan runs into the next function and adjacent thunks appear to overlap. Match the terminator to the function SHAPE; when a scan reports overlapping functions, the scan is wrong before the binary is.
+- **Absurd derived numbers point at a missing input, not a broken algorithm.** "Promoted 125,228 fallback entries" and a `+0x7adc4` owner offset were both the same missing function map. Chase the input before theorising about the code.
+- **When an artifact is lost, check whether it was ever really gone.** The Ghidra export was recoverable by JOIN: boundaries survived in the `.i64`, names survived in `symbols.map` (derived from runner filenames that the lost export produced). Validate the join before trusting it — here, 12,072/12,072 names landed exactly on an IDA function start.
+- **`.gitignore` on a bare directory kills every `!` negation under it.** Git does not descend into an excluded directory, so `build_scripts/` + `!build_scripts/x.py` silently tracks nothing. Use `build_scripts/*`. Symptom: a file you believe is committed has been untracked for months.
+- **An interior address needs an entry guard, not a new function.** Code emitted inside a neighbour's body with no dispatch slot is fixed by `case 0xADDR:` / `== 0xADDR`, never by carving a new function out of the map. `ctx->pc = 0xADDR;` assignments and `// 0xaddr:` comments appear for EVERY address in range — they do not prove dispatchability, and a substring match on them gives a false all-clear.
+
+### 2026-07-20f
+- **A generated function entered with an unmatched `ctx->pc` silently falls into its prologue.** The entry `switch (ctx->pc)` ends `default: break;` and the prologue label follows immediately (`function_emitter.cpp:110-123`). Symptom: `sp` drops by the prologue amount and never comes back. Detect with a frame-imbalance wrapper (`exitSp != entrySp`); fix by guarding `default:`.
+- **A stack-pointer shift masquerades as pointer corruption.** When several callee-saved registers hold plausible-but-wrong values at once (`s0`/`s2`/`s3`/`ra` all wrong), suspect a shifted `sp`, not a bad store. Store traps will find nothing, because nothing was ever written wrong.
+- **`0x2xxxxxxx` is a valid pointer, not garbage.** It is the PS2 uncached mirror. Data reads mask via `PS2_RAM_MASK` (`ps2_runtime_macros.h:162,187`); only code/dispatch lookup fails to mask. Never treat a `0x2…` value as corruption without checking which path consumes it.
+- **Check what a value *means* before guarding how it is read.** A defensive `< 0x02000000` range guard suppressed a perfectly safe read and printed `0xffffffff`. The read was never the risk.
+- **`RecompiledFunction` is nested — `PS2Runtime::RecompiledFunction` (`ps2_runtime.h:476`).** Unqualified use = 12 errors from one line. Verify identifier scope before shipping a build command; flagging a guess is not resolving it.
+- **`template <size_t I>` wrappers get one `static` counter per instantiation.** Bounded-log counters print `#1` from every slot, not `#1/#2/#3`. Make the counter a shared non-template global if a global cap is intended.
+- **The tee'd `run_log.txt` carries console line-wrapping (~120 chars) on top of UTF-16.** A logical record spans 2–3 physical lines; `Select-String` needs `-Context 0,3`.
+
+- **2026-07-23 encoding correction:** current `run_log.txt` is UTF-8/ASCII, not UTF-16. `Select-String -Encoding unicode` decodes pairs of normal bytes as CJK-looking glyphs and returns false-negative searches. Use `Select-String -Encoding utf8 ... -Context 0,3`. A fresh run still repeatedly reports `No exact recompiled function for guest PC 0x1`, but has no `1baf90`, `RAFORK`, or `SLOTWATCH` marker. This is not evidence against the new trace path: first verify that `build\\ps2xRuntime\\Debug\\ps2EntryRunner.exe` was relinked after the `game_overrides.cpp` instrumentation edit.
+
 - `registerFunction` only intercepts dispatch-loop calls; direct C++ fn_ calls bypass it; fix: add hasFunction check at top of generated fn_ADDR file or use game_overrides.cpp
 - ALL behavioral fixes go in game_overrides.cpp ONLY (no fn_*.cpp patches, no runner/ edits)
 - NEVER hand-write IOP output values; run actual ARKD_DVD.IRX via R3000 interpreter
@@ -839,6 +1528,13 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - Log tag `[sifman]`/`[cdvdman]`/`[libsd]` (with lowercase sce* fn names) = the REAL IRX running in the R3000 interpreter, NOT our C++ stubs (ours use `[SifCallRpc]`/`[sceSifSetDma:...]` CamelCase-tag style). When such a tag returns a stuck value, the bug is IOP-side or an EE→IOP signal the interpreted IRX waits on — fix behaviorally, never fake the return.
 - Multi-session summaries can go STALE: always re-run + read a fresh `run_log.txt` before acting on a documented blocker — this session's boot had already jumped past 3 documented blockers (SIF-RPC bind, CdInit recv-starve) with GS rendering, making the planned "Option B" fix moot before a line was written.
 - `sceSifCheckInit -> -1` forever = SIF init handshake never completes; guest polls CheckInit and never proceeds. IOP-side sifman never flags "initialized" (likely a missing EE→IOP DMA-completion/register signal). [open blocker 2026-07-16h]
+- **A value-trap on STORES cannot catch a bad value that arrives by LOAD.** When `pc==ra==target` and a store-trap on that value produces zero hits at the suspect stack slot, stop hunting writers — the slot was never written this frame; the epilogue read stale caller data. Reach for read-side/frame-symmetry instrumentation instead.
+- **Recompiler re-entry switches break prologue/epilogue pairing.** Generated functions carry an entry `switch (ctx->pc)` that `goto`s mid-body labels, skipping `addiu $sp,-N` and `sd $ra,off($sp)` — but the epilogue still runs in full (`ld $ra,off($sp)` + `addiu $sp,+N`). Prologue is conditional, epilogue is not ⇒ `$ra` loaded from the CALLER's frame. Newer codegen adds a second route: a post-`jr` `switch (jumpTarget)` that re-enters the body after `sp` was already popped. Suspect this whenever a jump target equals live payload data rather than a code address.
+- **A plausible value at a plausible address is not evidence of corruption.** `0x20561900` (SIF packet-pool base) appearing all over the stack was genuine packet payload, not damage — three hypotheses died before that was accepted. Corruption is only proven when the value reaches `$ra`/`pc`, not when it merely sits in memory.
+- **Duplicate `runner/*.cpp` files cover identical address ranges from different recompiler generations** (confirmed at `0x178260`, `0x17ed60`, `0x178428`) with materially different codegen. Before reasoning about a generated function's behavior, establish WHICH variant the dispatch table registers — reading the wrong file yields confident, wrong conclusions.
+- **Bound a runtime writer by its address range before theorizing about it.** `guestRealloc` died instantly to one constant (`kGuestHeapHardLimit = 0x01F00000` vs a fault at `0x01FFBC60`). Grep the ceiling constants first; it is cheaper than reading the copy logic.
+- **Exclusion by log ABSENCE is valid and cheap.** ARKD `sub_ADD4` was retired by zero `[ARKD:sifdma]` lines. If a code path has a bounded log line and the log is silent, the path never ran — no need to read it.
+- **Honor your own discriminator before generalizing.** Twice this session a hypothesis was declared dead after checking one of two required functions (`0x17ed60` has no frame; `0x178428` does, and it flipped the verdict). If a test names N functions, check all N before concluding.
 
 ## Key Files
 - `PS2Recomp/ps2xRuntime/src/lib/iop/iop_kernel.cpp` — IOP module registry

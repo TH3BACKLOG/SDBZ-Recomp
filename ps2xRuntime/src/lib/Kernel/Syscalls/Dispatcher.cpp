@@ -257,6 +257,27 @@ namespace ps2_syscalls
         case 0x64:
             FlushCache(rdram, ctx, runtime);
             return true;
+        case 0x68:
+        case static_cast<uint32_t>(-0x68):
+        {
+            // EE kernel syscall 0x68: fired every frame by the GS field-flip
+            // routine fn_104F20 @ 0x104ff8 with $a0=0. The guest DISCARDS the
+            // return (label_105000 does an unconditional `b 0x105010`), so this
+            // is cosmetic — a no-op returning 0 just removes the repeating
+            // [Syscall TODO] v1=0xffffff98 warning so ARKD transfer diagnostics
+            // read cleanly. Not the boot blocker; its per-frame firing is a
+            // sign of life, not a stall.
+            {
+                static std::atomic<uint32_t> s_sys68Logs{0u};
+                if (s_sys68Logs.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                {
+                    std::cerr << "[syscall:0x68] a0=0x" << std::hex << getRegU32(ctx, 4)
+                              << " -> 0 (no-op, result discarded)" << std::dec << std::endl;
+                }
+            }
+            setReturnU32(ctx, 0u);
+            return true;
+        }
         case 0x6E:
             SetOsdConfigParam2(rdram, ctx, runtime);
             return true;

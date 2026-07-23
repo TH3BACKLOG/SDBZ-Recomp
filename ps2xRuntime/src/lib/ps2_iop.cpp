@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -12,6 +14,11 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_runtime.h"
 #include "Kernel/Syscalls/RPC.h"
+
+// S2.1: real ARKD_DVD.IRX loader lives in ps2_iop_irx_loader.cpp. Declared here
+// (no header touched) so the LOADFILE path can hand it the module when the game
+// asks for it. Loads + relocates the IRX into IOP RAM and builds the import map.
+extern bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath);
 
 ps2_iop::ps2_iop()
 {
@@ -168,6 +175,43 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                     }
                 }
                 std::fprintf(stderr, "[iop:LOADFILE] path=\"%s\"\n", path.c_str());
+            }
+        }
+
+        // S2.1: if this LOADFILE is for ARKD_DVD.IRX, load the real module into
+        // IOP RAM (once). Independent of the bounded diagnostic logging above so
+        // it still fires after the 32-log cap. Extracts the module path fresh
+        // from the send buffer (first printable ASCII run, same scan as above).
+        static std::atomic<bool> s_arkdLoadTried{false};
+        bool expected = false;
+        if (s_arkdLoadTried.compare_exchange_strong(expected, true))
+        {
+            const uint8_t *snd2 = sendBufAddr ? getConstMemPtr(m_rdram, sendBufAddr) : nullptr;
+            if (snd2 && sendSize > 0u)
+            {
+                std::string path;
+                for (uint32_t i = 0; i < sendSize; i++)
+                {
+                    const char c = static_cast<char>(snd2[i]);
+                    if (c >= 0x20 && c < 0x7F)
+                    {
+                        path.push_back(c);
+                        if (path.size() >= 128u) break;
+                    }
+                    else if (path.size() >= 3u) break;
+                    else path.clear();
+                }
+                std::string upper = path;
+                std::transform(upper.begin(), upper.end(), upper.begin(),
+                               [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+                if (upper.find("ARKD_DVD") != std::string::npos)
+                {
+                    ps2_iop_loadArkdIrx(runtime, path);
+                }
+                else
+                {
+                    s_arkdLoadTried.store(false); // wasn't ARKD -- allow a later try
+                }
             }
         }
 

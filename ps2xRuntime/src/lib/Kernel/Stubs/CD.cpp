@@ -2,6 +2,38 @@
 #include "CD.h"
 #include "MPEG.h"
 
+// -----------------------------------------------------------------------------
+// S2.2c bridge: expose the ONE live CD sector reader to the ARKD IRX loader.
+// readCdSectors + all CD state (g_cdFilesByKey, configured CD image) live in
+// Support.h's ANONYMOUS namespace, so each TU that includes it gets its own
+// private copy. CD.cpp is the TU that actually populates that state (the game's
+// sceCd* syscalls + registerCdFile compile here), so the loader MUST route
+// through this file rather than including Support.h itself (which would give it
+// an empty, separate table). Plain external-linkage forwarder; the loader
+// declares it `extern` (no header touched, per project rules). Reads real ISO
+// bytes by absolute LBN -- honors feedback_no_iop_faking.
+bool ps2_iop_cdReadSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
+{
+    return readCdSectors(lbn, sectors, dst, byteCount);
+}
+
+// S2.2c-2: expose the ISO9660 filename->(LBN,size) resolver to the ARKD loader.
+// ARKD's sceCdSearchFile import (cdvdman fid=10, sub_ACA8) gates every real read:
+// `while(!sceCdSearchFile(fp,"\\INFO.DAT;1")) delay();`. registerCdFile lives in
+// the same Support.h anon namespace as readCdSectors, so the pseudo-LBN it hands
+// back is the SAME one readCdSectors resolves -- search + read stay consistent.
+bool ps2_iop_cdSearchFile(const char *name, uint32_t *lbnOut, uint32_t *sizeOut)
+{
+    CdFileEntry entry;
+    if (!registerCdFile(std::string(name), entry))
+        return false;
+    if (lbnOut)
+        *lbnOut = entry.baseLbn;
+    if (sizeOut)
+        *sizeOut = entry.sizeBytes;
+    return true;
+}
+
 namespace ps2_stubs
 {
     namespace
