@@ -19,6 +19,7 @@
 #include "Kernel/Syscalls/Sync.h"      // stopAlarmWorker
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
@@ -80,6 +81,36 @@ static std::atomic<uint64_t> g_guest_progress{0};
 extern "C" uint64_t ps2x_guest_progress()
 {
     return g_guest_progress.load(std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Guest execution duty cycle (stage 5.6.2).
+//
+// ps2x_guest_progress() measures how MUCH guest code ran, but not what share of
+// the wall clock it had. Those two produce identical evidence for the two live
+// hypotheses: "the guest executes slowly" and "the guest is idle, waiting". The
+// executor's resume bracket below is exactly the interval during which guest
+// code is on-CPU, so timing it separates them in one measurement.
+//
+// Cost is one steady_clock pair per fiber resume -- resumes happen at scheduler
+// granularity (blocking syscalls, preemption), not per back-edge, so this is
+// not a hot path. Both counters are unconditional so the numbers stay valid for
+// diagnostics regardless of PS2X_DETERMINISM.
+//
+// extern "C" for the same reason as the two accessors above: declaring these in
+// ps2_scheduler.h would rebuild ~30,000 generated runner TUs (§3 prohibition).
+// ps2_runtime.cpp re-declares them locally.
+static std::atomic<uint64_t> g_guest_busy_ns{0};
+static std::atomic<uint64_t> g_guest_resumes{0};
+
+extern "C" uint64_t ps2x_guest_busy_ns()
+{
+    return g_guest_busy_ns.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_resumes()
+{
+    return g_guest_resumes.load(std::memory_order_relaxed);
 }
 
 extern "C" int ps2x_determinism_enabled()
@@ -467,7 +498,17 @@ static void guest_executor_main()
         g_currentThreadId = fc->tid;
 
         lk.unlock();
+        // This bracket is the guest's on-CPU time: the executor holds no lock
+        // and does nothing else until the fiber yields back. See the duty-cycle
+        // note near g_guest_busy_ns.
+        const auto guestEnter = std::chrono::steady_clock::now();
         ps2fiber_resume(fc->fiber); // runs until yield or finish
+        g_guest_busy_ns.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - guestEnter)
+                                      .count()),
+            std::memory_order_relaxed);
+        g_guest_resumes.fetch_add(1, std::memory_order_relaxed);
         lk.lock();
 
         tls_current_fiber = nullptr;

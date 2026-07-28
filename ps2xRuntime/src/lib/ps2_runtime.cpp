@@ -346,6 +346,15 @@ namespace
     // to report whether the guest is executing at all.
     extern "C" uint64_t ps2x_guest_progress();
 
+    // Same no-header rule. ps2x_guest_busy_ns/ps2x_guest_resumes are defined in
+    // ps2_scheduler.cpp (executor resume bracket); ps2x_vblank_ticks in
+    // Kernel/Syscalls/Interrupt.cpp (vblank delivery point). Together with
+    // ps2x_guest_progress they let the watchdog separate "the guest executes
+    // slowly" from "the guest is idle waiting" -- see the watchdog comment.
+    extern "C" uint64_t ps2x_guest_busy_ns();
+    extern "C" uint64_t ps2x_guest_resumes();
+    extern "C" uint64_t ps2x_vblank_ticks();
+
     // Structured probe sink (Phase B), defined in game_overrides.cpp. Same
     // extern-between-.cpp rule as above -- no header, no 30h rebuild.
     extern "C" void ps2x_probe_kv(const char *name, int n,
@@ -2611,13 +2620,30 @@ void PS2Runtime::run()
                 //   gif/s  = packets actually handed to the rasterizer
                 //            (PS2Memory::m_gifCopyCount, bumped only where
                 //            submitGifPacket is really called)
-                //   vif/s  = VIF register writes
-                //   gsw/s  = GS register writes
                 // gif/s is the load-bearing one: if dma/s is healthy while gif/s is
                 // 0, packets are being queued and dropped rather than drawn -- that
                 // is the m_gifPacketCallback/m_gifArbiter guard in
                 // PS2Memory::writeIORegister, not a guest-side fault.
-                uint64_t prevDma = 0, prevGif = 0, prevGsw = 0, prevVif = 0;
+                uint64_t prevDma = 0, prevGif = 0;
+                // Stage 5.6.2. progress=~117/s means ~15,000 guest back-edges
+                // per second (one tick per 128), which is orders of magnitude
+                // below what statically recompiled code should manage -- but
+                // that single number cannot tell "executes slowly" from "idle,
+                // waiting most of the second", because both produce a low rate.
+                //
+                //   busy%  = share of the wall clock the executor spent inside
+                //            ps2fiber_resume, i.e. guest code actually on-CPU.
+                //            High + low progress => execution really is slow.
+                //            Low                 => the guest is blocked, and
+                //            the fault is wake latency, not throughput.
+                //   res/s  = fiber resumes; pairs with busy% to give mean time
+                //            on-CPU per resume.
+                //   vbl/s  = vblank ticks delivered. Expected ~60 under
+                //            -Determinism 0 (wall-clock paced). If vbl/s is ~60
+                //            while gif/s is ~3 the guest needs ~20 vblanks per
+                //            frame; if vbl/s is itself low the pacing thread is
+                //            the bottleneck and gif/s merely follows it.
+                uint64_t prevBusyNs = 0, prevResumes = 0, prevVbl = 0;
                 while (!isStopRequested())
                 {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2628,30 +2654,47 @@ void PS2Runtime::run()
                     last = pc;
                     const uint64_t curDma = m_memory.dmaStartCount();
                     const uint64_t curGif = m_memory.gifCopyCount();
-                    const uint64_t curGsw = m_memory.gsWriteCount();
-                    const uint64_t curVif = m_memory.vifWriteCount();
                     const uint64_t dDma = curDma - prevDma;
                     const uint64_t dGif = curGif - prevGif;
-                    const uint64_t dGsw = curGsw - prevGsw;
-                    const uint64_t dVif = curVif - prevVif;
                     prevDma = curDma;
                     prevGif = curGif;
-                    prevGsw = curGsw;
-                    prevVif = curVif;
+                    const uint64_t curBusyNs = ps2x_guest_busy_ns();
+                    const uint64_t curResumes = ps2x_guest_resumes();
+                    const uint64_t curVbl = ps2x_vblank_ticks();
+                    // The watchdog sleeps 1s, so the deltas are already per-second
+                    // and busy% is (ns on-CPU / 1e9) * 100 with no extra timing.
+                    const uint64_t dBusyNs = curBusyNs - prevBusyNs;
+                    const uint64_t dResumes = curResumes - prevResumes;
+                    const uint64_t dVbl = curVbl - prevVbl;
+                    prevBusyNs = curBusyNs;
+                    prevResumes = curResumes;
+                    prevVbl = curVbl;
+                    const uint64_t busyPct = dBusyNs / 10000000ull; // ns -> % of 1s
                     // progress = ps2sched's guest clock (one tick per 128 guest
                     // back-edges). Two uses: it distinguishes "the guest is
                     // spinning in a loop" from "the guest is not executing at
                     // all" -- pc alone cannot -- and its rate per second is what
                     // PS2X_DET_VBLANK_QUANTUM should be tuned against.
-                    std::cerr << "[watchdog] t=" << (++t) << "s pc=0x" << std::hex << pc
-                              << " ra=0x" << ra << " lastCall=0x" << lastCall
-                              << std::dec << " stuckSecs=" << stuck
+                    // Field order is defensive, not cosmetic. Long lines get
+                    // clipped somewhere between here and the log (see the console
+                    // buffer note in launch_recomp.ps1), so the rate fields this
+                    // stage is actually measuring go FIRST and the bulky trace=
+                    // stays last. vif/s, gsw/s and gifTot were dropped: the first
+                    // two only count direct MMIO register writes and this game
+                    // feeds VIF1 by DMA, so both read 0 by design and neither ever
+                    // discriminated anything; gifTot is just the running sum of
+                    // gif/s.
+                    std::cerr << "[watchdog] t=" << (++t) << "s"
+                              << " busy%=" << busyPct
+                              << " res/s=" << dResumes
+                              << " vbl/s=" << dVbl
                               << " progress=" << ps2x_guest_progress()
-                              << " dma/s=" << dDma
                               << " gif/s=" << dGif
-                              << " vif/s=" << dVif
-                              << " gsw/s=" << dGsw
-                              << " gifTot=" << curGif
+                              << " dma/s=" << dDma
+                              << " stuckSecs=" << stuck
+                              << std::hex << " pc=0x" << pc
+                              << " ra=0x" << ra << " lastCall=0x" << lastCall
+                              << std::dec
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
                 } });
         }

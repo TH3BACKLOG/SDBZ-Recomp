@@ -123,6 +123,23 @@ if ($Tracers.PS2X_DETERMINISM -eq 1) {
 }
 if (-not $Full) { Write-Host "[launch_recomp] console filtered -> important lines only (-Full for raw)" -ForegroundColor DarkGray }
 
+# Native-command output piped through PowerShell is hard-wrapped at the console
+# buffer width -- roughly 110 columns here -- and Tee-Object writes the already
+# clipped text, so the LOG loses the tail of every long line too, not just the
+# screen. That silently ate the last fields of every [watchdog] line and made a
+# measurement look like it had not been built. Widen the buffer before launching.
+# Non-fatal: some hosts (VS Code's terminal) have no settable RawUI.
+try {
+    $rawUi = $Host.UI.RawUI
+    if ($rawUi.BufferSize.Width -lt 512) {
+        $newBuf = $rawUi.BufferSize
+        $newBuf.Width = 512
+        $rawUi.BufferSize = $newBuf
+    }
+} catch {
+    Write-Host "[launch_recomp] could not widen console buffer -- long log lines may be clipped: $_" -ForegroundColor Yellow
+}
+
 # Full stdout+stderr is ALWAYS captured to $Log via Tee-Object. The console is
 # then filtered to the important lines unless -Full is passed, so nothing scrolls
 # past too fast and the full record is still on disk for grepping.

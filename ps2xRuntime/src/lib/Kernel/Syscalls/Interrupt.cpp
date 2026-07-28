@@ -499,6 +499,22 @@ namespace ps2_syscalls
     extern "C" uint64_t ps2x_guest_progress();
     extern "C" int ps2x_determinism_enabled();
 
+    // Delivered vblank ticks (stage 5.6.2). gif/s ~3 against an expected ~60
+    // has two readings -- the guest renders one frame per ~20 vblanks, or the
+    // vblank tick itself is not arriving at 60Hz -- and nothing measured so far
+    // separates them. Counted at the point of delivery, after the pacing wait,
+    // so it reflects ticks the guest actually saw. Read by the watchdog via a
+    // local extern "C" (no header change; §3 prohibition).
+    static std::atomic<uint64_t> g_vblankTicks{0};
+
+    // Defined inside ps2_syscalls deliberately: extern "C" gives the symbol C
+    // language linkage, so the enclosing namespace does not decorate its name
+    // and ps2_runtime.cpp can declare it locally without a header change.
+    extern "C" uint64_t ps2x_vblank_ticks()
+    {
+        return g_vblankTicks.load(std::memory_order_relaxed);
+    }
+
     // Guest-progress ticks per vblank under PS2X_DETERMINISM. There is no
     // principled value here -- the real ratio depends on how many back-edges the
     // guest retires per frame, which varies by workload -- so it is tunable via
@@ -625,6 +641,7 @@ namespace ps2_syscalls
 
             for (int i = 0; i < ticksToProcess; ++i)
             {
+                g_vblankTicks.fetch_add(1, std::memory_order_relaxed);
                 const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
                 ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
 
