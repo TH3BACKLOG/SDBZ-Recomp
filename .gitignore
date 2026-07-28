@@ -15,9 +15,34 @@ build
 # Now we can place the dump code here and test while expand the Runtime
 ps2xRuntime/include/ps2_recompiled_functions.h
 ps2xRuntime/include/ps2_recompiled_stubs.h
-ps2xRuntime/src/runner/ps2_recompiled_functions.cpp
-ps2xRuntime/src/runner/register_functions.cpp
 ps2xRuntime/outputbuild-*/
+
+# ---------------------------------------------------------------------------
+# RECOMPILED GAME CODE — must never be committed.
+#
+# Everything under ps2xRuntime/src/runner/ is machine output derived from the
+# retail SLUS-214.42 disc image: ~36,000 generated fn_*.cpp bodies plus the
+# register_functions.cpp dispatch table (31 MB). It is the game's own code,
+# just transliterated to C++, so it carries the game's copyright.
+#
+# `src/runner/*` (not `src/runner/`) per the note above: git will not descend
+# into an excluded DIRECTORY, which would break any future `!` negation here.
+# ps2xRecomp/src/runner/main.cpp is a DIFFERENT tree (the recompiler tool's own
+# entrypoint, upstream-authored) and is deliberately still tracked.
+ps2xRuntime/src/runner/*
+
+# Auto-generated from a regex scan of game_overrides.cpp on every build; 4.2 MB
+# of declarations naming every guest function. Regenerated, never hand-edited.
+ps2xRuntime/include/fn_forward_decls.h
+
+# Guest symbol table extracted from the retail ELF (generate_symbols_map.ps1).
+ps2xRuntime/symbols.map
+
+# Per-run diagnostic sink (PS2X_PROBE_FILE) — truncated every run.
+run_probe.jsonl
+
+# Recompiler config: machine-specific absolute paths to the local ELF/ISO dump.
+config.toml
 # Note: must be `build_scripts/*`, not `build_scripts/`. Git does not descend
 # into an excluded DIRECTORY, so a `!` negation under one never takes effect.
 build_scripts/*
