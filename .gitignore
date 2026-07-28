@@ -98,3 +98,50 @@ gaps.csv
 suspects.csv
 pcsx2-qt_*.png
 Input?Tab?Controller.psd
+
+# ===========================================================================
+# ALWAYS-TRACK ALLOWLIST  --  keep these rules LAST (last match wins).
+#
+# WHY THIS EXISTS: sync.ps1 was written 2026-07-08, silently untracked by the
+# blanket `build_scripts/*` rule, then deleted from disk. Git never warned,
+# because git cannot warn about a file it was never tracking. It was only
+# recoverable because it happened to be committed once before the ignore rule
+# landed. Every other tool in build_scripts/ had the same exposure.
+#
+# Tracking IS the safety net: delete a TRACKED file and `git status` shows a
+# loud ` D`. Delete an IGNORED file and nothing happens at all.
+#
+# RULE: authored source (.py/.ps1/.java/.md) is tracked. Machine output stays
+# ignored -- decompile dumps, logs, exports, caches. Never add a negation for
+# *.txt, *.csv, *.log or any recompiler/decompiler output; those are large and
+# game-derived.
+#
+# GOTCHA: git does not descend into an excluded DIRECTORY, so a `!` under one
+# never fires. Each level must be re-admitted first (`!dir/`), then its
+# contents re-excluded (`dir/*`), then the wanted files negated.
+# Verify any change with:  git check-ignore -v <path>   (no output = tracked)
+# ===========================================================================
+
+# Per-machine sync bookkeeping. Rewritten by sync.ps1 on both machines, so
+# tracking it guarantees a conflict on every single sync.
+_ClaudeMemory/
+
+# build_scripts/* excluded above. Authored tools only; dumps/logs stay out.
+!build_scripts/*.py
+!build_scripts/*.ps1
+
+# ghidra_scripts/ is swept up by `ghidra_*/`, so re-admit the dir explicitly.
+!ghidra_scripts/
+ghidra_scripts/*
+!ghidra_scripts/*.py
+!ghidra_scripts/*.java
+!ghidra_scripts/*.md
+
+# ida_scripts/ holds authored scripts AND large game-derived decompile dumps.
+# Track the scripts; the dumps are *.txt and stay ignored.
+!ida_scripts/
+ida_scripts/*
+!ida_scripts/idapy_ps2/
+ida_scripts/idapy_ps2/*
+!ida_scripts/idapy_ps2/*.py
+!ida_scripts/idapy_ps2/*.md
