@@ -339,6 +339,18 @@ namespace
         return ps2sched::current_dispatch_history();
     }
 
+    // ps2sched's guest clock: one tick per 128 guest back-edges. Defined in
+    // ps2_scheduler.cpp and declared here rather than in ps2_scheduler.h,
+    // because editing that header would force a full rebuild of the ~30,000
+    // generated runner translation units (§3 prohibition). Used by the watchdog
+    // to report whether the guest is executing at all.
+    extern "C" uint64_t ps2x_guest_progress();
+
+    // Structured probe sink (Phase B), defined in game_overrides.cpp. Same
+    // extern-between-.cpp rule as above -- no header, no 30h rebuild.
+    extern "C" void ps2x_probe_kv(const char *name, int n,
+                                  const char *const *keys, const uint64_t *vals);
+
     // Diagnostic-only (PS2_PC_WATCHDOG): the most recent guest PC handed to
     // lookupFunction(), globally across all threads. The outer-dispatch snapshot
     // (m_debugPc) freezes at a function's entry PC while that function's whole
@@ -1265,6 +1277,23 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
               << " codeRegion=" << (m_memory.isCodeAddress(address) ? "yes" : "no")
               << " trace=" << formatDispatchHistory()
               << std::dec << std::endl;
+
+    // Phase B: the derail terminus, structured. Hard-bounded -- once $ra is
+    // clobbered the dispatcher retries the bad target forever and this site is
+    // reached ~89,000 times in a 25s run. Only the FIRST few carry information;
+    // the rest are the same event and would bloat the sink to no purpose.
+    {
+        static std::atomic<uint32_t> s_missProbes{0};
+        const uint32_t n = s_missProbes.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n <= 8u)
+        {
+            static const char *const k[] = {"n", "pc", "tableBase", "tableEnd", "codeRegion"};
+            const uint64_t v[] = {n, address, g_ps2RecompiledFunctionTableBase,
+                                  g_ps2RecompiledFunctionTableEnd,
+                                  m_memory.isCodeAddress(address) ? 1u : 0u};
+            ps2x_probe_kv("MISS", 5, k, v);
+        }
+    }
 
     static RecompiledFunction missingFunction = [](uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -2571,6 +2600,24 @@ void PS2Runtime::run()
                 uint32_t last = 0xFFFFFFFFu;
                 int stuck = 0;
                 int t = 0;
+                // Per-second render rates. These four counters already existed and
+                // are already maintained on the hot paths; only their *rate* was
+                // never observable, so "the game renders slowly" and "the game does
+                // not render" were indistinguishable. The watchdog already ticks at
+                // exactly 1Hz, so a delta here is a rate in Hz with no new state.
+                //
+                // How to read them:
+                //   dma/s  = CHCR.STR=1 kicks accepted (all channels)
+                //   gif/s  = packets actually handed to the rasterizer
+                //            (PS2Memory::m_gifCopyCount, bumped only where
+                //            submitGifPacket is really called)
+                //   vif/s  = VIF register writes
+                //   gsw/s  = GS register writes
+                // gif/s is the load-bearing one: if dma/s is healthy while gif/s is
+                // 0, packets are being queued and dropped rather than drawn -- that
+                // is the m_gifPacketCallback/m_gifArbiter guard in
+                // PS2Memory::writeIORegister, not a guest-side fault.
+                uint64_t prevDma = 0, prevGif = 0, prevGsw = 0, prevVif = 0;
                 while (!isStopRequested())
                 {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2579,9 +2626,32 @@ void PS2Runtime::run()
                     const uint32_t lastCall = g_lastDispatchPc.load(std::memory_order_relaxed);
                     stuck = (pc == last) ? (stuck + 1) : 0;
                     last = pc;
+                    const uint64_t curDma = m_memory.dmaStartCount();
+                    const uint64_t curGif = m_memory.gifCopyCount();
+                    const uint64_t curGsw = m_memory.gsWriteCount();
+                    const uint64_t curVif = m_memory.vifWriteCount();
+                    const uint64_t dDma = curDma - prevDma;
+                    const uint64_t dGif = curGif - prevGif;
+                    const uint64_t dGsw = curGsw - prevGsw;
+                    const uint64_t dVif = curVif - prevVif;
+                    prevDma = curDma;
+                    prevGif = curGif;
+                    prevGsw = curGsw;
+                    prevVif = curVif;
+                    // progress = ps2sched's guest clock (one tick per 128 guest
+                    // back-edges). Two uses: it distinguishes "the guest is
+                    // spinning in a loop" from "the guest is not executing at
+                    // all" -- pc alone cannot -- and its rate per second is what
+                    // PS2X_DET_VBLANK_QUANTUM should be tuned against.
                     std::cerr << "[watchdog] t=" << (++t) << "s pc=0x" << std::hex << pc
                               << " ra=0x" << ra << " lastCall=0x" << lastCall
                               << std::dec << " stuckSecs=" << stuck
+                              << " progress=" << ps2x_guest_progress()
+                              << " dma/s=" << dDma
+                              << " gif/s=" << dGif
+                              << " vif/s=" << dVif
+                              << " gsw/s=" << dGsw
+                              << " gifTot=" << curGif
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
                 } });
         }

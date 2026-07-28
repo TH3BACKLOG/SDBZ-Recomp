@@ -4,6 +4,16 @@
 
 namespace ps2_syscalls
 {
+    // 2026-07-25 stage 5.4.1 -- an RAII $ra entry/exit guard lived here for one
+    // run and ANSWERED ITS QUESTION, so it has been removed. Result: across a
+    // run with 431 `guest PC 0x1` derails and 64 semaphore syscalls, $ra was
+    // never once altered across a syscall ("changed" count = 0), and the only
+    // two "entry-bad" hits were boot-time syscalls 0x3c/0x3d with raIn=0, before
+    // $ra is meaningful. handleSyscall -> dispatchNumericSyscall is the sole
+    // dispatch road (ps2_runtime.cpp:1587) and nothing runs after this function
+    // returns, so the fiber save/restore path and "the caller passed a bad $ra
+    // into the syscall" are both EXONERATED. Do not re-add this probe.
+
     bool dispatchNumericSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         if (dispatchSyscallOverride(syscallNumber, rdram, ctx, runtime))

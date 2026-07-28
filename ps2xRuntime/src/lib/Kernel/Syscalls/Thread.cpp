@@ -2,6 +2,82 @@
 #include "Thread.h"
 #include "ps2_scheduler_internal.h"
 
+// Phase C -- EE thread visibility.
+//
+// Until now EE thread creation was COMPLETELY INVISIBLE: the only CreateThread
+// lines anywhere in run_log.txt were [iop:import] ones. We have been running
+// guest fibers on guest stacks for weeks with no record of where those stacks
+// are, which is exactly why the "foreign prologue running with sp inside
+// 0x178be8's live frame" question could never be settled by measurement.
+//
+// Defined in game_overrides.cpp. Declared extern here rather than in a header:
+// touching a .h forces a full 30h+ rebuild (skill SS3 prohibition 3).
+extern "C" void ps2x_probe_kv(const char *name, int n,
+                              const char *const *keys, const uint64_t *vals);
+
+// ---------------------------------------------------------------------------
+// Phase C -- stack-bounds guard.
+//
+// Every probe we have fires where corruption is OBSERVED, which is always
+// downstream of where the invariant BROKE. RASLOT is the extreme case: the
+// det=0 run put it 0 progress ticks and 1 record ahead of the dispatch miss,
+// i.e. it reports the damage at the same instant the damage is consumed.
+//
+// This guard fires on the violation instead: the first moment a fiber's sp
+// leaves the stack range its own StartThread handed it. Kept in a file-scope
+// map keyed by tid rather than as a FiberContext field, because FiberContext
+// lives in a header and headers are off-limits.
+namespace
+{
+    struct GuestStackRange
+    {
+        uint32_t lo = 0;
+        uint32_t hi = 0;   // exclusive; hi==0 means "unknown, do not check"
+    };
+
+    std::mutex g_stackRangeMutex;
+    std::unordered_map<int, GuestStackRange> g_stackRanges;
+
+    // Bounded. An out-of-bounds sp usually stays out of bounds for every
+    // subsequent call, so an unbounded guard would reproduce exactly the
+    // 89,000-line flood the dispatch-miss path already produces.
+    std::atomic<int> g_stackOobReports{0};
+    constexpr int kStackOobMax = 16;
+}
+
+extern "C" void ps2x_stack_register(int tid, uint32_t lo, uint32_t hi)
+{
+    std::lock_guard<std::mutex> lock(g_stackRangeMutex);
+    g_stackRanges[tid] = GuestStackRange{lo, hi};
+}
+
+// Returns 1 if sp is outside the calling fiber's registered stack, else 0.
+// site is a caller-chosen tag (0 = slot entry, 1 = slot exit) so the record
+// says WHERE the check ran without needing a second probe family.
+extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
+{
+    const int tid = g_currentThreadId;
+    GuestStackRange r;
+    {
+        std::lock_guard<std::mutex> lock(g_stackRangeMutex);
+        auto it = g_stackRanges.find(tid);
+        if (it == g_stackRanges.end())
+            return 0;   // never started through StartThread; nothing to compare
+        r = it->second;
+    }
+    if (r.hi == 0 || (sp >= r.lo && sp < r.hi))
+        return 0;
+
+    if (g_stackOobReports.fetch_add(1, std::memory_order_relaxed) < kStackOobMax)
+    {
+        static const char *const k[] = {"pc", "sp", "lo", "hi", "site", "thid"};
+        const uint64_t v[] = {pc, sp, r.lo, r.hi, site,
+                              static_cast<uint64_t>(static_cast<uint32_t>(tid))};
+        ps2x_probe_kv("STACKOOB", 6, k, v);
+    }
+    return 1;
+}
+
 namespace ps2_syscalls
 {
     // Restored 2026-07-14 for the RecompDebugger revival (see Thread.h).
@@ -274,6 +350,19 @@ namespace ps2_syscalls
             g_threads[id] = info;
         }
 
+        // The guest's DECLARED intent, before StartThread's fixups run. Emitted
+        // even when stack==0/stackSize==0, because that combination is the
+        // precondition for the threadSp=callerSp fallback below and we need the
+        // record to prove whether it actually fires.
+        {
+            static const char *const k[] = {"tid", "entry", "stack", "stackSize",
+                                            "gp", "prio", "attr"};
+            const uint64_t v[] = {static_cast<uint64_t>(id), info->entry,
+                                  info->stack, info->stackSize, info->gp,
+                                  info->priority, info->attr};
+            ps2x_probe_kv("EECREATE", 7, k, v);
+        }
+
         setReturnS32(ctx, id);
     }
 
@@ -401,11 +490,39 @@ namespace ps2_syscalls
             const uint32_t stackSize = (info->stackSize != 0) ? info->stackSize : 0x800u;
             threadSp = (info->stack + stackSize) & ~0xFu;
         }
+        // borrowed=1 means info->stack was still 0 after both fixups above, so
+        // this fiber is about to run on the CREATING FUNCTION'S stack pointer.
+        // That is the Thread.cpp:398 latent bug named in the plan; this record
+        // is what confirms or clears it, instead of us arguing about it.
+        const uint32_t borrowedSp = (info->stack == 0) ? 1u : 0u;
         uint32_t threadGp = info->gp;
         const uint32_t normalizedGp = threadGp & 0x1FFFFFFFu;
         if (threadGp == 0 || normalizedGp < 0x10000u || normalizedGp >= PS2_RAM_SIZE)
         {
             threadGp = callerGp;
+        }
+
+        {
+            static const char *const k[] = {"tid", "entry", "stack", "stackSize",
+                                            "sp", "gp", "callerSp", "borrowed"};
+            const uint64_t v[] = {static_cast<uint64_t>(tid), info->entry,
+                                  info->stack, info->stackSize, threadSp,
+                                  threadGp, callerSp, borrowedSp};
+            ps2x_probe_kv("EESTART", 8, k, v);
+        }
+
+        // Arm the bounds guard for this fiber. When the stack was borrowed from
+        // the caller we have no honest range to check against, so we register
+        // hi=0 ("unknown") rather than inventing one -- a guard that fires on a
+        // made-up range is worse than no guard.
+        if (info->stack != 0)
+        {
+            const uint32_t stackSize = (info->stackSize != 0) ? info->stackSize : 0x800u;
+            ps2x_stack_register(tid, info->stack, info->stack + stackSize);
+        }
+        else
+        {
+            ps2x_stack_register(tid, 0, 0);
         }
 
         ensureFiberExitHookRegistered();

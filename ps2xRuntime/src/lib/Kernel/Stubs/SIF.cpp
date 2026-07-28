@@ -169,6 +169,30 @@ namespace ps2_stubs
         constexpr uint32_t kSifDispatcherFn = 0x00178068u;  // game EE SIF RX dispatcher
         constexpr uint32_t kSifDispatcherEnd = 0x001781B0u; // one past its last instruction
         constexpr uint32_t kSifDispatcherMaxResume = 64u;   // bound on mid-body resumes
+        // Private stack for the nested dispatcher mini-loop, carved out of the unused
+        // guest-heap headroom (heap is hard-capped below 0x01F00000; RAM ends 0x01FFFFFF).
+        // Grows down from here; isolates re-entrant dispatcher frames from the caller's
+        // live stack frame so they can't stomp its saved-$ra slot.
+        //
+        // 2026-07-25: a FIXED absolute top (0x01FFFF00) was measured colliding with the
+        // real caller's frame even at depth=0 -- SLOTWATCH showed the dispatcher's own
+        // nested chain (0x178068 -> 0x177eb0 -> 0x177fe8) descending ~0x4110 bytes from
+        // that fixed top in a single non-reentrant pass, landing 0xC0 bytes above the
+        // real caller's saved-$ra slot. The real EE $sp is already deep in RAM by the
+        // time deliverSifRpcReply runs (observed savedSp=0x1FFBEC0, only ~16KB below RAM
+        // top), so a fixed top near RAM-top has no reliable clearance from it. Every live
+        // address for the current call chain sits at >= savedSp (MIPS prologues store
+        // locals/saved-ra at small positive offsets from $sp), so instead the scratch
+        // region is now derived relative to savedSp and pinned strictly BELOW it --
+        // this is safe against ANY dispatcher stack depth, not just the ~16KB that
+        // happened to be free under the old fixed address.
+        constexpr uint32_t kSifReplyScratchHeadroom = 0x8000u;
+        // Each re-entrancy level gets its own 8 KB band below the headroom so overlapping
+        // nested reply dispatches never share a physical stack slot. s_deliverDepth is
+        // capped at 8, so worst case is headroom + 8*0x2000 = 0x18000 (~96KB) below
+        // savedSp -- still enormous headroom above the guest-heap hard cap (0x01F00000)
+        // given savedSp is only ever a few hundred KB above it in practice.
+        constexpr uint32_t kSifReplyScratchStackSize = 0x2000u;
 
         // The dispatcher (sub_178068) routes on packet WORD[8] (byte offset 0x20),
         // masked with 0x7FFFFFFF -> a slot in the system handler table dword_5616E4.
@@ -422,9 +446,28 @@ namespace ps2_stubs
 
             // Stage 1: record clientObj->sid for every BIND so a later CALL can be
             // routed to handleRPC with its real bound sid (see arkdRecordBind).
-            if (arkdTraceEnabled() && req.cid == kSifCmdRpcBind)
+            // 5.5.1: bind recording is now UNCONDITIONAL. It used to sit behind
+            // PS2_ARKD_TRACE, but a CALL packet carries the rpc func in WORD[8],
+            // not the sid, so without this table a non-ARKD service (padman) can
+            // never be identified at CALL time. The table is a passive 16-slot
+            // client->sid map; recording into it has no behavioral effect on its
+            // own. The ARKD *logging* below stays gated.
+            if (req.cid == kSifCmdRpcBind)
             {
                 arkdRecordBind(req.words[7], req.words[kSifDiscWordIdx]);
+
+                // Bounded census of every bind the game makes, so "which services
+                // does this title actually use" stops being a guess.
+                static std::atomic<uint32_t> s_bindLogs{0u};
+                if (s_bindLogs.fetch_add(1u, std::memory_order_relaxed) < 48u)
+                {
+                    std::cerr << "[SIF:BIND] client=0x" << std::hex << req.words[7]
+                              << " sid=0x" << req.words[kSifDiscWordIdx]
+                              << std::dec << std::endl;
+                }
+            }
+            if (arkdTraceEnabled() && req.cid == kSifCmdRpcBind)
+            {
                 if (isArkdPacket(req.words))
                 {
                     std::cerr << "[ARKD:BIND] client=0x" << std::hex << req.words[7]
@@ -444,6 +487,60 @@ namespace ps2_stubs
                 pkt[2] = kSifCmdRpcEnd;                 // dispatcher -> _request_end
                 pkt[kSifDiscWordIdx] = kSifCmdRpcCall;  // WORD[8] -> callback branch
                 // WORD[7] (client block ptr) survives verbatim from the memcpy.
+
+                // --- 5.5.1 PROBE: padman (libpad) service bridge -----------------
+                // Unlike the ARKD bridge below this one is NOT observe-only: it
+                // writes the reply into the guest's recv buffer before the echo
+                // synthesis signals the parked waiter. It is not IOP faking of the
+                // forbidden kind -- the only value produced is the libpad module
+                // version, a fixed constant of the module the disc ships, and only
+                // its major nibble is ever inspected (0x187d34: sra $s0,$s1,8 ;
+                // beq $s0,4). Everything else falls through unserved.
+                //
+                // Client/sid geometry read live from PCSX2 (SLUS-21442):
+                //   0x187cb0 binds sid 0x80000100 -> client 0x568940
+                //   0x187d04 binds sid 0x80000101 -> client 0x568968
+                //   0x189110 issues rpcNum 1, send==recv==0x568b80, cmd 0x12 at +0,
+                //            version read back from recv+0xC.
+                {
+                    const uint32_t padClient = req.words[7];
+                    const uint32_t padSid    = arkdLookupSid(padClient);
+                    if (padSid == 0x80000100u || padSid == 0x80000101u)
+                    {
+                        const uint32_t padRpcNum   = req.words[kSifDiscWordIdx];
+                        const uint32_t padRecvAddr = req.words[10];
+                        const uint32_t padRecvSize = req.words[11];
+                        const uint32_t padSendSize = req.words[9];
+                        // The payload rides its own DMA entry; if the list did not
+                        // carry one, fall back to the recv buffer, which for this
+                        // service IS the same EE buffer the guest wrote the cmd into.
+                        uint32_t padSendAddr =
+                            sifFindSendPayload(padSendSize, req.words[5]);
+                        if (padSendAddr == 0u)
+                        {
+                            padSendAddr = padRecvAddr;
+                        }
+
+                        uint32_t padResult = 0u;
+                        bool padSignal = false;
+                        runtime->iop().init(rdram);
+                        const bool padHandled = runtime->iop().handleRPC(
+                            runtime, padSid, padRpcNum, padSendAddr, padSendSize,
+                            padRecvAddr, padRecvSize, padResult, padSignal);
+
+                        static std::atomic<uint32_t> s_padCallLogs{0u};
+                        if (s_padCallLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+                        {
+                            std::cerr << "[PADMAN:CALL] client=0x" << std::hex << padClient
+                                      << " sid=0x" << padSid << " func=0x" << padRpcNum
+                                      << " send=0x" << padSendAddr << " ssz=0x" << padSendSize
+                                      << " recv=0x" << padRecvAddr << " rsz=0x" << padRecvSize
+                                      << std::dec << " handled=" << (padHandled ? 1 : 0)
+                                      << std::endl;
+                        }
+                    }
+                }
+                // --- end 5.5.1 padman bridge -------------------------------------
 
                 // --- Stage 1 observe-only bridge to handleRPC (ARKD only) --------
                 // We do NOT apply any result here (no IOP faking) -- the existing
@@ -724,9 +821,38 @@ namespace ps2_stubs
             // shifted by -0xa0. Drive it in a bounded mini dispatch loop instead, and enter
             // with ctx->pc at the function start rather than the caller's syscall pc.
             const uint32_t savedPc = ctx ? ctx->pc : 0u;
+            const uint32_t savedSp = ctx ? getRegU32(ctx, 29) : 0u;
+            const uint32_t savedRa = ctx ? getRegU32(ctx, 31) : 0u;
             if (ctx)
             {
                 ctx->pc = kSifDispatcherFn;
+                // 2026-07-25n -- $ra was never set for the nested run. Measured: every
+                // one of 48 LEAFENTRY samples entered the dispatcher with entryRa=0x0.
+                // The dispatcher's prologue spills that 0 to its scratch frame and its
+                // epilogue reloads it, so its final `jr $ra` jumps to low memory --
+                // exactly the "guest PC 0x1" derail. Point it at the caller's own pc
+                // instead: a real, in-range address that is outside
+                // [kSifDispatcherFn, kSifDispatcherEnd), so the mini dispatch loop
+                // below still recognises the return and breaks.
+                SET_GPR_U32(ctx, 31, savedPc);
+                // Isolate the nested dispatcher's stack frames from the caller's live
+                // frame AND from other re-entrancy levels of this same function: without
+                // a per-depth band, overlapping nested resumes (s_deliverDepth can reach
+                // 8) all pointed $sp at the same fixed address and stomped each other's
+                // saved-$ra slot (see PS2_PROJECT_STATE.md, "ROOT CAUSE FOUND (2026-07-23d)",
+                // reopened 2026-07-24 as a single-address-for-all-depths bug).
+                const uint32_t scratchTop =
+                    savedSp - kSifReplyScratchHeadroom - (s_deliverDepth * kSifReplyScratchStackSize);
+                SET_GPR_U32(ctx, 29, scratchTop);
+
+                static std::atomic<uint32_t> s_depthLogs{0u};
+                if (s_depthLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+                {
+                    std::cerr << "[SifRpcReply] depth=" << s_deliverDepth
+                              << " savedSp=0x" << std::hex << savedSp
+                              << " scratchTop=0x" << scratchTop
+                              << std::dec << std::endl;
+                }
             }
 
             ++s_deliverDepth;
@@ -773,6 +899,11 @@ namespace ps2_stubs
             if (ctx)
             {
                 ctx->pc = savedPc;
+                SET_GPR_U32(ctx, 29, savedSp);
+                // $ra was clobbered on the way in (and by the nested run); the caller's
+                // syscall stub is about to execute its own `jr $ra`, so it must see the
+                // value it had before delivery, not our sentinel.
+                SET_GPR_U32(ctx, 31, savedRa);
             }
         }
         // --- end SIF-RPC reply delivery ---

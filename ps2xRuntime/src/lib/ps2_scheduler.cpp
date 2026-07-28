@@ -53,6 +53,156 @@ static uint64_t g_host_token_grants = 0;
 std::unordered_map<int, std::unique_ptr<FiberContext>> g_fiber_map;
 std::thread g_guest_thread;
 
+// ---------------------------------------------------------------------------
+// Determinism support (Phase A).
+//
+// The recomp's derail signature has been non-reproducible run-to-run: the same
+// binary lands on pc=0x30, on the 0x178be8 $ra clobber, or on pc=0x100008. The
+// cause is that the only preemption source in the system -- the VBLANK IRQ
+// worker in Interrupt.cpp -- is paced by std::chrono::steady_clock, so guest
+// interrupt delivery lands at a wall-clock-dependent point in the guest's
+// instruction stream. Every conclusion drawn from a single run is therefore n=1
+// against a moving target.
+//
+// PS2X_DETERMINISM=1 replaces that wall clock with GUEST PROGRESS: the counter
+// below advances once per 128 guest back-edges (i.e. once per yield_point
+// sample), and the IRQ worker paces its vblank ticks off it instead of off
+// time. Interrupt delivery then lands at a fixed point in the guest instruction
+// stream, making the run repeatable.
+//
+// Exposed as extern "C" rather than through ps2_scheduler.h on purpose: adding
+// a declaration to that header would force a full rebuild of ~30,000 generated
+// runner translation units (§3 prohibition). Interrupt.cpp re-declares these
+// two symbols locally.
+// ---------------------------------------------------------------------------
+static std::atomic<uint64_t> g_guest_progress{0};
+
+extern "C" uint64_t ps2x_guest_progress()
+{
+    return g_guest_progress.load(std::memory_order_relaxed);
+}
+
+extern "C" int ps2x_determinism_enabled()
+{
+    // Read once; the env var is fixed for the lifetime of the process.
+    static const int enabled = []() -> int
+    {
+        const char* e = std::getenv("PS2X_DETERMINISM");
+        return (e && *e && *e != '0') ? 1 : 0;
+    }();
+    return enabled;
+}
+
+// ---------------------------------------------------------------------------
+// Guest interrupt-disable preemption gate (2026-07-26).
+//
+// The EE guest protects structures shared with interrupt handlers by clearing
+// the COP0 Status EIE bit (`cop0 0x39` = di) and restoring it (`cop0 0x38` =
+// ei). SDBZ's pool allocator at 0x178428 does exactly that around its free-list
+// walk. The runtime had NO notion of EIE, so the guest's `di` was a no-op to us:
+// yield_point could hand the guest token to the IRQ worker in the middle of the
+// critical section, the worker would re-enter the SIF dispatcher 0x178068 on its
+// own R5900Context, and the interleaving corrupted a caller's saved-$ra word at
+// 0x1ffbeb0 (measured: RASLOT bad=1, SLOTENTRY before-flip bracketed strictly
+// between the 0x17ed60 / 0x17edb0 calls). This also explains why the derail is
+// non-deterministic with PS2X_DETERMINISM=0 and never reproduces with =1.
+//
+// The fix is to make `di` mean what it means on hardware: while the guest holds
+// interrupts disabled, the fiber does not surrender the guest execution slot, so
+// no host worker can acquire the token and no handler can run. That is strictly
+// a scheduling restriction -- it adds no locking around guest rdram (see the
+// NOTE in Kernel/Syscalls/Interrupt.cpp) and cannot deadlock the fiber itself.
+//
+// Safety valve: if the guest ever leaves interrupts disabled indefinitely (a
+// stub path that skips the `ei`, or a spin that expects an interrupt to break
+// it), an unconditional gate would hang. After kIntrDisableYieldEscape
+// yield_point samples inside one critical section the gate opens anyway and the
+// escape is counted, so a runaway section surfaces as data rather than a freeze.
+//
+// extern "C" rather than a header declaration, for the same reason as the
+// determinism accessors above: touching ps2_scheduler.h would force a full
+// rebuild of ~30,000 generated runner translation units (§3 prohibition).
+// game_overrides.cpp re-declares these symbols locally.
+// ---------------------------------------------------------------------------
+// 2026-07-27 -- STATE, NOT DEPTH. The first cut of this used a nesting counter,
+// and the run disproved it: CRITSEC reported sections=1 with depth pinned at 2
+// for all 835 samples, i.e. two enters leaked at boot and the gate then stayed
+// armed forever with the escape valve carrying the whole run (escapes climbing
+// past 0x58, one per ~4090 progress ticks). That is not a balanced-pair failure
+// to patch around -- a counter is the wrong model outright.
+//
+// The EE kernel's DisableIntr RETURNS the previous EIE state, and the standard
+// guest idiom is `old = DisableIntr(); ...; if (old) EnableIntr();` -- a nested
+// disable is deliberately NOT paired with an enable, so enters legitimately
+// outnumber leaves and no counter can ever settle back to zero. EIE is a single
+// bit in COP0 Status, so the shadow of it here is a single bit too, and the
+// nesting idiom then works out on its own: the inner disable is a no-op on an
+// already-clear bit, the inner code skips its EnableIntr, and the outer
+// EnableIntr is what re-opens the gate. Unbalanced by construction, correct by
+// construction.
+static thread_local bool     tls_intr_disabled     = false;
+static thread_local uint32_t tls_intr_disable_samples  = 0u;
+static std::atomic<uint64_t> g_intr_disable_escapes{0};
+static std::atomic<uint64_t> g_intr_disable_sections{0};
+// Redundant = disable while already disabled (the nesting idiom, expected to be
+// non-zero). Stray = enable while already enabled. A large stray count would mean
+// the bit is being cleared by something other than the section that set it, which
+// is the one way this single-bit model can still under-protect.
+static std::atomic<uint64_t> g_intr_disable_redundant{0};
+static std::atomic<uint64_t> g_intr_disable_stray{0};
+
+// One yield_point sample = 128 guest back-edges, so this is ~512K back-edges of
+// slack. Any legitimate EE critical section is orders of magnitude shorter.
+static constexpr uint32_t kIntrDisableYieldEscape = 4096u;
+
+extern "C" void ps2x_guest_intr_disable_enter()
+{
+    if (tls_intr_disabled)
+    {
+        g_intr_disable_redundant.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    tls_intr_disabled = true;
+    tls_intr_disable_samples = 0u;
+    g_intr_disable_sections.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void ps2x_guest_intr_disable_leave()
+{
+    if (!tls_intr_disabled)
+    {
+        g_intr_disable_stray.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    tls_intr_disabled = false;
+    tls_intr_disable_samples = 0u;
+}
+
+extern "C" uint32_t ps2x_guest_intr_disable_depth()
+{
+    return tls_intr_disabled ? 1u : 0u;
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_escapes()
+{
+    return g_intr_disable_escapes.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_sections()
+{
+    return g_intr_disable_sections.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_redundant()
+{
+    return g_intr_disable_redundant.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_stray()
+{
+    return g_intr_disable_stray.load(std::memory_order_relaxed);
+}
+
 // True only on the single guest executor thread (g_guest_thread). Set once at the
 // top of guest_executor_main, before any fiber can be resumed. Read by
 // ps2fiber_on_executor_thread(). A thread_local bool is lock-free and avoids the
@@ -1106,6 +1256,13 @@ bool ps2sched::yield_point()
 {
     if ((++tls_backedge_counter & 127u) != 0u) return false; // cheap fast path
 
+    // Guest-progress tick: one increment per 128 guest back-edges. This is the
+    // clock the IRQ worker uses under PS2X_DETERMINISM (see the extern "C"
+    // accessors above). Kept off the fast path -- it costs one relaxed atomic
+    // add per 128 back-edges, and is unconditional so the counter stays valid
+    // for diagnostics even when determinism is off.
+    g_guest_progress.fetch_add(1, std::memory_order_relaxed);
+
     FiberContext* fc = tls_current_fiber;
     if (!fc) return false; // running under a host worker (AsyncGuestScope): no preempt
 
@@ -1120,6 +1277,28 @@ bool ps2sched::yield_point()
     {
         block_current();
         return false;
+    }
+
+    // 2b. Guest holds interrupts disabled (COP0 Status EIE clear) -> do not
+    // surrender the guest execution slot. Steps 3 and 4 below are the only ways
+    // a fiber gives the slot up voluntarily, and step 4 is precisely how the IRQ
+    // worker gets in; gating both makes the guest's `di` mean what it means on
+    // hardware. Terminate (1) and suspend (2) are deliberately left above this
+    // gate: terminate is shutdown and must always win, and suspend is an
+    // explicit request from another EE thread rather than a preemption.
+    //
+    // The escape hatch keeps a guest that never re-enables interrupts from
+    // hanging the process; ps2x_guest_intr_disable_escapes() should read 0 on a
+    // healthy run, and any non-zero value means a critical section ran long
+    // enough that this gate stopped protecting it.
+    if (tls_intr_disabled)
+    {
+        if (++tls_intr_disable_samples < kIntrDisableYieldEscape)
+        {
+            return false;
+        }
+        g_intr_disable_escapes.fetch_add(1, std::memory_order_relaxed);
+        tls_intr_disable_samples = 0u;
     }
 
     // 3. Higher-priority fiber ready -> cooperative yield (enqueue Ready first).

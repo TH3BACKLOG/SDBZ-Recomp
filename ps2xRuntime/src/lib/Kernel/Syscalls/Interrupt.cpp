@@ -5,6 +5,16 @@
 #include "ps2_fiber.h"
 
 #include <bit>
+#include <cstdlib> // std::getenv / std::strtoull for the determinism knobs below
+
+// Cross-.cpp externs (no header edit: a .h change forces a full rebuild of all
+// 30,000+ generated runner TUs). Defined in ps2_scheduler.cpp and
+// game_overrides.cpp respectively. The depth counter is thread_local, so on the
+// IRQ worker thread it always reads 0 -- only the inline, on-guest-fiber dispatch
+// path can ever observe a non-zero value, which is exactly the case being probed.
+extern "C" uint32_t ps2x_guest_intr_disable_depth();
+extern "C" void ps2x_probe_kv(const char *name, int n,
+                              const char *const *keys, const uint64_t *vals);
 
 namespace ps2_syscalls
 {
@@ -133,6 +143,33 @@ namespace ps2_syscalls
         if (!rdram || !runtime)
         {
             return;
+        }
+
+        // 2026-07-26 -- guest interrupt-mask visibility (see the CRITSEC block in
+        // game_overrides.cpp and the gate in ps2_scheduler.cpp). The host-worker
+        // path below is already covered: while the guest holds DisableIntr, the
+        // fiber refuses to surrender the guest token, so AsyncGuestScope cannot
+        // acquire it and no handler runs. The INLINE path (ps2sched::is_guest_thread
+        // branch further down) is NOT covered -- it is a direct nested call on the
+        // calling fiber, not a preemption, so a DMAC dispatch reached from
+        // sceSifSetDma / sceDmaSend / drainCompletedDmacHandlers can still run
+        // inside a guest critical section.
+        //
+        // No evidence yet that this happens (0x178428's section makes no syscall),
+        // so this only reports rather than defers: deferring would need a queue and
+        // would change delivery ordering on a path that has not been shown broken.
+        // If DEFERINL ever appears in run_probe.jsonl, that assumption is wrong and
+        // the inline path needs the same treatment as the token path.
+        if (ps2x_guest_intr_disable_depth() != 0u)
+        {
+            static std::atomic<uint32_t> s_inlineInSection{0};
+            const uint32_t n = s_inlineInSection.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if (n <= 16u)
+            {
+                static const char *const k[] = {"n", "cause", "depth"};
+                const uint64_t v[] = {n, cause, ps2x_guest_intr_disable_depth()};
+                ps2x_probe_kv("DEFERINL", 3, k, v);
+            }
         }
 
         std::vector<IrqHandlerInfo> handlers;
@@ -405,6 +442,21 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
             reg = g_vsync_registration;
             tickValue = ++g_vsync_tick_counter;
+
+            // Consume the registration: syscall 73h is ONE-SHOT. The SDK's
+            // GsSyncV (guest 0x1751c0) registers its OWN stack frame --
+            // flag = sp+0, tick = sp+8 -- spins until the flag flips, then
+            // returns and pops the frame WITHOUT ever calling
+            // SetVSyncFlag(0, 0). No deregister path exists in that function.
+            // So the idiom is only sound if the kernel stops writing after it
+            // fires once; a persistent registration turns every later vblank
+            // into an async store into an abandoned frame. Measured 2026-07-27:
+            // flag = 0x1ffbeb0 with GsSyncV's saved $ra at 0x1ffbec0, and a
+            // hardware watchpoint caught this very store planting 0x1 in
+            // rpc_call's (0x178be8) saved-$ra slot once that stack depth was
+            // reused -- the Stage 5.4.2 boot derail.
+            g_vsync_registration.flagAddr = 0u;
+            g_vsync_registration.tickAddr = 0u;
         }
 
         // Wake all guest threads waiting for the next vsync tick.
@@ -435,6 +487,33 @@ namespace ps2_syscalls
         return tickValue;
     }
 
+    // --- Deterministic vblank pacing (Phase A) -----------------------------
+    // Defined in ps2_scheduler.cpp. Declared here rather than in
+    // ps2_scheduler.h because touching that header forces a full rebuild of the
+    // ~30,000 generated runner translation units (§3 prohibition).
+    //
+    // ps2x_guest_progress() advances once per 128 guest back-edges, so it is a
+    // clock measured in guest execution rather than wall time. Pacing vblank off
+    // it makes interrupt delivery land at a fixed point in the guest instruction
+    // stream, which is what makes a run reproducible.
+    extern "C" uint64_t ps2x_guest_progress();
+    extern "C" int ps2x_determinism_enabled();
+
+    // Guest-progress ticks per vblank under PS2X_DETERMINISM. There is no
+    // principled value here -- the real ratio depends on how many back-edges the
+    // guest retires per frame, which varies by workload -- so it is tunable via
+    // PS2X_DET_VBLANK_QUANTUM and the effective value is logged once at startup.
+    static uint64_t deterministicVblankQuantum()
+    {
+        static const uint64_t q = []() -> uint64_t
+        {
+            const char *e = std::getenv("PS2X_DET_VBLANK_QUANTUM");
+            const uint64_t parsed = (e && *e) ? std::strtoull(e, nullptr, 0) : 0ull;
+            return (parsed != 0ull) ? parsed : 20000ull;
+        }();
+        return q;
+    }
+
     static void interruptWorkerMain(uint8_t *rdram, PS2Runtime *runtime)
     {
         g_currentThreadId = -1;
@@ -442,27 +521,106 @@ namespace ps2_syscalls
         using clock = std::chrono::steady_clock;
         auto nextTick = clock::now() + kVblankPeriod;
 
+        const bool deterministic = (ps2x_determinism_enabled() != 0);
+        const uint64_t quantum = deterministicVblankQuantum();
+        uint64_t nextProgressTick = ps2x_guest_progress() + quantum;
+        uint64_t lastProgressSeen = ps2x_guest_progress();
+        int stalledPolls = 0;
+        // Poll cadence and stall threshold for the deterministic path. The stall
+        // fallback exists because the guest can legitimately stop retiring
+        // back-edges precisely BECAUSE it is waiting for the vblank we are about
+        // to deliver (the 0x175210 INTC_STAT spin parks its fiber). Without a
+        // fallback that is a deadlock: vblank waits on progress, progress waits
+        // on vblank. Delivering on stall does not reintroduce interleaving
+        // non-determinism, because a stalled guest has no instruction stream for
+        // the interrupt to interleave with.
+        constexpr auto kDetPollPeriod = std::chrono::microseconds(250);
+        constexpr int kDetStallPolls = 200; // ~50 ms of no guest progress
+
+        if (deterministic)
+        {
+            // std::cerr, not RUNTIME_LOG: RUNTIME_LOG compiles to nothing unless
+            // PS2_RUNTIME_LOGS is on, and this line must always be present so a
+            // run's log states unambiguously whether determinism was active.
+            std::cerr << "[determinism] vblank paced by guest progress, quantum="
+                      << quantum << " ticks" << std::endl;
+        }
+
         while (runtime != nullptr && !runtime->isStopRequested())
         {
+            int ticksToProcess = 0;
+
+            if (deterministic)
             {
-                std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
-                if (g_irq_worker_cv.wait_until(lock, nextTick, []()
-                                               { return g_irq_worker_stop.load(std::memory_order_acquire); }))
                 {
-                    break;
+                    std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
+                    if (g_irq_worker_cv.wait_for(lock, kDetPollPeriod, []()
+                                                 { return g_irq_worker_stop.load(std::memory_order_acquire); }))
+                    {
+                        break;
+                    }
+                }
+
+                const uint64_t progress = ps2x_guest_progress();
+                if (progress != lastProgressSeen)
+                {
+                    lastProgressSeen = progress;
+                    stalledPolls = 0;
+                }
+                else
+                {
+                    ++stalledPolls;
+                }
+
+                if (progress >= nextProgressTick)
+                {
+                    // Catch up in whole quanta, capped like the wall-clock path.
+                    while (progress >= nextProgressTick && ticksToProcess < kMaxCatchupTicks)
+                    {
+                        ++ticksToProcess;
+                        nextProgressTick += quantum;
+                    }
+                    // If the guest outran the catch-up cap, resynchronise rather
+                    // than accumulating a debt we would burn down over later
+                    // frames (that debt would itself be a source of drift).
+                    if (progress >= nextProgressTick)
+                    {
+                        nextProgressTick = progress + quantum;
+                    }
+                }
+                else if (stalledPolls >= kDetStallPolls)
+                {
+                    ticksToProcess = 1;
+                    stalledPolls = 0;
+                    nextProgressTick = progress + quantum;
+                }
+
+                if (ticksToProcess == 0)
+                {
+                    continue;
                 }
             }
+            else
+            {
+                {
+                    std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
+                    if (g_irq_worker_cv.wait_until(lock, nextTick, []()
+                                                   { return g_irq_worker_stop.load(std::memory_order_acquire); }))
+                    {
+                        break;
+                    }
+                }
 
-            const auto now = clock::now();
-            int ticksToProcess = 0;
-            while (now >= nextTick && ticksToProcess < kMaxCatchupTicks)
-            {
-                ++ticksToProcess;
-                nextTick += kVblankPeriod;
-            }
-            if (ticksToProcess == 0)
-            {
-                continue;
+                const auto now = clock::now();
+                while (now >= nextTick && ticksToProcess < kMaxCatchupTicks)
+                {
+                    ++ticksToProcess;
+                    nextTick += kVblankPeriod;
+                }
+                if (ticksToProcess == 0)
+                {
+                    continue;
+                }
             }
 
             for (int i = 0; i < ticksToProcess; ++i)
@@ -477,7 +635,22 @@ namespace ps2_syscalls
                 // screen). Set before dispatching the VBon handler list.
                 runtime->memory().orIORegister(0x1000F000u, 1u << 2);
                 dispatchAndCountIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                // Gap between VBon and VBoff so the guest gets a chance to run
+                // its VBon handler before VBoff is asserted. Off the wall clock
+                // under determinism: wait on guest progress instead, with a
+                // bounded poll count so a quiescent guest cannot wedge the tick.
+                if (deterministic)
+                {
+                    const uint64_t gapTarget = ps2x_guest_progress() + 1ull;
+                    for (int i = 0; i < 8 && ps2x_guest_progress() < gapTarget; ++i)
+                    {
+                        std::this_thread::sleep_for(std::chrono::microseconds(250));
+                    }
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
 
                 // Raise INTC_STAT VBLANK-end (bit3) for the VBoff handler list.
                 runtime->memory().orIORegister(0x1000F000u, 1u << 3);
@@ -674,6 +847,26 @@ namespace ps2_syscalls
     {
         const uint32_t flagAddr = getRegU32(ctx, 4);
         const uint32_t tickAddr = getRegU32(ctx, 5);
+
+        // 2026-07-27: the hardware-watchpoint run named signalVSyncFlag as the
+        // writer of the 0x1 that lands in rpc_call's saved-$ra slot (0x1ffbeb0).
+        // The write itself is correct per ps2tek 73h -- so the registered
+        // flagAddr must be a dead stack address. Log every registration with the
+        // caller's $ra so we can see (a) who registers it and (b) whether the
+        // guest ever deregisters with (0,0) as the wait-then-release idiom
+        // requires. Guest stack lives below 0x02000000 and above the heap; the
+        // `stack` field flags the addresses that can be reused under us.
+        {
+            static uint64_t s_seq = 0;
+            const char *k[5] = {"seq", "flag", "tick", "ra", "stack"};
+            const uint64_t v[5] = {
+                ++s_seq,
+                flagAddr,
+                tickAddr,
+                getRegU32(ctx, 31),
+                (flagAddr >= 0x01000000u && flagAddr < 0x02000000u) ? 1ull : 0ull};
+            ps2x_probe_kv("VSYNCREG", 5, k, v);
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);

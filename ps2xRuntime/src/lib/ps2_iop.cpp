@@ -218,6 +218,136 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
         // Intentionally fall through (return false) -- Phase 0 is diagnostics only.
     }
 
+    // Stage 5.5.1 PROBE: padman (libpad) RPC service.
+    //
+    // Ground truth read live from PCSX2 (SLUS-21442, paused at the memcard screen):
+    //   0x187cb0  binds sid 0x80000100 with client data 0x568940
+    //   0x187d04  binds sid 0x80000101 with client data 0x568968
+    //   0x189110  version query -- rpcNum 1, send==recv==0x568b80 (0x80 bytes),
+    //             cmd word 0x12 at send+0, module version read back from recv+0xC.
+    //   0x187d34  sra $s0,$s1,8 ; beq $s0,4 -- ONLY the major nibble is checked,
+    //             and the full version word is dead afterwards (0x187d78 passes
+    //             only $a0 = $s2), so 0x0400 is behaviourally exact.
+    //
+    // Built up one command at a time, each round driven by what the previous run
+    // logged as UNSERVED, so every reply below is decoded from a real call site
+    // rather than guessed: 0x12 (version) -> 0x10 (init) -> 0x01 (port open).
+    // Still not served: the per-frame pad state itself, which the real padman
+    // pushes asynchronously via SIF CMD 0x80000019 (the guest registers its own
+    // handler, callback 0x187d98, on a successful cmd 0x10).
+    if (sid == 0x80000100u && rpcNum == 1u)
+    {
+        const uint8_t *snd = sendBufAddr ? getConstMemPtr(m_rdram, sendBufAddr) : nullptr;
+        uint32_t cmd = 0u;
+        if (snd && sendSize >= sizeof(uint32_t))
+        {
+            std::memcpy(&cmd, snd, sizeof(cmd));
+        }
+
+        // Reply convention for this service, read off three call sites:
+        //   0x189110 (cmd 0x12) returns recv+0xC
+        //   0x187de0 (cmd 0x10) returns recv+0xC
+        //   0x187ed8 (cmd 0x0F) compares recv+0xC against 1
+        // So recv+0xC is the single return slot, and 1 means success.
+        uint32_t reply = 0u;
+        uint32_t reply14 = 0u;      // recv+0x14, only meaningful for cmd 0x1
+        bool haveReply14 = false;
+        const char *replyWhat = nullptr;
+
+        switch (cmd)
+        {
+        case 0x12u: // scePadGetModVersion
+            // Major nibble only is inspected (0x187d34: sra $s0,$s1,8 ; beq $s0,4)
+            // and the full word is dead afterwards, so 0x0400 is behaviourally exact.
+            reply = 0x0400u;
+            replyWhat = "modversion";
+            break;
+
+        case 0x10u: // scePadInit's open -- send+0x10 = 0, send+0x14 = global 0x464E14
+            // On a non-negative rpc_call the guest itself registers the async pad
+            // handler (0x177de8 with cmd 0x80000019 -> callback 0x187d98), so we
+            // only have to stop returning a failure here. Pad state pushes are a
+            // separate piece and are still not served.
+            reply = 1u;
+            replyWhat = "init";
+            break;
+
+        case 0x1u: // scePadPortOpen (0x1880e4)
+        {
+            // Send layout read off 0x18818c-0x1881a0:
+            //   send+0x04 = port, send+0x08 = slot, send+0x10 = EE-side pad buffer.
+            // Reply: recv+0xC is the return value (0x188230 lw $v0,12($s0)) and
+            // recv+0x14 is an IOP-side address (0x188204 lw $t0,20($s0)) stored into
+            // the pad state table at +8. scePadRead (0x187f68) later uses that word
+            // as the sceSifSetDma *dest* for a 0x20-byte EE->IOP request, indexing
+            // it as a double buffer (+0x20 on alternate frames). So it must be
+            // non-zero and must have 0x40 bytes of room; the EE side never reads it.
+            uint32_t port = 0u, slot = 0u;
+            if (snd && sendSize >= 0xCu)
+            {
+                std::memcpy(&port, snd + 0x4, sizeof(port));
+                std::memcpy(&slot, snd + 0x8, sizeof(slot));
+            }
+            // Distinctive base so these show up unmistakably in SIF DMA logs.
+            reply14 = 0x001E0000u + ((port & 0xFu) * 0x100u) + ((slot & 0x3u) * 0x40u);
+            haveReply14 = true;
+            reply = 1u;
+            replyWhat = "portopen";
+            break;
+        }
+
+        default:
+            break;
+        }
+
+        if (replyWhat)
+        {
+            uint8_t *recvPtr = recvBufAddr ? getMemPtr(m_rdram, recvBufAddr) : nullptr;
+            if (recvPtr && recvSize >= 0x10u)
+            {
+                // Safe to wipe even though send == recv for this service: cmd was
+                // already latched above and nothing reads the send words after.
+                std::memset(recvPtr, 0, recvSize);
+                std::memcpy(recvPtr + 0xC, &reply, sizeof(reply));
+                if (haveReply14 && recvSize >= 0x18u)
+                {
+                    std::memcpy(recvPtr + 0x14, &reply14, sizeof(reply14));
+                }
+            }
+
+            static std::atomic<uint32_t> s_padServedLogs{0u};
+            if (s_padServedLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
+            {
+                std::fprintf(stderr,
+                             "[iop:PADMAN] served cmd=0x%X (%s): recvBuf=0x%08X recvSize=%u reply=0x%X iopbuf=0x%08X\n",
+                             cmd, replyWhat, recvBufAddr, recvSize, reply,
+                             haveReply14 ? reply14 : 0u);
+            }
+
+            resultPtr = recvBufAddr;
+            return true;
+        }
+
+        static std::atomic<uint32_t> s_padOtherLogs{0u};
+        if (s_padOtherLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+        {
+            std::fprintf(stderr,
+                         "[iop:PADMAN] UNSERVED cmd=0x%X sendBuf=0x%08X sendSize=%u recvBuf=0x%08X recvSize=%u\n",
+                         cmd, sendBufAddr, sendSize, recvBufAddr, recvSize);
+        }
+        // Fall through unhandled -- the caller treats that as a failed RPC.
+    }
+    else if (sid == 0x80000101u)
+    {
+        static std::atomic<uint32_t> s_pad101Logs{0u};
+        if (s_pad101Logs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+        {
+            std::fprintf(stderr,
+                         "[iop:PADMAN] sid 0x80000101 rpcNum=%u sendBuf=0x%08X sendSize=%u recvBuf=0x%08X recvSize=%u\n",
+                         rpcNum, sendBufAddr, sendSize, recvBufAddr, recvSize);
+        }
+    }
+
     if (sid == IOP_SID_CDVD_SCMD)
     {
         // cdvdman S-command RPC. The EE libcdvd wrappers read the result buffer's first

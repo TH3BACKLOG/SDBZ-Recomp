@@ -5,6 +5,7 @@
 #include "runtime/ps2_diag.h"
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -1315,6 +1316,55 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if ((address & 0xFF) == 0x00 && (value & 0x100))
         {
             const uint32_t channelBase = address & 0xFFFFFF00u;
+
+            // [dmakick] Bounded, env-gated census of DMA channel starts
+            // (PS2X_DMATRACE=N; unset/0 => no output and one relaxed load per
+            // kick). EVERY CHCR.STR=1 on EVERY channel funnels through this
+            // point, so it is the one place that can answer "does the render
+            // path ever kick VIF1/GIF at all?" without having to guess the
+            // exact CHCR word a PS2X_TRAPVAL value-trap would need to match --
+            // libdma (sceDmaSend @ 0x172e20) ORs 0x105 into whatever bits the
+            // channel already carried, so the stored value is not predictable.
+            // Channel bases of interest: 0x10008000 VIF0, 0x10009000 VIF1,
+            // 0x1000A000 GIF, 0x1000B000/B400 IPU, 0x1000D000/D400 SPR.
+            {
+                static const uint32_t s_dmaTraceLimit = []() -> uint32_t
+                {
+                    const char *e = std::getenv("PS2X_DMATRACE");
+                    return (e && *e) ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+                }();
+                if (s_dmaTraceLimit != 0u)
+                {
+                    static std::atomic<uint32_t> s_dmaKicks{0u};
+                    const uint32_t n = s_dmaKicks.fetch_add(1, std::memory_order_relaxed);
+                    // First N in full, then a heartbeat every 1000 so a channel
+                    // that only starts firing late still shows up.
+                    if (n < s_dmaTraceLimit || (n % 1000u) == 0u)
+                    {
+                        const auto reg = [this](uint32_t a) -> uint32_t
+                        {
+                            const auto it = m_ioRegisters.find(a);
+                            return (it == m_ioRegisters.end()) ? 0u : it->second;
+                        };
+                        // vram/cb/arb are the two guards a GIF/VIF1 kick has to
+                        // clear below: the block is skipped entirely when
+                        // m_gsVRAM is null, and GIF transfers are only drained
+                        // when a packet callback or arbiter is installed. If
+                        // kicks appear here but the screen stays black, these
+                        // three flags say whether the packet was dropped on the
+                        // floor rather than rendered.
+                        std::fprintf(stderr,
+                                     "[dmakick] #%u ch=0x%08X chcr=0x%08X mode=%u dir=%u "
+                                     "madr=0x%08X qwc=%u tadr=0x%08X vram=%d cb=%d arb=%d\n",
+                                     n, channelBase, value, (value >> 2) & 0x3u, value & 0x1u,
+                                     reg(channelBase + 0x10u), reg(channelBase + 0x20u),
+                                     reg(channelBase + 0x30u),
+                                     m_gsVRAM ? 1 : 0,
+                                     m_gifPacketCallback ? 1 : 0,
+                                     m_gifArbiter ? 1 : 0);
+                    }
+                }
+            }
 
             // Scratchpad (SPR) DMA channels 8 (fromSPR, 0x1000D000) and 9 (toSPR,
             // 0x1000D400) copy between scratchpad and main RAM and then raise the
