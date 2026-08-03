@@ -32,11 +32,18 @@
 #include <atomic>
 #include <thread>
 #include <sstream>
+#include <vector>
 
 namespace ps2_stubs
 {
     void resetSifState();
 }
+
+// Host CPU sampling profiler (src/lib/Kernel/HostSampler.cpp). Declared here
+// rather than in a header because a header change forces all ~30,000 runner TUs
+// to recompile. No-ops unless PS2X_PROFILE is set.
+extern "C" void ps2x_host_sampler_start(void);
+extern "C" void ps2x_host_sampler_stop(void);
 
 namespace
 {
@@ -378,9 +385,60 @@ namespace
     std::array<std::atomic<uint32_t>, kGlobalDispatchRingSize> g_globalDispatchRing{};
     std::atomic<uint32_t> g_globalDispatchNext{0u};
 
+    // ---- Stage 5.7 execution coverage (arm with PS2_COVERAGE=1) -------------
+    //
+    // WHY THIS EXISTS. The ring above answers "what ran in the last
+    // millisecond". It cannot answer "what ran AT ALL", and that is the only
+    // question Stage 5.7 actually has: the frame loop is healthy, the screen is
+    // black, and the sole game-band address ever observed executing is
+    // 0x421f10. Guessing one candidate address per rebuild is a bit of
+    // information per multi-hour cycle. Counting every dispatch gives the whole
+    // executed SET for the price of one increment.
+    //
+    // DIRECT-MAPPED, NOT HASHED. Guest code occupies 0x100000..0x640380 and
+    // every dispatched PC is 4-byte aligned, so (pc - base) >> 2 is a perfect
+    // index -- no hashing, no collisions, no allocation, no locking on the hot
+    // path. 344,286 slots x 4 bytes = ~1.4 MB of host BSS, and one relaxed
+    // fetch_add is cheaper than the ring store it sits beside.
+    //
+    // LOWER BOUND, NOT EXACT -- read the dump with this in mind. pushDispatchPc
+    // only sees TABLE-DISPATCHED calls; a direct fn_* C++ call bypasses
+    // lookupFunction entirely. A nonzero count therefore proves "this ran"; a
+    // zero count proves only "this was never dispatched", NOT "this never
+    // executed". Never argue absence from this array alone.
+    constexpr uint32_t kCoverageBase = 0x00100000u;
+    constexpr uint32_t kCoverageEnd = 0x00640380u; // ELF mapped-segment end
+    constexpr uint32_t kCoverageSpan = kCoverageEnd - kCoverageBase;
+    constexpr uint32_t kCoverageSlots = kCoverageSpan / 4u;
+    // Everything below this is Sony SDK (libdma/libgraph/libpad/libcdvd);
+    // game code lives above it. Splitting the dump on this line is what makes
+    // it interpretable at a glance -- "3000 distinct, all of them SDK" and
+    // "3000 distinct, 900 of them game" are opposite diagnoses.
+    // 2026-07-29: was 0x00400000, which was measured wrong. The first coverage
+    // run showed heavy per-frame game code at 0x2ca270 (147k dispatches),
+    // 0x2f44d0 (138k), 0x2d5d90, 0x2b6840, 0x240780, 0x337420 -- all of which
+    // 0x400000 misfiled as "SDK" and, worse, dropped entirely from the COVGAME
+    // shutdown dump. Env-driven now (PS2_COV_GAMELO) so re-calibrating this
+    // line never costs another rebuild.
+    uint32_t kGameBandStart = 0x00200000u;
+
+    std::atomic<bool> g_coverageArmed{false};
+    std::array<std::atomic<uint32_t>, kCoverageSlots> g_coverage{};
+
     void pushDispatchPc(uint32_t pc)
     {
         g_lastDispatchPc.store(pc, std::memory_order_relaxed);
+
+        if (g_coverageArmed.load(std::memory_order_relaxed))
+        {
+            // Unsigned wrap makes the single < test reject pc < kCoverageBase
+            // as well as pc >= kCoverageEnd, so this is one compare, not two.
+            const uint32_t off = pc - kCoverageBase;
+            if (off < kCoverageSpan)
+            {
+                g_coverage[off >> 2].fetch_add(1u, std::memory_order_relaxed);
+            }
+        }
 
         const uint32_t slot = g_globalDispatchNext.fetch_add(1u, std::memory_order_relaxed);
         g_globalDispatchRing[slot % kGlobalDispatchRingSize].store(pc, std::memory_order_relaxed);
@@ -417,6 +475,116 @@ namespace
             oss << "0x" << std::hex << pc;
         }
         return oss.str();
+    }
+
+    // How many hottest addresses the periodic dump names. Small on purpose --
+    // the summary counts are the diagnosis; the top list is only there to say
+    // WHICH loop is hot without re-reading a 40 MB console log.
+    constexpr uint32_t kCoverageTopN = 48u;
+
+    struct CoverageSummary
+    {
+        uint64_t distinct = 0; // addresses dispatched at least once
+        uint64_t game = 0;     // ... of those, in the game band
+        uint64_t sdk = 0;      // ... of those, below kGameBandStart
+        uint64_t calls = 0;    // total dispatches
+    };
+
+    // One pass over the counter array. Optionally emits to the structured probe
+    // sink (run_probe.jsonl) rather than the console, because the console log
+    // has twice produced wrong answers via encoding and line-wrapping -- see
+    // the header comment in build_scripts/analyze_run.py.
+    //
+    // fullGameBand dumps EVERY distinct game-band address, not just the top N.
+    // That is the actual Stage 5.7 payload -- the set of game functions the
+    // recomp entered -- so it is written once at shutdown rather than every
+    // tick. Cost is one row per address, bounded by what actually executed.
+    CoverageSummary scanCoverage(bool emit, uint32_t phase, bool fullGameBand)
+    {
+        CoverageSummary s;
+        if (!g_coverageArmed.load(std::memory_order_relaxed))
+        {
+            return s;
+        }
+
+        // Fixed-size insertion selection instead of sorting 344k entries: no
+        // allocation, and this runs on the watchdog thread, which must never
+        // become the reason a run is slow.
+        uint32_t topAddr[kCoverageTopN] = {};
+        uint32_t topCount[kCoverageTopN] = {};
+        uint32_t topUsed = 0;
+
+        for (uint32_t i = 0; i < kCoverageSlots; ++i)
+        {
+            const uint32_t c = g_coverage[i].load(std::memory_order_relaxed);
+            if (c == 0u)
+            {
+                continue;
+            }
+            const uint32_t addr = kCoverageBase + (i * 4u);
+            ++s.distinct;
+            s.calls += c;
+            if (addr >= kGameBandStart)
+            {
+                ++s.game;
+            }
+
+            if (topUsed < kCoverageTopN || c > topCount[kCoverageTopN - 1])
+            {
+                uint32_t at = (topUsed < kCoverageTopN) ? topUsed++ : (kCoverageTopN - 1);
+                while (at > 0u && topCount[at - 1] < c)
+                {
+                    topCount[at] = topCount[at - 1];
+                    topAddr[at] = topAddr[at - 1];
+                    --at;
+                }
+                topCount[at] = c;
+                topAddr[at] = addr;
+            }
+        }
+        s.sdk = s.distinct - s.game;
+
+        if (!emit)
+        {
+            return s;
+        }
+
+        {
+            const char *keys[] = {"phase", "distinct", "game", "sdk", "calls", "slots"};
+            const uint64_t vals[] = {phase, s.distinct, s.game, s.sdk, s.calls,
+                                     static_cast<uint64_t>(kCoverageSlots)};
+            ps2x_probe_kv("COVERAGE", 6, keys, vals);
+        }
+
+        for (uint32_t i = 0; i < topUsed; ++i)
+        {
+            const char *keys[] = {"rank", "addr", "count", "game"};
+            const uint64_t vals[] = {i, topAddr[i], topCount[i],
+                                     topAddr[i] >= kGameBandStart ? 1ull : 0ull};
+            ps2x_probe_kv("COVTOP", 4, keys, vals);
+        }
+
+        if (fullGameBand)
+        {
+            for (uint32_t i = 0; i < kCoverageSlots; ++i)
+            {
+                const uint32_t c = g_coverage[i].load(std::memory_order_relaxed);
+                if (c == 0u)
+                {
+                    continue;
+                }
+                const uint32_t addr = kCoverageBase + (i * 4u);
+                if (addr < kGameBandStart)
+                {
+                    continue;
+                }
+                const char *keys[] = {"addr", "count"};
+                const uint64_t vals[] = {addr, c};
+                ps2x_probe_kv("COVGAME", 2, keys, vals);
+            }
+        }
+
+        return s;
     }
 
     std::string formatDispatchHistory()
@@ -1280,20 +1448,54 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         }
     }
 
-    std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
-              << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
-              << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
-              << " codeRegion=" << (m_memory.isCodeAddress(address) ? "yes" : "no")
-              << " trace=" << formatDispatchHistory()
-              << std::dec << std::endl;
+    // 2026-07-28 -- the std::cerr below is now bounded too.
+    //
+    // The probe sink further down was capped at 8 long ago for exactly this
+    // reason, but the human-readable line above it was left unbounded, and it
+    // is by far the more expensive of the two: formatDispatchHistory() builds
+    // a ~1KB "0x1 -> 0x1 -> ..." string, and std::endl flushes it to a synced
+    // stdio handle every single time. In the 2026-07-28 gated-off baseline the
+    // guest derailed to pc=0x1 at t~32s and this one statement produced
+    // **225 MB of run_log.txt in 64 seconds** -- 65.5s of CPU (42% of the whole
+    // run) in ZwWriteFile + iostream formatting, on a thread that was doing no
+    // guest work at all. It made the run look CPU-bound on emitted code when it
+    // was really spinning on our own diagnostics.
+    //
+    // Keep the first 8 -- only those carry information; every later one is the
+    // same event. After that stay silent but keep counting, and emit a rate
+    // line every 100k so a spin is still distinguishable from a stall (an
+    // unsampled counter cannot tell slow from dead).
+    static std::atomic<uint32_t> s_missProbes{0};
+    const uint32_t n = s_missProbes.fetch_add(1, std::memory_order_relaxed) + 1u;
+
+    if (n <= 8u)
+    {
+        std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
+                  << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
+                  << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
+                  << " codeRegion=" << (m_memory.isCodeAddress(address) ? "yes" : "no")
+                  << " trace=" << formatDispatchHistory()
+                  << std::dec << std::endl;
+
+        if (n == 8u)
+        {
+            std::cerr << "Error: dispatch-miss reporting suppressed after 8 hits;"
+                         " a running total prints every 100000"
+                      << std::endl;
+        }
+    }
+    else if ((n % 100000u) == 0u)
+    {
+        std::cerr << "Error: dispatch-miss x" << std::dec << n
+                  << " (still spinning, latest guest PC 0x" << std::hex << address << std::dec << ")"
+                  << std::endl;
+    }
 
     // Phase B: the derail terminus, structured. Hard-bounded -- once $ra is
     // clobbered the dispatcher retries the bad target forever and this site is
     // reached ~89,000 times in a 25s run. Only the FIRST few carry information;
     // the rest are the same event and would bloat the sink to no purpose.
     {
-        static std::atomic<uint32_t> s_missProbes{0};
-        const uint32_t n = s_missProbes.fetch_add(1, std::memory_order_relaxed) + 1u;
         if (n <= 8u)
         {
             static const char *const k[] = {"n", "pc", "tableBase", "tableEnd", "codeRegion"};
@@ -2496,7 +2698,22 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    RecompDbg::Init();
+    // The debug shared-memory writer is NOT free: RecompDbg::Update() runs on
+    // every dispatch-loop iteration (i.e. every guest function call) and copies
+    // a 2 KB RAM window into a cross-process section. Init() previously ran
+    // unconditionally, so that cost was paid on every run whether or not
+    // RecompDebugger was attached. Gated 2026-07-28 while measuring the guest
+    // execution rate; leaving s_shm null makes Update()/CheckBreakpoint()
+    // collapse to a single early-out branch. launch_recomp.ps1 sets this when
+    // it launches RecompDebugger.
+    if (const char *dbgShm = std::getenv("PS2X_DEBUGSHM"); dbgShm && *dbgShm && *dbgShm != '0')
+    {
+        RecompDbg::Init();
+    }
+
+    // Started here so the profile window covers the whole guest run, including
+    // the 4.4s stall at t=2-6s that the watchdog sees but cannot explain.
+    ps2x_host_sampler_start();
 
     // Ground-truth dump of every function address actually registered by the
     // recompiler, so RecompDebugger (a separate process with no PS2Runtime
@@ -2565,6 +2782,22 @@ void PS2Runtime::run()
     {
         g_ps2FrameTraceArmed.store(true, std::memory_order_relaxed);
         std::cerr << "[frametrace] armed" << std::endl;
+    }
+
+    // Execution coverage (env PS2_COVERAGE=1). Armed HERE rather than inside the
+    // watchdog thread on purpose: the watchdog starts late, and the boot path is
+    // exactly the stretch of execution Stage 5.7 needs counted. Unset => the
+    // per-dispatch cost stays one relaxed bool load, same contract as the two
+    // knobs above.
+    if (const char *cov = std::getenv("PS2_COVERAGE"); cov && *cov && *cov != '0')
+    {
+        g_coverageArmed.store(true, std::memory_order_relaxed);
+        if (const char *gl = std::getenv("PS2_COV_GAMELO"); gl && *gl)
+            kGameBandStart = static_cast<uint32_t>(std::strtoul(gl, nullptr, 16));
+        std::cerr << "[coverage] armed -- counting table-dispatched calls in [0x"
+                  << std::hex << kCoverageBase << ",0x" << kCoverageEnd << ")"
+                  << std::dec << ", game band >= 0x" << std::hex << kGameBandStart
+                  << std::dec << std::endl;
     }
 
     // Optional R3000A IOP-core self-test (env PS2_IOP_CPU_SELFTEST=1): runs a
@@ -2644,6 +2877,70 @@ void PS2Runtime::run()
                 //            frame; if vbl/s is itself low the pacing thread is
                 //            the bottleneck and gif/s merely follows it.
                 uint64_t prevBusyNs = 0, prevResumes = 0, prevVbl = 0;
+                // Stage 5.7. Every rate field above measures the *render* loop,
+                // and they all read healthy while the screen stays black -- so
+                // none of them can answer the question that is actually open:
+                // does the guest's game-state machine ever tick? The community
+                // EE map puts SDBZ's GameMode word at 0x005e6b3c, with 0x00 =
+                // MainMenu, i.e. boot success. Sampling it at the same 1Hz as
+                // everything else turns "black screen" into a number: a value
+                // that never changes across a whole run means the frame loop is
+                // spinning on a state machine that is not advancing, which is a
+                // different fault from anything the DMA/GIF counters can see.
+                //
+                // The address is env-overridable (PS2_WATCH_ADDR, hex, with or
+                // without 0x) because moving a hardcoded probe costs a rebuild
+                // and a rebuild here is measured in hours. gstate= prints four
+                // consecutive words so neighbouring state (submode, timers) is
+                // visible without a second run. gchg= counts how many samples
+                // differed from the previous one -- 0 is the damning result.
+                //
+                // 2026-07-29 correction: gchg originally compared only w[0], so
+                // on a constant address (the 0x421f10 positive control) it read
+                // 0 by construction and carried no information. It now compares
+                // all four sampled words.
+                auto envHex = [](const char *name, uint32_t fallback) -> uint32_t
+                {
+                    const char *v = std::getenv(name);
+                    if (v == nullptr || *v == '\0')
+                    {
+                        return fallback;
+                    }
+                    const char *p = (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) ? v + 2 : v;
+                    return static_cast<uint32_t>(std::strtoul(p, nullptr, 16));
+                };
+
+                const uint32_t watchAddr = envHex("PS2_WATCH_ADDR", 0x005e6b3cu);
+                uint32_t prevWatch[4] = {0, 0, 0, 0};
+                bool havePrevWatch = false;
+                uint32_t watchChanges = 0;
+
+                // Stage 5.7 BSS liveness scan.
+                //
+                // Watching one guessed address answers one guess. readelf -l on
+                // SLUS_214.42 gives a single LOAD with FileSiz 0x400680 but
+                // MemSiz 0x540380, so 0x500680..0x640380 is BSS: zero-filled at
+                // load, no file bytes. Every game global that is not statically
+                // initialised lives in there. Sweeping the whole range converts
+                // "is THIS address ticking?" into a question with three
+                // distinguishable answers, none of which depend on trusting a
+                // community memory map:
+                //
+                //   bssnz=0                  the guest writes no globals at all
+                //   bssnz large, bsschg=0    globals initialised once, then the
+                //                            state machine is genuinely frozen
+                //   bsschg>0                 state IS advancing, and the address
+                //                            we were watching was simply wrong
+                //
+                // Bounds are env-overridable (PS2_BSS_LO/PS2_BSS_HI) so the next
+                // question costs a run, not a rebuild. Sampling the previous
+                // snapshot costs one heap buffer of span/4 words (~330 KB), read
+                // once per second on the watchdog thread.
+                const uint32_t bssLo = envHex("PS2_BSS_LO", 0x00500680u) & ~3u;
+                const uint32_t bssHi = envHex("PS2_BSS_HI", 0x00640380u) & ~3u;
+                const size_t bssWords = (bssHi > bssLo) ? ((bssHi - bssLo) / 4u) : 0u;
+                std::vector<uint32_t> bssPrev(bssWords, 0u);
+                bool haveBssPrev = false;
                 while (!isStopRequested())
                 {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2670,6 +2967,51 @@ void PS2Runtime::run()
                     prevResumes = curResumes;
                     prevVbl = curVbl;
                     const uint64_t busyPct = dBusyNs / 10000000ull; // ns -> % of 1s
+                    // Plain RDRAM, so read32 cannot re-enter the MMIO handlers;
+                    // guarded anyway because the watchdog must never be the
+                    // thing that takes the run down.
+                    uint32_t w[4] = {0, 0, 0, 0};
+                    uint64_t bssNonZero = 0;
+                    uint64_t bssChanged = 0;
+                    try
+                    {
+                        for (int i = 0; i < 4; ++i)
+                            w[i] = m_memory.read32(watchAddr + (i * 4));
+
+                        for (size_t i = 0; i < bssWords; ++i)
+                        {
+                            const uint32_t v = m_memory.read32(bssLo + static_cast<uint32_t>(i * 4u));
+                            if (v != 0u)
+                            {
+                                ++bssNonZero;
+                            }
+                            if (haveBssPrev && v != bssPrev[i])
+                            {
+                                ++bssChanged;
+                            }
+                            bssPrev[i] = v;
+                        }
+                        haveBssPrev = (bssWords != 0u);
+                    }
+                    catch (const std::exception &)
+                    {
+                    }
+                    if (havePrevWatch &&
+                        (w[0] != prevWatch[0] || w[1] != prevWatch[1] ||
+                         w[2] != prevWatch[2] || w[3] != prevWatch[3]))
+                    {
+                        ++watchChanges;
+                    }
+                    for (int i = 0; i < 4; ++i)
+                        prevWatch[i] = w[i];
+                    havePrevWatch = true;
+
+                    // Coverage is scanned every tick for the inline cov= fields,
+                    // but only written to the structured sink every 10s -- the
+                    // summary is what the watchdog line needs, and the sink is
+                    // for analyze_run.py afterwards.
+                    const CoverageSummary cov =
+                        scanCoverage((static_cast<uint32_t>(t) % 10u) == 9u, 1u, false);
                     // progress = ps2sched's guest clock (one tick per 128 guest
                     // back-edges). Two uses: it distinguishes "the guest is
                     // spinning in a loop" from "the guest is not executing at
@@ -2685,6 +3027,16 @@ void PS2Runtime::run()
                     // discriminated anything; gifTot is just the running sum of
                     // gif/s.
                     std::cerr << "[watchdog] t=" << (++t) << "s"
+                              // cov=<distinct>/<game band>. A game-band count
+                              // that never rises is the Stage 5.7 answer.
+                              << " cov=" << cov.distinct << "/" << cov.game
+                              << " bssnz=" << bssNonZero
+                              << " bsschg=" << bssChanged
+                              << " gchg=" << watchChanges
+                              << std::hex
+                              << " gstate@0x" << watchAddr << "="
+                              << w[0] << "," << w[1] << "," << w[2] << "," << w[3]
+                              << std::dec
                               << " busy%=" << busyPct
                               << " res/s=" << dResumes
                               << " vbl/s=" << dVbl
@@ -2696,6 +3048,23 @@ void PS2Runtime::run()
                               << " ra=0x" << ra << " lastCall=0x" << lastCall
                               << std::dec
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
+                }
+
+                // Final dump, with fullGameBand=true. This is the Stage 5.7
+                // payload: every distinct game-band address the recomp actually
+                // dispatched. Written here, on the way out, so a run stopped by
+                // -RunSeconds still leaves the set on disk instead of only in a
+                // console buffer that gets clipped.
+                const CoverageSummary fin = scanCoverage(true, 2u, true);
+                if (g_coverageArmed.load(std::memory_order_relaxed))
+                {
+                    std::cerr << "[coverage] final: distinct=" << fin.distinct
+                              << " game=" << fin.game
+                              << " sdk=" << fin.sdk
+                              << " calls=" << fin.calls
+                              << "  (table-dispatched only -- a zero count means"
+                                 " never DISPATCHED, not never executed)"
+                              << std::endl;
                 } });
         }
     }
@@ -2968,6 +3337,10 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
+
+    // Backstop only: the sampler normally reports itself on its own timer, since
+    // launch_recomp.ps1's auto-stop can Kill() before this point is reached.
+    ps2x_host_sampler_stop();
 
     RecompDbg::Shutdown();
     UnloadTexture(frameTex);

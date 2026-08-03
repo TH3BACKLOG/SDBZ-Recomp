@@ -10,11 +10,10 @@ constexpr uint32_t IOP_SID_LOTR_SOUND = 0x00012345u;
 constexpr uint32_t IOP_SID_LIBSD = 0x80000701u;
 constexpr uint32_t IOP_SID_FATAL_FRAME_SDRDRV = 0x19740512u;
 
-// MCSERV.IRX real memory-card RPC service, registered by its start() thread
-// (sub_298) via sceSifRegisterRpc(sid=0x80000080, handler=sub_33C). Backs
-// sceMc* client calls (GetDir/Open/Close/Read/Write/GetInfo/etc.) routed
-// through sceSifCallRpc rather than the direct syscall-style stubs.
-constexpr uint32_t IOP_SID_MCSERV = 0x80000080u;
+// MCSERV.IRX real memory-card RPC service SID seen on SDBZ runtime logs.
+// Keep legacy SID as fallback for other module revisions.
+constexpr uint32_t IOP_SID_MCSERV = 0x80000400u;
+constexpr uint32_t IOP_SID_MCSERV_LEGACY = 0x80000080u;
 
 // cdvdman S-command RPC server. EE libcdvd routes sceCdReadDvdDualInfo (and other
 // S-commands) through this server; the result buffer's first word is the success flag.

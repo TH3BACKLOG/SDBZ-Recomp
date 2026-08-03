@@ -188,6 +188,9 @@ struct GSDebugSnapshot
     uint32_t transferY = 0;
     uint32_t transferTotalPixels = 0;
     uint32_t transferCopiedPixels = 0;
+    // Bytes of IMAGE payload declared by a GIFtag but not yet delivered; the
+    // following packets are raw pixel data rather than GIFtags (BUG-028).
+    uint64_t pendingImageBytes = 0;
     uint32_t lastDisplayBaseBytes = 0;
     GSFrameReg preferredDisplaySourceFrame{};
     uint32_t preferredDisplayDestFbp = 0;
@@ -391,6 +394,13 @@ private:
         uint32_t copied_pixels{ 0 };
     } m_transferState;
 
+    // Bytes of GIF IMAGE-mode payload still owed by an IMAGE GIFtag whose data
+    // did not fit in the packet that carried the tag. Large uploads are split
+    // across DMA transfers, so the tag routinely lands in one packet and its
+    // payload in the following ones; without this the payload was dropped and
+    // then re-parsed as GIFtags.
+    uint64_t m_pendingImageBytes = 0;
+
     static constexpr int kMaxVerts = 6;
     GSVertex m_vtxQueue[kMaxVerts];
     int m_vtxCount = 0;
@@ -450,6 +460,14 @@ private:
     std::atomic<uint64_t> m_statPrims{0};
     std::atomic<uint64_t> m_statImageBytes{0};
     std::atomic<uint32_t> m_statLastDrawFbp{0};
+
+    // Per-frame pixel aggregates reported by the [gs:frame] probe and reset on
+    // every report. These replace the old sampled [gs:pixels] probe.
+    std::atomic<uint64_t> m_statPixelsWritten{0};
+    std::atomic<uint64_t> m_statPixelsNonBlack{0};
+    std::atomic<uint64_t> m_statPixelsTextured{0};
+    std::atomic<uint32_t> m_statPixelMaxRgb{0};
+    std::atomic<uint32_t> m_statPrimMask{0};
 };
 
 inline u32 GS::ReadVram(u32 psm, u32 base, u32 bw, u32 x, u32 y) const

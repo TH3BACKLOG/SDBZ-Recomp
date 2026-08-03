@@ -49,8 +49,20 @@ void register_scheduler_stack_isolation_tests();
 void register_scheduler_override_isolation_tests();
 void register_scheduler_join_starvation_tests();
 
-int main()
+int main(int argc, char **argv)
 {
+    // Optional filters: ps2x_tests.exe [suite-substring] [test-substring]
+    // Both are case-insensitive substring matches. Needed because suites run in
+    // alphabetical order and one hanging test blocks every later suite.
+    const std::string suiteFilter = (argc > 1) ? argv[1] : std::string();
+    const std::string testFilter = (argc > 2) ? argv[2] : std::string();
+
+    if (!suiteFilter.empty() || !testFilter.empty())
+    {
+        std::cout << "[filter] suite~\"" << suiteFilter
+                  << "\" test~\"" << testFilter << "\"" << std::endl;
+    }
+
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
     register_code_generator_tests();
@@ -98,7 +110,7 @@ int main()
     register_scheduler_override_isolation_tests();
     register_scheduler_join_starvation_tests();
     register_ps2_observability_tests();
-    int res = MiniTest::Run();
+    int res = MiniTest::Run(suiteFilter, testFilter);
     std::cout.flush();
     std::cerr.flush();
     std::_Exit(res);

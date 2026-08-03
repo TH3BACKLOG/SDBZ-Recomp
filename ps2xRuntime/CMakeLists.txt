@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 8 CACHE STRING "Unity build batch size for ps2EntryRunner")
+set(PS2X_RUNNER_CL_JOBS 6 CACHE STRING "cl.exe /MP worker count for ps2EntryRunner")
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 option(PS2X_FIBER_PTHREAD "Build the pthread fiber backend on a non-Vita host (for TSan/ASan testing)" OFF)
 # PS2X_SANITIZE is declared and applied in the top-level CMakeLists.txt so the
@@ -504,6 +505,28 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
+# Optimizer bomb. sub_0022F200 is a single recompiled function of ~278,000 lines
+# (12.9 MB) -- roughly 350x its neighbours. MSVC /O2 goes superlinear on it: the
+# 2026-07-28 RelWithDebInfo build sat on unity_3681 (which contained it) for over
+# two hours at 100% of one core with no end in sight, while surrounding unity TUs
+# averaged ~7 s each. Keep it out of the unity batch and build it unoptimized so
+# it can never serialize the whole target again.
+set(PS2X_OPT_BOMB_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/sub_0022F200_0x22f200.cpp"
+)
+foreach(_bomb IN LISTS PS2X_OPT_BOMB_SOURCES)
+    if(EXISTS "${_bomb}")
+        set_source_files_properties("${_bomb}" PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION ON
+        )
+        if(MSVC)
+            set_source_files_properties("${_bomb}" PROPERTIES
+                COMPILE_OPTIONS "/Od;/Ob0"
+            )
+        endif()
+    endif()
+endforeach()
+
 if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
     target_compile_definitions(ps2EntryRunner PRIVATE
         PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}"
@@ -511,7 +534,12 @@ if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
 endif()
 
 if(MSVC)
-    target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # MSBuild's CL task hands every source of this target to ONE cl.exe in a single
+    # response file, so /m:N on msbuild buys nothing here -- it parallelizes across
+    # projects, and this is one project. Without /MP all 4520 unity TUs compile
+    # serially on a single core. Capped rather than bare /MP: cl peaked at 3.6 GB on
+    # the worst TU, and 12 logical procs x that would exhaust a 16 GB box.
+    target_compile_options(ps2EntryRunner PRIVATE /FS /MP${PS2X_RUNNER_CL_JOBS})
 endif()
 
 target_include_directories(ps2_runtime PUBLIC

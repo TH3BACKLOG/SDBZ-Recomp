@@ -28,6 +28,7 @@
 // -----------------------------------------------------------------------------
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -35,9 +36,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ps2_runtime.h"
@@ -55,6 +58,12 @@ extern bool ps2_iop_cdReadSectors(uint32_t lbn, uint32_t sectors,
 // real ISO9660 filename to the same pseudo-LBN readCdSectors uses.
 extern bool ps2_iop_cdSearchFile(const char *name, uint32_t *lbnOut,
                                  uint32_t *sizeOut);
+// EE-side SIF soft-register store, defined in Kernel/Stubs/SIF.cpp (the map it
+// writes lives in that TU's anonymous namespace, so it cannot be reached any
+// other way). Used by the sifcmd sceSifSendCmd import below to land an IOP-side
+// SIF_CMD_SET_SREG where the EE's sceSifGetSreg will read it. Same
+// extern-decl-no-header pattern as the two above.
+extern void ps2_iop_sifSetEeSreg(uint32_t reg, uint32_t value);
 
 namespace
 {
@@ -101,6 +110,17 @@ namespace
     // so the full init import sequence is visible without the repeat-call flood.
     std::unordered_map<uint32_t, uint32_t>       g_arkdImportCalls;
 
+    // ---- Unhandled-import census. Every import that falls off the end of the
+    // dispatch chain returns $v0 = 0. For a boolean-success IOP API that reads
+    // as "call failed", and the module's idiom is `while (!x) x = api(...);` --
+    // so one unlisted ordinal is an infinite spin that burns the whole budget
+    // and looks exactly like "the handler never returned". That is precisely
+    // what sifcmd fid=12 did to the state-11 audio call. Silent is the bug:
+    // record every distinct (lib, fid) that defaults, announce the first hit,
+    // and dump the census whenever a service run fails to reach its halt.
+    struct ArkdUnhandled { uint32_t count; uint32_t firstPc; uint32_t firstRa; };
+    std::map<std::pair<std::string, uint16_t>, ArkdUnhandled> g_arkdUnhandled;
+
     // ---- S2.2a-follow / S2.2b: HLE bookkeeping for the _start + server-thread
     // runs. The module's _start creates a few server threads then returns; the
     // RPC registration (sceSifRegisterRpc) happens INSIDE those thread bodies,
@@ -136,6 +156,40 @@ namespace
     uint8_t *g_arkdIopRam = nullptr;
     // EE RDRAM host base, cached at load for the SIF-DMA (IOP->EE) import thunk.
     uint8_t *g_arkdEeRam = nullptr;
+
+    // ---- S2.2e: the sub_6920 thread trio (the state-11 completion path) ----
+    // The module's own init (+0x30) calls sub_6920 before InitLoadBuffers. The
+    // loader never did, so the three threads it creates were never even recorded:
+    //   +0x62A4  job worker      -- WaitSema(dword_B338), then computes dword_B334
+    //                               into the 0x3xxxxxxx (ok) / 0x4xxxxxxx (error) band
+    //   +0x2C90  sreg publisher  -- sceSifSendCmd(SET_SREG, 12, dword_B334) per pass
+    //   +0x2FC4  pad reporter    -- not ticked
+    // All three are `while(1)` bodies, so they are ticked with a bound rather than
+    // run once like the RPC server threads.
+    constexpr uint32_t kArkdInitThreadsOff = 0x6920u;
+    constexpr uint32_t kArkdJobWorkerOff   = 0x62A4u;
+    constexpr uint32_t kArkdSregPubOff     = 0x2C90u;
+
+    // Set only while one of those ticks is the active inline run, so the WaitSema
+    // (+0xAEDC) and yield (+0xAE90) thunks can end that run without changing how
+    // they behave for the _start / server-thread / load-worker runs.
+    bool     g_arkdJobTickActive = false;
+    bool     g_arkdPubTickActive = false;
+    uint32_t g_arkdPubPasses     = 0u;
+
+    // EE address of libsifcmd's _sif_sreg[] array. Game-specific (SDBZ: 0x561880,
+    // installed by the guest's own sceSifInitCmd at EE 0x177B00, which stores it
+    // at cmd_data+0x1C). This is the SAME env var the EE-side SET_SREG path in
+    // Kernel/Syscalls/RPC.cpp reads, so both halves agree on where the array is.
+    // 0/unset = disabled.
+    uint32_t arkdEeSregBase()
+    {
+        static const uint32_t base = []() -> uint32_t {
+            const char *s = std::getenv("PS2_SIF_EE_SREG_BASE");
+            return (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 0u;
+        }();
+        return base;
+    }
 
     // Copy a NUL-terminated IOP string into a host buffer, bounded by both the
     // destination size and the end of IOP RAM. Used by the sysclib string thunks
@@ -513,6 +567,7 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
         constexpr uint32_t kHaltPc = 0x0FFFFFF0u; // sentinel return address
         g_arkdAllocCursor = kIopAllocBase;        // fresh allocator per run
         g_arkdImportCalls.clear();
+        g_arkdUnhandled.clear();
         g_arkdThreads.clear();
         g_arkdServices.clear();
         g_arkdNextTid  = 0x10;
@@ -541,8 +596,29 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             // Per-stub capped logging: show the first few hits of each distinct
             // import so the whole init sequence is captured without flooding once
             // a stub is hit in a loop.
+            // Env-overridable cap + one-shot saturation disclosure. A silent cap
+            // makes "this import stopped being called" and "I stopped logging it"
+            // identical in the log -- see PS2X_ARKD_CALL_MAX / PS2X_ARKD_RUN_MAX.
+            static const uint32_t kImportMax = []() -> uint32_t {
+                if (const char *e = std::getenv("PS2X_IOP_IMPORT_MAX"))
+                    return static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+                return 6u;
+            }();
             const uint32_t seen = g_arkdImportCalls[pc]++;
-            if (seen < 6u)
+            if (seen == kImportMax)
+            {
+                static bool s_told = false;
+                if (!s_told)
+                {
+                    s_told = true;
+                    std::fprintf(stderr,
+                        "[cap] tag=iop:import saturated at %u per stub (first at %s"
+                        " fid=%u @0x%06x) -- per-stub absence past this point is NOT"
+                        " evidence. Raise with PS2X_IOP_IMPORT_MAX.\n",
+                        kImportMax, lib.c_str(), fid, pc);
+                }
+            }
+            if (seen < kImportMax)
             {
                 std::fprintf(stderr,
                     "[iop:import] %-8s fid=%-3u @0x%06x a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x\n",
@@ -561,6 +637,19 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             // inline worker run by halting; every other wait "acquires" (returns 0).
             if (off == 0xAEDCu)
             {
+                // S2.2e job-worker tick (+0x62A4): it re-blocks on dword_B338 at
+                // the top of every pass. End the inline run once a pass has moved
+                // dword_B334 out of the 0x1xxxxxxx busy band -- the direct
+                // analogue of the load-worker idle rule just below. If the pass
+                // leaves it busy we fall through and the run ends on budget, which
+                // shows up as halted=0 in the [ARKD:jobtick] line.
+                if (g_arkdJobTickActive &&
+                    a0 == cpu.busRead32(g_arkdLoadBase + 0xB338u) &&
+                    (cpu.busRead32(g_arkdLoadBase + 0xB334u) & 0xF0000000u) != 0x10000000u)
+                {
+                    cpu.setPC(kIopHaltPc);
+                    return true;
+                }
                 if (a0 == g_arkdWorkerSema &&
                     cpu.busRead32(g_arkdLoadBase + 0xB310u) == 0u)
                 {
@@ -585,6 +674,17 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                 }
                 cpu.setGpr(2, 0);
                 cpu.setPC(ra);
+                return true;
+            }
+
+            // S2.2e yield/delay stub (+0xAE90), called at the top of the sreg
+            // publisher's loop. During the publisher tick, end the run after one
+            // full pass -- a pass publishes sregs 12/14/15 and then loops back to
+            // here. Falls through untouched on the first visit and for every other
+            // caller of +0xAE90 (it is shared with +0x2FC4 and two others).
+            if (off == 0xAE90u && g_arkdPubTickActive && ++g_arkdPubPasses > 1u)
+            {
+                cpu.setPC(kIopHaltPc);
                 return true;
             }
 
@@ -645,7 +745,48 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                     std::fprintf(stderr,
                         "[ARKD:cdread] lbn=%u sectors=%u iopDest=0x%06x -> %s\n",
                         lbn, sectors, iopDest, ok ? "ok" : "FAIL");
+                // The first-8 detail cap above hides how far streaming actually
+                // gets: a saturated count reads identically whether the driver
+                // stopped after the TOC or streamed the whole archive. Keep a
+                // running total so the log always answers "did asset streaming
+                // continue?" without unbounded spam.
+                {
+                    static std::atomic<uint64_t> s_reads{0u};
+                    static std::atomic<uint64_t> s_sectors{0u};
+                    static std::atomic<uint64_t> s_fails{0u};
+                    const uint64_t n = s_reads.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    s_sectors.fetch_add(sectors, std::memory_order_relaxed);
+                    if (!ok)
+                        s_fails.fetch_add(1u, std::memory_order_relaxed);
+                    if ((n & (n - 1u)) == 0u) // powers of two: dense early, sparse later
+                        std::fprintf(stderr,
+                            "[ARKD:cdread-total] reads=%llu sectors=%llu bytes=%llu fails=%llu lastLbn=%u\n",
+                            (unsigned long long)n,
+                            (unsigned long long)s_sectors.load(std::memory_order_relaxed),
+                            (unsigned long long)(s_sectors.load(std::memory_order_relaxed) * 2048ull),
+                            (unsigned long long)s_fails.load(std::memory_order_relaxed),
+                            lbn);
+                }
                 cpu.setGpr(2, ok ? 1u : 0u); // 1 = read complete (breaks caller poll)
+                cpu.setPC(ra);
+                return true;
+            }
+
+            // cdvdman fid 5 thunk (sub_AC90): a cdvd settle/completion poll.
+            // Every ARKD call site is `do r = sub_AC90(); while (!r);` (sub_8B8,
+            // ra=0x8F0) run after read/retry ops and alongside the sub_91C
+            // DiskReady gate (RpcReplyRetryLoop +0x2AA8, CdReadRetryLoop retry
+            // paths). The unhandled default of $v0 = 0 reads as "still busy" and
+            // spun 444,438 times inside the sid=0x500 fno=0x1 service handler,
+            // so the service never halted and its reply was never delivered.
+            // Our cdread HLE is synchronous -- the operation is always complete
+            // by the time the driver polls -- so nonzero ("settled") is correct.
+            if (off == 0xAC90u)
+            {
+                static uint32_t settleSeen = 0;
+                if (settleSeen < 4 && ++settleSeen)
+                    std::fprintf(stderr, "[ARKD:cdsettle] fid=5 poll ra=0x%08x -> 1\n", ra);
+                cpu.setGpr(2, 1u);
                 cpu.setPC(ra);
                 return true;
             }
@@ -699,7 +840,7 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                 const long v = std::strtol(buf, &end, int(a2));
                 if (a1)
                     cpu.busWrite32(a1, a0 + uint32_t(end - buf)); // endptr, in IOP space
-                if (seen < 6u)
+                if (seen < kImportMax)
                     std::fprintf(stderr,
                         "[ARKD:strtol] \"%s\" base=%u -> %ld\n", buf, a2, v);
                 cpu.setGpr(2, uint32_t(int32_t(v)));
@@ -766,11 +907,30 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                         cpu.busRead32(g_arkdLoadBase + 0xB310u),
                         cpu.busRead32(g_arkdLoadBase + 0xB49Cu));
                 }
+                // Same rationale as [ARKD:cdread-total]: the first-8 detail cap
+                // makes "streaming stopped after the TOC" and "streaming ran the
+                // whole archive" produce identical logs. Track the real totals.
+                {
+                    static std::atomic<uint64_t> s_dmas{0u};
+                    static std::atomic<uint64_t> s_bytes{0u};
+                    static std::atomic<uint64_t> s_skips{0u};
+                    const uint64_t n = s_dmas.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (ok)
+                        s_bytes.fetch_add(size, std::memory_order_relaxed);
+                    else
+                        s_skips.fetch_add(1u, std::memory_order_relaxed);
+                    if ((n & (n - 1u)) == 0u) // powers of two: dense early, sparse later
+                        std::fprintf(stderr,
+                            "[ARKD:sifdma-total] dmas=%llu bytes=%llu skipped=%llu lastEeDest=0x%08x\n",
+                            (unsigned long long)n,
+                            (unsigned long long)s_bytes.load(std::memory_order_relaxed),
+                            (unsigned long long)s_skips.load(std::memory_order_relaxed),
+                            dest);
+                }
                 cpu.setGpr(2, 1u); // non-zero queue id -> breaks the submit poll
                 cpu.setPC(ra);
                 return true;
             }
-
             // sceSifDmaStat(id) (sub_ADDC): the worker polls this in a
             // `do { stat = sceSifDmaStat(id); DelayThread(); } while (stat >= 0)`
             // loop after submitting via 0xADD4. IOP convention is 0 = still
@@ -804,7 +964,7 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                                  size, g_arkdAllocCursor);
                     rv = 0;
                 }
-                if (seen < 6u)
+                if (seen < kImportMax)
                     std::fprintf(stderr, "[iop:import]   -> alloc 0x%06x (size 0x%x)\n", rv, size);
             }
             // thsemap CreateSema (ordinal 4) -> non-zero sema id (0 reads as fail).
@@ -820,7 +980,7 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                 const uint32_t entry = cpu.busRead32(a0 + 8u);
                 g_arkdThreads.push_back(ArkdThread{entry, 0u});
                 rv = g_arkdNextTid++;
-                if (seen < 6u)
+                if (seen < kImportMax)
                     std::fprintf(stderr, "[iop:import]   -> CreateThread entry=0x%06x tid=0x%x\n",
                                  entry, rv);
             }
@@ -831,6 +991,109 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                 const uint32_t idx = a0 - 0x10u;
                 if (idx < g_arkdThreads.size()) g_arkdThreads[idx].arg = a1;
                 rv = 0;
+            }
+            // sifcmd sceSifSendCmd (ordinal 12):
+            //   (cmd, packet, psize, srcExtra, destExtra, sizeExtra)
+            // Args 5/6 are on the IOP stack at $sp+0x10 / +0x14 (o32).
+            //
+            // Identified from the CALL SITE, not an ordinal table -- the func-map
+            // name trap has cost this project four sessions already. Decompile
+            // irx_arkddvd_sub_A3C0 (module offset 0xA3C0) reads verbatim:
+            //     while ( !dword_B4C4 )
+            //         dword_B4C4 = sub_AD90(-2147483647, &unk_13A30, 24, 0, 0, 0);
+            // and the logged args match exactly (a0=0x80000001, a1=0x53a30 =
+            // base+0x13A30, a2=0x18). Falling through to the rv=0 default meant
+            // "not queued" forever: that spin is what burned the whole 4M
+            // instruction budget on the sid=0x501 fno=0x101 service (the state-11
+            // audio call), so its reply was never produced. Exactly the same class
+            // as the sceSifDmaStat/0xADDC case above.
+            else if (lib == "sifcmd" && fid == 12u)
+            {
+                const uint32_t sp        = cpu.gpr(29);
+                const uint32_t destExtra = cpu.busRead32(sp + 0x10u);
+                const uint32_t sizeExtra = cpu.busRead32(sp + 0x14u);
+
+                // Optional trailing payload: a real IOP->EE copy, identical in
+                // shape to the 0xADD4 SIF-DMA path. Zero for this call site.
+                if (sizeExtra && a3 && destExtra && g_arkdIopRam && g_arkdEeRam)
+                {
+                    const uint32_t s = a3 & kIopRamMask;
+                    const uint32_t d = destExtra & PS2_RAM_MASK;
+                    if (size_t(s) + sizeExtra <= PS2Memory::IOP_RAM_SIZE &&
+                        size_t(d) + sizeExtra <= PS2_RAM_SIZE)
+                    {
+                        std::memcpy(g_arkdEeRam + d, g_arkdIopRam + s, sizeExtra);
+                    }
+                }
+
+                // SIF_CMD_SET_SREG (0x80000001): the 24-byte packet is a 16-byte
+                // SifCmdHeader followed by {index, value} at +0x10 / +0x14 -- the
+                // same layout the EE-side decoder in RPC.cpp already assumes. On
+                // real hardware the EE's libsifcmd system-command handler stores
+                // it into _sif_sreg[index]; mirror it into the EE sreg map that
+                // sceSifGetSreg reads. The values are the module's own, read out
+                // of IOP RAM -- nothing is invented (feedback_no_iop_faking).
+                if (a0 == 0x80000001u && a1)
+                {
+                    const uint32_t idx = cpu.busRead32(a1 + 0x10u);
+                    const uint32_t val = cpu.busRead32(a1 + 0x14u);
+                    if (idx < 0x40u)
+                    {
+                        ps2_iop_sifSetEeSreg(idx, val);
+
+                        // ...and into EE RAM. The game never calls sceSifGetSreg:
+                        // its libsifcmd SET_SREG handler (EE 0x177A88) stores
+                        // straight into _sif_sreg[] and the state-11 poll reads
+                        // that array directly (EE 0x177AB8 -> dword_561880[i]).
+                        // Without this the host-side map above is written and
+                        // never read by anything.
+                        uint32_t eeSlot = 0u;
+                        const uint32_t sregBase = arkdEeSregBase();
+                        if (sregBase && g_arkdEeRam)
+                        {
+                            const uint32_t d = (sregBase + idx * 4u) & PS2_RAM_MASK;
+                            if (size_t(d) + 4u <= PS2_RAM_SIZE)
+                            {
+                                std::memcpy(g_arkdEeRam + d, &val, 4u);
+                                eeSlot = d;
+                            }
+                        }
+                        // The publisher tick re-sends sregs 12/14/15 on every
+                        // service call, so a flat `seen < N` cap would go silent
+                        // almost immediately and make later CHANGES invisible --
+                        // exactly the saturated-probe false negative this project
+                        // keeps re-learning. Log every value change per index
+                        // instead; the interesting event is 0x1xxxxxxx ->
+                        // 0x3xxxxxxx, not the repeat traffic.
+                        static std::unordered_map<uint32_t, uint32_t> s_lastSreg;
+                        auto  itLast  = s_lastSreg.find(idx);
+                        const bool isNew = (itLast == s_lastSreg.end());
+                        if (isNew || itLast->second != val)
+                        {
+                            s_lastSreg[idx] = val;
+                            std::fprintf(stderr,
+                                "[ARKD:sendcmd] SET_SREG index=0x%x value=0x%08x"
+                                " -> EE[0x%06x] (%s)%s\n",
+                                idx, val, eeSlot, isNew ? "first" : "CHANGED",
+                                eeSlot ? "" : "  <-- NOT MIRRORED"
+                                              " (set PS2_SIF_EE_SREG_BASE)");
+                        }
+                    }
+                    else if (seen < kImportMax)
+                    {
+                        std::fprintf(stderr,
+                            "[ARKD:sendcmd] SET_SREG index=0x%x OUT OF RANGE"
+                            " (packet=0x%06x) -- not stored\n", idx, a1);
+                    }
+                }
+                else if (seen < kImportMax)
+                {
+                    std::fprintf(stderr,
+                        "[ARKD:sendcmd] cmd=0x%08x packet=0x%06x psize=0x%x"
+                        " -> acked, no EE-side handler\n", a0, a1, a2);
+                }
+
+                rv = 1; // non-zero == queued. 0 spins the caller forever.
             }
             // sifcmd sceSifRegisterRpc (ordinal 17):
             //   (srv, sid, func, buff, cfunc, cbuff, qd) -> a1=sid, a2=func, a3=buff
@@ -845,7 +1108,7 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             // stdio printf (ordinal 4): a0 = IOP format-string pointer. Log it.
             else if (lib == "stdio" && fid == 4u)
             {
-                if (seen < 6u)
+                if (seen < kImportMax)
                 {
                     char buf[80]; int n = 0;
                     for (; n < 79; ++n)
@@ -861,6 +1124,21 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             }
             // Everything else (InitRpc, SetRpcQueue, RpcLoop, DelayThread,
             // RegisterLibraryEntries, CpuEnable/DisableIntr, ...) -> return 0.
+            // Correct for void/init calls, FATAL for any boolean-success API
+            // the module retries on -- so census it instead of failing silently.
+            else
+            {
+                auto &u = g_arkdUnhandled[{lib, fid}];
+                if (u.count++ == 0u)
+                {
+                    u.firstPc = pc;
+                    u.firstRa = ra;
+                    std::fprintf(stderr,
+                        "[iop:unhandled] %-8s fid=%-3u @0x%06x ra=0x%06x -> $v0=0 "
+                        "(default). If the caller retries on 0, this spins.\n",
+                        lib.c_str(), fid, pc, ra);
+                }
+            }
 
             cpu.setGpr(2, rv);        // $v0
             cpu.setPC(ra);            // return to caller ($ra)
@@ -942,6 +1220,32 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                 dumpIopTrace("thread did not reach halt sentinel", g_arkdCpu->pc());
         }
         if (arkdStateEnabled()) dumpArkdState("after threads");
+
+        // ---- S2.2e: run sub_6920 (+0x6920) once, mirroring the module's own init
+        // order in +0x30 (RpcReplyRetryLoop -> sub_6920 -> sub_9EAC ->
+        // InitLoadBuffers). It memsets the pad tables, creates the job worker /
+        // sreg publisher / pad reporter threads, creates the job semaphore
+        // (dword_B338) and seeds dword_B334 with 0x30000000 (ready). Deliberately
+        // AFTER the generic thread pass above: all three bodies it creates are
+        // `while(1)` loops, so they get bounded ticks per service call instead.
+        {
+            const size_t before = g_arkdThreads.size();
+            g_arkdCpu->setGpr(29, kIopStackTop - 0x9000u);
+            g_arkdCpu->setGpr(31, kHaltPc);
+            g_arkdCpu->setHaltPc(kHaltPc);
+            g_arkdCpu->setPC(g_arkdLoadBase + kArkdInitThreadsOff);
+            if (g_iopTraceOn) iopTraceReset();
+            const uint32_t iret = g_arkdCpu->run(2u * 1000u * 1000u);
+            std::fprintf(stderr,
+                         "[iop:irx] initThreads run: retired=%u finalPC=0x%08x halted=%d "
+                         "created=%zu B334=%08x B338=0x%x\n",
+                         iret, g_arkdCpu->pc(), g_arkdCpu->halted() ? 1 : 0,
+                         g_arkdThreads.size() - before,
+                         g_arkdCpu->busRead32(g_arkdLoadBase + 0xB334u),
+                         g_arkdCpu->busRead32(g_arkdLoadBase + 0xB338u));
+            if (g_iopTraceOn && (!g_arkdCpu->halted() || g_arkdCpu->pc() != kHaltPc))
+                dumpIopTrace("initThreads did not reach halt sentinel", g_arkdCpu->pc());
+        }
 
         // ---- S2.2c: run InitLoadBuffers (sub_28AC @ +0x28AC) once so the module
         // creates its worker wait-sema (dword_B318), allocates its load buffers,
@@ -1128,6 +1432,56 @@ bool ps2_iop_runArkdService(PS2Runtime *runtime,
         if (arkdStateEnabled()) dumpArkdState("after worker");
     }
 
+    // ---- S2.2e: tick the job worker (+0x62A4) and the sreg publisher (+0x2C90).
+    // The state-11 dispatchers (+0x6528 / +0x65C8 / +0x6668) set dword_B334 to
+    // 0x10000000 (busy) and SignalSema(dword_B338). On real HW that wakes the job
+    // worker, which computes the completion status into dword_B334, and the
+    // publisher then pushes it to EE sreg 12 -- which is exactly the word the EE's
+    // state-11 poll reads. With no scheduler both threads were inert, which is why
+    // sreg 12 never left the busy band. Nothing is invented here: both bodies are
+    // the module's own code, ticked instead of scheduled.
+    if (g_arkdCpu->busRead32(g_arkdLoadBase + 0xB338u) != 0u)
+    {
+        static uint32_t s_tickLogs = 0u;
+        const bool logThis = (s_tickLogs < 16u);
+
+        uint32_t jret = 0u, jhalt = 2u; // jhalt==2 => job tick skipped (not busy)
+        if ((g_arkdCpu->busRead32(g_arkdLoadBase + 0xB334u) & 0xF0000000u) == 0x10000000u)
+        {
+            g_arkdJobTickActive = true;
+            g_arkdCpu->setGpr(29, kIopStackTop - 0x9000u);
+            g_arkdCpu->setGpr(31, kHaltPc);
+            g_arkdCpu->setHaltPc(kHaltPc);
+            g_arkdCpu->setPC(g_arkdLoadBase + kArkdJobWorkerOff);
+            jret  = g_arkdCpu->run(4u * 1000u * 1000u);
+            jhalt = g_arkdCpu->halted() ? 1u : 0u;
+            g_arkdJobTickActive = false;
+        }
+
+        // Publish whatever dword_B334 now holds -- 0x30000000 (ready) after init,
+        // or the status the job pass above just computed.
+        g_arkdPubTickActive = true;
+        g_arkdPubPasses     = 0u;
+        g_arkdCpu->setGpr(29, kIopStackTop - 0x9000u);
+        g_arkdCpu->setGpr(31, kHaltPc);
+        g_arkdCpu->setHaltPc(kHaltPc);
+        g_arkdCpu->setPC(g_arkdLoadBase + kArkdSregPubOff);
+        const uint32_t pret  = g_arkdCpu->run(4u * 1000u * 1000u);
+        const uint32_t phalt = g_arkdCpu->halted() ? 1u : 0u;
+        g_arkdPubTickActive = false;
+
+        if (logThis)
+        {
+            ++s_tickLogs;
+            std::fprintf(stderr,
+                "[ARKD:tick] job: retired=%u halted=%u  pub: retired=%u halted=%u"
+                "  B334=%08x B374=%u\n",
+                jret, jhalt, pret, phalt,
+                g_arkdCpu->busRead32(g_arkdLoadBase + 0xB334u),
+                g_arkdCpu->busRead32(g_arkdLoadBase + 0xB374u));
+        }
+    }
+
     // Copy the func's reply into the guest recv buffer. Only on a clean halt with
     // a non-null reply pointer -- otherwise leave recvOut untouched and the
     // caller keeps its observe-only behavior (no faked data).
@@ -1138,8 +1492,48 @@ bool ps2_iop_runArkdService(PS2Runtime *runtime,
         delivered = true;
     }
 
+    // Env-overridable cap + saturation disclosure -- see the matching note at
+    // the [ARKD:CALL] site in Kernel/Stubs/SIF.cpp. The old fixed 32 saturated
+    // during boot, so every service run in the live window was unlogged.
+    static const uint32_t kRunMax = []() -> uint32_t {
+        if (const char *e = std::getenv("PS2X_ARKD_RUN_MAX"))
+            return static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+        return 32u;
+    }();
     static uint32_t s_logs = 0u;
-    if (s_logs < 32u)
+    if (s_logs == kRunMax)
+    {
+        ++s_logs;
+        std::fprintf(stderr,
+            "[cap] tag=ARKD:run saturated at %u -- ALL LATER RUNS ARE INVISIBLE."
+            " Absence of a record past this point is NOT evidence. Raise with"
+            " PS2X_ARKD_RUN_MAX.\n", kRunMax);
+    }
+    // A run that did not halt exhausted its budget -- it is spinning. The most
+    // likely reason is an import returning 0 to a caller that retries on 0, so
+    // name every candidate here rather than leaving the next session to find it
+    // by disassembly (this cost Phase 3b-4 an entire session for sifcmd fid=12).
+    if (!halted && !g_arkdUnhandled.empty())
+    {
+        static uint32_t s_censusDumps = 0u;
+        if (s_censusDumps < 4u)
+        {
+            ++s_censusDumps;
+            std::fprintf(stderr,
+                "[iop:unhandled] census after non-halting sid=0x%x fno=0x%x "
+                "(%zu distinct defaulted imports):\n", sid, rpcNum,
+                g_arkdUnhandled.size());
+            for (const auto &e : g_arkdUnhandled)
+            {
+                std::fprintf(stderr,
+                    "[iop:unhandled]   %-8s fid=%-3u calls=%-8u first@0x%06x ra=0x%06x\n",
+                    e.first.first.c_str(), e.first.second, e.second.count,
+                    e.second.firstPc, e.second.firstRa);
+            }
+        }
+    }
+
+    if (s_logs < kRunMax)
     {
         ++s_logs;
         std::fprintf(stderr,

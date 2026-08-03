@@ -1581,6 +1581,18 @@ namespace ps2_syscalls
         uint32_t rpcId = getRegU32(ctx, 5);
         uint32_t mode = getRegU32(ctx, 6);
 
+        // BUG-009 diagnostic: unconditional entry log, not gated behind the
+        // gameBindWaitSema>0 branch below, so we can tell whether SifBindRpc
+        // is reached at all for these clients (2026-07-30).
+        {
+            static std::atomic<uint32_t> s_bindEntryLogs{0u};
+            if (s_bindEntryLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            {
+                std::cerr << "[SifBindRpc:ENTRY] client=0x" << std::hex << clientPtr
+                          << " sid=0x" << rpcId << " mode=0x" << mode << std::dec << std::endl;
+            }
+        }
+
         t_SifRpcClientData *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
 
         if (!client)
@@ -1654,6 +1666,27 @@ namespace ps2_syscalls
             client->server = 0;
             client->buf = 0;
             client->cbuf = 0;
+        }
+
+        // BUG-009: rpc_handle_valid (0x178de8) polls client->hdr.pkt_addr and,
+        // once nonzero, dereferences it expecting a real SifRpcCallPkt with a
+        // matching rpc_id at +24 and a ready bit at +16 (layout confirmed in
+        // SIF.cpp against this game's DMA traffic: w[4]=ready, w[6]=rpc_id).
+        // The bind above clobbers pkt_addr to 0 and never sets it back, so the
+        // game's post-bind poll spins forever. Stamp a real bind-reply packet
+        // from the existing scratch pool before waking the game's wait sema.
+        {
+            uint32_t bindReplyPkt = rpcAllocPacketAddr(rdram);
+            if (bindReplyPkt)
+            {
+                if (uint32_t *pktWords = reinterpret_cast<uint32_t *>(getMemPtr(rdram, bindReplyPkt)))
+                {
+                    pktWords[4] = 1u;                 // ready bit (+0x10)
+                    pktWords[6] = client->hdr.rpc_id;  // rpc_id echo (+0x18)
+                    pktWords[7] = clientPtr;           // owning client (+0x1C)
+                }
+                client->hdr.pkt_addr = bindReplyPkt;
+            }
         }
 
         SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx);
@@ -2657,6 +2690,28 @@ namespace ps2_syscalls
                               << std::endl;
                     ++unresolvedEndFuncWarnCount;
                 }
+            }
+        }
+
+        // BUG-009: rpc_handle_valid (0x178de8) polls client->hdr.pkt_addr and,
+        // once nonzero, dereferences it expecting a real SifRpcCallPkt with a
+        // matching rpc_id at +24 and a ready bit at +16 (layout confirmed in
+        // SIF.cpp against this game's DMA traffic: w[4]=ready, w[6]=rpc_id).
+        // This HLE path completes the call synchronously but never wrote that
+        // packet back, so every poll saw pkt_addr==0 and failed instantly.
+        // Stamp a real completion packet from the existing scratch pool so the
+        // client header points at genuine data, not a fabricated result.
+        {
+            uint32_t completionPkt = rpcAllocPacketAddr(rdram);
+            if (completionPkt)
+            {
+                if (uint32_t *pktWords = reinterpret_cast<uint32_t *>(getMemPtr(rdram, completionPkt)))
+                {
+                    pktWords[4] = 1u;                        // ready bit (+0x10)
+                    pktWords[6] = client->hdr.rpc_id;         // rpc_id echo (+0x18)
+                    pktWords[7] = clientPtr;                  // owning client (+0x1C)
+                }
+                client->hdr.pkt_addr = completionPkt;
             }
         }
 

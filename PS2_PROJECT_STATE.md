@@ -1,5 +1,33 @@
 # PS2_PROJECT_STATE — SDBZ Recomp
 
+## 2026-08-02 Handoff Update
+- The live tree at `F:\SDBZ Recomp` is the authoritative runtime tree for all boot-blocker work. The worktree copy under `F:\SDBZ Recomp.worktrees\claude-memory-sdbz-recomp-plan` is historical and should not be used for runtime fixes.
+- The ARKD cdvdman fid=5 settle-poll hook is now present in the live tree at `ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp`. It returns `1` for the `sub_AC90` poll loop, which is the semantics implied by the call-site loop shape in the IRX decompile, and it emits the first four `[ARKD:cdsettle]` traces.
+- Last run evidence shows the earlier ARKD completion-path fix is working: `initThreads` created 3 workers, `SET_SREG` mirrored to the EE-side `0x5618B0` path, `mcserv Init` answered, and `gstate` reached `0,0,0,1`. The earlier memcard-check theory is no longer the lead.
+- Immediate next step: re-run the build and launch scripts with the watch set armed so we can confirm whether the fid=5 hook clears the `sid=0x500 fno=0x1` service halt and whether `CAppInit` advances beyond state 11.
+- Known follow-up bugs / leads:
+  - `0x5E5924` (`CAppInit` state) remains the primary boot-state probe. If it stalls at 11, inspect the audio-slot gate at `0x5D6B80` / `0x5D6BA4` next.
+  - The old `gstate` pointer watch is not a trustworthy stall signal by itself; use the actual state word and the audio-slot table instead.
+  - Keep `PS2X_HWWATCH` unset; it adds overhead and has not been needed for this blocker.
+- Handoff goal: verify whether the fid=5 hook ends the service spin cleanly; on success, pivot immediately to the next state-11/audio-gate diagnosis rather than revisiting the memcard path.
+
+## 2026-08-02 Update 2 — ★★★ CAppInit RETIRES (state 0x3e8), matches real hardware exactly. New lead: first-ever texture upload + TEXFLUSH observed.
+Pasted watch/GS log (partial — starts mid-run, ends on user-initiated window close, not a crash/hang).
+- **`appinit_state 0x5e5924` climbed the full remaining ladder and RETIRED:** `...0x8→0x9→0xa→0xb→0xc→0xd→0xe→0x3e8`. `0x3e8` (1000) is the exact terminal value measured on real PCSX2 hardware in 5.8 measurement #2 Finding 9. **State 11 is no longer a blocker — this sub-thread of 5.8 is CLOSED.**
+- **`req12 0x5618b0` changed `0x30000000 → 0x3000c270`** — the SET_SREG EE-mirror fix from measurement #4 is confirmed live (exit test from that section: MET).
+- **`snd00 0x5d6ba4` (slot-0 audio status) cycled `0x0→0x3→0x1`** — confirms Finding 11's audio-gate mechanism resolved; state 11's `str_queue_msg`/slot-wait passed for real.
+- The fid=5 cdvdman settle-poll hook (2026-08-02 note above) is implicated as part of what unblocked this, but this paste doesn't include the early-run `[ARKD:cdsettle]`/`sid=0x500` lines to confirm directly — re-check the full log, not just this excerpt.
+- **New, never-seen-before signal:** near the end of the run, `[gs:image] n=16 dbp=0x2a00 dpsm=0x13 dbw=4 trxreg=256x256 sizeBytes=59520 (DBP CHANGED)` — a real 256×256 texture upload to VRAM — followed immediately by `[gs:ad] n=6000 addr=0x3a data=...` (GS reg `0x3a` = TEXFLUSH, the standard "texture upload just completed, invalidate cache before drawing with it" idiom). This is the first texture transfer seen in the project's history. Every `[gs:frame-change]`/`[gs:frame]` line in this paste still shows `tme=0`/`textured=0`/`tex0.tbp=0x0`/`primmask=0x40` (SPRITE-only) — so no textured draw has landed yet, but the pipeline immediately upstream of one just fired for the first time.
+- Run ended via `[run] window close requested` (user closed it) at `wall=96.44s`, not a timeout/crash — so it's unknown whether a textured frame would have followed within seconds. `cpu=99.4%`, CPU-bound as expected (GS software raster, per the 07-29 co-piolet findings — not a new concern).
+- **Next action:** rerun and let it finish its own timeout (don't close the window early) to see whether `tme` ever flips to 1 / `tex0.tbp` goes non-zero after this TEXFLUSH — that is the literal 5.8 top-level exit test (line ~63 above). If it does, 5.8 closes and the project moves to whatever renders after that. If it doesn't, capture the full log (not just a tail paste) and check what gates the actual draw call using this new texture.
+
+## 2026-08-02 Update 3 — Periodic stall (progress frozen 3s, busy%=0/all-zero throughput) then small burst. Debugger bp_hit ruled out.
+- User reports intermittent "4-5 pixels flashing every once in a while" during long runs (4:30+). Watchdog paste showed `progress` frozen at exactly `21991` for 3 straight seconds (t=337-339) with `res/s=0 vbl/s=0 gif/s=0 dma/s=0 busy%=0`, then a burst at t=340 (`vbl/s=5 gif/s=1 dma/s=2 busy%=330`). This is a genuine stall (busy%=0 means the guest fiber truly isn't scheduled, not spin-polling) — matches the earlier `[cputime]` finding of a thread spending 43.63s/96s in `Wait/ExecutionDelay`.
+- **Ruled out: debugger breakpoint stall (`g_bp_hit`).** `main_gui.cpp` (where `g_bp_hit=true` gets set) compiles into `RecompDebugger.exe`, a separate executable from `ps2EntryRunner.exe` (confirmed in `ps2xRuntime/CMakeLists.txt`). The Active Runner Command uses `-NoDebugger`, which per `launch_recomp.ps1` skips launching `RecompDebugger.exe` entirely AND unsets `PS2X_DEBUGSHM`, so `recomp_debug_writer.cpp`'s `bp_hit=1` writes (gated on that env var) can't fire either. Not the cause.
+- **Ruled out: IRQ worker sleeps.** `Kernel/Syscalls/Interrupt.cpp:659-670` sleeps 250-500us per vblank tick, capped at 8 iterations under determinism — orders of magnitude too small to explain a 3s+ freeze.
+- **Still open:** the stall's `pc=ra=0x421f10` (self-loop), `lastCall=0x172998`. `recomp_function_table.txt` only has a raw address list, no symbol names — could not identify the function without Ghidra (no GhydraMCP tool available this session). Next step: user to paste the Ghidra disasm for `0x421f10` (and its caller at `0x172998`) so the wait condition it's polling can be identified directly, per the project's "user pastes disasm, don't search for it" convention.
+- Also still open from Update 2: whether `tme` ever flips to 1 / `tex0.tbp` goes non-zero (5.8 exit test) — need an uninterrupted run past the point where the `[gs:image]`/TEXFLUSH pair was seen.
+
 ## Game Info
 - **Title:** Super Dragon Ball Z (US NTSC)
 - **Disc ID:** SLUS_214.42
@@ -9,9 +37,13 @@
 - **Branch:** work/laptop-session-0519
 
 ## Active Runner Command
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
 ```
-& "F:\SDBZ Recomp\build\ps2xRuntime\Debug\ps2EntryRunner.exe" "F:\SDBZ Recomp\ELF\SLUS_214.42"
-```
+**Changed 2026-07-28 — use the RelWithDebInfo exe for everything now.** The A/B proved it does **109×** the guest work of the Debug build for the same CPU seconds (`progress` @ t=89: 12 101 → 1 320 490), so a Debug diagnostic run covers ~1 % of the guest execution for the same wall-clock cost. The Debug exe still exists and must not be deleted — it is the control arm — but there is no longer a reason to *run* it.
+
+Raw form, if the launcher is not wanted: `& "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe" "F:\SDBZ Recomp\ELF\SLUS_214.42"`
+
 (corrected 2026-07-13c — `PS2Recomp\out\build\...` no longer exists; build.ps1's real output tree is `F:\SDBZ Recomp\build\...`)
 
 ## Agent Runner Script
@@ -38,11 +70,204 @@ WIP checkpointed as commit `9957294f`. Checked all 7 new upstream commits vs HEA
 - **Opt-in ASan flag on the IOP interpreter** — considered as a debugging aid for the hand-written R3000 memory code (out-of-bounds/UAF). Only wire it if the cdRoot re-run still spins with no clear cause; make it a CMake flag, off by default.
 
 ## Current Phase
-**Phase 5 — Boot to and pass the memory card loading prompt (in progress, started 2026-05-27; goal changed 2026-07-07 — was "boot to title screen/main menu", now targets the memory card prompt; main menu deferred to a later phase)**
+**Phase 5 — in progress, started 2026-05-27.**
+**Memory-card-prompt goal ABANDONED/deprioritized (2026-08-02)** — repeated attempts across many sessions could not get the memcard prompt to populate no matter what was tried; continuing to target it stopped being productive. The active goal is now whatever the current sub-phase tracker below says (currently 5.8: reach a textured draw). Boot-to-title-screen/main-menu remains the longer-term Phase 5 target once 5.8 closes.
+
+**Provenance note (2026-08-02):** the 2026-08-02 Handoff/Update 2/Update 3 entries above were written from a GitHub Copilot ("fables") session, not a Claude session — flagged here in case terminology, address claims, or tone in those entries need reconciling with this project's conventions. User indicated these can be cleaned up if needed.
 
 ### Sub-phase tracker (established 2026-07-20g)
 
-**🔵 ACTIVE: 5.6.1** — render-path DMA-kick census (5.4.2 CLEARED, 5.5.1/5.5.2/5.5.3 padman chain drained and demoted as blocker candidates, both parked leads triaged and dismissed — all 2026-07-27)
+**✅ 5.6 CLOSED (2026-07-28)** — build-config A/B ran: RelWithDebInfo does **109×** the guest work for the same CPU (`progress` @ t=89: 12 101 → **1 320 490**; `gif/s` 3–5 → **47–49**, i.e. normal PS2 frame rates). Debug build was the entire performance story. **Throughput is no longer a variable — always measure on the RelWithDebInfo exe.**
+(5.6.1 render-path DMA-kick census and 5.6.2 watchdog `busy%`/`res/s`/`vbl/s` fields both shipped; 5.4.2 CLEARED, 5.5.1/5.5.2/5.5.3 padman chain drained and demoted as blocker candidates, both parked leads triaged and dismissed — all 2026-07-27)
+
+**🔵 ACTIVE: 5.8 (opened 2026-08-01)** — **the guest state machine never advances to a textured draw.** Replaces 5.7's framing, whose surviving lead (BUG-009) is now **CLOSED — benign**. Everything underneath works and is measured: frame loop healthy (~46–49 fps, `vbl/s`≈49, `dma/s`≈98), asset streaming proven end-to-end (1024 reads / 2.1 MB / **zero fails**), GS proven innocent (BUG-028 fixed + verified twice). Yet `primmask=0x40` (SPRITE only), `tme` **never** 1, `tex0.tbp` always 0, `nonblack=0` across ~24 M pixels/interval. **Exit test:** a single frame in which `tme=1` and `tex0.tbp != 0`. **Method (this is the change that matters):** stop reasoning from our own log in a vacuum — *difference against real PCSX2 + the real ISO*, which reaches the memory-card prompt in 7–8 s, using `mcp__pcsx2__*`. Six retractions in this file all came from inferring semantics instead of measuring them against ground truth. First steps: (1) arm `PS2_COVERAGE` — built, documented, and **not armed since 2026-07-29** (last run `cov=0/0`) — it answers "which game-band addresses does the EE actually dispatch" directly, instead of hand-reading 2800-line generated `switch` bodies; (2) watch `0x44D26C` (SRD test-and-set gate: `sub_12F1E8`/`sub_12F7E0` tick only if they win it, `sub_12EB28` can set it to 1 after a 1000-iteration spin — if it sticks at 1 all five SCMD wrappers silently stop being reached, with no log output), `0x463294` (libcdvd bind latch), `0x5AA7D0` (the CCD reply word `sub_1C0A30` actually branches on), `0x5e6b3c` (GameMode); (3) breakpoint `0x1C0A30` on PCSX2 and read `MEM[0x5AA7D0]` per hit — settles whether our `0x30000000` is the advancing answer or the keep-waiting one. **That single measurement may be the whole blocker.**
+
+> ⚠️ **The "First steps" above are HISTORICAL — they were carried out, and measurements #1–#4 below supersede them.** 5.8 has since narrowed all the way from "never advances to a textured draw" to one named gate: `CAppInit` parks at state 11 waiting on an ARKD completion that four separate breaks prevented from ever being published. **Read § 5.8 measurement #4 first; it holds the root cause, the fix (built, unrun), and the exact next command.**
+
+#### ★★ 5.8 measurement #1 (2026-08-01, two runs) — the blocker is localized to ONE variable: `CAppInit` state at `0x5E5924`
+
+Two 90 s runs with `PS2_COVERAGE=1`, the second with `PS2_COV_GAMELO=0x100000` (env-overridable at `ps2_runtime.cpp:2795`, **no rebuild**) to census the whole `0x10xxxx–0x1Cxxxx` band the default `kGameBandStart=0x200000` had been silently excluding.
+
+**Finding 1 — the executed set is CLOSED.** Reproduced independently in both runs:
+
+| run | `distinct` across 9 dumps | `calls` |
+|---|---|---|
+| A (band 0x200000) | 1374 → **1375, then frozen ×8** | 476,257 → 2,536,872 (5.3×) |
+| B (band 0x100000) | 1309 → **1313, then frozen ×8** | 473,282 → 2,503,343 (3.4×) |
+
+The EE enters **zero new functions** for ~80 s while call volume climbs 3–5×. This is *positive* proof that the guest state machine never advances — far stronger than the negative `tme=0` evidence, and it is now a reusable regression signal: **any real fix must make `distinct` climb.**
+
+**Finding 2 — libcdvd/CCD is boot-only and idle, not stuck.** Full-band census: `CD_Init` (`0x186EC8`) = 2, `_sceCd_scmd_prechk` (`0x186CC0`) = 3, `sub_1C0A30` (CCD state machine) = **2**. They ran at boot and were never re-entered. Meanwhile `sub_327810` = 3959, `0x421EA0` = 3959, `0x421F10` = 3959 (once per frame, every frame).
+
+**Finding 3 — the SRD disc-streaming subsystem never executes at all.** Region histogram: `0x12xxxx` = **1 address, 1 call**; `0x121000–0x135FFF` (84 KB, containing `sub_12EB28`/`sub_12F1E8`/`sub_12F7E0`) is entirely unentered. Consistent with `srd_gate 0x44D26C` showing **zero writes** all run — nobody ever *contends* the gate. **The 07-31 "stuck test-and-set gate" hypothesis is therefore dead:** the gate is untouched, not held.
+
+**Finding 4 — falsified my own candidate before acting on it.** `0x463294` showed one transition `0xFFFFFFFF -> 0x0` @ `pc=0x186dfc`; I read it as a stuck in-flight latch. The decompile (3 refs in 15.9 MB) shows `if (dword_463294 < 0)` is a **lazy bind-once guard** and `sub_186CC0` returns `result = 1` on *both* paths. One transition is correct, healthy behaviour. Condition 3 of the `sub_186CC0` bail list is now **tested and exonerated**.
+
+**Finding 5 — `ccd_reply` (`0x5AA7D0`) oscillates `0x0 ↔ 0x30000000` forever**, writer `pc=0x100160`, never `0x40000000`. But `sub_1C0A30` returns 1 for `0x30000000` **and** `0x40000000` — both branches pass, so this is not obviously a gate either. Probe **saturated at exactly its 16-record `should_log` cap**, so 16 oscillations and 16,000 are indistinguishable → fresh evidence for the cap-disclosure tooling item. `gamemode 0x5E6B3C`: zero transitions. `bind_ready 0x464DE4`: one, `0x0 -> 0x5`.
+
+**★ Finding 6 — the localization.** `sub_327810` is **`CAppInit::Update`**, a staged app-init state machine (`decompiles_SLUS_214_42.txt:428822`), ticked 3959× and never advancing. Its object is constructed in place by `wrap_obj_register_d_0` @ `0x4E5050`:
+
+```c
+dword_5E5920 = (int)dword_4F2FC0;   // vtable  -> object base = 0x5E5920
+dword_5E592C = 0;                   // object+12 = substate counter
+```
+
+so the state word `*(_WORD *)(a1 + 4)` that every `case` label increments is at a **fixed known address, `0x5E5924`** (`+6` = saved stat, `+8` = error code, `+12` = substate). State 1 has exactly one gate:
+
+```c
+case 1LL:
+  if ( !wrap_noop_wrapper_unk_z_z_196() )   // 0x1BFF40, a thunk
+    goto LABEL_63;                          // stay in state 1 forever
+  ++*(_WORD *)(v4 + 4);
+```
+
+The failure path is also self-announcing: state `9900` prints `"%s::Init() ERROR!! Stat=%d Code=%08X"`. **We never see that string**, so `CAppInit` is *waiting*, not erroring.
+
+⚠️ All six state-handler callees (`0x1BF340`, `0x1BFF40`, `0x3273D0`, `0x327550`, `0x327730`, `0x2FF4C0`) read `--NEVER dispatched--`, but they are thunks and **coverage counts table-dispatched calls only** (`ps2_runtime.cpp:404-408`) — a direct `fn_*` call bypasses `lookupFunction`. This is *not* proof they never ran, and must not be reported as such. Read `0x5E5924` directly instead.
+
+**Next:** watch `0x5E5924:2` + `0x5E592C:4` (zero rebuild) → which state, and does the substate counter move; then read `0x5E5924` on PCSX2 at the memory-card prompt for the first exact divergence-table row.
+
+#### ★★★ 5.8 measurement #2 (2026-08-01) — PCSX2 differential: **every nominated suspect MATCHES; the only divergence is `CAppInit` itself**
+
+First ground-truth differential in the project's history. PCSX2 `d75a0ad`, DebugServer 21512 + Pine 28011 both live, `SLUS-21442` UUID `de2df62d`, paused at EE `pc=0x175220`, GameMode already `0`.
+
+| Addr | What | **PCSX2** | **Ours** | Verdict |
+|---|---|---|---|---|
+| `0x5E5920` | `CAppInit` vtable | `0x004F2FC0` | (same by construction) | **MATCH** — confirms the `0x4E5050` object-layout derivation on real hardware |
+| **`0x5E5924`** | **`CAppInit` state** | **`1000` (0x03E8)** | **stuck; `Update` ticks 3959×/run** | **★ THE DIVERGENCE** |
+| `0x5E5926` | saved stat | `0` | TBD | — |
+| `0x5E592C` | substate | `0` | TBD | — |
+| `0x5E5944` | `CAppFinal` state | `0` | TBD | never entered on either side |
+| `0x5AA7D0` | CCD reply word | `0x30000000` | `0x30000000` | **MATCH — ARKD exonerated** |
+| `0x44D26C` | SRD test-and-set gate | `0` | `0` (never written) | **MATCH — lead dead both sides** |
+| `0x463294` | libcdvd bind latch | `0` | (exonerated by decompile) | **MATCH** |
+| `0x5E6B3C` | GameMode | `0` | `0` | MATCH — `0` is not yet a discriminator |
+
+**★ Finding 7 — `0x1BFF40` is NOT a "noop wrapper". It is a one-instruction tail-jump into `0x1C0A30`.** Native PCSX2 disasm: `0x001bff40: j ->$0x001C0A30` + `nop`. So the sole gate on `CAppInit` state 1 *is* the CCD boot state machine, and its gate in turn is the reply content at `0x5AA7D0`. **Second func-map name in two days that meant the opposite of what it said** (after `rpc_handle_valid` = `sceSifCheckStatRpc`). See the 2026-08-01 Learned Patterns entry.
+
+**★ Finding 8 — the whole gate chain evaluates TRUE for us.**
+`CAppInit::Update` state 1 → `0x1BFF40` → `0x1C0A30` → returns 1 iff `(MEM[0x5AA7D0] & 0xF0000000)` ∈ `{0x40000000, 0x30000000}`. We measured `0x30000000` on **both** machines, and `sub_1C0A30` returns 1 for either value. **So if we were in state 1, we would advance.** Therefore either (a) we are stuck in a *different* state, or (b) `sub_1C0A30` never reaches its final check in our build. Our coverage shows `sub_1C0A30` dispatched only **2×** against `CAppInit::Update`'s 3959 — which favours (a) — **but `0x1BFF40` is a thunk and coverage counts table-dispatched calls only, so that count cannot decide it.** Reading `0x5E5924` decides it. Do not guess.
+
+**★ Finding 9 — on real hardware `CAppInit::Update` is RETIRED.** Breakpoint at `0x327810`, resumed, ~1.34 × 10⁹ EE cycles (≈4.5 s) elapsed with **zero hits**. State `1000` is the terminal state: init completed and the object stopped being ticked entirely. Ours is ticked 3959× in 90 s and never leaves. This is the cleanest positive success signal the project has had — better than any of our negative ones.
+
+⚠️ **The plan anticipated this outcome and it is a result, not a dead end:** all four addresses nominated for the differential match real hardware. The blocker is not in any of them; `CAppInit`'s own state word is now the instrument.
+
+**Next:** the pending zero-rebuild run reads `0x5E5924`. Then the fix target is whichever state it names — and the reference answer (`1000`, retired) is now known, so 5.8 finally has a **positive** exit test: `0x5E5924` reaches `1000` and `sub_327810` stops being dispatched.
+
+#### ★★★ 5.8 measurement #3 (2026-08-01) — **the blocker is named: `CAppInit` state 11, waiting on the 16-slot audio table**
+
+The run above landed. `appinit_state` at `0x5E5924` produced **10 changes, well under the 16-print cap, so the sequence is complete and trustworthy**:
+
+`0 → 1 → 2 → 3 → 5 → 6 → 7 → 8 → 9 → 10 → 11`, then **stops at 11 (0xb)** for the rest of the 90 s.
+
+So Finding 8's hypothesis **(a) is correct** — we are stuck in a *different* state, not state 1. `sub_1C0A30`, the CCD gate, was passed long ago. **BUG-009's whole neighbourhood is now doubly dead.**
+
+`appinit_sub` (`0x5E592C`) produced **exactly 16** changes = saturated at `should_log(c,16,600)`. Interleaving both watches in log order shows every one of those 16 fell **inside state 8** (the `3↔4` oscillation at `pc=0x327640`/`0x327710` is `sub_327550`'s 31-entry sound-bank load loop), which then completed normally and let the state advance 8→9→10→11. **Substate values after state 8 are unknown — the probe went silent, it did not stop changing.** This is the third time a saturated bounded probe has had to be reasoned around; see the deferred cap-disclosure tooling item.
+
+**★ Finding 10 — `CAppInit::Update` case 11 is a wait-for-audio gate, and its func-map name is the FOURTH one to mean the opposite of what it says.**
+
+```c
+case 11LL:
+  if ( *(_DWORD *)(a1 + 12) == 1 ) {                       // substate 1
+    if ( input_device_get_button_map_clone_01(0x10u) ) {   // <-- NOT an input read
+      *(_DWORD *)(v4 + 12) = 0; v10 = 1; goto LABEL_52; }  // advance to state 12
+  } else {
+    if ( *(_DWORD *)(a1 + 12) ) { v10 = 0; goto LABEL_52; }  // substate >=2 => WEDGED FOREVER
+    str_queue_msg(0, (unsigned int)aSndStdeff);             // queue "snd/stdeff.ase"
+    ++*(_DWORD *)(v4 + 12);                                 // substate 0 -> 1
+  }
+  v10 = 0;
+```
+
+`input_device_get_button_map_clone_01` is `sub_2FCDF0 @ 0x2FCDF0`, and reading its body settles it — it touches no pad state at all:
+
+```c
+sub_2FCDF0(a1):
+  if (a1 != 16) return LOBYTE(dword_5D6BA4[10*a1]) < 2;    // one slot's status < 2
+  for (i = 0; i < 16; i++)                                  // a1 == 16 (0x10) => ALL slots
+    if (slot[i].byte36 != 1 && slot[i].byte36) return 0;    // any status >= 2 => not ready
+  return 1;
+```
+
+It is **"are all 16 audio slots idle?"**. It is byte-for-byte identical to `input_port_is_available @ 0x2FCE70`, which is plainly where the auto-labeller cloned the bogus "input_device / button_map" name from. The `0x10` argument is not a button mask, it is the **slot count**. Add to the Learned Patterns tally: `rpc_handle_valid`→`sceSifCheckStatRpc`, `wrap_noop_wrapper_unk_z_z_196`→tail-jump, and now `input_device_get_button_map_clone_01`→`all_sound_slots_idle`.
+
+**★ Finding 11 — the reference audio table, read live from PCSX2.** The array is at `0x5D6B80`, **40-byte stride**, filename at `+0`, **status byte at `+36`** (`dword_5D6BA4 == 0x5D6B80 + 0x24`). At the memory-card prompt:
+
+| slot | name | status |
+|---|---|---|
+| 0 | `snd/stdeff.ase` | **1** |
+| 2 | `snd/comeff.ase` | 0 |
+| 3 | `snd/comvoi.ase` | 0 |
+| 5 | `stg/s01/s01.ase` | 0 |
+| 7 | `snd/etceff.ase` | 0 |
+| 8 | `snd/etcvoi.ase` | 0 |
+| 10 | `ply/p04/p04.ase` | 0 |
+| 11 | `ply/p12/p12.ase` | 0 |
+| 1,4,6,9,12–15 | (empty) | 0 |
+
+All ∈ `{0,1}` → the gate returns 1 → state 11 passes on hardware. Slot 0 being `snd/stdeff.ase` at status 1 **independently confirms** the `str_queue_msg(0, aSndStdeff)` → slot-0 linkage.
+
+**Two candidate mechanisms, and the pending run distinguishes them without a rebuild:**
+- **(A)** substate reached 1, `str_queue_msg` queued `stdeff`, and some slot is parked at status ≥2 because our audio backend never completes the load. Signature: **slot watches show transitions**.
+- **(B)** substate was ≥2 on entry to state 11 (leftover from state 10's handler), which per the `else` branch above is an **unrecoverable wedge with no path back to 0**. Signature: **no slot watch ever fires**, because `str_queue_msg` is never reached.
+
+Watching all 16 status bytes decides it: `str_queue_msg` only runs at state 11 substate 0, so *any* slot-0 transition proves substate reached 1. `appinit_sub` was deliberately **not** re-armed — it spends all 16 prints inside state 8 and tells us nothing new.
+
+#### ★★★ 5.8 measurement #4 (2026-08-01) — **root cause found: the ARKD completion path was never built, and the sreg it publishes to is EE libsifcmd's own array**
+
+Answer to #3's A/B: **neither, as stated.** The chain broke further upstream than both candidates assumed.
+
+**Retraction first.** The intermediate framing "the sid `0x501` reply is empty" is **wrong and withdrawn**. The reply was never produced at all: the `fno=0x101` handler **never returned** (`retired=4000000` = full interpreter budget, `halted=0`), so `$v0`/`rsz`/`delivered` were zeros *by construction*, not by measurement. SIF transport is **exonerated** — do not go back to it.
+
+**★ Identity correction that made the fix findable.** `0x5618B0` has been described for several sessions as "entry 12 of an async status table at `0x561880`". It is **EE libsifcmd's `_sif_sreg[]` array** — 32 entries, installed by the game's own `sceSifInitCmd` at EE `0x177B00` (stored to `cmd_data+0x1C` = `0x5616F4`). `0x561880 + 4*12 == 0x5618B0`, so `SET_SREG index=0xc` and the `req12` watch are **the same word**. Readers: `0x177AB8` = `return dword_561880[a1]`; `0x177AD0` = `sceSifSetReg`; `0x177A88` = the SET_SREG system-command handler. Fifth entry in the misleading-name tally.
+
+**Four independent breaks, all measured, all on one path:**
+
+| # | Break | Evidence |
+|---|---|---|
+| 1 | `sub_6920` (+0x6920) never called — the loader ran only `InitLoadBuffers`, skipping the module's own init `+0x30` (`RpcReplyRetryLoop → sub_6920 → sub_9EAC → InitLoadBuffers`) | log `threads=4`, all four RPC servers (`0x4a4dc/0x4a554/0x4a5cc/0x4a644`); `0x042c90` absent from every `CreateThread` |
+| 2 | job worker `+0x62A4` never runs — state-11 dispatchers set `dword_B334=0x10000000` + `SignalSema(dword_B338)`, nothing consumes it | no IOP scheduler; `B334` never leaves the `0x1` band |
+| 3 | publisher `+0x2C90` never runs — it is the only caller of `sub_A3C0(12, dword_B334)` | `sendcmd=1` for the whole run |
+| 4 | the one SET_SREG we did emit landed nowhere — it wrote host-side `g_sifSregs`, but the game never calls `sceSifGetSreg`; it reads `dword_561880[i]` out of guest RAM | `set_sreg=0` |
+
+`sub_6920` also seeds `dword_B334 = 0x30000000` (ready) and creates the job semaphore. The single `SET_SREG value=0x10000000` seen in the 3c run was the **dispatcher's busy stamp**, correct for that instant, with nothing present to advance it.
+
+**Fix written (not yet built), all in `ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp`** — no headers, no `runner/`, no `fn_*`: run `+0x6920` at load after the generic thread pass; tick `+0x62A4` then `+0x2C90` per service call under bounded halt rules modelled on the existing `+0xAEDC` idle-worker rule; mirror SET_SREG into EE RAM. All three created bodies are `while(1)` loops, hence ticking rather than running once.
+
+**⚠️ The fix is INERT unless `PS2_SIF_EE_SREG_BASE=0x561880` is set** (the env var `RPC.cpp:134` already defines). The log self-discloses: `<-- NOT MIRRORED (set PS2_SIF_EE_SREG_BASE)`.
+
+**Exit test:** `[ARKD:sendcmd] index=0xc value=0x3xxxxxxx (CHANGED)`, `req12` leaves `0xF0000000`, `appinit_state` leaves `0xb`. **Two runs, per standing rule.**
+
+**Bundled in the same rebuild** — the generalization of this bug class, since an unhandled import silently returning `$v0=0` is what caused break 4 *and* the 3b-4 `sceSifSendCmd` spin:
+- `[iop:unhandled]` — every `(lib, fid)` that falls through to the default is censused; first hit announced; full census dumped whenever a service run fails to halt (i.e. exactly when something is spinning).
+- `[iop:import]` cap is now env-overridable (`PS2X_IOP_IMPORT_MAX`) and prints a `[cap]` saturation line, joining `PS2X_ARKD_CALL_MAX` / `PS2X_ARKD_RUN_MAX`.
+
+**Still open, explicitly unmeasured:** `thsemap fid=6/8` and `sifman fid=7/8` semantics (deliberately *not* guessed from an ordinal table — the new `[iop:unhandled]` census will name them if they matter); the `cdvdman fid=5` (`a0=6`) spin on `sid=0x500 fno=0x1`.
+
+**✅ BUILD SUCCEEDED 2026-08-01 (`ps2EntryRunner.exe`, RelWithDebInfo, +04:02).** All of the above — the Phase 3d fix and the bundled `[iop:unhandled]` census — is now **in the exe and completely unrun.** Nothing in this section has been validated against a run; everything is code-proven or decompile-proven only.
+
+**→ THE SINGLE NEXT ACTION IS THE RUN.** It must carry `PS2_SIF_EE_SREG_BASE=0x561880` or the fix does nothing:
+
+```powershell
+$env:PS2_IOP_TRACE  = "1"
+$env:PS2_ARKD_STATE = "1"
+$env:PS2_SIF_EE_SREG_BASE = "0x561880"
+$env:PS2X_ARKD_CALL_MAX = "100000"
+$env:PS2X_ARKD_RUN_MAX  = "100000"
+$env:PS2X_WATCH = "0x005A9380:4:pkt_snd,0x005A9358:4:pkt_ccd,0x005618B0:4:req12,0x005D6BA4:4:snd00,0x005E5924:2:appinit_state"
+
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger `
+    -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+Read, in this order — the first two are informative **whether or not the fix works**:
+1. `[iop:irx] initThreads run: … created=3 B334=30000000` → did break 1 actually close?
+2. `[iop:unhandled] …` first-hit lines, and any post-non-halt census → names the next spin, if there is one.
+3. `[ARKD:tick] job: … pub: … B334=…` → breaks 2 and 3.
+4. `[ARKD:sendcmd] SET_SREG index=0xc value=0x3xxxxxxx -> EE[0x5618b0] (CHANGED)` → break 4, and the exit test.
+5. Validity gate before reasoning from any absence: `[watch] armed 5` present **and** no `[cap]` line for the tag in question.
+
+**⚪ 5.7 (superseded 2026-08-01, folded into 5.8)** — **the `0x421f10` / `sceDmaSync` (`0x172998`) plateau is a correctness gate, not slowness.** At ~47 fps the guest still never leaves it in 90 s (≈2.7 h of Debug-equivalent work) while PCSX2 reaches the memory-card prompt in 7–8 s. `dma/s`=92–98 and `gif/s`=47–49 prove DMA *is* completing, so the guest is either polling a completion flag the runtime never sets or syncing a channel that is never serviced. **Exit test:** watchdog `pc` leaves `0x421f10` and `lastCall` leaves `0x172998` under its own power. First steps: (1) one `-RunSeconds 300` confirmation run, ~~(2) disassemble `0x421f10` — it is `pc` *and* `ra`, a tight self-loop, and has never been decoded despite being the plateau address for weeks~~ **(2) RETRACTED 2026-07-29 (co-piolet) — `0x421f10` is `jal sub_00199840`, call site 10 of a 14-`jal` fan-out inside the per-frame driver `sub_00421EA0` (real extent `0x421EA0–0x422168`, sole caller `sub_00422630` @ `0x422658`); it is not a loop and `pc==ra` there is a dispatch-boundary sampling artefact. This agrees with stage 5.5 below and supersedes the wording here. Replacement step (2): stop treating `pc` as the plateau signal and instead find why `gstate@0x50227c` never changes — the fan-out is running to completion every frame, so the stall is in what those subsystems read, not in reaching them.**, (3) walk the stable trace tail `0x174f20 -> 0x172e20 -> 0x172a90 -> 0x172998`, (4) A/B the same point against real PCSX2.
 
 | # | Stage | State | Exit test |
 |---|---|---|---|
@@ -81,6 +306,781 @@ Legend: 🔵 active · ⚪ not started · ✅ passed exit test · ⛔ blocked
 2. **Notify the user when a stage needs to extend.** If new information subdivides a stage, add decimal children (`5.1.1`, `5.1.2`) and break down further as needed. Do not silently widen a stage's scope.
 3. Update the State column and the `🔵 ACTIVE` marker as work moves.
 4. A stage is only ✅ when its exit test is verified against real build/run output — never on code-complete alone.
+
+## Session 2026-07-29 (co-piolet) — ⚠️ CORRECTION: `0x421ea0` is NOT a spin loop and is NOT 0xa4 bytes. Stale-worktree analysis retracted; 5.7's step (2) premise was wrong.
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** No build, no run, no code change — read-only address resolution against `F:\SDBZ Recomp\Logs\studio_callgraph.csv`.
+
+**What happened.** A watchdog paste (t=57–59s, `busy%=44–61`, `vbl/s=48–50`, `gif/s≈48`, `dma/s≈96`, `progress` +~12 000/s, `gstate@0x50227c` byte-identical for 22 s, `stuckSecs=20→22`, `pc=ra=0x421f10`, `cputime` 97.2 % of one core) was analysed in a **stale git worktree** (`F:\SDBZ Recomp.worktrees\watchdog-performance-analysis`, HEAD `c68adaf4` = 2026-05-27). That worktree's `CSV Map\map.csv` claims `fn_421EA0` spans `0x421EA0–0x421F44` (0xA4 bytes), which led to the conclusion "`0x421f10` is +0x70 into a 0xa4-byte function, `pc==ra` ⇒ tight self-contained loop, that is the CPU sink." **That conclusion is wrong and is retracted in full.**
+
+**Measured correction** (from `Logs\studio_callgraph.csv`, the reconstructed function map — authoritative, `caller,callee,address`):
+- `sub_00421EA0` has call sites out to **`0x0042213c`**; the next function is `sub_00422170`. Real extent ≈ **`0x421EA0–0x422168`**, ~0x2C8 bytes — **not** 0xA4. The worktree `map.csv` boundary is stale and must not be trusted for this address (or, by extension, anywhere in the 0x42xxxx region).
+- `0x421f10` is **`jal sub_00199840`** — one entry in a straight-line run of 14 consecutive `jal`s at `0x421ebc, ec4, ed0, edc, ee8, ef0, ef8, f00, f08, f10, f18, f20, f28, f30` (targets `0x199800, 0x1aedb0, 0x327f90, 0x3280c0, 0x328160, 0x2fcc00, 0x1bad10, 0x1bb450, 0x1997e0, 0x199840, 0x1bfb00, 0x1bddc0, 0x1bda00, 0x1bf3a0`). That is a **subsystem-update fan-out**, i.e. the per-frame tick driver — exactly what the 5.5 note at the tracker already said. There is no loop instruction at `0x421f10`.
+- Sole caller: **`sub_00422630` at `0x422658`** — one call site, consistent with a main-loop body.
+- The pasted `trace=` tail corroborates this and nothing else: `0x1bb450 -> 0x1bbdf0 -> 0x177ab8 ... -> 0x1997e0 -> 0x19ae60 -> 0x104af0 -> 0x421f10 -> 0x199840 -> 0x104c00 -> ...` walks the fan-out **left to right in call-site order** (`0x1bb450` @f00, `0x1997e0` @f08, then `0x421f10`/`0x199840` @f10). The frame driver is *progressing through its call list*, not spinning.
+
+**Consequence for the 5.7 plan.** Step (2) of 5.7 as written — *"disassemble `0x421f10` — it is `pc` and `ra`, a tight self-loop"* — is **based on a false premise and should not be actioned as stated.** `pc==ra==0x421f10` is a **sampling artefact**: the fiber/dispatch loop parks `ctx->pc` at the return address of the `jal` it is currently inside, and because `0x421ea0` is re-entered every frame at ~48 fps the watchdog lands on the same `jal` boundary essentially every sample. Line 70 of this file (stage 5.5, 2026-07-27) **already recorded this correctly** — *"a `jal 0x199840` site inside the per-frame function … so this is a called-every-frame body, not a spin"* and *"`stuckSecs` is a **false positive** by construction"*. **The 5.7 wording at line 52 contradicts 5.5 and 5.5 is the correct one.** Corrected inline; see the 5.7 entry.
+
+**Therefore the 97.2 % CPU burn needs a different explanation than "guest spin at `0x421f10`".** Do not re-derive it from the `pc` field. The two live threads in the `cputime` dump (`24336` = 33.16 s, `22232` = 27.77 s, each ≈ half of `wall=66.07s`) are consistent with **runtime host threads** — the fiber executor plus the vblank/IRQ worker — not with one guest hot loop. `busy%=44–61` is itself the runtime's own on-CPU accounting and is *below* 100 %, which contradicts a guest spin as the whole story.
+
+**What is actually still true and unchanged from 5.7:** the guest renders every frame (`vbl/s`/`gif/s`/`dma/s` nominal) while `gstate@0x50227c` never changes and `bsschg=7–16` — the state machine does not advance. **That** is the blocker. `lastCall=0x172998` (`DMAC_WaitIdle`, the `0x1000000`-countdown poll on `*(a0) & 0x100` with the `0x4c01a8` error message on expiry) is a per-frame timeout-guarded busy-wait and is normal, per 5.5.
+
+**Prior-art check (requested):** searched `_ClaudeMemory\`, `Logs\`, `Session Summary Logs\`, `Solutions Log\`, `INDEX_INDEX\` for `0x421f10`/`0x421ea0` — **no doc hits**; only `Logs\studio_callgraph.csv` and two 04-29 debug logs. The nearby `0x421c84` **was** worked before and is written up in `ps2xRuntime\src\lib\game_overrides.cpp` (`sdbzRegisterHandler104BF0`, the 2026-07-19 `pc=0x104bf0 ra=0x421c84` boot hang) — same caller region, different mechanism (recompiler truncation), not related to this.
+
+**Housekeeping / traps found:**
+- The worktree at `F:\SDBZ Recomp.worktrees\watchdog-performance-analysis` is **~2 months stale** (2026-05-27) and its `_ClaudeMemory\project_state.md`, `CSV Map\map.csv` and `ghidra_scripts\labels.csv` all predate the Ghidra map reconstruction of 2026-07-21. **Any analysis done from that worktree must be re-checked against `F:\SDBZ Recomp` before it is believed.** It also still names `C:\SDBZ Recomp` and `Laptop_Build.ps1` as the build path; neither exists. Live root is `F:\SDBZ Recomp`, build is `build.ps1`, run is `launch_recomp.ps1`.
+- Corollary rule for the Learned Patterns list: **`pc == ra` does not imply a loop.** In this runtime it is the normal steady state at any `jal` boundary. A loop claim requires the actual instruction at that address, or a function whose measured extent makes a backward branch possible — and function extents must come from `Logs\studio_callgraph.csv`, not `CSV Map\map.csv`.
+
+## Session 2026-07-29 (co-piolet, part 2) — ⚠️ SECOND CORRECTION: `gstate@0x50227c` is 4 unrelated static singleton pointers, not a game-state struct. "Frozen `gstate`" is not evidence of a stall.
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** No build, no run, no code change — read-only: `ps2xRuntime\src\lib\ps2_runtime.cpp` (watchdog implementation) + `decompiled_dump_full.txt` (full Ghidra decompile of `SLUS_214.42`, present only in git history at commit `eabd4112`, retrieved via `git show eabd4112:decompiled_dump_full.txt`).
+
+**What `gstate=` actually is.** The watchdog's default watch address is `0x005e6b3c` (`ps2_runtime.cpp` ~line 2913, the community "GameMode" byte), overridable via the `PS2_WATCH_ADDR` env var. The `0x50227c` telemetry pasted this session was already running with that override — it was never the default and was never documented anywhere before now. At whatever address is watched, the probe (`ps2_runtime.cpp` ~lines 2973–2979) blindly reads **4 consecutive raw 32-bit words** and prints them as `gstate@ADDR=w0,w1,w2,w3`. It has no concept of struct layout — it is a flat memory dump, not a state-machine read.
+
+**What those 4 words are at `0x50227c` specifically** (found in `decompiled_dump_full.txt`):
+- `0x50227c` (`piRam0050227c`) — pointer to a **polymorphic C++ object**; called every relevant tick via `(**(code**)(*this+0x28))(this, dx*scale, dy*scale)` from `FUN_0034c040` with controller-stick-scaled deltas → best-guess **camera/field-pan controller**.
+- `0x502280`/`0x502284` (`iRam00502280`/`iRam00502284`) — a **paired pair of object pointers**, both tested with identical bitmask logic (`&0x10`, `&0x3d0` on fields `+0x22`/`+0x1e`) in the same conditional blocks → best-guess **Player 1 / Player 2** entities.
+- `0x502288` (`iRam00502288`) — used in `effect_spawn_colored(...)` calls and vtable slots `+0x10`/`+0x18`. **Confirmed static**, not just guessed: the literal assignment `iRam00502288 = 0x63fe40;` appears verbatim in the decompile, and `0x63fe40` is exactly `w[3]` in every line of the pasted telemetry.
+- Exhaustive search for any runtime write to any of the 4 addresses (`...227c =`, `...2280 =`, `...2284 =`, `...2288 =`) across the full 454k-line decompile: **zero hits.** These are `.data`-section pointers fixed once at init/link time and never reassigned.
+
+**Consequence.** Watching these 4 raw pointer *values* for 20+ seconds and seeing them "byte-identical" tells you nothing — they are singleton object pointers, expected to never change for the life of the process, the same way `this` doesn't change. The 5.7 conclusion "`gstate@0x50227c` never changes ⇒ the state machine does not advance" (line 108 above) is now **suspect and should not be relied on as-is**. It is the **second** false-positive diagnostic found in two consecutive sessions, after the `0x421f10`/`pc==ra` one above. A real liveness probe needs to **dereference** these pointers and watch a field *inside* the objects that is expected to tick every frame (e.g. whatever `piRam0050227c`'s vtable slot `+0x28` writes on the camera object, or the `+0x22`/`+0x1e` flag fields on the two paired objects) — not the pointer values themselves.
+
+**Not yet done / next step if picked up:** identify concrete in-object offsets that are known-dynamic (found by reading what the `+0x28` vtable function and the `+0x22`/`+0x1e` flag-check code actually touch), then re-run the watchdog with a probe that dereferences into the object rather than reading the raw pointer. Object identities (camera/P1/P2/effects) are inferred from code-pattern context only, not from an authoritative symbol/label source — treat as a strong hypothesis, not confirmed, unless cross-checked against Ghidra/IDA labels. The original 97.2%-of-one-core CPU burn from the same telemetry paste is still fully unexplained; no replacement theory exists yet.
+
+## Session 2026-07-29 (co-piolet, part 3) — new `[hostprof]` capture confirms the CPU cost is GS pixel math (retracts "unexplained" claim in part 2); `gchg=0` window is consistent with the static-singleton theory, not new evidence of a stall.
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** No build, no run, no code change — read-only analysis of a `[watchdog]`/`[hostprof]`/`[cputime]` capture the user pasted (t≈84–89 s window inside a `wall=96.09s cpu=108.53s =113%` run, `PS2_WATCH_ADDR` still overridden to `0x50227c`).
+
+**Correction to part 2 (line 130 above):** part 2 said *"the original 97.2%-of-one-core CPU burn … is still fully unexplained; no replacement theory exists yet."* **That is wrong — it was already explained** in the very next section of this file (2026-07-28 later / Claude Code, "Hot code is still GS pixel math…", line 152, and the RelWithDebInfo table above it). This new `[hostprof]` paste independently reconfirms it with fresh numbers:
+- tid 25544 (44.33 s CPU, 84.4% in `ps2EntryRunner`): dominated by `GSRasterizer::writePixel` (30.7%), `GS::WriteVram`, `GSMem::LookupPixelAddressCT32`, `GS::ReadVram`, `GSMem::ReadPixelAddressCT32`, `GSInternal::bitsPerPixel`, `GSMem::LookupPixelAddressZ32` — the software GS rasterizer doing real per-pixel work.
+- tid 1224 (39.44 s CPU): dominated by `GS::copyFrameToHostRgbaUnlocked`, `` `anonymous namespace'::countNonBlackPixels ``, `GS::latchHostPresentationFrameUnlocked`, `` `anonymous namespace'::blendPresentationChannel `` — the host presentation/compositing pipeline, already flagged as a ~12%-of-thread cost in the 07-28 section (line 180) and as a `hwWatchArm()`-style env-gate candidate.
+- **Conclusion: the CPU burn has never been a spin/bug at any point in this project's history.** It is legitimate software-rendering cost (worse in Debug, ~109× better in RelWithDebInfo per the A/B above). Stop treating it as an open question — it is closed and cross-confirmed by two independent captures on two different sessions.
+
+**`gchg=0` this window is not new information.** The paste still watches the override address `0x50227c` (four static singleton pointers, per part 2 above), and this window happened to start after whatever one-time init write sets them — so `gchg=0` here is exactly what the static-singleton theory predicts, not a fresh sign of a stalled state machine. **The recommended default-address (`0x5e6b3c`) rerun from part 2 has still not been done** and remains the next actual test.
+
+**Still true and unchanged:** `pc=ra=0x421f10`, `lastCall=0x172998` (`sceDmaSync`), `stuckSecs` climbing then resetting — the same plateau documented in the 07-28 section's "Next action" (line 166 above: *why does the guest never leave the `0x421f10`/`sceDmaSync` loop*). That is still the real open blocker, unaffected by anything in this entry.
+
+## Session 2026-07-29 (co-piolet, part 4) — new capture shows **~9× faster `progress` and full 60 `vbl/s`** vs. the part-3 capture; this looks like a genuine full-rate frame loop, not a stall. Visual confirmation (pink screen still present?) is now the key open question.
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** No build, no run, no code change — read-only analysis of a fresh `[watchdog]`/`[hostprof]`/`[cputime]` paste (`wall=96.14s cpu=103.06s =107.2%`, `PS2_WATCH_ADDR` still `0x50227c`).
+
+- **`progress` rate jumped ~9×:** t=81→94 (13 s) goes `5,319,065 → 6,446,535`, ≈86.7 k/s. The part-3 capture over a similar 5 s window (t=84→89) only moved ≈9.7 k/s. Same build, same watch address, same machine — the only explanation is the guest is doing far more real work per wall-second in this run.
+- **`vbl/s` is pinned at 60–61 and `busy%` at 99–101%** throughout this whole capture (vs. 36–86% / variable `vbl/s` in every prior capture this project has seen). A steady 60 `vbl/s` at ~100% busy is what a fully-running PS2 title's main loop looks like — one vblank serviced per real vblank, CPU saturated doing the frame's rendering work, not idling or blocked.
+- **`gstate@0x50227c` still frozen (`gchg=0` the whole window)** — expected and unremarkable per part 2/3 (static singleton pointers, not live state).
+- **`pc=ra=0x421f10` / `lastCall=0x172998` and `stuckSecs` cycling 0→9→0 are unchanged** — per the Learned Patterns entries above, this is the documented false-positive shape (dispatch-loop `jal` boundary + `pc`-stability heuristic), not evidence against the "real frame loop" reading above. The two readings are consistent: a steady per-frame fan-out revisits the same `jal` site every frame, which is exactly what a healthy 60 vbl/s loop would do.
+- **`hostprof` composition is materially the same as part 3** (`GSRasterizer::writePixel` still the #1 cost, `countNonBlackPixels` / `copyFrameToHostRgbaUnlocked` / `blendPresentationChannel` still active in the presentation thread) — so `countNonBlackPixels` is being called every frame, meaning the presentation path is actively checking real frame content, not a frozen/blank buffer.
+- **This is the strongest evidence yet that the boot is not hung at all in this capture** — it reads like a title's ordinary steady-state main loop under heavy software-rasterizer cost, not the earlier "stuck" narrative built around `stuckSecs`/`pc==ra`.
+- **Open question, needs the user's eyes, not more telemetry:** is the on-screen output still the "pink screen" described in Phase 5's blocker, or is real content now visible? `countNonBlackPixels` being hot suggests non-trivial pixel content is present, which would be new information Phase 5's blocker doesn't yet account for. **Next step: confirm visually** (screenshot/recording from this run) before revising the Phase 5 blocker status.
+
+## Session 2026-07-29 (co-piolet, part 5) — ⚠️ CORRECTION: `[present]` probe cannot fire in any build to date — `RUNTIME_LOG` is compile-time disabled, `PS2X_DIAG=1` alone does nothing for it
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** No build, no run — read-only investigation into why `Select-String -Path run_log.txt -Pattern "\[present\]"` came back with **zero matches** after the user set `$env:PS2X_DIAG="1"` and reran (per part 4's recommendation above, which was wrong).
+
+**Root cause found:** `RUNTIME_LOG(x)` ([ps2_log.h:107-126](ps2xRuntime/include/ps2_log.h)) expands to `do {} while(0)` — a total no-op, string literal and all — unless the CMake option `PS2X_ENABLE_RUNTIME_LOGS` is `ON` at **configure** time. That option ([ps2xRuntime/CMakeLists.txt:17](ps2xRuntime/CMakeLists.txt)) defaults `OFF` and has been `OFF` in `build\CMakeCache.txt` (confirmed by direct read) for the entire history of this build tree — never set anywhere in this repo (grepped, zero hits outside its own declaration). `PS2X_DIAG=1` only gates `ps2_diag::enabled()`, which the `[present]` probe checks to decide whether to *populate* the already-compiled-out macro — it has no effect when the macro itself was never compiled in.
+
+**Verified three ways, not just theorized** (per the Learned Patterns "zero-record probe" entry): exe mtime (1:33:33) > source mtime (1:27:44) > confirms build is current, not stale; `findstr /M /C:"[hostprof]"` against the 354 MB `ps2EntryRunner.exe` returns exit 0 (control marker present, findstr itself works); `findstr /M /C:"[present]"` and `findstr /M /C:"present] has="` both return exit 1 — the literal string is absent from the binary. This is airtight: the probe cannot have fired in ANY run analyzed this session (parts 1-4 above), because it was never in the exe to begin with.
+
+**Corrects part 4's recommendation.** The `$env:PS2X_DIAG="1"` rerun command given in part 4 was necessary-but-not-sufficient — it will never produce `[present]` output on the current build regardless of how long or how many times it's run.
+
+**Actual fix (requires a CMake reconfigure the user must run, per PROHIBITION #4 — never cmake directly):**
+```powershell
+cmake -S "F:\SDBZ Recomp" -B "F:\SDBZ Recomp\build" -DPS2X_ENABLE_RUNTIME_LOGS=ON
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+**Cost warning:** `RUNTIME_LOG` is used in ~22 TUs (`ps2_gs_gpu.cpp`, `ps2_runtime.cpp`, `ps2_memory.cpp`, `game_overrides.cpp`, several `Kernel/Stubs/*.cpp`, etc.) — this is a build-option flip, which CMake will treat similarly to a widely-included header change: expect a partial-but-wide recompile of every TU that includes `ps2_log.h`, not a quick relink. Not prohibited (it is not a clean build), but budget real time for it.
+
+**Still open:** the magenta→black visual question from part 4 remains unanswered — once this rebuild lands, rerun with `PS2X_DIAG=1` (now meaningful) and grep `run_log.txt` for `[present]` as originally planned.
+
+## Session 2026-07-29 (co-piolet, part 6) — reconfirms part 5; two more captures pasted, no new root cause; **HANDOFF POINT**
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** No build, no run, no code change — read-only analysis of two more pasted captures plus a repeat `Select-String -Pattern "\[present\]"` (again zero matches, run against the still-unmodified build).
+
+**Finding 1 — `[present]` reconfirmed absent, CMake reconfigure from part 5 still not run.** The user's final command in this turn (`Select-String -Path run_log.txt -Pattern "\[present\]"`) returned no output again. This is expected and is **not a new bug** — it is the same root cause as part 5 (`PS2X_ENABLE_RUNTIME_LOGS` still `OFF`). Nothing changes here until the user actually runs the two-line reconfigure+rebuild given in part 5.
+
+**Finding 2 — `[hostprof]` again shows GS pixel math as the dominant cost, consistent with part 3.** Two worker threads: tid 23192 (45.80s CPU) is 85.1% inside `ps2EntryRunner`, top symbol `GSRasterizer::writePixel` at 30.3%/13.88s, with `GS::WriteVram`, `GSMem::LookupPixelAddressCT32/Z32`, `WritePixelCT32/Z32` filling out the rest — a real rasterizer, not a spin loop. tid 23676 (38.33s CPU) is dominated by `GS::copyFrameToHostRgbaUnlocked` (15.8%), `countNonBlackPixels` (6.2%), `blendPresentationChannel` (5.7%) — the host-presentation path, also real work. No new symbol or anomaly vs. part 3's writeup.
+
+**Finding 3 — one capture shows a sharp stall onset worth flagging for the next session.** In the t=81-90s window, `busy%` ran 57-74% (healthy) through t=89, then **t=90 shows `busy%=2, res/s=3, vbl/s=1, progress` frozen at 869787 (vs 869786 the tick before)** — i.e. the frame loop essentially stopped advancing in that single sample, with `pc/ra` still `0x421f10` but `lastCall` shifting to `0x1bda00` and the trace tail changing shape (`0x104c00 -> 0x102420 -> ... -> 0x1bddc0 -> 0x1bda00`, cut off mid-trace in the paste). This single-tick cliff (perfectly healthy → near-zero throughput in the same watchdog interval) is a different shape than the previously-documented gradual `stuckSecs` climb, and has not been analyzed before. **Not yet root-caused** — could be a real stall onset, a paste/output truncation artifact (the trace was visibly cut off at the end of the paste), or the watchdog printing mid-transition. Flagging only; no conclusion drawn.
+
+**Run-to-run variance persists.** The other capture in this turn (t=57-59s) again shows the older, previously-documented "stuck" shape (`busy%` 44-61%, monotonic-ish `stuckSecs` 20→22, no reset) — same `-Determinism 0` nondeterminism already logged in part 4/earlier sessions, not new.
+
+**No new BUG-0xx filed this turn** — findings 1-3 above are reconfirmations/refinements of already-open threads (part 5's rebuild-pending item, and the pre-existing GS-cost / magenta-black open question), not new distinct defects. If finding 3's single-tick cliff recurs with a *complete, untruncated* trace, it should be promoted to a BUG_LOG.md entry.
+
+**★ HANDOFF — next session/tool, start here:**
+1. **Blocking action still on the user:** run the part-5 reconfigure, in order:
+   ```powershell
+   cmake -S "F:\SDBZ Recomp" -B "F:\SDBZ Recomp\build" -DPS2X_ENABLE_RUNTIME_LOGS=ON
+   & "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+   ```
+   then rerun with `$env:PS2X_DIAG = "1"` set and grep `F:\SDBZ Recomp\run_log.txt` for `\[present\]`. This has now been requested 3 sessions running (parts 4, 5, 6) and is the only unblocking step left for the magenta→black question.
+2. **Once `[present]` lines exist:** read `nonblack=`, `dispFbp=` vs `ctx0/1.fbp=`, `pref=` fields — see "next steps" logic already written in part 5/earlier summaries.
+3. **Secondary, lower-priority thread:** if a *complete* trace ever shows finding 3's healthy→busy%≈0 single-tick cliff again, capture the full untruncated watchdog line and file it as a new BUG_LOG.md entry — do not chase it further off a truncated paste.
+4. **Do not re-litigate:** `pc==ra`, `gstate@0x50227c` frozen, and the GS-pixel-math CPU cost are all closed/explained (parts 1-3, and the retractions above them). Re-reading those threads from scratch wastes a session — check this file's Session 2026-07-29 entries first.
+
+## Session 2026-07-29 (co-piolet, part 7) — user ran the part-5/6 reconfigure; build FAILED with 2 real (pre-existing, unrelated) compile errors — **FIXED**, rebuild is now the next action
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** User ran `cmake -DPS2X_ENABLE_RUNTIME_LOGS=ON` + `build.ps1 RelWithDebInfo` for the first time and pasted a bare `Failed (exit 1) after +24:11` with no visible error (build output scrolled past). Found the real errors by reading `F:\SDBZ Recomp\build_log.txt` (MSBuild's own log, freshly written 3:00 AM, matches the failure).
+
+**Root cause — exactly the risk flagged in part 5's cost warning:** flipping `PS2X_ENABLE_RUNTIME_LOGS` from OFF→ON makes the compiler actually parse/type-check `RUNTIME_LOG(...)` argument expressions for the first time in a long while (they'd been compiling to `do {} while(0)` — arguments discarded, never type-checked). Two of those expressions had bit-rotted:
+- `ps2xRuntime\src\lib\ps2_gs_gpu.cpp:2389` — `m_registers.prim.type` — **`GSPrimReg` has no `.type` member**, the primitive-type bitfield is named `.prim` (`ps2xRuntime\include\runtime\ps2_gs_gpr.h:282`, `Bitfield<u64,0,3> prim`). A local `const GSPrimReg prim = m_registers.prim;` was already in scope one line above (line 2340) and used correctly as `prim.prim` elsewhere in the same function (line 2343) — the `RUNTIME_LOG` call just never got the memo.
+- `ps2xRuntime\src\lib\ps2_gs_rasterizer.cpp:551` — `gs->m_prim` — **`GS` has no `m_prim` member**; the primitive register lives at `gs->m_registers.prim` (`GS::m_registers` is a `GSGpr`, `ps2xRuntime\include\runtime\ps2_gs_gpu.h:155/384`).
+
+**Fixed both** (`ps2_gs_gpu.cpp:2389` → `prim.prim`; `ps2_gs_rasterizer.cpp:551` → `gs->m_registers.prim.tme`).
+
+**Also fixed 2 more latent instances of the identical bug in the same file, still dormant behind a *different* compile-time gate** (`PS2_IF_AGRESSIVE_LOGS`/`PS2X_ENABLE_AGRESSIVE_LOGS`, still `OFF`, not touched this session) — these did **not** cause today's build failure but would explode the instant someone enables that flag too, so fixed proactively while already in the file:
+- `ps2_gs_rasterizer.cpp` lines 257-261 (`[gs:prim]` block) and 322-326 (`[gs:copy-prim]` block): `gs->m_prim.type/tme/abe/fst/ctxt` → `gs->m_registers.prim.{prim,tme,abe,fst,ctxt}`.
+- `ps2_gs_rasterizer.cpp` lines 279-281 and 342-344 (`texclut=(...)` fields in the same two blocks): `gs->m_texclut.{cbw,cou,cov}` → `gs->m_registers.texclut.{cbw,cou,cov}` (`GS` has no `m_texclut`; it's `GSGpr::texclut`, same pattern).
+- Verified via a repo-wide grep for `->m_prim\b|->m_texclut\b|\.prim\.type\b` — zero remaining hits after the fixes.
+- `gs->m_vtxQueue[...]` (also referenced in the same blocks) was checked and is **correct as-is** — `GS::m_vtxQueue` is a real member (`ps2_gs_gpu.h:395`), not part of this bug.
+
+**Not yet verified by a real build** — these are source edits only; the assistant does not run cmake/MSBuild (standing rule). **User must rebuild.**
+
+**★ HANDOFF — next action is still the user's, in order:**
+1. Rerun the build (reconfigure already succeeded; only recompile is needed now):
+   ```powershell
+   & "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+   ```
+2. If it fails again, paste the *full* error — prefer reading `F:\SDBZ Recomp\build_log.txt` directly (`Select-String -Path "F:\SDBZ Recomp\build_log.txt" -Pattern "error"`) over trusting the console tail, since `build.ps1`'s progress bar swallows the actual `C2039`-style lines (this is the second time that log has been the only way to see the real error — worth remembering as a pattern).
+3. Once it builds clean, proceed exactly as parts 5/6 describe: rerun with `$env:PS2X_DIAG = "1"`, grep `run_log.txt` for `\[present\]`, and analyze `nonblack=`/`dispFbp=`/`ctx0/1.fbp=`/`pref=`.
+
+## Session 2026-07-29 (co-piolet, part 8) — ★ BUG-027 VERIFIED: rebuild succeeded, `ps2EntryRunner.exe` built with `PS2X_ENABLE_RUNTIME_LOGS=ON`. **Next action: `$env:PS2X_DIAG=1` run + grep for `[present]`.**
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** User reran `build.ps1 RelWithDebInfo` after the part-7 fixes. Build completed: `ps2EntryRunner.vcxproj -> F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe`, `Done in +05:48`. Only warnings emitted (`LNK4075`/`LNK4006`/`LNK4088`, all pre-existing/benign — raylib vs. user32 duplicate-symbol shadowing and the expected `/FORCE`-link note, unrelated to BUG-027).
+
+**BUG-027 is now CLOSED/VERIFIED** — the `RUNTIME_LOG`/`PS2_IF_AGRESSIVE_LOGS` member-reference fixes from part 7 compile cleanly with `PS2X_ENABLE_RUNTIME_LOGS=ON`.
+
+**★ HANDOFF — next action is still the user's:**
+1. Run the game with runtime diagnostics enabled:
+   ```powershell
+   $env:PS2X_DIAG = "1"
+   & "F:\SDBZ Recomp\launch_recomp.ps1"
+   ```
+   (or whatever the standard launch command is — see earlier parts/run command in project header.)
+2. Grep the fresh `run_log.txt` for the `[present]` probe:
+   ```powershell
+   Select-String -Path "F:\SDBZ Recomp\run_log.txt" -Pattern "\[present\]"
+   ```
+3. This is the **first time** `[present]` can actually fire (previously blocked by BUG-027's build failure, and before that by `RUNTIME_LOG` being compile-disabled per part 5). Paste whatever it prints — even if empty, that itself is new information (would mean the probe site never executes, a different bug).
+4. Once `[present]` output exists, analyze `nonblack=`, `dispFbp=` vs `ctx0/1.fbp=`, and `pref=` to determine whether the drawn frame is genuinely near-black, DISPFB points at a stale page, or fallback frame-selection picks the wrong candidate.
+
+**Do not re-litigate:** `pc==ra` (dispatch-boundary artifact), `gstate@0x50227c` frozen (static singleton pointers), GS-pixel-math CPU cost (real rasterizer work) — all closed in parts 1-3. The part-6 single-tick busy%-cliff (74→2) remains unexplained but low-priority; only chase it with a complete untruncated trace.
+
+## Session 2026-07-29 (co-piolet, part 9) — ★★ `[present]` FIRED FOR THE FIRST TIME: `nonblack=0` confirmed — the presented frame is genuinely solid black, and `[gs:pixels]` shows every draw is color `(0,0,0,0)`. Root cause shifts upstream to color-source, not presentation/DISPFB.
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).**
+
+**Detour that delayed this (now closed, for the record):** the first several `$env:PS2X_DIAG=1` runs still produced zero `[present]` lines even after BUG-027's fix, which looked like a runtime-gating bug. Root cause was mundane: `launch_recomp.ps1`'s default `-Exe` points at `build\ps2xRuntime\Debug\ps2EntryRunner.exe`, last built **2026-07-28 23:37**, while `ps2_runtime.cpp` was edited **2026-07-29 00:47** — after that Debug build. The part-7/8 rebuild that was verified only produced `RelWithDebInfo\ps2EntryRunner.exe` (built 2026-07-29 14:58). Every run in parts 5-8 executed the **stale Debug exe**, which predated the fix entirely. Lesson: **always pass `-Exe` pointing at whichever config was just rebuilt, or rebuild Debug too** — `launch_recomp.ps1` does not default to the most-recently-built config. (Aside, also resolved: my own PowerShell tool's view of `F:\SDBZ Recomp\run_log.txt` was reading a stale/disconnected copy relative to the user's live session for several turns — I stopped trying to self-check the log and relied on the user's own `Select-String` output, which is correct going forward. Also confirmed the runtime source in `F:\SDBZ Recomp` — a different git worktree/branch, `work/laptop-session-0519` @ `81a0dbc` with local uncommitted edits — is what's actually built; this session's own worktree, `agents/watchdog-performance-analysis` @ `c68adaf`, is a **different branch** and must not be assumed to match the build tree's source without checking.)
+
+**The fix that worked:**
+```powershell
+$env:PS2X_DIAG = "1"
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe" -RunSeconds 90
+```
+
+**Captured `[present]` lines (2 samples over the run):**
+```
+[present] has=1 w=512 h=448 nonblack=0 dispFbp=0x0  srcFbp=0x0  pref=0 ctx0.fbp=0x70 ctx0.fbw=8 ctx0.psm=0x0 ctx1.fbp=0x70 ctx1.fbw=8 ctx1.psm=0x0 pmode=0x7f27 dispfb1=0x1000 dispfb2=0x1000 display1=0x1bf9ff0203327c display2=0x1bf9ff0203227c
+[present] has=1 w=512 h=448 nonblack=0 dispFbp=0x70 srcFbp=0x70 pref=0 ctx0.fbp=0x70 ctx0.fbw=8 ctx0.psm=0x0 ctx1.fbp=0x70 ctx1.fbw=8 ctx1.psm=0x0 pmode=0x7f27 dispfb1=0x1000 dispfb2=0x1000 display1=0x1bf9ff0203327c display2=0x1bf9ff0203227c
+```
+Interleaved `[gs:pixels]` samples (dozens across the run, `n=1008000000` through `n=1056000000`) all report `r=0 g=0 b=0 a=0` at varying `x`/`y`, with `tme=0` (untextured) and `frame.psm=0x0` (PSMCT32). `[gs:frame-change]` shows the game alternating draw target between `frame.fbp=0x0` and `frame.fbp=0x70` (double-buffering), both PSMCT32/fbw=8 (512px wide, matches `w=512` above).
+
+**Analysis:**
+- `nonblack=0` is real, not a symptom of watching the wrong buffer: `[gs:pixels]` independently confirms every sampled draw pixel is `(0,0,0,0)`, i.e. fully transparent black, regardless of which buffer (`0x0` or `0x70`) is being drawn to at that moment.
+- The previously-known DISPFB mismatch (`dispfb1=0x1000` vs. `ctx0/1.fbp=0x70`) is confirmed real and the fallback path (`pref=0`, so `srcFbp` follows `ctx.fbp` instead of trusting `DISPFB`) is confirmed active — but this is **not the root cause**, since the buffer the fallback correctly picks (`0x70`) is *also* black.
+- **Root cause has moved upstream of presentation entirely**: the question is now why every GS draw's output color is `(0,0,0,0)`. Candidates: (a) RGBAQ/vertex-color register read as zero due to a GIFtag/VIF unpack bug before the primitive reaches the rasterizer, (b) alpha-blend/test state incorrectly zeroing color, or (c) the game is genuinely intentionally drawing black at this exact boot moment (e.g. a pre-fade-in black screen) and the real bug is that it never advances past this state (a hang/stall bug, not a color bug) — needs a longer capture across multiple seconds to see if `frame.fbp`/pixel colors ever change.
+
+**★ HANDOFF — next action:**
+1. Get a longer `[present]`/`[gs:pixels]` capture (`-RunSeconds 30`+ with the same `-Exe RelWithDebInfo` override) to see whether `nonblack` ever goes above 0, or whether the game is simply stuck drawing black indefinitely (would point back to a stall/derail rather than a color bug).
+2. If it's confirmed to stay black indefinitely: trace the color source for `prim=6` draws — check RGBAQ register state and the GIFtag unpack path feeding this primitive, comparing against what the guest ELF's boot-splash code is expected to set.
+3. Remember for every future run: pass `-Exe` explicitly pointing at whichever build config was just rebuilt (currently `RelWithDebInfo`), since `launch_recomp.ps1`'s default `-Exe` (`Debug`) is not being kept in sync.
+
+**Do not re-litigate:** presentation/DISPFB fallback logic (confirmed working as designed, not the bug), the missing-`PS2X_DIAG`-env-var hypothesis (ruled out — the var was correctly inherited; it was the stale exe), and everything closed in parts 1-3.
+
+## Session 2026-07-29 (co-piolet, part 10) — longer capture RE-CONFIRMS solid black across ~48M `n` (many draws/frames); GS register dump shows nothing that would force color to zero — prime suspect is now specifically **RGBAQ / vertex color source**, which has not yet been observed in any capture.
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).**
+
+**New data pasted this segment:** a much larger excerpt of `run_log.txt` (still same `-Exe RelWithDebInfo` corrected launch). Confirms and extends part 9:
+- `[gs:pixels]` `n` counter spans **`n=1008000000` → `n=1056000000+`** in this excerpt alone (with the user noting "there's a lot more, can't fit it all") — this is tens of millions of counted draws, not a one-off transient, all still `r=0 g=0 b=0 a=0`. Strongly favors **"stuck black" over "transient black before fade-in"**, since a real fade-in would show non-zero color within this many samples.
+- Two more `[present]` lines, still `nonblack=0`, `dispFbp`/`srcFbp` alternating `0x0`/`0x70` in step with `ctx0.fbp`/`ctx1.fbp=0x70` as before. `pmode=0x7f27`, `dispfb1=dispfb2=0x1000` unchanged — consistent with part 9, no new drift.
+- `[gs:frame-change]` continues normal `frame.fbp` alternation `0x0`⇄`0x70`, `frame.psm=0x0` (PSMCT32), `tex0.tbp=0x0`/`tme=0` throughout — still flat-color (untextured) fills, never textured draws.
+- New: `[gs:ad]` (direct GS privileged-register writes) samples decoded:
+  - `addr=0x4a data=0x0` / `addr=0x4b data=0x0` → **FBA_1/FBA_2 = 0** (alpha-correction bit off, not a factor).
+  - `addr=0x4e data=0x1300000e0` → **ZBUF_1** configured (has a real base pointer + PSM, not the all-zero/uninitialized state).
+  - `addr=0x47 data=0x30003` → **TEST_1**: `ATE=1, ATST=ALWAYS` (alpha test enabled but always passes — does not discard pixels), `ZTE=0` (z-test **disabled**, so depth cannot be silently failing these draws either). Nothing here would force output color to black.
+  - `addr=0x1a data=0x1` → **PRMODECONT=1**, matches the `prmodecont=1` already seen per-primitive; context-mode-from-PRIM is active as expected, not a stray fixed-mode override.
+  - `[gs:giftag] n=280000 lo=0x1000000000008004 hi=0xe nloop=4 eop=1 flg=0 nreg=1` → a normal small GIFtag (4-loop, 1-register PACKED format, `hi=0xe` = register selector `0xE`=`A+D` mode), consistent with these being register-write packets, not the actual vertex/color payload for the black primitives.
+
+**Analysis / what this rules out:** none of the decoded GS state registers (FBA, ZBUF, TEST, PRMODECONT) would force a drawn pixel to `(0,0,0,0)` — alpha test always passes, z-test is off, FBA is a no-op. This keeps the leading hypothesis on the **vertex/primitive color source itself**, i.e. whatever sets `RGBAQ` (GS register `0x01`) before each `PRIM`/kick — and notably **no `[gs:ad] addr=0x01` (RGBAQ) line has appeared in any capture pasted so far**. Either RGBAQ genuinely never gets written with a non-zero color for these draws (real bug), or RGBAQ writes go through a different, unlogged path (e.g. packed GIFtag registers other than A+D mode, such as PACKED-mode RGBAQ fields embedded directly in a vertex-format GIFtag rather than as a discrete `[gs:ad]`-style register write) that the current probes don't capture.
+
+**★ HANDOFF — next action (refined from part 9):**
+1. Add/confirm a probe on RGBAQ specifically — either extend `[gs:ad]` to flag `addr=0x01` distinctly, or add a `[gs:rgbaq]` probe at the point PACKED-mode GIFtags set the primitive color, so we can see what color value (if any) is actually being loaded before each black draw.
+2. Once RGBAQ's value is visible: if it's genuinely `0x00000000` going into the draw, the bug is upstream in whatever guest code / GIFtag unpack path is supposed to set the boot-splash color — trace that write path next. If RGBAQ is non-zero but the rasterizer still outputs black, the bug is in the recompiled rasterizer's color-application path (`GS::` pixel write in `ps2_gs_gpu.cpp`) instead.
+3. Longer-capture confirmation already strongly suggests "stuck black," but keep an eye out in future captures for any moment `nonblack` becomes nonzero (would falsify the stuck-black theory and point back to a timing/derail issue instead).
+4. Continue passing `-Exe` explicitly (`RelWithDebInfo\ps2EntryRunner.exe`) per the part-9 lesson — no change needed here, just carrying the reminder forward.
+
+**Do not re-litigate:** everything closed in parts 1-9 (dispatch-boundary `pc==ra`, frozen `gstate@0x50227c` singleton pointers, GS-pixel-math CPU cost, `PS2X_DIAG` env var, DISPFB/ctx.fbp presentation fallback, the stale-Debug-exe root cause). FBA/ZBUF/TEST/PRMODECONT register state is now also closed as a suspect per this entry — do not re-decode these registers again without new evidence.
+
+## Session 2026-07-29 (co-piolet, part 11) — ★★★ ROOT CAUSE FOUND: **GIF IMAGE-mode payload was dropped entirely.** Every VRAM image upload transferred **0 bytes**. Also: two process bugs corrected — the assistant CAN read `run_log.txt` directly, and the `[gs:pixels]` probe was sampling-biased and produced the wrong conclusion in parts 9-10.
+
+### ★ PROCESS CORRECTION 1 — `run_log.txt` is directly readable by the assistant. The prior claim that it isn't was wrong.
+Verified this session: `F:\SDBZ Recomp\run_log.txt` (1,870,926 bytes) is fully readable and greppable, and whole-log frequency analysis runs in a single command. **Parts 1-10 were all reasoned from hand-pasted few-hundred-line excerpts while whole-log statistics were available the entire time.** Going forward: the user runs the game and says so; the assistant reads and aggregates the whole log itself. Do not go back to the paste loop.
+
+### ★ PROCESS CORRECTION 2 — the `[gs:pixels]` probe was sampling-biased. Part 10's RGBAQ conclusion rested on it and is **demoted**.
+`[gs:pixels]` logged 1 sample per **2,000,000** pixel writes. A 512x448 framebuffer clear is ~229k pixels at ~50Hz ≈ 11M cleared pixels/sec, so essentially every sample landed on a black screen-clear sprite. Whole-log truth: the entire run contains exactly **16** `[gs:pixels]` lines. "Every draw is black" was 16 samples of a black clear — not evidence about geometry at all. The probe has been **replaced** (see fix 2 below).
+
+### ★ ROOT CAUSE — `GS::processGIFPacket` had no state for IMAGE payload spanning DMA packets
+Whole-log evidence:
+- **`[gs:image]` — every image transfer moved zero bytes:** `dbp=0x0 dpsm=0x0 dbw=16 trxreg=1024x64 sizeBytes=0`, ~10 occurrences, then never again. `[gs:giftag]` shows exactly one IMAGE tag: `flg=2 nloop=16384 nreg=16 eop=1` → 16384 qw = **262,144 bytes requested, 0 delivered**. `1024x64 PSMCT32 = 262,144 bytes` — the sizes agree exactly.
+- **`[gs:ad] addr=0x51` (TRXPOS) sweeps DSAY = 0, 64, 128, 192, 256, 320, 384, 448** — eight 1024x64 strips = one **1024x512** upload to VRAM base 0, split into 8 strips. All 8 delivered nothing.
+- **82 of 88 logged GIFtags are all-zero garbage** (`flg=0 nloop=0 nreg=16 eop=0 hi=0x0`) — the parser was chewing through the dropped image payload and misreading it as tags.
+
+Mechanism (`ps2_gs_gpu.cpp`, IMAGE branch of `processGIFPacket`):
+```cpp
+uint32_t imageBytes = nloop * 16;
+if (offset + imageBytes > sizeBytes)
+    imageBytes = sizeBytes - offset;   // clamps to 0 when the tag ends the buffer
+processImageData(data + offset, imageBytes);
+```
+The DMA chain delivers the IMAGE GIFtag as the **last qword of one packet** and its 16384 qwords of pixel data in the **following** packets. `offset == sizeBytes` → `imageBytes = 0` → payload silently discarded, **and** the next packet's pixel data was then parsed as GIFtags (hence the 82 zero-tags). `m_transferState` correctly persisted the *destination* cursor across IMAGE tags, but nothing persisted the *source* byte debt.
+
+### ★ WHAT THIS EXPLAINS
+- No texture data ever reaches GS VRAM.
+- All 4,579 `[gs:frame-change]` events are only two states: `prim=6 (SPRITE) tme=0 tex0.tbp=0x0`, alternating `fbp 0x70 <-> 0x00`. **The game never issues a single textured draw.** The render loop is healthy and double-buffering correctly — it just clears to black forever.
+- `[gs:ad] addr=0x1` (RGBAQ) = `0x3f80000000000000` → Q=1.0f, R=G=B=A=0. RGBAQ *is* black — but that is the correct color for a screen clear, which is all that is being drawn. Not the bug; a symptom.
+- Geometry decode cross-check: `addr=0x05` (XYZ2) = `0x8e009000` → X=2304.0, Y=2272.0; `addr=0x18` (XYOFFSET) = `0x720000007000` → OFX=1792.0, OFY=1824.0 → **512 x 448**, exactly the screen. Full-screen clear sprites, confirmed.
+
+### ★ CLOSED THIS SESSION
+- **Presentation path — not the bug.** `[present] has=1 w=512 h=448 pmode=0x7f27 dispfb1=0x1000`. Correct geometry, valid pmode; it is faithfully presenting an empty buffer. Stop investigating DISPFB/present.
+- **RGBAQ — not the bug.** Demoted from part 10's "prime suspect". It is black because clears are black.
+
+### ★ FIXES APPLIED (co-piolet, needs user build + run to verify)
+1. **`m_pendingImageBytes` (new `GS` member, `ps2_gs_gpu.h`)** — persists the IMAGE payload byte debt across `processGIFPacket` calls. `processGIFPacket` now drains any outstanding debt from the head of each incoming packet *before* parsing GIFtags, and the IMAGE branch records `requested - delivered` instead of discarding it. Debt is decremented *before* dispatching to `processImageData`, because `processImageData` can call `EndTransfer()` mid-drain (that would otherwise underflow the counter). `EndTransfer()` deliberately does **not** clear the debt — remaining declared qwords are padding that must still be consumed as payload, never re-parsed as tags. Cleared on `GS::reset()` and on each `TRXDIR` write (new transfer supersedes any stale debt).
+2. **`[gs:pixels]` replaced by `[gs:frame]`** (`ps2_gs_rasterizer.cpp` + present probe in `ps2_gs_gpu.cpp`) — per-interval aggregates instead of 1-in-2M sampling: `px=` pixels written, `nonblack=` pixels with any non-zero RGB channel, `textured=` pixels drawn with TME=1, `maxrgb=` brightest channel seen, `primmask=` bitmask of primitive types rasterized, plus running `imagebytes=` / `prims=`. Counters reset at each report, so **`nonblack=0` on this probe genuinely means nothing coloured was rasterized** — unlike the sampled probe it cannot miss draws.
+
+**★ HANDOFF — next action:**
+1. Build with `build.ps1 -Config RelWithDebInfo` (**not** `Laptop_Build.ps1` — that script and the `C:\SDBZ Recomp` root are dead, see the stale-worktree note above) and run with `PS2X_DIAG=1` and an explicit `-Exe` at the freshly built config. Then read `run_log.txt` directly (do not paste).
+2. Check exactly three things: does `[gs:image] sizeBytes` go **non-zero**; does `[gs:frame] textured` go **non-zero** (i.e. any TME=1 draw at all); does `[gs:frame] nonblack` / `[present] nonblack` go **non-zero**.
+3. If image bytes now land but still nothing textured is ever drawn, the blocker is upstream of GS entirely — pivot to the IOP/SIF side. The log is dense with `SIF_DIAG` (210), `ARKD:CALL` (192), `SifRpcPkt:SIG` (180), `iop:import` (156); determine whether IOP-side asset loading ever completes.
+4. Watch the all-zero-GIFtag count (`flg=0 nloop=0 nreg=16 eop=0 hi=0x0`, was 82/88). It should collapse toward zero if the carryover fix is correct — that is the cheapest single confirmation signal.
+
+### ★★ VERIFIED 2026-07-29 20:15 (co-piolet) — BUG-028 fix CONFIRMED WORKING; black screen persists for a *different*, now-isolated reason
+
+Built `RelWithDebInfo` (clean, zero errors; the LNK4075/4006/4088 warnings are pre-existing `/FORCE:MULTIPLE` noise from `ps2xRuntime/CMakeLists.txt:636`) and ran 45 s with `PS2X_DIAG=1`. Read `run_log.txt` directly. Results against the four signals:
+
+| # | signal | before | after | verdict |
+|---|--------|--------|-------|---------|
+| 1 | `[gs:image] sizeBytes` | `0` on **every** transfer | `262144` on **all 16** transfers | ★ **FIXED** |
+| 4 | all-zero garbage GIFtags | **82 of 88** | **0 of 33** | ★ **FIXED** |
+| 2 | `[gs:frame] textured` | 0 | **still 0** | unchanged |
+| 3 | `[gs:frame] nonblack` | 0 | **still 0** | unchanged |
+
+- **BUG-028 is genuinely fixed and is now closed.** Two independent signals confirm it. The garbage-GIFtag count going 82/88 → 0/33 is the decisive one: the runtime is no longer mis-parsing pixel payload as tags, which proves the cross-packet carryover works. Total delivered `imagebytes=4194304` = 16 x 262144 = the full 1024x1024 PSMCT32 upload, exactly as declared. Nothing regressed; the log is *cleaner* than before.
+- **The new `[gs:frame]` probe (BUG-029 fix) works and is now the primary GS instrument.** Sample line: `px=24313856 nonblack=0 textured=0 maxrgb=0 primmask=0x40 imagebytes=4194304 prims=479`. Because it aggregates rather than samples, `nonblack=0` here is *authoritative*: across ~24 M rasterized pixels per interval, **not one pixel with a non-zero RGB channel was ever written, and not one TME=1 pixel was ever drawn.** This is no longer an inference.
+- **`primmask=0x40` = bit 6 only = `GS_PRIM_SPRITE` and nothing else, for the entire run.** The game issues exactly one primitive type. `[gs:frame-change]` has only **three** distinct states in 2104 events, all `prim=6 tme=0 tex0.tbp=0x0` — differing only in `fbp` (0x0 / 0x70) and `prmodecont`. Confirms pure double-buffered black clears.
+- **The 16 image uploads all happen once at boot and never recur** (`imagebytes` is cumulative and flatlines at 4194304). They target `dbp=0x0 dbw=16`, i.e. a 1024x1024 block at VRAM base — this is a **VRAM initialization/clear**, not asset content. **No texture is ever uploaded after boot init.**
+- Watchdog is unchanged and still spinning: `t=44s ... stuckSecs=43 pc=0x421f10 ra=0x421f10`, `vbl/s=46`, `gif/s=44`. The guest is alive and pumping frames, it just never advances past the clear loop.
+
+**Conclusion — the blocker is definitively upstream of the GS.** GS was innocent of everything except BUG-028, and BUG-028 was real but not sufficient. The EE never *asks* for a textured draw: no `TEX0` is ever programmed to a non-zero `tbp`, `TME` is never set, and no image upload other than the boot VRAM clear ever occurs. Something before the GS — asset load, or the code path that would issue the first textured primitive — never runs.
+
+**★ HANDOFF — next action (supersedes the list above):**
+0. **★ METHOD: use `ps2xTest`, not the game loop.** The project has a full MiniTest suite that drives `GS` directly — `ps2xTest/src/ps2_gs_tests.cpp` is 198 KB with 66 `processGIFPacket`/`GIF_FMT_IMAGE`/`TRXDIR` hits, and `ps2_sif_rpc_tests.cpp` / `ps2_sif_dma_tests.cpp` are 56 KB each and cover the *next* lead. A Debug test build is minutes, versus ~48 minutes for `ps2EntryRunner` plus a game run. `build.ps1` now has a **`-Test`** switch (added this session) targeting `build\ps2xTest\ps2x_tests.vcxproj`:
+   ```powershell
+   & "F:\SDBZ Recomp\build.ps1" Debug -Test
+   & "F:\SDBZ Recomp\build\ps2xTest\Debug\ps2x_tests.exe"
+   ```
+   Reserve full runner builds for confirming end-to-end behaviour, not for iterating on a hypothesis.
+
+   **★ Gotcha found while enabling this (co-piolet, 2026-07-29):** `ps2x_tests` had been **unlinkable since the generated-body overrides were added** — the on-disk exe was stale from 7/24. `ps2_runtime` (STATIC) contains `src/lib/game_overrides.cpp`, which does `registerFunction(0x00180D30u, &fn_180D30_0x180d30)` and three more. Those bodies live in `ps2xRuntime/src/runner/*.cpp`, which CMake globs **only into the `ps2EntryRunner` executable** (`ps2xRuntime/CMakeLists.txt:484-499`), never into the library — so they resolve for the runner and for nothing else, and every other consumer of `ps2_runtime` dies with LNK2019.
+   Fixed by adding **`ps2xTest/src/recomp_override_stubs.cpp`** (abort-on-call stubs for the four symbols) to the `ps2x_tests` executable sources. Linking the real runner TUs was rejected: the transitive `fn_*` closure is most of the generated codebase and would make the test exe as slow to build as the runner.
+   **Every new `game_overrides.cpp` entry pointing at a generated body adds another unresolved symbol here — add a matching stub.**
+
+   **★ STATUS 2026-07-29 21:22 (co-piolet): this method is now PROVEN.** The test build links and runs. First real payoff: `ps2x_tests.exe PS2GS "BUG-028"` → 3/3 passed, unit-confirming the BUG-028 fix in a ~5-minute loop. Two things you must know before using it:
+   - **`ps2x_tests.exe` now accepts filters:** `ps2x_tests.exe [suite-substring] [test-substring]` (case-insensitive, empty = all).
+   - **A bare `ps2x_tests.exe` HANGS** in `PS2RuntimeKernel`'s semaphore test, and because suites run **alphabetically** (`std::map`), everything after it — `PS2SifRpc`, `SifDma`, `PS2Vu1`, `Pad`, ~35 `Scheduler*` — never runs. **The SIF suites are reachable only via the filter.** Details under BUG-028 below.
+   - There are ~14 pre-existing baseline failures unrelated to any of this (clut-cache CSM1 T4, T4HL planes, TEX2 CLUT, PABE, ALPHA FIX, `sceGsExec*Image`, `sceGsResetGraph`, `sceGsSyncV` parity, VIF1 DIRECT continuation, `SetVSyncFlag` tick, `_realloc_r`, ghidra map starts). **None are regressions.** Do not chase them without an explicit decision.
+1. ~~**Pivot to IOP/SIF asset loading.** ... Note `SifRpcReply` (88) < `SifRpcPkt:SIG` (180) — roughly half the RPC signals appear to go unanswered. **That ratio is the first thing to check** ...~~ **⛔ RETRACTED 2026-07-29 21:40 — the ratio is a log-cap artifact (both counters saturated at 24+64 vs an uncapped SIG counter). See BUG-030. Do not chase it.** The rest of that item is also answered: **IOP asset loading is PROVEN to work end-to-end** (disc → IOP RAM → EE RAM, real ISO lookups, real sectors, `IsReady` = `0x30000000`) — see the 21:40 entry below. Tag census retained for reference only: `SIF_DIAG` 210, `ARKD:CALL` 192, `SifRpcPkt:SIG` 180, `iop:import` 156, `sceSifSetDma:DTX` 89, `SifRpcReply` 88 (capped), `ARKD:run` 55, `Sema:Signal` 32. **For the current entry point, skip to ★★ HANDOFF 22:00 at the end of this session block.**
+2. Cross-reference against BUG-009 and the `dword_441A00` lead (see the 2026-06-21/22 entries) rather than starting fresh — this may be the same root cause finally surfacing with clean instrumentation behind it.
+3. `run_log.txt` is **directly readable by the agent** (~1 MB). Do not ask the user to paste logs. The only thing the user must do is build and run.
+
+**Do not re-litigate:** all of parts 1-10, plus (new this session) the presentation path, the RGBAQ colour source, the GIF IMAGE carryover path (BUG-028, fixed and verified), and the claim that "every draw renders black is a rendering bug" — it is not; nothing coloured is ever *submitted*.
+
+### ★★ 2026-07-29 21:40 (co-piolet) — the "RPC reply deficit" lead is REFUTED, and IOP asset loading is PROVEN TO WORK. Two dead ends closed from `run_log.txt` alone, no build required.
+
+**1. `SifRpcReply` (88) < `SifRpcPkt:SIG` (180) is a LOGGING-CAP ARTIFACT, not a real deficit. This lead is dead — do not chase it again.**
+The 88 is the sum of two *saturated* counters:
+
+| log line | observed | cap in source |
+|---|---|---|
+| `[SifRpcReply] deliver cid=...` | **24** | `s_replyLogs ... < 24u` — [SIF.cpp:752](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp:752) |
+| `[SifRpcReply] depth=...` | **64** | `s_depthLogs ... < 64u` — [SIF.cpp:849](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp:849) |
+
+24 + 64 = 88, both exactly at their caps. Meanwhile `[SifRpcPkt:SIG]` is **deliberately never rate-limited** ([SIF.cpp:1619](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp:1619)). Comparing an uncapped counter against two saturated ones produces a "deficit" out of thin air. The signal/reply cids are also perfectly consistent: SIG is `0x8000000a` x173 + `0x80000009` x7; deliver is `0x8000000a` x14 + `0x80000009` x10 — same two cids, no orphan server.
+
+**Generalize this:** before treating any log-frequency ratio as evidence, check whether either counter is capped. Several probes in this codebase cap at 6/8/16/24/64.
+
+**2. `[ARKD:CALL] handleRPC -> false` (64x) is ALSO a red herring.** That call site is explicitly labelled *"Stage 1 observe-only bridge ... result never written back to the guest ... (expected: false -> the Stage 2 gap)"* ([SIF.cpp:600-608](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp:600)). The *real* service path is the separate `PS2_ARKD_SERVICE` bridge below it, and `launch_recomp.ps1` defaults both `PS2_ARKD_SERVICE=1` and `PS2_ARKD_IRX_RUN=1`, so it was active. `handleRPC -> false` says nothing about whether assets load.
+
+**3. ★ IOP asset loading WORKS end-to-end. Disc → IOP RAM → EE RAM is a proven, live path.** From the same run:
+```
+[ARKD:search] "\INFO.DAT;1" -> found lbn=1048576 size=0x18000
+[ARKD:search] "\GAME.DAT;1" -> found lbn=1048625 size=0x2ba29000
+[ARKD:cdread]  lbn=1048576 sectors=47 iopDest=0x060000 -> ok      (+7 more, all ok)
+[ARKD:sifdma]  iopSrc=0x060000 eeDest=0x01652400 size=0x18000 -> copied
+[ARKD:sifdma]  iopSrc=0x078000 eeDest=0x01670c00..0x01673c00 size=0x800 -> copied  (x7)
+```
+Real ISO lookups resolve, real sectors are read, and the bytes are memcpy'd into **EE RAM**. `[ARKD:run] sid=0x503 fno=0x2` (IsReady) returns `00 00 00 30` = `0x30000000` = ready, matching the June `ccdReply` finding exactly. **The premise "determine whether IOP-side asset loading ever completes" is answered: it starts and it delivers.**
+
+**4. What is still open, and it is now much sharper.** Only **8** `[ARKD:cdread]` and **8** `[ARKD:sifdma]` lines appear — and both probes cap at `seen < 8u` ([ps2_iop_irx_loader.cpp:644](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp:644) and [:751](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp:751)). So the log **cannot distinguish** "streaming stopped right after the TOC" from "streaming ran the whole 0x2ba29000-byte GAME.DAT". That distinction is now the single most valuable unknown, and it was unanswerable purely because of a log cap.
+
+**Instrumentation added (co-piolet, BUILT 2026-07-30 — needs a RelWithDebInfo run to read):** running totals that never saturate, emitted at power-of-two event counts (dense early, sparse later — so an early stop is always visible and a full stream costs ~19 lines) —
+- `[ARKD:cdread-total] reads= sectors= bytes= fails= lastLbn=`
+- `[ARKD:sifdma-total] dmas= bytes= skipped= lastEeDest=`
+
+The first-8 detail lines are unchanged. Read the **last** `-total` line of each: if `dmas` stalls in the single/double digits, asset streaming genuinely stops after the TOC and *that* is the blocker. If `bytes` climbs into the megabytes, assets are loading fine and the failure is in the EE-side consumer that should turn loaded data into a texture upload.
+
+~~**Surviving lead (unchanged, still the best one): BUG-009 `rpc_handle_valid`.**~~ **RETRACTED 2026-08-01 — BUG-009 is benign, see the CLOSED table in the 07-29 22:00 handoff. Historical only.** June proved the boot state machine `sub_327810` is frozen at state 1, gated by `wrap_rpc_handle_valid()` over 4 client handles (`0x5A9330`/`0x5A9358`/`0x5A9380`/`0x5A93A8`), *not* by `ccdReply` content (which reads the passing `0x30000000`). `rpc_handle_valid` (`0x178de8`) is `v1 = *a1; return v1 && a1[1] == *(u32*)(v1+24) && (*(u32*)(v1+16) & 1);`. A `rpcValid=` 4-bit diagnostic was written in June but **grep confirms it emits nothing in the current `run_log.txt` — it is not in the build.** Re-instating that measurement identifies which handle fails and which of the three sub-conditions (null backing pointer / id mismatch / ready bit clear) is at fault, which points straight at what `SifBindRpc` ([RPC.cpp](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp)) fails to populate. Note the related `dword_441A00` thread is **CLOSED as a dead end** (2026-07-06c) — do not restart it.
+
+## ~~★★ HANDOFF 2026-07-30 — BUG-009: `SifBindRpc` is dead code, HWWATCH now armed on `pkt_addr`~~ — **SUPERSEDED 2026-08-01. Do not action.**
+
+> **RETRACTED.** BUG-009 is benign (see the 2026-08-01 CLOSED entry in the 07-29 handoff below). The `pkt_addr` HWWATCH run described here **must not be run** — it costs ~20 % CPU and answers a question that no longer matters. The one durable finding here is the `SifBindRpc`-has-zero-call-sites fact, which stands. `PS2X_HWWATCH` / `PS2X_HWWATCH_CLIENT` should be **unset** for all runs going forward.
+
+**Read this before the 07-29 HANDOFF below — it changes the BUG-009 plan of attack.**
+
+Two sequential fix attempts this session (one in `SifCallRpc`, one a bind-reply-packet stamp in `SifBindRpc`) both **failed and were retracted** — fresh runs still show all 5 client handles (`0x464dc0`, `0x5a9330`, `0x5a9358`, `0x5a9380`, `0x5a93a8`) with `pktAddr=0x0` on every `[rpcValid]` poll.
+
+**Root cause of both failures: `SifBindRpc`/`sceSifBindRpc` has zero call sites anywhere in `src/runner/`** — confirmed by grepping the entire generated directory for both `sceSifBindRpc` and the bare substring `BindRpc` (targeted content grep, not a listing — rule-compliant). This is stronger than a dispatch-bypass: the SDK's bind logic was statically inlined into the ELF's translated MIPS (same pattern as `rpc_handle_valid_0x178de8.cpp`), so nothing in `RPC.cpp` is ever reached for it. **Do not attempt further fixes in `SifBindRpc`/`SifCallRpc` — that code path is unreachable for this game's binary.**
+
+**Per the project's own rule** ("for who wrote value X to address Y, use the hardware data breakpoint, not log-greps or store-site bisection — the latter produced four retractions in ten days") — this session just produced its own two retractions the same way. Switched tools.
+
+**Wired 2026-07-30:** `sdbzDiagRpcHandleValid178DE8` in `game_overrides.cpp` (the existing `[rpcValid]` hook at `0x178de8`) now arms the existing HWWATCH infra (built 2026-07-27 for the `rpc_call` `$ra` hunt — VEH + background armer thread, unchanged) on `client->hdr.pkt_addr` (offset 0) for client `0x464dc0` specifically, to catch the real writer or prove there is none. Not yet run.
+
+**Next run, hand the user:**
+```powershell
+.\build.ps1 RelWithDebInfo 6
+$env:PS2X_HWWATCH = "1"
+$env:PS2X_HWWATCH_VAL = "0xFFFFFFFF"   # record every store, not just value 1 — filter is unknown for this address
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+Check `run_log.txt.hwwatch.txt` for symbolized hits. `PS2X_HWWATCH_CLIENT=0x...` overrides which of the 5 clients gets watched (default `0x464dc0`) — the watchpoint only tracks one address at a time, so if this run comes back empty, re-run against a different client before concluding pkt_addr is never written at all. **Cost: ~20% CPU while armed (measured 07-27) — do not trust perf numbers from this run, and unset `PS2X_HWWATCH` for anything else.**
+
+---
+
+## ★★ HANDOFF 2026-07-29 22:00 — **SINGLE ENTRY POINT. Read this before any other 07-29 entry.**
+
+Everything above this line in the 2026-07-29 block is history, including handoffs that point at leads since refuted. This is the only current one.
+
+### Where the blocker is
+
+**The EE never submits a textured draw.** `primmask=0x40` (SPRITE only) for an entire run, `tme` never 1, `tex0.tbp` always 0, `nonblack=0` across ~24 M rasterized pixels per interval. The render loop is *healthy* — ~46 fps, double-buffering `fbp 0x0 ↔ 0x70` — it just clears to black forever. The fault is in the guest state machine, **upstream of the GS and upstream of the IOP**.
+
+### CLOSED — do not reopen, do not re-derive
+
+| Thread | Verdict |
+|---|---|
+| BUG-028 GIF IMAGE cross-packet carryover | **FIXED + VERIFIED twice** (live run: `sizeBytes` 0 → 262144 on all 16 transfers, garbage GIFtags 82/88 → 0/33; unit: `ps2x_tests.exe PS2GS "BUG-028"` 3/3) |
+| BUG-029 `[gs:pixels]` sampling bias | **FIXED** — replaced by aggregate `[gs:frame]`, now the primary GS instrument |
+| BUG-030 capped-counter evidence | **Both instances refuted/handled** — see registry |
+| "RPC reply deficit" 88 vs 180 | **Log-cap artifact.** No deficit exists |
+| `[ARKD:CALL] handleRPC -> false` (64×) | **Red herring** — that site is the labelled observe-only Stage-1 bridge; the real path is `PS2_ARKD_SERVICE`, which was active |
+| IOP asset loading | **PROVEN WORKING** end-to-end, disc → IOP RAM → EE RAM |
+| Presentation / DISPFB / RGBAQ colour source | **Innocent** — faithfully presenting an empty buffer; RGBAQ is black because clears are black |
+| `pc==ra=0x421f10`, frozen `gstate@0x50227c`, GS CPU burn | All false positives, closed parts 1–3 |
+| `dword_441A00` | Dead end, closed 2026-07-06c |
+| **BUG-009 `rpc_handle_valid` / `pkt_addr` / `SifBindRpc`** | **CLOSED 2026-08-01 — BENIGN.** `rpc_handle_valid` (`0x178de8`) is `sceSifCheckStatRpc`: it answers *"is this async RPC still **busy**?"*, not *"is it valid?"*. Our always-0 answer means "not busy", which **passes** both consumers. Four sessions + two retracted fixes were spent on a misleading func-map name. Evidence table in the 2026-08-01 handoff. **Do not reopen. Do not attempt further `SifBindRpc`/`SifCallRpc` fixes.** |
+
+### ★ CLOSED 2026-08-01 — BUG-009 is benign; `rpc_handle_valid` is a busy-check, not a validity-check
+
+The 07-29 "surviving lead" and the 07-30 HWWATCH plan below are both **retracted**. `rpc_handle_valid` (`0x178de8`) is `sceSifCheckStatRpc`. Both known consumers use it as a **busy**-check, so our constant-0 return is the *permissive* answer:
+
+| Consumer | Code | Effect of our always-0 answer |
+|---|---|---|
+| `sub_1C0A30` (boot/CCD state machine) | `while (wrap_rpc_handle_valid(client)) ;` × 8 | loops exit **immediately** → passes |
+| `sub_186CC0` `_sceCd_scmd_prechk` | `if (busy) { SignalSema; return 0; }` | reports "not busy" → **lets execution through** |
+
+Sources: `ida_scripts/decompiles_SLUS_214_42.txt:152804` (full `sub_1C0A30` body) and the 2026-07-30b `sub_186CC0` finding. They agree. **`pkt_addr` never being armed cannot gate anything.**
+
+**The real gate in `sub_1C0A30` is the RPC reply *content* at EE `0x5AA7D0`, not the handle:**
+
+```c
+mem_fill_z_369(client=0x5A9358, func=2, mode=3, send=0x5A97D0, 0, recv=0x5AA7D0, 16, 0, 0);
+if ((MEM[0x205AA7D0] & 0xF0000000) == 0x40000000) { ... result = 1; }
+else result = ((MEM[0x205AA7D0] & 0xF0000000) == 0x30000000);
+```
+
+Our ARKD returns `0x30000000`. Whether that is the *advancing* answer or the *keep-waiting* answer has **never been checked against real hardware**. That is the new thread → stage 5.8.
+
+### ★ CLOSED 2026-07-30 05:18 — the one open measurement is ANSWERED: asset streaming does NOT stop after the TOC
+
+Real RelWithDebInfo run (96.3s, `Determinism=0`), `-total` lines finally observed (the first attempt used a stale exe — Debug -Test never builds `ps2EntryRunner`; corrected by rebuilding RelWithDebInfo directly, verified via source/exe mtime ordering before trusting the run):
+
+```
+[ARKD:cdread-total]  reads=1024  sectors=1070  bytes=2191360  fails=0  lastLbn=1075481
+[ARKD:sifdma-total]  dmas=1024   bytes=2156160  skipped=0     lastEeDest=0x017b5c00
+```
+
+Both counters doubled cleanly across all 11 samples (1→2→4→...→1024) with **zero fails, zero skips**, `lastLbn` and `lastEeDest` climbing continuously the entire run — **2.1-2.2 MB streamed, no stall at the TOC.** IOP asset loading is proven not just to start (prior finding) but to **run continuously and successfully for the full session.**
+
+**Verdict: asset streaming is innocent.** The blocker is 100% EE-side: loaded data is never turned into a textured draw (`tme=0` unchanged all run). This closes the load-path investigation — **do not re-open it.** The only surviving lead is BUG-009 below.
+
+### ~~The surviving lead — BUG-009 `rpc_handle_valid`~~ — **RETRACTED 2026-08-01, see the CLOSED entry above. Historical only.**
+
+June proved the boot state machine `sub_327810` is frozen at **state 1**, gated by `wrap_rpc_handle_valid()` over 4 client handles (`0x5A9330` / `0x5A9358` / `0x5A9380` / `0x5A93A8`) — *not* by `ccdReply` content, which reads the passing `0x30000000`.
+
+`rpc_handle_valid` (`0x178de8`) is: `v1 = *a1; return v1 && a1[1] == *(u32*)(v1+24) && (*(u32*)(v1+16) & 1);`
+
+A `rpcValid=` 4-bit diagnostic was written in June but **is not in the current build** (grep-confirmed: zero hits in `game_overrides.cpp`, zero in `run_log.txt`). Re-instating it names **which handle** fails and **which of the three sub-conditions** (null backing pointer / id mismatch / ready bit clear) — which points straight at what `SifBindRpc` ([RPC.cpp](ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp)) fails to populate.
+
+### Method — use `ps2xTest`, not the game loop
+
+```powershell
+& "F:\SDBZ Recomp\build.ps1" Debug -Test
+& "F:\SDBZ Recomp\build\ps2xTest\Debug\ps2x_tests.exe" Sif
+```
+Minutes, versus ~48 min for `ps2EntryRunner` plus a game run. Reserve full runner builds for end-to-end confirmation, not hypothesis iteration.
+
+Three hard rules for this path:
+1. **Always pass a filter** — a bare `ps2x_tests.exe` hangs and silently skips ~40 suites (BUG-031).
+2. **Always pass `-Exe`** pointing at the config you just built — `launch_recomp.ps1` defaults to `Debug` and does not track the newest build. This has burned three sessions.
+3. **Every new `game_overrides.cpp` entry that points at a generated body needs a matching stub in `ps2xTest/src/recomp_override_stubs.cpp`**, or `ps2x_tests` stops linking.
+
+`run_log.txt` (~1–2 MB) is **directly readable by the agent**. Do not paste logs; run the game, say so, and let the agent aggregate the whole file.
+
+### Test baseline as of 22:00
+
+`ps2x_tests.exe Sif` → **27 / 28 passed**. The one failure is **BUG-032** (`sceSifSetDma` multi-descriptor validation not atomic), newly observed because the SIF suites had never been reachable before. Not triaged, probably latent. ~14 other pre-existing baseline failures exist elsewhere in the suite (clut-cache CSM1 T4, T4HL planes, TEX2 CLUT, PABE, ALPHA FIX, `sceGsExec*Image`, `sceGsResetGraph`, `sceGsSyncV` parity, VIF1 DIRECT continuation, `SetVSyncFlag` tick, `_realloc_r`, ghidra map starts) — **none are regressions; do not chase without an explicit decision.**
+
+### Low priority, flagged only
+
+The part-6 single-tick `busy%` cliff (74 → 2 in one watchdog interval) is unexplained. Only chase it with a **complete, untruncated** trace; do not reason from the truncated paste.
+
+---
+
+## Session 2026-07-28 (later, Claude Code / Opus 5) — ★ RelWithDebInfo `ps2EntryRunner.exe` BUILT. Build was unfinishable for three reasons, all found and fixed. **A/B measurement run is the single next action.**
+
+**Read this first if you are picking the project up.** A full agent handoff written for GitHub Copilot lives at [.github/copilot-instructions.md](.github/copilot-instructions.md) — durable rules, repo layout, and the "what do I do next" pointer. This section is the live state it points at.
+
+### ★★★ THE A/B RAN — 109×. Stage 5.6 is CLOSED.
+
+Run: `-Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile -Exe ...\RelWithDebInfo\ps2EntryRunner.exe`
+
+| metric | Debug control arm | RelWithDebInfo | delta |
+|---|---|---|---|
+| **`progress` @ t=89** | **12 101** | **1 320 490** | **109×** |
+| `gif/s` | 3–5 | **47–49** | normal band is 30–60 |
+| `vbl/s` | 3–6 | **47–49** | |
+| `[cputime]` | wall 96.52 s · cpu 99.53 s · 103.1 % | wall 96.33 s · cpu 102.84 s · 106.8 % | **same CPU** |
+| `busy%` | (field post-dates this arm) | 60–73 | headroom remains |
+| `_RTC_CheckStackVars` | 7.0 % / 8.5 % | **absent** | ⇒ correct exe was launched |
+| busiest threads | 46.14 s / 44.42 s | 49.05 s / 42.25 s | unchanged shape |
+
+**Same CPU seconds, 109× the guest work.** The build configuration was the entire performance story, exactly as hypothesised, and by a much larger factor than the 5–20× Debug→Release rule of thumb — which is itself the lesson: per-pixel `constexpr` accessor math is the pathological case for an unoptimised build.
+
+Hot code is still GS pixel math but under its real post-inlining names — `GSMem::LookupPixelAddressCT32` / `ReadPixelAddressCT32` / `ReadPixelCT32`, `GSRasterizer::writePixel`, `GS::WriteVram`, `GS::copyFrameToHostRgbaUnlocked`. `PixelStorageTraits` is gone from the profile because `/O2` inlined it.
+
+### ★ What this actually buys us: "slow" and "stuck" are now separate problems
+
+**The game is no longer slow. It is still stuck.**
+
+The watchdog holds `pc=0x421f10` / `ra=0x421f10` / `lastCall=0x172998` (`sceDmaSync`) with `stuckSecs` climbing 45→53 — **the same plateau as the Debug arm**, but now running at ~47 fps with the call trace churning healthily every tick.
+
+90 s at this rate is **≈2.7 hours of Debug-equivalent guest work**. Real PCSX2 reaches the memory-card prompt in 7–8 s of wall time at comparable frame rates. We do not reach it at all.
+
+⇒ **This is a correctness gate, not a throughput problem.** Every prior caveat of the form *"we can't tell whether it's blocked or merely too slow to observe"* is now void. Throughput is solved and must stop being treated as a variable. **All subsequent diagnostic runs should use the RelWithDebInfo exe** — they now cover ~100× more guest execution per wall-second.
+
+**Resolved by elimination:** the t≈89 s watchdog breakout out of the `0x421f10`/`0x172998` plateau — which reproduced **2-for-2** under Debug and was logged in the previous session as an unexplained lead — **did not occur on this run**. It was a Debug-timing artifact, not a milestone being approached. The queued `-RunSeconds 300` run drops from "cheap follow-up lead" to "run once for completeness".
+
+### Next action — the blocker, at the new speed
+
+The question is now sharply posed: **why does the guest never leave the `0x421f10` / `sceDmaSync` (`0x172998`) loop, despite the GIF moving 47 packets/s and vblank ticking at 47/s?**
+
+Starting points, in order of cheapness:
+
+1. **One `-RunSeconds 300` run** on the RelWithDebInfo exe to confirm the plateau is genuinely terminal and not a very long wait. ≈9 hours of Debug-equivalent work. If it never leaves, the loop is unconditional.
+2. **Identify `0x421f10`.** It is `pc` *and* `ra` — a tight self-loop. It has been the plateau address across every run for weeks and has never been disassembled. Do that.
+3. **`0x172998` is `sceDmaSync`.** With `dma/s` at 92–98 and `gif/s` at 47–49, DMA is demonstrably completing. So either the guest is polling a completion flag the runtime never sets, or it is syncing on a channel that never gets serviced. Compare against PCSX2 at the same point.
+4. The recurring trace tail `0x174f20 -> 0x172e20 -> 0x172a90 -> 0x172998` is stable across ticks — that's the caller chain into the sync. Walk it.
+
+### Smaller findings from the fast run
+
+- **~30 % of tid 39824 is now spent waiting, not computing** — `ntdll!NtWaitForSingleObject` 8.6 %, `ZwDelayExecution` 6.5 %; tid 14552 spends 15.2 % in `ZwWaitForAlertByThreadId`. Under Debug this was swamped by pixel math. The scheduler/fiber handoff is now a legitimate thing to examine.
+- **Our own probes cost ~12 % of the presentation thread**: `` `anonymous namespace'::countNonBlackPixels `` 2.47 s (6.3 %) + `` `anonymous namespace'::blendPresentationChannel `` 2.20 s (5.6 %). Candidates for the same env-gate treatment `hwWatchArm()` got in BUG-025. Not urgent — there is headroom (`busy%` 60–73).
+- `tid 36884` burns 6.22 s in `Wait/ExecutionDelay` and does not appear in `[hostprof]` — the same unexplained pattern as Debug's tid 9288. Still not chased.
+
+### Build artifacts — verified on disk, not assumed
+
+| | |
+|---|---|
+| `build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe` | **354,563,584 bytes**, 2026-07-28 **17:42:18** (Debug exe is 730 MB — the halving is `/O2` + no `/RTC1`) |
+| unity objs | **4520** + 1 quarantined = 4521, 2.33 GB |
+| build window | 14:0x → 17:42 (**~3 h 40 m**), ~21 obj/min |
+| prior attempt for contrast | 04:14 → 06:36 at `/m:2`, reached 808 objs, ~5.7 obj/min ⇒ **≈11 h** projected |
+
+### Why the build could not finish — three independent causes
+
+**(1) `/m:$Jobs` was never going to help.** MSBuild's `/m` is **project**-level parallelism. `ps2EntryRunner` is a single `.vcxproj`, and MSBuild's CL task hands every source of one project to **one** `cl.exe` via a single response file, which compiles them **serially**. All 4520 unity TUs ran on one core at `/m:2` and would have at `/m:12`. The source-level knob is `cl /MP<N>`.
+
+**(2) `src/runner/sub_0022F200_0x22f200.cpp` is an `/O2` optimizer bomb.** **278,316 lines / 12.9 MB** in one recompiled function — ~**350×** its unity siblings (5.9–37.7 KB). It sat at 100 % of one core for **2 h 09 m** and emitted a **37,164,827-byte** object while surrounding unity TUs averaged ~7 s each. It was never deadlocked; it just could not be waited out, and being inside a unity batch it serialized the entire target. This is the `unity_3680`/`unity_3681` stall the user reported at 12:04→13:26.
+
+**(3) There are no CL tlogs, so no build ever resumes.** MSBuild's per-source up-to-date check reads `CL.read.*.tlog` / `CL.write.*.tlog` / `CL.command.*.tlog`. **This target has none.** Every build re-passes all 4520 sources to `cl`. ⛔ **This retracts the claim in the previous session section that "the 808 objs are valid and MSBuild resumes past them"** — they were silently recompiled from scratch. **A partial obj count is not progress and must never be quoted as an ETA.**
+
+### The fix — three edits, `ps2xRuntime/CMakeLists.txt` only
+
+No header touched, no recompiler run, no `runner/*.cpp` touched.
+
+1. **Cache variables** (`PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE` = 8, `PS2X_RUNNER_CL_JOBS` = 6) so both knobs are tunable without editing logic.
+2. **Optimizer-bomb quarantine** — `SKIP_UNITY_BUILD_INCLUSION ON` plus `COMPILE_OPTIONS "/Od;/Ob0"` on `sub_0022F200_0x22f200.cpp`.
+3. **`target_compile_options(ps2EntryRunner PRIVATE /FS /MP${PS2X_RUNNER_CL_JOBS})`** — `/MP` needs `/FS` alongside `/Zi`; `/FS` was already there. Capped at 6 rather than bare `/MP` (= all logical processors) because `cl` peaked at 3.6 GB on the worst TU and 12 × that exhausts a 16 GB box.
+
+**How to verify these survived CMake generation** (do this before committing to another multi-hour build — grep `build/ps2xRuntime/ps2EntryRunner.vcxproj`):
+
+- `/MP6` becomes **two** elements and you need both: `<MultiProcessorCompilation>true</MultiProcessorCompilation>` **and** `<ProcessorNumber>6</ProcessorNumber>`. Confirmed present in all four configurations (lines 103/174/247/321 and 106/177/250/324). Bare `MultiProcessorCompilation` without `ProcessorNumber` would mean all cores.
+- The quarantine shows as the bomb's `<ClCompile>` entry **lacking** the `IncludeInUnityFile="true" CustomUnityFile="true" UnityFilesDirectory="…"` attributes that every neighbour carries, plus `<Optimization>Disabled</Optimization>` + `<InlineFunctionExpansion>Disabled</InlineFunctionExpansion>` per config. Confirmed at line 34411 for Debug, Release, MinSizeRel **and** RelWithDebInfo.
+
+`build.ps1` builds the `.vcxproj` directly and never calls `cmake`, but MSBuild's `Checking Build System` / `generate.stamp` step re-runs CMake by itself when `cmake.verify_globs` is newer than `generate.stamp.depend` — so a manual reconfigure is not required, and a Ctrl-C'd one is harmless.
+
+### BUG-026 (open, low severity, 2026-07-28) — guest function `0x22f200` is unoptimized in every configuration
+
+A consequence of the quarantine above, recorded deliberately rather than hidden. `sub_0022F200_0x22f200.cpp` now compiles `/Od /Ob0` in Debug, Release, MinSizeRel **and** RelWithDebInfo.
+
+- **Not expected to matter for the current A/B:** the `[hostprof]` profile put the cost in the *host* software-GS (`PixelStorageTraits`, `GSRasterizer::writePixel`), not in guest code, and `0x22f200` has never appeared in a profile.
+- **But it is the first thing to rule out** if the RelWithDebInfo numbers come back oddly flat.
+- **Independently suspicious:** a 278,316-line recompiled function is itself an anomaly — plausibly a recompiler function-boundary failure that swallowed a large span of code, in the same family as [[project_truncated_function_bug]]. Flagged, never investigated. Cheap first check: disassemble `0x22f200` and see whether the original MIPS function is remotely that large.
+- **Reversal is one line** if it ever matters: drop the `COMPILE_OPTIONS` while keeping `SKIP_UNITY_BUILD_INCLUSION` — the quarantine alone stops it serializing the target, at the cost of a 2 h tail on the critical path of every full rebuild.
+
+### BUG-027 (FIXED + VERIFIED by clean rebuild, 2026-07-29, co-piolet) — `[gs:frame-change]`/`[gs:pixels]`/`[gs:prim]`/`[gs:copy-prim]` `RUNTIME_LOG`/`PS2_IF_AGRESSIVE_LOGS` probes referenced nonexistent members; broke the build the instant `PS2X_ENABLE_RUNTIME_LOGS=ON` was first tried. Rebuild with the fixes applied completed successfully (`Done in +05:48`, warnings only, no errors) — closed.
+
+**How found:** user tried the part-5 reconfigure (`PS2X_ENABLE_RUNTIME_LOGS=ON`) for the first time ever, and `build.ps1` failed with a bare `Failed (exit 1)` and no visible error — the real `C2039` lines were only in `build_log.txt`, not the console tail.
+
+**Root cause:** `RUNTIME_LOG(x)`/`PS2_IF_AGRESSIVE_LOGS(x)` compile to `do {} while(0)` by default, so their arguments are never type-checked while the corresponding CMake option is `OFF`. Four call sites across two files had silently bit-rotted behind these no-op macros, referencing struct members that no longer exist:
+- `ps2_gs_gpu.cpp:2389` — `m_registers.prim.type` (no such member; the field is `.prim`, `GSPrimReg::prim` is a `Bitfield<u64,0,3>`) → fixed to use the already-in-scope local `prim.prim`.
+- `ps2_gs_rasterizer.cpp:551` (the one that actually broke the build, gated by `RUNTIME_LOG`) — `gs->m_prim` (no such member on `GS`; it's `gs->m_registers.prim`) → fixed.
+- `ps2_gs_rasterizer.cpp:257-261` and `322-326` — same `gs->m_prim.{type,tme,abe,fst,ctxt}` bug, ×2, still dormant behind the separate `PS2_IF_AGRESSIVE_LOGS`/`PS2X_ENABLE_AGRESSIVE_LOGS` gate (still OFF, untouched) — fixed proactively so enabling that flag later doesn't hit the same wall.
+- `ps2_gs_rasterizer.cpp:279-281` and `342-344` — `gs->m_texclut.{cbw,cou,cov}` (no such member on `GS`; it's `gs->m_registers.texclut`), same two dormant blocks — fixed.
+- `gs->m_vtxQueue[...]` in the same blocks was checked and is correct (`GS::m_vtxQueue` is real) — not part of this bug.
+
+**Status:** source-fixed, verified with a repo-wide grep (`->m_prim\b|->m_texclut\b|\.prim\.type\b`, zero hits remaining) but **not yet confirmed by an actual rebuild** — assistant does not run builds (standing rule). Next action is the user re-running `build.ps1 RelWithDebInfo`. If it succeeds, this closes; if there are further errors, paste `build_log.txt`'s error lines, not just the console tail.
+
+### BUG-028 (★ FIXED AND VERIFIED 2026-07-29 by co-piolet — CLOSED) — GIF IMAGE-mode payload spanning DMA packets was silently discarded; **every VRAM image upload transferred 0 bytes**
+
+**How found:** whole-log analysis of `run_log.txt` (not a pasted excerpt). Every `[gs:image]` line reads `trxreg=1024x64 sizeBytes=0`; the single logged IMAGE GIFtag is `flg=2 nloop=16384` = 262,144 bytes requested vs 0 delivered. 82 of 88 logged GIFtags were all-zero garbage — the parser reading dropped pixel data as tags.
+
+**Root cause:** `GS::processGIFPacket`, `GIF_FMT_IMAGE` branch. `imageBytes` was clamped to `sizeBytes - offset`, which is **0** when the IMAGE GIFtag is the last qword of its DMA packet — the normal framing for a large upload, where the payload arrives in the following packets. Nothing carried the outstanding source-byte count across `processGIFPacket` calls, so the payload was both dropped *and* re-parsed as GIFtags. (`m_transferState` persisted the *destination* cursor across IMAGE tags correctly; the *source* debt had no equivalent.)
+
+**Fix:** new `GS::m_pendingImageBytes`. `processGIFPacket` drains outstanding debt from the head of each packet before tag parsing; the IMAGE branch records `requested - delivered`. Debt is decremented *before* dispatching to `processImageData` (which can call `EndTransfer()` mid-drain and would otherwise underflow it). `EndTransfer()` intentionally does not clear the debt — declared-but-surplus qwords are padding and must still be consumed, never parsed as tags. Cleared on `GS::reset()` and on each `TRXDIR` write.
+
+**Verify by:** `[gs:image] sizeBytes` becoming non-zero, and the all-zero GIFtag count (`flg=0 nloop=0 nreg=16 eop=0 hi=0x0`) collapsing toward zero.
+
+**VERIFIED 2026-07-29 20:15 (RelWithDebInfo, `PS2X_DIAG=1`, 45 s run):** `[gs:image] sizeBytes` = **262144 on all 16 transfers** (was 0 on every one); all-zero GIFtags = **0 of 33** (was 82 of 88); `[gs:frame] imagebytes=4194304` = the complete 16 x 262144 upload. Both verification signals passed. **Bug closed.**
+
+**Caveat — fixing this did NOT fix the black screen.** `textured` and `nonblack` remained 0. The uploads that now succeed are a one-time boot VRAM clear at `dbp=0x0`, not asset content; no texture is ever uploaded afterwards and `TME` is never set. This bug was real, but the Phase 5 blocker is upstream of the GS. See the part-11 verification section for the IOP/SIF pivot.
+
+**Known limitation (accepted, unverified):** `m_pendingImageBytes` is global, not per-GIF-path. `processGIFPacket` is reachable from PATH3 (DMA) and PATH1 (VU1 XGKICK). A PATH1 packet interleaving mid-IMAGE-transfer would be misconsumed as payload. Real hardware holds the GIF bus for PATH3 during an IMAGE transfer, so this is believed safe, but it was not checked against `m_gifArbiter`.
+
+**Regression-tested 2026-07-29 (co-piolet).** Three tests added to `ps2xTest/src/ps2_gs_tests.cpp`, inserted just before the existing split-IMAGE test:
+1. *"GS IMAGE payload arriving in a later packet than its GIFtag is not dropped (BUG-028)"* — packet A is a bare 16-byte IMAGE tag with no payload; packets B and C are raw payload. **Fails on the pre-fix code.**
+2. *"...partially trailing its GIFtag carries only the shortfall (BUG-028)"* — guards the debt arithmetic.
+3. *"...byte debt is dropped when a new transfer is started (BUG-028)"* — guards the `TRXDIR` clear.
+
+**Why the existing suite missed this:** `ps2_gs_tests.cpp` already had *"GS PSMT4 host-local upload keeps position across split IMAGE packets"*, but each of its packets carries **its own IMAGE tag alongside its own payload** — repeated-tag framing. It never covered the game's actual framing: **tag at the end of a packet, payload in the packets that follow.** Worth remembering when judging whether a path is "covered".
+
+**★ UNIT-CONFIRMED 2026-07-29 21:22 (co-piolet).** `ps2x_tests.exe PS2GS "BUG-028"` → **3 / 3 passed, 0 failed.** BUG-028 is now proven twice: end-to-end against a live 45 s run, *and* at unit level with no game, no ELF, and a ~5-minute build. The emitted probe lines confirm the exact framing that broke in the game — tag-only packet then `sizeBytes=16` + `sizeBytes=16` (carryover), and `nloop=3` then `sizeBytes=16` + `sizeBytes=32` (shortfall carried).
+
+**★ GOTCHA worth not rediscovering — `EndTransfer()` zeroes the state you are about to assert on.** The first run of these three tests *failed*, and the failure was entirely in the tests, not the fix. `GS::EndTransfer()` ([ps2_gs_gpu.h:480](F:/SDBZ%20Recomp/ps2xRuntime/include/runtime/ps2_gs_gpu.h:480)) is two lines: `m_registers.trxdir.xdir = 3;` and `m_transferState = { };`. That second line wipes `copied_pixels`, `x`, `y`, `total_pixels`. `getDebugSnapshot()` reads *live* state, so **`transferCopiedPixels` is always 0 for a COMPLETED transfer** — an assertion like `Equals(copied, 8u)` after completion is unsatisfiable no matter how correct the code is. `m_transferState.copied_pixels` is likewise reset on every `TRXDIR` write ([ps2_gs_gpu.cpp:2114](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/ps2_gs_gpu.cpp:2114)), next to `m_pendingImageBytes = 0`. Assert transfer counters **mid-flight**, or assert the new debt field instead.
+
+*Diagnostic heuristic that cracked it, reusable:* when a test fails, look at **which** assertions failed versus which passed. All three tests failed on exactly one assertion each while their *strongest* assertions (byte-for-byte VRAM comparison) passed. That pattern means the **observation** is wrong, not the code under test.
+
+**New instrumentation added while confirming this (co-piolet):**
+- `GSDebugSnapshot::pendingImageBytes` — exposes `m_pendingImageBytes`, the outstanding IMAGE byte debt, so it is directly assertable rather than inferred. Declared in [ps2_gs_gpu.h](F:/SDBZ%20Recomp/ps2xRuntime/include/runtime/ps2_gs_gpu.h) (~190), populated in `getDebugSnapshot` ([ps2_gs_gpu.cpp](F:/SDBZ%20Recomp/ps2xRuntime/src/lib/ps2_gs_gpu.cpp) ~607). The rewritten tests now verify the debt shrinks by exactly the bytes consumed per packet — strictly stronger than the assertions they replaced.
+- **`ps2x_tests.exe` now takes filters:** `ps2x_tests.exe [suite-substring] [test-substring]`, case-insensitive, empty = match all. Prints a `[filter]` banner and a "Skipped by filter" summary. Added in [MiniTest.h](F:/SDBZ%20Recomp/ps2xTest/include/MiniTest.h) (`Run()` kept as a no-arg overload) and [main.cpp](F:/SDBZ%20Recomp/ps2xTest/src/main.cpp) (`main(argc, argv)`).
+
+**★ BLOCKER for anyone running the full test suite — `ps2x_tests.exe` HANGS in `PS2RuntimeKernel`.** Test *"semaphore syscalls return sid on success (EE BIOS convention)"*, sub-case E ([ps2_runtime_kernel_tests.cpp:542-584](F:/SDBZ%20Recomp/ps2xTest/src/ps2_runtime_kernel_tests.cpp:542)): a worker thread blocks in `WaitSema`, the main thread deletes the semaphore, then calls `worker.join()` **unconditionally**. If `DeleteSema` does not wake the waiter with `KE_WAIT_DELETE`, this never returns. (The 500 ms `waitUntil` timeout above it does *not* protect the `join()`.) Pre-existing; unrelated to BUG-028; unknown whether it is a genuine `DeleteSema` runtime bug or a test-harness race.
+
+**Blast radius is larger than it looks:** `MiniTest::m_cases` is a `std::map`, so **suites and tests run in alphabetical order, not registration order.** Everything sorting after `PS2RuntimeKernel` therefore never executes — `PS2SifRpc`, `SifDma`, `PS2Vu1`, `Pad`, and ~35 `Scheduler*` suites. Use the new filter to reach them until the hang is fixed.
+
+### BUG-029 (diagnostic-quality bug, source-fixed 2026-07-29 by co-piolet) — the `[gs:pixels]` probe was sampling-biased and caused two wrong root-cause conclusions
+
+`[gs:pixels]` sampled 1 in **2,000,000** pixel writes. A 512x448 clear is ~229k pixels at ~50Hz ≈ 11M cleared pixels/sec, so effectively every sample landed on a black full-screen clear sprite. The whole run produced only **16** samples — and parts 9 and 10 of the session log concluded from them that "every draw renders black" and that RGBAQ was the prime suspect. Both conclusions were artifacts of the sampling rate.
+
+**Fix:** replaced with `[gs:frame]`, a per-interval aggregate emitted from the present probe: `px` / `nonblack` / `textured` / `maxrgb` / `primmask` / `imagebytes` / `prims`, reset at each report. `nonblack=0` on the new probe is a real statement about every rasterized pixel in the interval.
+
+**VERIFIED WORKING 2026-07-29:** emits ~1/s, e.g. `[gs:frame] px=24313856 nonblack=0 textured=0 maxrgb=0 primmask=0x40 imagebytes=4194304 prims=479`. It immediately paid for itself: `primmask=0x40` (SPRITE only, whole run) and an authoritative `nonblack=0` across ~24 M pixels/interval are both facts the sampled probe could never have established. **Bug closed. `[gs:frame]` is now the primary GS instrument — use it, not per-pixel sampling.**
+
+**Generalize this:** a sampled probe on a path dominated by one high-volume event measures only that event. On GS pixel paths, **aggregate — do not sample.**
+
+**Lesson (generalize):** a sampled probe on a path dominated by one high-volume event measures only that event. On GS pixel paths, aggregate — do not sample.
+
+### BUG-030 (diagnostic-quality bug, source-fixed 2026-07-29 by co-piolet — same family as BUG-029) — capped probe counters were used as quantitative evidence, manufacturing two phantom findings
+
+Sibling of BUG-029: BUG-029 was *sampling* bias, this is *saturation* bias. Several probes in this codebase stop printing after a fixed count, so their line count is a **cap, not a measurement** — and two separate root-cause leads were built on comparing a capped counter against an uncapped one.
+
+**Instance 1 — the phantom "RPC reply deficit" (`SifRpcReply` 88 vs `SifRpcPkt:SIG` 180).** REFUTED. The 88 is the sum of two *saturated* counters:
+
+| log line | observed | cap in source |
+|---|---|---|
+| `[SifRpcReply] deliver cid=...` | **24** | `s_replyLogs ... < 24u` — [SIF.cpp:752](ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp#L752) |
+| `[SifRpcReply] depth=...` | **64** | `s_depthLogs ... < 64u` — [SIF.cpp:849](ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp#L849) |
+
+24 + 64 = 88, both exactly at their caps, while `[SifRpcPkt:SIG]` is **deliberately never rate-limited** ([SIF.cpp:1619](ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp#L1619)). The cids are also perfectly consistent (SIG = `0x8000000a`×173 + `0x80000009`×7; deliver = `0x8000000a`×14 + `0x80000009`×10 — same two cids, no orphan server). **There is no deficit. Do not chase this ratio again.**
+
+**Instance 2 — ARKD streaming extent is unmeasurable.** `[ARKD:cdread]` and `[ARKD:sifdma]` both cap at `seen < 8u` ([ps2_iop_irx_loader.cpp:644](ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp#L644) and [:751](ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp#L751)). "Streaming stopped right after the TOC" and "streamed the whole 0x2ba29000-byte GAME.DAT" produce **byte-identical logs**. This also means the 2026-07-27 "ARKD disc I/O stops ~t=20s" retraction was the *same* bug surfacing earlier.
+
+**Fix VERIFIED WITH REAL DATA 2026-07-30 05:18** (RelWithDebInfo run, 96.3s) — non-saturating running totals emitted at power-of-two event counts, in `ps2_iop_irx_loader.cpp`:
+- `[ARKD:cdread-total] reads= sectors= bytes= fails= lastLbn=` → last line: `reads=1024 sectors=1070 bytes=2191360 fails=0 lastLbn=1075481`
+- `[ARKD:sifdma-total] dmas= bytes= skipped= lastEeDest=` → last line: `dmas=1024 bytes=2156160 skipped=0 lastEeDest=0x017b5c00`
+
+**Result: Instance 2 is now RESOLVED, not just unblocked.** Both counters climbed cleanly for the entire run (1→2→4→...→1024, zero fails/skipped) — streaming does not stop after the TOC, it runs continuously (~2.1MB delivered). See ★★ HANDOFF for the implication (blocker is EE-side, not load-path). The first-8 detail lines are unchanged.
+
+**Gotcha hit while verifying this:** `build.ps1 Debug -Test` does **not** build `ps2EntryRunner` (only the runtime lib + test exe) — the first game run after "building" used a stale exe and showed the old capped 8/8 lines. Always confirm exe mtime > source mtime before trusting a measurement run; `build.ps1 RelWithDebInfo` (no `-Test`) is what actually links the game exe.
+
+**Standing rule (generalize):** **before treating any log-frequency count or ratio as evidence, grep the probe's source for its cap.** Known caps in this codebase: 6, 8, 16, 24, 64. A counter sitting exactly on a round number is the tell. Cross-reference [[feedback_measure_dont_infer_rates]].
+
+### BUG-031 (open, 2026-07-29) — `ps2x_tests.exe` with no filter hangs forever, silently skipping ~40 suites
+
+Promoted from an inline note to its own entry because it gates the whole test-driven method.
+
+**Hang site:** suite `PS2RuntimeKernel`, test *"semaphore syscalls return sid on success (EE BIOS convention)"*, sub-case E ([ps2_runtime_kernel_tests.cpp:542-584](ps2xTest/src/ps2_runtime_kernel_tests.cpp#L542)). A worker thread blocks in `WaitSema`; the main thread deletes the semaphore, then calls `worker.join()` **unconditionally**. If `DeleteSema` does not wake the waiter with `KE_WAIT_DELETE`, `join()` never returns. The 500 ms `waitUntil` above it does **not** protect the `join()`.
+
+**Blast radius is larger than the hang itself:** `MiniTest::m_cases` is a `std::map`, so suites run **alphabetically, not in registration order**. Everything sorting after `PS2RuntimeKernel` never executes — `PS2SifRpc`, `SifDma`, `PS2Vu1`, `Pad`, and ~35 `Scheduler*` suites. That is why the SIF suites had never been run before 2026-07-29.
+
+**Workaround (use this, don't fix it mid-blocker):** always pass a filter — `ps2x_tests.exe [suite-substring] [test-substring]`, case-insensitive.
+
+**Root cause not established:** unknown whether this is a genuine `DeleteSema` runtime bug (real, would matter to the game) or a test-harness race (cosmetic). Deciding that is the first step if it is ever picked up. Pre-existing; unrelated to BUG-028/029/030.
+
+### BUG-032 (open, 2026-07-29, first observation) — `sceSifSetDma` multi-descriptor validation is not atomic
+
+**Surfaced by the first-ever run of the SIF suites** (reachable only via BUG-031's filter workaround), so it is a **newly-observed failure, not necessarily a regression** — it is not in the ~14-item baseline-failure list and has simply never been executed before.
+
+`ps2x_tests.exe Sif` → **27 / 28 passed, 1 failed.** Failing test: `PS2SifDma` / *"sceSifSetDma rejects invalid descriptors without partial writes"*, two assertions:
+- `sceSifSetDma should fail when any descriptor is invalid`
+- `failed multi-descriptor sceSifSetDma should not partially write earlier descriptors`
+
+Observed behaviour: given descriptor 0 valid (`src=0x21100 dest=0x21200 size=0x8`) and descriptor 1 with an invalid dest (`dest=0xe0000100`), the call **copies descriptor 0 and returns a nonzero id** (`[sceSifSetDma:OK] dmat=0x21000 count=2 pending=2 -> nonzero id`) instead of validating the whole list first and failing atomically. The `count=33` guard path works correctly (`[sceSifSetDma:GUARD] reject`), so only per-descriptor address validation is affected.
+
+**Not investigated, not triaged against the live blocker.** Relevance is unknown: the game's own transfers are single-descriptor in every log seen so far, so this may be latent. Do not spend on it unless the `rpc_handle_valid` lead points here.
+
+### Deferred, worth doing before the next long build
+
+`sccache not found; continuing without compiler launcher` appears in every configure. No compiler cache is in play, so every full build is from scratch. With a 4520-TU target and no working tlogs, `sccache` is the single highest-leverage build improvement available. Not done now — it would have delayed the A/B.
+
+### Minor A/B contaminant, flagged
+
+The reconfigure pulled new upstream **imgui** commits via FetchContent (`a9e7a8c..ff135cf master`) that were **not** in the Debug control-arm build. imgui is overlay/debug UI and is not in either hot thread, so it should not affect the comparison — but it is a real difference between the two arms, and it is the first suspect if the RelWithDebInfo build had failed to link.
+
+Pre-build steps reported `0 file(s) updated` and `fn_forward_decls.h unchanged (no recompile triggered)`, so **no recompiler regeneration occurred** — the runner sources are byte-identical to the control arm. That part of the A/B is clean.
+
+### Still open, unchanged by this session
+
+- **The `pc=0x1` clobber on `0x178be8`** is non-deterministic and still live. It derailed one of the three baseline attempts. It is a correctness blocker tracked separately, not a perf issue — see [[reference_ps2_sif_boot]].
+- **The t≈89 s watchdog breakout** out of the `pc=0x421f10` / `lastCall=0x172998` (`sceDmaSync`) plateau reproduced **2 for 2**, with different addresses but the same shape, right as the time box expires. We have never seen past it. **Do one `-RunSeconds 300` run after the A/B** — a longer box now would change the CPU-second comparison.
+- **tid 9288** burns 6.97 s in `Wait/ExecutionDelay` yet never appears in `[hostprof]`. Unexplained, not chased.
+
+---
+
+## Session 2026-07-28 (agent handoff: GitHub Copilot / Claude Sonnet 5) — verified prior Claude Code session's HostSampler work, no build/run performed
+
+**Context:** picked up mid-handoff from a Claude Code session (compacted transcript) investigating why the recomp guest runs ~5 orders of magnitude slower than native PCSX2 (native reaches the memcard prompt in 7-8s; recomp needs 90s+ CPU-bound at ~118% of one core with a black screen). That session had written `ps2xRuntime/src/lib/Kernel/HostSampler.cpp` (CPU-time-weighted sampling profiler, Suspend/GetThreadContext/GetThreadTimes/Resume) and wired it into `ps2_runtime.cpp` (start/stop calls, namespace-scope `extern "C"` decls, no header touched) and `launch_recomp.ps1` (new `-HostProfile` switch, `PS2X_PROFILE`/`PS2X_PROFILE_SECS` env set/clear, `[hostprof]` added to `$Important`, auto-stop grace widened 2s→6s) but had **not yet built or run it**, and had not yet reported any of this to the user.
+
+**This session (Copilot) did:** read the user's governing rules for Claude and recorded them to persistent repo memory (`/memories/repo/rules.md`) so they bind this agent too — most importantly *"never run build.ps1/builds directly, always give the user the command to run themselves"* and *"never modify runner/*.cpp or .h files"*. Verified (read-only, no edits) that all three files described in the handoff summary match exactly: `HostSampler.cpp` exists with the documented design (samples dropped when CPU-time delta is 0, self-reports on its own timer, `Kernel/` placement rides the existing `CONFIGURE_DEPENDS` glob so no CMakeLists edit is needed), `ps2_runtime.cpp:44-45/2520/2995` has the three wiring edits, `launch_recomp.ps1:20/136-143` has the `-HostProfile` param + env block. **No code changes made this session** — this was a verification-only continuation. Build/run deliberately deferred at user's direction ("start them later").
+
+**Handoff back to user — commands to run when ready (per the "never run builds directly" rule):**
+```powershell
+& "F:\SDBZ Recomp\build.ps1"
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile
+```
+This will produce a `[hostprof]` report naming the actual functions/modules the ~47s and ~43s host threads are burning CPU in, plus the 16.56s `Wait/ExecutionDelay` thread (suspected `Sleep()` in the det=0 vblank tick loop, `Kernel/Syscalls/Interrupt.cpp:625-676`). Paste the `[hostprof]` output back and I'll pick up the diagnosis (RecompDbg's shared-memory writer is already exonerated — verified live at ~118% CPU with the gate on across 3 runs).
+
+**Also confirmed:** the previous Claude Code session (transcript `6ec32f85-bf4b-441a-831b-36319f7f3fd2.jsonl`) hit its usage rate limit immediately after the user asked it to "update memory bugs and handoff" — that request was never carried out, which is why this handoff arrived only as a compacted summary. Nothing else from that session was lost; its last real work (the `HostSampler.cpp` build) is exactly what this entry already covers.
+
+**First real run + bug found + fixed (GitHub Copilot, same session, later same day):** user ran the build+run and pasted a `[hostprof]` report — sampler weighting is confirmed correct (per-thread totals matched `[cputime]` closely: 46.48s↔50.23s, 37.41s↔39.92s, 18.55s↔19.72s across the three real burner threads), but **every sample resolved to `module ?` with zero per-symbol lines on all threads** — the report was naming nothing. Root-caused (read-and-reason, not guesswork) to a **dbghelp double-init**: `game_overrides.cpp`'s hardware-watchpoint armer (`hwWatchArmerMain`, started unconditionally from `hwWatchArm()` every time `rpc_call`/`0x178BE8` true-enters — a leftover always-on hook from the 2026-07-27 VSync bug hunt) calls `SymInitialize(GetCurrentProcess(), nullptr, TRUE)` with no matching `SymCleanup`. dbghelp allows only one live `SymInitialize` per process handle; `HostSampler::report()`'s own later call therefore fails with `ERROR_INVALID_PARAMETER`, `haveSyms` reads `false`, and both the module and per-symbol resolution paths silently degrade to `"?"`/skipped.
+**Fix applied (`HostSampler.cpp` only, no header, no CMakeLists change):** treat `SymInitialize` failing with `ERROR_INVALID_PARAMETER` as success rather than failure — the pre-existing process-wide init (with `fInvadeProcess=TRUE`, so every module is already loaded) is still fully usable; there was never a reason to require *this* call site to be the one that succeeded.
+**Not yet verified — needs a rebuild + rerun** (one `.cpp` changed, incremental, `Kernel/` glob so no CMakeLists edit needed):
+```powershell
+& "F:\SDBZ Recomp\build.ps1"
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile
+```
+**Also worth a look independent of the symbol fix:** at `t=89s` of that same run, the watchdog broke out of the `pc=0x421f10`/`lastCall=0x172998` steady frame-loop plateau it had been pinned to since ~t=5s (`stuckSecs` reset `7→0`) into unrelated new code — trace tail `0x1c29b0 -> 0x398db0/0x1d3b30/0x2ae860/0x1d48d0/0x3d1550/0x2b65e0/0x2b83a0/0x2ca010 -> 0x1c29b0` (repeating dispatch-like pattern, distinct callee each iteration) `-> 0x1c4280 -> 0x19e620 -> 0x1bdfb0 -> 0x1a07c0 -> 0x23fca0 -> 0x240780`. The run auto-stopped (`wall=96.32s`) shortly after, so what this leads to is unknown. First time this specific breakout has been observed in the state file. Flagged, not yet chased.
+
+**BUG-024 false-alarm check (same session):** an earlier paste from a *different, shorter* run (`wall=38.26s`) showed `run_log.txt` cutting off mid-`[frametrace:IMBAL]` with no further watchdog ticks and no `[hostprof]` — pattern-matched against the open `BUG-024` (`STATUS_STACK_OVERFLOW`/`0xC00000FD`, found via `ps2xTest`, never root-caused in real gameplay). Chased via `$LASTEXITCODE` (first attempt read a stale value from the wrong terminal/cwd — user corrected to `C:\WINDOWS\system32` being the accidental cwd, not a file-location bug; no stray files existed there or in the user profile root, nothing was deleted). **Resolved as a false alarm, not BUG-024 recurring:** the very next full run (the one analyzed above) completed cleanly to auto-stop with a valid `[hostprof]` report and no crash — the short run was an incomplete/truncated paste, not a real early exit. Not chased further unless it recurs with a confirmed exit code.
+
+**Second finding, same session — real perf root cause identified, fix not yet applied (needs a decision + a build/run, not code-complete):** with symbol resolution fixed, the `[hostprof]` report named real hot code for the first time. The two busiest threads (43.8s + 40.6s CPU of a 96s run) are both dominated by `ps2EntryRunner!GSMem::PixelStorageTraits<0>::{PageId, Address, Read, Write, BlocksPerPage, BlockExtent, PixelsPerPage}` (`ps2xRuntime/include/runtime/ps2_gs_memory.h` — a header, **read-only per the standing rule, not edited**) — the software GS pixel-storage addressing math, called per-pixel from `GSRasterizer::writePixel`/`GS::copyFrameToHostRgbaUnlocked`. A third thread (19.06s) is our own `hwWatchArmerMain` toolhelp-enumeration overhead (instrumentation, not game logic). `_RTC_CheckStackVars` alone is 6-7% of each hot thread.
+**Root cause:** `build.ps1`/`launch_recomp.ps1` default to a **Debug** build (confirmed: `build.ps1`'s usage comment lists `Debug|RelWithDebInfo`, `launch_recomp.ps1` points at `...\Debug\ps2EntryRunner.exe`). In Debug, MSVC neither inlines nor constant-folds the `constexpr` `PixelStorageTraits` accessors (called millions of times/frame), and `/RTC1` stack-check instrumentation adds further per-call overhead on top. Confirmed via the runtime's `CMakeLists.txt` that `RelWithDebInfo` only adds `/SUBSYSTEM:WINDOWS` + `/ENTRY:mainCRTStartup` on top of CMake's default `/O2 /DNDEBUG` for that config — MSVC disallows `/RTC` together with optimizations, so `RelWithDebInfo` should both inline the hot math and drop the `_RTC_CheckStackVars` overhead entirely. This is a **build-configuration hypothesis, not yet tested** — no code or config was changed to test it.
+**Caveat flagged before testing:** `/SUBSYSTEM:WINDOWS` means the process may not get an attached console by default, so `[hostprof]`/`[watchdog]`/`[cputime]` prints could stop appearing in the terminal even if the process runs fine — check for this after the build.
+**Next step (commands prepared, not run by this agent per the "never run builds directly" rule):**
+```powershell
+cd "F:\SDBZ Recomp"
+.\build.ps1 RelWithDebInfo
+```
+then:
+```powershell
+cd "F:\SDBZ Recomp"
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+"EXITCODE: $LASTEXITCODE"
+```
+**Session summary — files actually changed this session (GitHub Copilot / Claude Sonnet 5, 2026-07-28):** `ps2xRuntime/src/lib/Kernel/HostSampler.cpp` (one fix, see above) and this file (`PS2_PROJECT_STATE.md`, handoff/session logging). No other source files were edited. No builds were run by the agent; all builds/runs were run by the user per the standing rule. Governing rules for this repo were recorded to persistent agent memory at `/memories/repo/rules.md` (outside the repo tree, survives across sessions for this agent).
+
+### BUG-025 (open, 2026-07-28) — the hardware-watchpoint armer is always-on and costs ~20% CPU
+
+`hwWatchArm()` (`game_overrides.cpp:1388`) spawns `hwWatchArmerMain` **unconditionally** on every `rpc_call`/`0x178BE8` true entry — there is no env gate. The armer then loops forever at 4 Hz doing a full `CreateToolhelp32Snapshot` plus `SuspendThread`/`GetThreadContext`/`SetThreadContext`/`ResumeThread` on **every thread in the process** (`hwWatchSweep`, `:1227-1270`).
+
+**Measured cost: 19.06s of CPU in a 96s run** (third-busiest thread in the `[hostprof]` report). This **supersedes an earlier measurement of "~0.3s over 62s", which was wrong.** Two consequences:
+1. It is a ~20% tax on every run, for a probe whose investigation (RAOUT / SetVSyncFlag) closed on 2026-07-27.
+2. It **suspends the very threads being profiled, 4×/s** — it perturbs any performance measurement it coexists with, including the RelWithDebInfo A/B queued above.
+3. Its unpaired `SymInitialize` is what broke `HostSampler`'s symbol resolution (fixed on the sampler side, but the underlying double-init is still there).
+
+**★ FIX APPLIED + BUILT 2026-07-28 (Claude Code session).** Debug build completed 09:26:09 with zero errors (`game_overrides.obj` 09:25:22, `ps2_runtime.lib`, then a full relink of the 730MB exe). Verified at the binary level: the exe now contains the `PS2X_HWWATCH` string alongside the pre-existing `PS2X_HWWATCH_VAL`. **VERIFIED at runtime 2026-07-28**: the gated-off baseline ran and the armer thread is absent from `[hostprof]`. It cost more than its own 19.06s — the two real threads rose 43.8+40.6s → 67.84+65.47s CPU (total 139s → 156.7s, 163% of one core), i.e. suspending every thread 4×/s was throttling the workers by ~55%. Symbol resolution is also correct for the first time now that the unpaired `SymInitialize` is gone, so this profile supersedes earlier attributions.
+
+**★★★ CONTROL ARM CAPTURED — third attempt, 2026-07-28, VALID.** Armer gated off, dispatch-miss log capped and built, and this time the guest did **not** derail: the watchdog held `pc=0x421f10`/`lastCall=0x172998` with `stuckSecs` cycling and resetting, `progress` climbing to **12101** at t=89. Baseline to compare RelWithDebInfo against:
+
+| metric | Debug baseline |
+|---|---|
+| `[cputime]` | wall 96.52s · **cpu 99.53s** · 103.1% of one core (auto-stopped) |
+| tid 6388 (presentation) | 46.14s — `GS::copyFrameToHostRgbaUnlocked` / `latchHostPresentationFrameUnlocked` |
+| tid 20108 (rasterizer) | 44.42s — `GSRasterizer::writePixel`, `PixelStorageTraits<48>`, `::Write` |
+| tid 9288 | 6.97s `Wait/ExecutionDelay`, absent from `[hostprof]` — unexplained, not chased |
+| watchdog `progress` @ t=89 | **12101** (vs 8523 on the derailed run — +42% guest work in the same time box) |
+| `gif/s` / `vbl/s` | 3–5 / 3–6 (normal 30–60 ⇒ still ~10× slow) |
+| `PixelStorageTraits` share | **≈48%** of tid 6388, **≈25%** of tid 20108 |
+| `_RTC_CheckStackVars` | 7.0% / 8.5% — Debug-only, `/O2` deletes it outright |
+
+**`progress` is the throughput metric, not wall clock** — `-RunSeconds 90` fixes the wall time by construction.
+
+**Retraction:** the earlier reading that gating the armer "bought ~55% more throughput" (43.8+40.6 → 67.84+65.47s) was wrong — that rise was the log-spam livelock, not worker throughput. On the clean run the two threads sit at 42.6+41.6s, statistically identical to the armer-on run. The gate bought the armer's own ~19s plus correct symbols, nothing more.
+
+**Also reinstated:** with the unpaired `SymInitialize` gone, symbols are trustworthy, and **both** hot threads really are `PixelStorageTraits`-dominated — the claim retracted while symbols were suspect is now confirmed on clean data.
+
+**Historical — the middle baseline was void (fix applied + built + verified).** The guest derailed to `pc=0x1` at t≈32s (`stuckSecs=57` at t=89; `frametrace #10901 func=0x178be8 exitPc=0x1 exitRa=0x1` — the known non-deterministic `0x1` clobber). For the remaining ~64s the dispatcher retried the bad target in a tight loop, and the **unbounded** `std::cerr` at `ps2_runtime.cpp:1289` emitted a ~1KB line per iteration: **225MB of `run_log.txt`** and **65.47s of CPU — 42% of the entire run** — in `ntdll!ZwWriteFile` + `MSVCP140D` iostream formatting, on a thread doing no guest work at all. That made the run look CPU-bound on emitted code when two thirds of it was our own diagnostics. Fix: hoisted the existing `s_missProbes` counter above the `cerr`, kept the first 8 lines, then silence plus a running total every 100000 (a bounded counter with no heartbeat cannot distinguish a spin from a stall). The probe sink 30 lines below had been capped at 8 for this exact reason long ago; the human-readable line beside it was simply missed. **Rebuild Debug and redo the baseline before starting the RelWithDebInfo arm** — editing `ps2_runtime.cpp` touches 1 obj in the 47-obj `ps2_runtime` lib and does not invalidate the 808 finished RelWithDebInfo unity objs. Also note `-RunSeconds 90` time-boxes the run, so wall clock is fixed at ~96s by construction: compare **CPU seconds and the per-thread profile**, never wall time.
+
+The hold-until-after-the-A/B plan was reversed, deliberately: it contradicts point 2 above. Leaving the armer on during the A/B does not keep the variables separable — it taxes **both** arms by ~20% and suspends the profiled threads 4×/s while doing it. Because the fix is an **env gate**, the two variables stay separable *at runtime* instead of across builds, which is strictly better: one binary can produce a gated-off perf run and a gated-on writer hunt, and no build is ever spent to switch between them.
+
+Two edits, no header, no recompiler run:
+1. `game_overrides.cpp` — new `hwWatchEnabled()` (function-local `static` so `getenv` runs once, never on the hot path) and an early-out at the top of `hwWatchArm()`. Gating the *entry point* rather than the `detach()` at `:1403` means the address publishes stop too, not just the thread spawn.
+2. `launch_recomp.ps1` — new `-HwWatch` switch, mirroring `-HostProfile`. Sets `PS2X_HWWATCH=1` and prints a yellow warning that perf numbers from that run are untrustworthy; **clears the var when absent**, since env vars persist across runs in the same shell (the same trap `-HostProfile` already documents).
+
+Default is **off**. `PS2X_HWWATCH_VAL` (the value filter) is unchanged and still only read once the armer is enabled.
+
+**Side effect, wanted:** with the armer off, the unpaired `SymInitialize` in point 3 no longer runs at all, so `HostSampler` gets a clean first init. Its `ERROR_INVALID_PARAMETER`-tolerant workaround stays in place and still covers the `-HwWatch` case.
+
+**Rebuild cost is small — this does *not* touch the stalled runner build.** `game_overrides.cpp` is in the `ps2_runtime` STATIC lib (`CMakeLists.txt:415`, 55 objs), not the 4520-TU `ps2EntryRunner` unity target. One obj recompiles; the 808 finished `RelWithDebInfo` runner objs are untouched and the build resumes rather than restarting.
+
+### RelWithDebInfo build — it is already 18% done, and the default `-Jobs 2` is the real cost (2026-07-28, Claude Code)
+
+The A/B build was **already started and stalled**, not never-begun. Measured from the build tree, not assumed:
+
+| | |
+|---|---|
+| Ran | 04:14 → 06:36 today (2h22m), no build process alive since |
+| Progress | **808 of 4520** unity TUs (`ps2EntryRunner.dir/RelWithDebInfo`, 497 MB) |
+| Order | descending — newest obj `unity_3707`, oldest `unity_4500` |
+| Rate | ~5.7 obj/min at `/m:2` |
+| Remaining at that rate | **≈11 hours** |
+
+**`build.ps1` defaults to `$Jobs = 2` (line 7). This machine is 6 cores / 12 threads.** Nothing in the build is serialized by design — the job count is just an unexamined default. Passing `6` should bring the remainder to roughly **3–4 h**. Disk is not a constraint (168 GB free; the full obj set projects to ~2.8 GB from the 497 MB/808 sample).
+
+**Do NOT clean.** Two reasons, the second decisive:
+1. The 808 objs are valid and MSBuild resumes past them — a clean pays for them again.
+2. A clean also destroys the **Debug** tree (4520 objs + a working 730 MB exe from 03:38). That tree is the **control arm** of the A/B. Without it there is no baseline to compare against, and re-creating it is a second multi-hour build. The comparison is the entire point of the exercise.
+
+**The `/SUBSYSTEM:WINDOWS` caveat is real but does NOT apply to this launcher — stand down on it.** `ps2xRuntime/CMakeLists.txt:595-596` does add `/SUBSYSTEM:WINDOWS` + `/ENTRY:mainCRTStartup` for `RelWithDebInfo`, so the process gets no console of its own. But `launch_recomp.ps1:281-283` runs the exe through a **pipeline** (`& $Exe $Elf 2>&1 | Tee-Object -FilePath $Log`), and a piped child inherits the redirected stdout handle regardless of subsystem — the CRT still writes to it. `[hostprof]`/`[watchdog]` output will reach both `run_log.txt` and the console. No CMakeLists edit is needed. (`run_log.txt` remains the authority if the console looks thin.)
 
 ## Session 2026-07-27 — ★★★ 5.4.1 PASSED: guest EE COP0 `Status.EIE` is now honoured by the fiber scheduler. Derail collapses to one bracketed event → 5.4.2
 
@@ -2083,6 +3083,23 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 
 ## Learned Patterns
 
+### 2026-08-01 (later — the ARKD completion-path session)
+- **★★ Any fallthrough that fabricates a return value must name itself.** The IOP import lambda returned `$v0 = 0` for every unhandled `(lib, fid)`. For a boolean-success API that reads as *failed*, and the IRX idiom is `while (!x) x = api(...)` — so **one unlisted ordinal is an infinite spin that consumes the entire interpreter budget and is indistinguishable in the log from "the handler hung."** That is exactly what `sifcmd fid=12` (`sceSifSendCmd`) did to the state-11 audio call, and it cost a session. This is the same disease as a silent probe cap ([[feedback_capped_probes_false_negatives]]) one layer down: a *silent default* manufacturing a zero that reads as data. Fixed generally, not specifically — `[iop:unhandled]` censuses every defaulted import, announces the first hit, and dumps the full census whenever a service run fails to halt (i.e. precisely when something is spinning).
+- **★ Identify an IOP import by its CALL SITE, not by an SDK ordinal table.** `sifcmd fid=12` was pinned by matching the live `[iop:import]` args (`a0=0x80000001 a1=0x53a30 a2=0x18`) against the verbatim decompiled loop in `irx_arkddvd_sub_A3C0`. Guessing semantics from an ordinal list is how this project produced five misleading-name retractions. **Corollary — a deliberate non-action:** `thsemap fid=6/8` and `sifman fid=7/8` fall through the same way and were **left alone**, because their real semantics may already be "return 0 = success". Building the census that will *name* them from live evidence is worth more than four plausible guesses.
+- **`retired == the budget literal` + `halted=0` means the zeros in that record are uninitialised, not measured.** `sid=0x501 fno=0x101 -> retired=4000000 halted=0 $v0=0 rsz=0 delivered=0` was read as "the reply is empty" for a full session. It was "the handler never returned" — `$v0`/`rsz`/`delivered` are zero *by construction* when the halt sentinel is never reached. **Before interpreting any output field, check the loop-exit flag that says whether the producer finished.** A round number equal to a literal in the source is the tell.
+- **A "status table" at a fixed address may be a standard SDK array the guest installed itself.** `0x5618B0` was described as "entry 12 of a bespoke async status table" for several sessions. It is `_sif_sreg[12]` — EE libsifcmd's own array, base `dword_561880`, installed by the guest's `sceSifInitCmd`. Once named correctly, the reader (`0x177AB8`), the writer (`0x177AD0`), and the SET_SREG handler (`0x177A88`) all fell out immediately, and with them the reason our host-side `g_sifSregs` write landed nowhere. **When an address resists explanation, try to match it to a documented SDK structure before inventing a bespoke one for it.**
+- **"No scheduler" is a load-bearing fact, not a caveat.** `thbase` CreateThread only *records* and StartThread does nothing, so **every thread body the IRX creates is dead code unless something explicitly ticks it.** Three of the four breaks in this blocker were just that: a worker, a publisher, and an init routine that were all correctly created and never once executed. When an IRX subsystem "does nothing," check whether anything runs its threads before looking for a bug in them.
+
+### 2026-08-01
+- **★ A function's name in `funcmap` / `studio_callgraph.csv` is a GUESS, not a symbol.** These names were auto-derived, and a wrong one is worse than no name because it silently seeds a hypothesis. `rpc_handle_valid` (`0x178de8`) is actually `sceSifCheckStatRpc` — it means **`is_busy`**, the *inverse* of what the name implies. Four sessions and two retracted fixes were spent trying to make a busy-check return "valid". **Before building any hypothesis on a named function, confirm its semantics from the decompiled body (`ida_scripts/decompiles_SLUS_214_42.txt`) or from ps2sdk.** One read of the caller (`sub_1C0A30`: `while (wrap_rpc_handle_valid(c)) ;`) would have settled it in minutes — a *busy*-check in a `while` with an empty body is a spin-until-idle, so returning 0 is the passing answer.
+- **Read the consumer, not just the callee.** The same return value can be a gate or a pass depending on how the caller uses it. Both consumers here inverted the naive reading. Enumerate call sites and read the branch before deciding what a return value gates.
+- **When six retractions have accumulated, the problem is the method, not the hypothesis.** Every one of them came from inferring semantics from our own log in a vacuum while a **real PCSX2 with the real ISO and a full MCP toolchain** sat unused. Differencing against the reference machine is not a last resort — it is the cheapest measurement available (PCSX2 reaches the memory-card prompt in 7–8 s).
+- **An instrument that exists but is not armed is not evidence.** `PS2_COVERAGE` answers "which game-band addresses does the EE actually dispatch" directly and has been built and documented since July; it has not been armed since 2026-07-29 (`cov=0/0`). Sessions were instead spent hand-reading 2800-line generated `switch` bodies to answer the same question worse.
+
+- **`pc == ra` does NOT imply a loop** (co-piolet, 2026-07-29). In this runtime the dispatch/fiber loop parks `ctx->pc` at the return address of the `jal` it is currently inside, so at any `jal` boundary `pc` and `ra` read the same value. `0x421f10` looked like a "tight self-loop" for weeks on exactly this evidence and is in fact `jal sub_00199840`, call 10 of 14 in a per-frame subsystem fan-out. Before claiming a spin, get the actual instruction, and get the function's extent from `Logs\studio_callgraph.csv` — **`CSV Map\map.csv` boundaries are stale** (it gives `sub_00421EA0` as 0xA4 bytes; the real body runs to `0x422168`).
+- **`stuckSecs` is a false positive whenever `progress` is climbing.** It keys off `pc` stability, and `pc` is stable by construction in a steady frame loop. Trust `progress` / `bsschg` for liveness; ~~`gstate`~~ **do not trust `gstate` alone — see next entry.**
+- **`gstate@ADDR` is a raw 4-word memory dump, not a struct read** (co-piolet, 2026-07-29). The watchdog's `gstate=` field reads whatever 4 consecutive 32-bit words sit at the watch address with zero knowledge of layout. At the address used this session, `0x50227c`, those 4 words are **static singleton object pointers** (`piRam0050227c`, `iRam00502280`, `iRam00502284`, `iRam00502288`) baked into `.data` at link time and never reassigned anywhere in the 454k-line decompile — confirmed by the literal `iRam00502288 = 0x63fe40;` matching the live telemetry's 4th word exactly. Watching pointer *values* to singletons is like watching `this`: it will always look "frozen" whether or not the game is progressing. To probe real liveness, dereference the pointer and watch a field **inside** the object that's expected to tick every frame — never take "`gstate` never changes" as evidence of a stall by itself.
+
 ### 2026-07-24
 - **A single green run does not close a nondeterministic bug.** The SIF-RPC ra-slot stomp (scratch-stack fix) was marked CLEARED after one clean run, then reopened when the next session's run happened to nest deeper. The bug only bites when re-entrancy actually overlaps, which isn't every run. Fix: verify the failure MODE was exercised (log + grep for depth≥2) before trusting a clean result, and require 3 consecutive passing runs, not 1, before marking closed.
 - **Isolating from the caller is not the same as isolating between re-entrancy levels.** Fix (1) gave the nested SIF reply dispatcher its own stack top, separate from the caller — but every nesting level shared that SAME address, so two overlapping levels of the same re-entrant function still collided with each other. When a fix targets "shared state with X," check whether the same resource is also shared among multiple concurrent instances of X itself.
@@ -2129,6 +3146,25 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - **`findstr /M /C:` is the only workable way to test for a string in the 730 MB exe.** PowerShell byte-array approaches (`-join ([char]$_)`, hand-rolled chunked scans) OOM or time out.
 - **`sdbzFrameTraceWrapper` can only see ENTRY and EXIT state.** If an entry-side probe is provably silent, the corruption is mid-body by construction — mirror the probe to the exit side (sample after `original(...)`) rather than adding more entry gates.
 - **Some registered "recompiled" functions are stub forwarders, not MIPS bodies** — shape `const uint32_t __entryPc = ctx->pc; ps2_stubs::X(...); if (ctx->pc == __entryPc) ctx->pc = getRegU32(ctx,31);`. They read `$ra` but never write it, so they can never be the source of a corrupt `$ra`. Check `register_functions.cpp` FIRST to find the live generation; the `fn_<ADDR>_0x<addr>.cpp` twin is often dead.
+- **A diagnostic env var being unset looks identical to "the code path was never reached."** `cov=0/0` and zero `[rpcValid]`/hwwatch lines in a run mean `PS2_COVERAGE`/`PS2X_HWWATCH` simply weren't set for that run — not that coverage was zero or the RPC handler never fired. Before drawing a conclusion from a silent env-gated probe, confirm the gating var was actually exported for that specific run.
+
+## Session 2026-07-30 — BUG-009: confirmed build is current (not stale); explained a silent-probe false lead; HWWATCH run still not executed
+
+No code change. Verified `game_overrides.cpp` (mtime Jul 30 06:41) predates all built `ps2EntryRunner.exe` copies, ruling out stale-build as the reason the user's pasted watchdog log showed zero `[rpcValid]` lines and `cov=0/0`. Root cause of the silence: that run simply didn't have `PS2X_HWWATCH`/`PS2_COVERAGE` env vars set — both diagnostics are env-gated and were never armed, not evidence about the RPC path itself. Handed the user the run command with `PS2X_HWWATCH=1`/`PS2X_HWWATCH_VAL=0xFFFFFFFF` set. **Still pending:** that HWWATCH run has not yet been executed/pasted back. **Also still open, flagged but not yet resolved:** two `hwWatchArm` call sites exist in `game_overrides.cpp` (line ~815 pkt_addr hunt vs line ~1555 older `$ra`/entrySp hunt) contending for the single global DR0 register — only one is meaningfully armed per run; worth confirming which fires before trusting a HWWATCH result.
+
+## Session 2026-07-30b — BUG-009: send-path fully traced, HWWATCH run completed, blocker re-localized to boot state machine
+
+HWWATCH run executed (90s, `PS2X_HWWATCH_CLIENT`-gated arbitration fix verified no contention with the old `$ra` hunt): 7 hits at `guest=0x00464dc0` in `run_probe.jsonl.hwwatch.txt`, all early in the run. Confirmed via `rpc_call_0x178be8.cpp:153` (sets `pkt_addr`) then `sub_00178560_0x178560.cpp:419` (genuine SDK reply-delivery clear, not a recompiler bug) — one clean bind/reply cycle, then silence for the remaining ~85s.
+
+Statically traced the full send path this session to find what's *supposed* to re-arm `pkt_addr`:
+- Six sceCd-style wrapper functions (`sub_1877C8`/`187898`/`187930`/`1879E8`/`187AA0`/`187B98` in `decompiles_SLUS_214_42.txt`) each gate through `sub_00186CC0_0x186cc0.cpp` ("SendSCmd"-style gate) before the real SIF send via `mem_fill_z_369` → `rpc_call_0x178be8`.
+- `sub_186CC0` has 3 short-circuit bail conditions: (1) owner-thread check on `dword_46326C`, (2) busy-check — calls `sub_186C50(1)` = `wrap_rpc_handle_valid(dword_464DC0)` directly, (3) in-flight flag `dword_463294 >= 0`.
+- **Check #2 (the BUG-009 gate) is NOT the blocker.** Since `pkt_addr==0` permanently, this busy-check always reports "not busy" and lets execution through to the real send *every time `sub_186CC0` is reached*.
+- **Re-localized the stall one level up: nothing calls `sub_186CC0` or its 6 wrapper callers again after the first cycle.** This matches the HWWATCH zero-re-arm evidence.
+
+Started reading `sub_00327810_0x327810.cpp` (boot state machine, 2819-line generated `switch(ctx->pc)`/state dispatcher) looking for what triggers a fresh wrapper call — read lines 1-1045 (state teardown for states 14→1, generic device-init/retry sequencer), no direct hit on rpc-related addresses in that range. Lines 1046-2819 unread.
+
+**Recommendation for next session:** static reading of the remaining ~1770 lines is expensive for a generated switch; a live breakpoint/HWWATCH on entry to `sub_00186CC0_0x186cc0` (address `0x186cc0`) will show directly and faster whether/when it's re-entered and with what register state — prefer that over continuing the manual disassembly read.
 
 ## Key Files
 - `PS2Recomp/ps2xRuntime/src/lib/iop/iop_kernel.cpp` — IOP module registry

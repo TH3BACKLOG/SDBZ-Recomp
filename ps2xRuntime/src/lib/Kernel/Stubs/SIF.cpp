@@ -3,6 +3,7 @@
 #include "../Syscalls/RPC.h"
 #include "../Syscalls/Thread.h"
 #include "runtime/ps2_address.h"
+#include "runtime/ps2_iop.h"
 
 #include <map>
 #include <string>
@@ -542,6 +543,52 @@ namespace ps2_stubs
                 }
                 // --- end 5.5.1 padman bridge -------------------------------------
 
+                // Generic IOP RPC bridge for other bound services (including
+                // mcserv/mcman). Bind maps clientObj->sid at BIND time; CALL
+                // packets carry func in WORD[8], so recover sid from the map.
+                {
+                    const uint32_t client   = req.words[7];
+                    const uint32_t boundSid = arkdLookupSid(client);
+                    if (boundSid != 0u &&
+                        boundSid != 0x80000100u && boundSid != 0x80000101u)
+                    {
+                        const uint32_t rpcNum   = req.words[kSifDiscWordIdx];
+                        const uint32_t recvAddr = req.words[10];
+                        const uint32_t recvSize = req.words[11];
+                        const uint32_t sendSize = req.words[9];
+                        uint32_t sendAddr = sifFindSendPayload(sendSize, req.words[5]);
+
+                        // Some services send in-place via the recv buffer when no
+                        // companion payload DMA exists.
+                        if (sendAddr == 0u && sendSize > 0u)
+                        {
+                            sendAddr = recvAddr;
+                        }
+
+                        uint32_t bridgeResult = 0u;
+                        bool bridgeSignal = false;
+                        runtime->iop().init(rdram);
+                        const bool bridgeHandled = runtime->iop().handleRPC(
+                            runtime, boundSid, rpcNum, sendAddr, sendSize,
+                            recvAddr, recvSize, bridgeResult, bridgeSignal);
+
+                        static const bool s_mcservTrace =
+                            (std::getenv("PS2X_MCSERV_TRACE") != nullptr);
+                        if (s_mcservTrace &&
+                            (boundSid == IOP_SID_MCSERV || boundSid == IOP_SID_MCSERV_LEGACY))
+                        {
+                            static std::atomic<uint32_t> s_mcservCallLogs{0u};
+                            if (s_mcservCallLogs.fetch_add(1u, std::memory_order_relaxed) < 96u)
+                            {
+                                std::fprintf(stderr,
+                                             "[SIF:mcserv-call] client=0x%08X sid=0x%08X rpc=0x%X send=0x%08X/%u recv=0x%08X/%u handled=%u\n",
+                                             client, boundSid, rpcNum, sendAddr, sendSize,
+                                             recvAddr, recvSize, bridgeHandled ? 1u : 0u);
+                            }
+                        }
+                    }
+                }
+
                 // --- Stage 1 observe-only bridge to handleRPC (ARKD only) --------
                 // We do NOT apply any result here (no IOP faking) -- the existing
                 // echo synthesis below stays authoritative so the stable main loop
@@ -567,10 +614,30 @@ namespace ps2_stubs
                     const uint32_t sendAddr =
                         sifFindSendPayload(sendSize, req.words[5]);
 
+                    // Cap is env-overridable and ANNOUNCES its own saturation.
+                    // The fixed 64 silently blinded every probe long before the
+                    // interesting window: 64 calls x 3 lines = the exact 192
+                    // records seen in the log, all of them from boot. "No
+                    // [ARKD:CALL] for fno=0x101" was therefore not evidence of
+                    // anything -- the same false-negative shape that produced the
+                    // retracted "streaming stopped" and "RPC reply deficit"
+                    // conclusions. A capped probe must never look like a zero.
+                    static const uint32_t kCallMax = []() -> uint32_t {
+                        if (const char *e = std::getenv("PS2X_ARKD_CALL_MAX"))
+                            return static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+                        return 64u;
+                    }();
                     static std::atomic<uint32_t> s_arkdCallLogs{0u};
                     const uint32_t n =
                         s_arkdCallLogs.fetch_add(1u, std::memory_order_relaxed);
-                    if (n < 64u)
+                    if (n == kCallMax)
+                    {
+                        std::cerr << "[cap] tag=ARKD:CALL saturated at " << kCallMax
+                                  << " -- ALL LATER CALLS ARE INVISIBLE. Absence of a"
+                                     " record past this point is NOT evidence. Raise"
+                                     " with PS2X_ARKD_CALL_MAX." << std::endl;
+                    }
+                    if (n < kCallMax)
                     {
                         std::cerr << "[ARKD:CALL] client=0x" << std::hex << client
                                   << " sid=0x" << sid << " func=0x" << rpcNum
@@ -730,6 +797,18 @@ namespace ps2_stubs
                 // IOP-bound sentinel instead: the DMA path skips the EE-side copy for
                 // non-copyable dests, and our RPC HLE reads payloads from src anyway.
                 pkt[10] = 0xFFFFFFFFu;           // client_block[5] = IOP-bound sentinel
+
+                static const bool s_mcservTrace = (std::getenv("PS2X_MCSERV_TRACE") != nullptr);
+                if (s_mcservTrace && req.words[8] == 0x80000400u)
+                {
+                    static std::atomic<uint32_t> s_mcservBindLogs{0u};
+                    if (s_mcservBindLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+                    {
+                        std::fprintf(stderr,
+                                     "[SIF:mcserv-bind] reqClient=0x%08X sid=0x%08X reqRecv=0x%08X/%u replyW9=0x%08X replyW10=0x%08X\n",
+                                     req.words[7], req.words[8], req.words[10], req.words[11], pkt[9], pkt[10]);
+                    }
+                }
             }
             std::memcpy(q, pkt, sizeof(pkt));
             // Ensure the pending byte is set last (dispatcher gate).
@@ -1818,4 +1897,17 @@ namespace ps2_stubs
     {
         setReturnS32(ctx, 0);
     }
+}
+
+// IOP-side entry point for SIF_CMD_SET_SREG (cid 0x80000001), called from the
+// sifcmd sceSifSendCmd import handler in ps2_iop_irx_loader.cpp. The real
+// ARKD_DVD.IRX sends that command to notify the EE; on hardware the EE's
+// libsifcmd system-command handler stores the payload into _sif_sreg[index],
+// which is exactly the map sceSifGetSreg above reads. g_sifSregs lives in this
+// TU's anonymous namespace, so this external-linkage forwarder is the only way
+// to reach it without touching a header (project rule).
+void ps2_iop_sifSetEeSreg(uint32_t reg, uint32_t value)
+{
+    std::lock_guard<std::mutex> lock(ps2_stubs::g_sifCmdStateMutex);
+    ps2_stubs::g_sifSregs[reg] = value;
 }

@@ -49,6 +49,7 @@ target_link_libraries(ps2_test_lib PRIVATE
 
 add_executable(ps2x_tests
     src/main.cpp
+    src/recomp_override_stubs.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 

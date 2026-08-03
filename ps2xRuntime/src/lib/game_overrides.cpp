@@ -769,10 +769,93 @@ namespace
         ctx->pc = GPR_U32(ctx, 31);
     }
 
+    // --- BUG-009 diagnostic: rpc_handle_valid (0x178de8) (2026-07-30) --------
+    // sub_327810's boot state machine is frozen at state 1, gated by
+    // wrap_rpc_handle_valid() over 4 SIF RPC client handles (0x5A9330 /
+    // 0x5A9358 / 0x5A9380 / 0x5A93A8). Source (per rpc_handle_valid_0x178de8.cpp):
+    //   v1 = *a0;                                   // client->hdr.pkt_addr
+    //   return v1 && a0[1] == *(u32*)(v1+24)          // == client->hdr.rpc_id
+    //             && (*(u32*)(v1+16) & 1);
+    // Re-instates the June rpcValid= diagnostic (never landed in this build --
+    // zero hits in git history for "rpc_handle_valid" additions to this file)
+    // by replacing the generated leaf with an identical-behavior version that
+    // logs, per call, which of the three sub-conditions failed: null pkt_addr,
+    // rpc_id mismatch, or ready-bit clear. Bounded so a spin doesn't flood the
+    // log. Logic must exactly match rpc_handle_valid_0x178de8.cpp -- do not
+    // "fix" the condition here, this is observation only.
+    // Forward decl: real definition (with the HWWATCH VEH/armer machinery) is
+    // further down this same anonymous namespace, from the 2026-07-27 $ra hunt.
+    void hwWatchArm(const uint8_t *rdram, uint32_t guestAddr);
+
+    void sdbzDiagRpcHandleValid178DE8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t clientPtr = GPR_U32(ctx, 4);
+        const uint32_t pktAddr = READ32(clientPtr + 0u);
+        bool result = false;
+        const char *reason = "null-pkt-addr";
+
+        // 2026-07-30 BUG-009: SifBindRpc has zero call sites anywhere in
+        // src/runner (confirmed by full-directory grep) -- the SDK bind path
+        // is not reachable from RPC.cpp, so both prior fix attempts targeted
+        // dead code. Point the existing HWWATCH infra (see the 07-27 rpc_call
+        // $ra hunt above) at client->hdr.pkt_addr (offset 0) itself instead,
+        // to catch the real writer -- or prove there isn't one. Single fixed
+        // target so the watchpoint doesn't thrash across all 5 clients;
+        // override with PS2X_HWWATCH_CLIENT=0x... Requires PS2X_HWWATCH=1 and
+        // PS2X_HWWATCH_VAL=0xFFFFFFFF (record every store, not just 0x1) to
+        // actually see anything -- see hwWatchArmerMain/hwWatchArm above.
+        static const uint32_t s_hwWatchClientTarget = [] {
+            if (const char *env = std::getenv("PS2X_HWWATCH_CLIENT"))
+                if (env[0] != '\0')
+                    return static_cast<uint32_t>(std::strtoul(env, nullptr, 0));
+            return 0x00464dc0u;
+        }();
+        if (clientPtr == s_hwWatchClientTarget)
+        {
+            hwWatchArm(rdram, clientPtr);
+        }
+
+        if (pktAddr != 0u)
+        {
+            const uint32_t clientRpcId = READ32(clientPtr + 4u);
+            const uint32_t pktRpcId = READ32(pktAddr + 24u);
+            if (clientRpcId != pktRpcId)
+            {
+                reason = "rpc-id-mismatch";
+            }
+            else
+            {
+                const uint32_t readyWord = READ32(pktAddr + 16u);
+                if (readyWord & 1u)
+                {
+                    result = true;
+                    reason = "ready";
+                }
+                else
+                {
+                    reason = "ready-bit-clear";
+                }
+            }
+        }
+
+        static std::atomic<uint32_t> s_rpcValidLogs{0u};
+        if (s_rpcValidLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+        {
+            std::cerr << "[rpcValid] client=0x" << std::hex << clientPtr
+                       << " pktAddr=0x" << pktAddr << std::dec
+                       << " result=" << (result ? 1 : 0)
+                       << " reason=" << reason << std::endl;
+        }
+
+        SET_GPR_S32(ctx, 2, result ? 1 : 0);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
     void applySdbzKernelThunkFixes(PS2Runtime &runtime)
     {
         runtime.replaceFunction(0x0017F5D0u, &sdbzKernelStoreWordEret);
         runtime.replaceFunction(0x00104BF0u, &sdbzRegisterHandler104BF0);
+        runtime.replaceFunction(0x00178DE8u, &sdbzDiagRpcHandleValid178DE8);
         // No table slot exists for these four -- register, do not replace.
         runtime.registerFunction(0x001BFDB0u, &sdbzCtor1BFDB0);
         runtime.registerFunction(0x001BFB80u, &sdbzDtorThunk1BFB80);
@@ -1383,10 +1466,32 @@ namespace
         }
     }
 
+    // 2026-07-28 -- HWWATCH is now OPT-IN, off by default.
+    //
+    // It found the SetVSyncFlag writer (see the 07-27 entry) and is worth
+    // keeping, but it is NOT free: the armer thread suspends every thread in
+    // the process 4x/second to re-sweep the debug registers, and [hostprof]
+    // measured it at 19.06s of CPU in a 96s run -- ~20% of the wall clock.
+    // Leaving it always-on puts that cost inside every perf measurement,
+    // including the Debug-vs-RelWithDebInfo A/B it would otherwise skew.
+    //
+    // Arm it explicitly with PS2X_HWWATCH=1 when hunting a writer; leave it
+    // unset for any run whose timing matters.
+    bool hwWatchEnabled()
+    {
+        static const bool enabled = [] {
+            const char *env = std::getenv("PS2X_HWWATCH");
+            return env != nullptr && env[0] != '\0' && env[0] != '0';
+        }();
+        return enabled;
+    }
+
     // Guest-side entry point. Cheap and lock-free; safe to call on every
     // rpc_call true entry even though the slot address moves between calls.
     void hwWatchArm(const uint8_t *rdram, uint32_t guestAddr)
     {
+        if (!hwWatchEnabled())
+            return;
         if (rdram == nullptr)
             return;
         const uint32_t masked = guestAddr & 0x1FFFFFFCu; // 4-byte aligned
@@ -1447,7 +1552,19 @@ namespace
             // slot address is NOT constant across rpc_call invocations (seen
             // 0x1ffbec0 and 0x1ffbe30), so re-publish it every true entry
             // rather than latching the first one.
-            hwWatchArm(rdram, entrySp - 0x10u);
+            //
+            // 2026-07-30: this re-arms on EVERY rpc_call entry, which starves
+            // the BUG-009 client->hdr.pkt_addr hunt (sdbzDiagRpcHandleValid178DE8
+            // arms the same single DR0 slot, conditionally, far less often) --
+            // this stack-slot arm wins the race almost every time and the
+            // pkt_addr watch never gets a chance to fire. Skip this arm when
+            // PS2X_HWWATCH_CLIENT selects the client-target hunt instead.
+            static const bool s_clientHuntActive =
+                std::getenv("PS2X_HWWATCH_CLIENT") != nullptr;
+            if (!s_clientHuntActive)
+            {
+                hwWatchArm(rdram, entrySp - 0x10u);
+            }
         }
 
         // 2026-07-22 SLOTWATCH2 -- fn_178068 is SLOTWATCH's #1 (deepest wrapped

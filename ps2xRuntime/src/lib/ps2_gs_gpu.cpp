@@ -538,6 +538,7 @@ void GS::reset()
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     m_vtxCount = 0;
     m_vtxIndex = 0;
+    m_pendingImageBytes = 0;
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0;
     m_preferredDisplaySourceFrame = {};
@@ -603,6 +604,7 @@ GSDebugSnapshot GS::getDebugSnapshot() const
     snapshot.transferY = m_transferState.y;
     snapshot.transferTotalPixels = m_transferState.total_pixels;
     snapshot.transferCopiedPixels = m_transferState.copied_pixels;
+    snapshot.pendingImageBytes = m_pendingImageBytes;
     snapshot.lastDisplayBaseBytes = m_lastDisplayBaseBytes;
     snapshot.preferredDisplaySourceFrame = m_preferredDisplaySourceFrame;
     snapshot.preferredDisplayDestFbp = m_preferredDisplayDestFbp;
@@ -1011,6 +1013,82 @@ void GS::latchHostPresentationFrame()
 
 void GS::latchHostPresentationFrameUnlocked()
 {
+    // [present] probe (PS2X_DIAG=1). Stage 5.7: the rasterizer is demonstrably
+    // busy (GSRasterizer::writePixel dominates the EE thread) yet the screen is
+    // black, so the open question is whether DISPFB/DISPLAY point at the pages
+    // the draws land in. Emitted from a scope guard so every early-return path
+    // is covered by one insertion, and throttled to ~1 line/sec at 60Hz because
+    // this runs per latch on the presentation thread.
+    struct PresentProbe
+    {
+        GS *self;
+        bool armed;
+        ~PresentProbe()
+        {
+            if (!armed)
+            {
+                return;
+            }
+
+            uint32_t nonBlack = 0u;
+            if (self->m_hasHostPresentationFrame && self->m_hostPresentationWidth != 0u)
+            {
+                nonBlack = countNonBlackPixels(self->m_hostPresentationFrame,
+                                               self->m_hostPresentationWidth,
+                                               self->m_hostPresentationHeight);
+            }
+
+            const uint64_t pmodeRaw = self->m_privRegs ? self->m_privRegs->pmode : 0ull;
+            const uint64_t dispfb1Raw = self->m_privRegs ? self->m_privRegs->dispfb1 : 0ull;
+            const uint64_t dispfb2Raw = self->m_privRegs ? self->m_privRegs->dispfb2 : 0ull;
+            const uint64_t display1Raw = self->m_privRegs ? self->m_privRegs->display1 : 0ull;
+            const uint64_t display2Raw = self->m_privRegs ? self->m_privRegs->display2 : 0ull;
+
+            RUNTIME_LOG("[present] has=" << (self->m_hasHostPresentationFrame ? 1 : 0)
+                                         << " w=" << std::dec << self->m_hostPresentationWidth
+                                         << " h=" << self->m_hostPresentationHeight
+                                         << " nonblack=" << nonBlack
+                                         << " dispFbp=0x" << std::hex << self->m_hostPresentationDisplayFbp
+                                         << " srcFbp=0x" << self->m_hostPresentationSourceFbp
+                                         << " pref=" << std::dec << (self->m_hostPresentationUsedPreferred ? 1 : 0)
+                                         << " ctx0.fbp=0x" << std::hex << self->m_registers.ctx[0].frame.fbp
+                                         << " ctx0.fbw=" << std::dec << self->m_registers.ctx[0].frame.fbw
+                                         << " ctx0.psm=0x" << std::hex << static_cast<uint32_t>(self->m_registers.ctx[0].frame.psm)
+                                         << " ctx1.fbp=0x" << self->m_registers.ctx[1].frame.fbp
+                                         << " ctx1.fbw=" << std::dec << self->m_registers.ctx[1].frame.fbw
+                                         << " ctx1.psm=0x" << std::hex << static_cast<uint32_t>(self->m_registers.ctx[1].frame.psm)
+                                         << " pmode=0x" << pmodeRaw
+                                         << " dispfb1=0x" << dispfb1Raw
+                                         << " dispfb2=0x" << dispfb2Raw
+                                         << " display1=0x" << display1Raw
+                                         << " display2=0x" << display2Raw
+                                         << std::dec);
+
+            // [gs:frame]: aggregate replacement for the old sampled
+            // [gs:pixels] probe. Counts cover the interval since the previous
+            // report, so `nonblack=0` here really does mean nothing coloured
+            // was rasterized -- unlike the sampled probe it cannot miss draws.
+            const uint64_t px = self->m_statPixelsWritten.exchange(0, std::memory_order_relaxed);
+            const uint64_t pxNonBlack = self->m_statPixelsNonBlack.exchange(0, std::memory_order_relaxed);
+            const uint64_t pxTextured = self->m_statPixelsTextured.exchange(0, std::memory_order_relaxed);
+            const uint32_t pxMaxRgb = self->m_statPixelMaxRgb.exchange(0, std::memory_order_relaxed);
+            const uint32_t primMask = self->m_statPrimMask.exchange(0, std::memory_order_relaxed);
+
+            RUNTIME_LOG("[gs:frame] px=" << std::dec << px
+                                         << " nonblack=" << pxNonBlack
+                                         << " textured=" << pxTextured
+                                         << " maxrgb=" << pxMaxRgb
+                                         << " primmask=0x" << std::hex << primMask
+                                         << " imagebytes=" << std::dec
+                                         << self->m_statImageBytes.load(std::memory_order_relaxed)
+                                         << " prims=" << self->m_statPrims.load(std::memory_order_relaxed));
+        }
+    };
+
+    static std::atomic<uint64_t> s_latchCount{0};
+    const uint64_t latchIndex = s_latchCount.fetch_add(1, std::memory_order_relaxed);
+    PresentProbe presentProbe{this, ps2_diag::enabled() && ps2_diag::should_log(latchIndex, 4, 60)};
+
     if (!m_privRegs || !m_vram || m_vramSize == 0u)
     {
         m_hostPresentationFrame.clear();
@@ -1354,17 +1432,35 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    if (!data || sizeBytes < 16 || !m_vram)
+    if (!data || sizeBytes == 0 || !m_vram)
         return;
 
-    if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    // Drain any IMAGE payload still owed from a previous packet before this
+    // buffer is interpreted as GIFtags -- the leading qwords are raw pixel
+    // data, not tags.
+    uint32_t offset = 0;
+    if (m_pendingImageBytes != 0)
+    {
+        const uint32_t take = static_cast<uint32_t>(
+            std::min<uint64_t>(m_pendingImageBytes, sizeBytes));
+        // Decrement first: processImageData may complete the transfer and call
+        // EndTransfer(), and the remaining declared qwords must still be
+        // consumed as payload rather than re-parsed as GIFtags.
+        m_pendingImageBytes -= take;
+        processImageData(data, take);
+        offset = take;
+        if (offset >= sizeBytes)
+            return;
+    }
+
+    if (offset == 0 && sizeBytes >= 16 && tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
-        if (packetIndex < 48u)
+        if (packetIndex < 48u && offset + 16u <= sizeBytes)
         {
-            const uint64_t tagLo = loadLE64(data);
+            const uint64_t tagLo = loadLE64(data + offset);
             const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
             const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
             uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
@@ -1382,7 +1478,6 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     });
 
 
-    uint32_t offset = 0;
     while (offset + 16 <= sizeBytes)
     {
         uint64_t tagLo = loadLE64(data + offset);
@@ -1460,11 +1555,22 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (flg == GIF_FMT_IMAGE)
         {
-            uint32_t imageBytes = nloop * 16;
-            if (offset + imageBytes > sizeBytes)
-                imageBytes = sizeBytes - offset;
-            processImageData(data + offset, imageBytes);
+            const uint64_t requested = static_cast<uint64_t>(nloop) * 16ull;
+            const uint32_t available = sizeBytes - offset;
+            const uint32_t imageBytes = static_cast<uint32_t>(
+                std::min<uint64_t>(requested, available));
+
+            // The rest of the payload arrives in following GIF packets. Record
+            // the debt before dispatching so those packets are consumed as
+            // pixel data instead of being misparsed as GIFtags.
+            m_pendingImageBytes = requested - imageBytes;
+
+            if (imageBytes != 0)
+                processImageData(data + offset, imageBytes);
             offset += imageBytes;
+
+            if (m_pendingImageBytes != 0)
+                return;
         }
     }
 }
@@ -2007,6 +2113,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_transferState.y = m_registers.trxpos.dsay;
         m_transferState.total_pixels = m_registers.trxreg.rrw * m_registers.trxreg.rrh;
         m_transferState.copied_pixels = 0;
+        m_pendingImageBytes = 0;
 
         const auto xdir = m_registers.trxdir.xdir;
 
@@ -2329,7 +2436,7 @@ void GS::vertexKick(bool drawing)
         if (drawCtx.frame.fbp != s_prevDrawFbp)
         {
             const int ctxIndex = m_registers.prim.ctxt ? 1 : 0;
-            RUNTIME_LOG("[gs:frame-change] prim=" << static_cast<uint32_t>(m_registers.prim.type)
+            RUNTIME_LOG("[gs:frame-change] prim=" << static_cast<uint32_t>(prim.prim)
                                                    << " ctx=" << ctxIndex
                                                    << " frame.fbp=0x" << std::hex << drawCtx.frame.fbp
                                                    << " frame.fbw=" << std::dec << drawCtx.frame.fbw

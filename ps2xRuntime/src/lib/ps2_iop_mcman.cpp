@@ -4,6 +4,9 @@
 #include "Kernel/Stubs/MemoryCard_Internal.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -34,6 +37,25 @@ namespace
     constexpr uint32_t kRpcUnformat = 0x11u;
     constexpr uint32_t kRpcGetEntSpace = 0x12u;
     constexpr uint32_t kRpcRename = 0x13u;
+    // libmc sceMcInit handshake (game EE 0x189318 calls fnum 0xFE with a 12-byte
+    // recv buffer): recv+0 = result, recv+4 = mcserv version (must be >= 0x20A),
+    // recv+8 = mcman version (must be >= 0x20E) or libmc prints
+    // "too old release of mcserv.irx"/"mcman.irx" and disables the memory card.
+    constexpr uint32_t kRpcInit = 0xFEu;
+    constexpr int32_t kMcServVersion = 0x20A;
+    constexpr int32_t kMcManVersion = 0x20E;
+
+    bool isMcInitBypassEnabled()
+    {
+        const char *env = std::getenv("PS2X_MC_BYPASS_INIT_CHECK");
+        return env && env[0] != '\0' && env[0] != '0';
+    }
+
+    bool mcservTraceEnabled()
+    {
+        const char *env = std::getenv("PS2X_MCSERV_TRACE");
+        return env && env[0] != '\0' && env[0] != '0';
+    }
 
     bool readGuestU32(const uint8_t *rdram, uint32_t addr, uint32_t &out)
     {
@@ -84,8 +106,19 @@ namespace ps2_iop_mcman
                          uint32_t recvSize,
                          uint32_t &resultPtr)
     {
-        if (sid != IOP_SID_MCSERV)
+        const bool traceMcserv = mcservTraceEnabled();
+        if (sid != IOP_SID_MCSERV && sid != IOP_SID_MCSERV_LEGACY)
         {
+            if (traceMcserv && sid == 0x80000400u)
+            {
+                static std::atomic<uint32_t> s_sidRejectLogs{0u};
+                if (s_sidRejectLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
+                {
+                    std::fprintf(stderr,
+                                 "[iop:mcserv] sid reject sid=0x%08X rpc=0x%X expected=0x%08X/0x%08X\n",
+                                 sid, rpcNum, IOP_SID_MCSERV, IOP_SID_MCSERV_LEGACY);
+                }
+            }
             return false;
         }
 
@@ -103,6 +136,21 @@ namespace ps2_iop_mcman
 
         switch (rpcNum)
         {
+        case kRpcInit:
+        {
+            if (uint8_t *dst = getMemPtr(rdram, recvBufAddr))
+            {
+                const int32_t reply[3] = {kMcResultSucceed, kMcServVersion, kMcManVersion};
+                std::memcpy(dst, reply, sizeof(reply));
+            }
+            std::fprintf(stderr,
+                         "[iop:mcserv] Init (fnum 0xFE) -> result=0 mcservVer=0x%X mcmanVer=0x%X recv=0x%08X\n",
+                         kMcServVersion, kMcManVersion, recvBufAddr);
+            setMcCommandResultLocked(static_cast<int32_t>(kRpcInit), kMcResultSucceed);
+            resultPtr = recvBufAddr;
+            return true;
+        }
+
         case kRpcOpen:
         {
             uint32_t flags = 0u;
@@ -447,6 +495,31 @@ namespace ps2_iop_mcman
         }
 
         default:
+            if (traceMcserv)
+            {
+                static std::atomic<uint32_t> s_unhandledLogs{0u};
+                if (s_unhandledLogs.fetch_add(1u, std::memory_order_relaxed) < 96u)
+                {
+                    std::fprintf(stderr,
+                                 "[iop:mcserv] unhandled rpc=0x%X send=0x%08X/%u recv=0x%08X/%u\n",
+                                 rpcNum, sendBufAddr, sendSize, recvBufAddr, recvSize);
+                }
+            }
+            if (isMcInitBypassEnabled() && recvBufAddr != 0u && recvSize >= 12u)
+            {
+                if (uint8_t *dst = getMemPtr(rdram, recvBufAddr))
+                {
+                    const int32_t reply[3] = {kMcResultSucceed, kMcServVersion, kMcManVersion};
+                    std::memcpy(dst, reply, sizeof(reply));
+                }
+                std::fprintf(stderr,
+                             "[iop:mcserv] Debug bypass active (env PS2X_MC_BYPASS_INIT_CHECK) rpc=0x%X recv=0x%08X\n",
+                             rpcNum, recvBufAddr);
+                setMcCommandResultLocked(static_cast<int32_t>(rpcNum), kMcResultSucceed);
+                resultPtr = recvBufAddr;
+                return true;
+            }
+
             // Unhandled MCSERV command: still claim the RPC so the caller gets a
             // definite (empty/zero) reply instead of parking forever waiting for
             // one that will never arrive.

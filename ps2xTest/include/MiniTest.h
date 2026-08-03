@@ -5,6 +5,7 @@
 #include <map>
 #include <iostream>
 #include <exception>
+#include <cctype>
 
 class TestCase;
 using TestRunnerCallback = std::function<void(TestCase&)>;
@@ -122,13 +123,29 @@ public:
 
     static int Run()
     {
+        return Run(std::string(), std::string());
+    }
+
+    // Substring, case-insensitive filters. An empty filter matches everything.
+    // Filtering matters here because suites run in alphabetical order and a
+    // single hanging test blocks every suite that sorts after it.
+    static int Run(const std::string& suiteFilter, const std::string& testFilter)
+    {
         int failedCount = 0;
         int totalTests = 0;
+        int skippedSuites = 0;
+        int skippedTests = 0;
 
         for (auto& c : m_cases)
         {
             const std::string& suiteName = c.first;
             const TestCaseCallback& suiteCallback = c.second;
+
+            if (!Matches(suiteName, suiteFilter))
+            {
+                skippedSuites++;
+                continue;
+            }
 
             std::cout << "\n[Suite]: " << suiteName << std::endl;
 
@@ -144,6 +161,12 @@ public:
             {
                 const std::string& testName = cc.first;
                 const TestRunnerCallback& testFn = cc.second;
+
+                if (!Matches(testName, testFilter))
+                {
+                    skippedTests++;
+                    continue;
+                }
 
                 totalTests++;
                 testCase.ClearFailures();
@@ -204,8 +227,33 @@ public:
         std::cout << "Total Tests: " << totalTests << std::endl;
         std::cout << "Passed: " << (totalTests - failedCount) << std::endl;
         std::cout << "Failed: " << failedCount << std::endl;
+        if (skippedSuites != 0 || skippedTests != 0)
+        {
+            std::cout << "Skipped by filter: " << skippedSuites << " suite(s), "
+                      << skippedTests << " test(s)" << std::endl;
+        }
         std::cout << "========================================" << std::endl;
 
         return failedCount;
+    }
+
+private:
+    static bool Matches(const std::string& name, const std::string& filter)
+    {
+        if (filter.empty())
+        {
+            return true;
+        }
+
+        const auto lower = [](std::string s)
+        {
+            for (char& ch : s)
+            {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            return s;
+        };
+
+        return lower(name).find(lower(filter)) != std::string::npos;
     }
 };

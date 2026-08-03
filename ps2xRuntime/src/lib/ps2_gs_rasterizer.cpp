@@ -254,11 +254,11 @@ void GSRasterizer::drawPrimitive(GS *gs)
         if (primitiveIndex < 64u)
         {
             std::cout << "[gs:prim] idx=" << primitiveIndex
-                      << " type=" << static_cast<uint32_t>(gs->m_prim.type)
-                      << " tme=" << static_cast<uint32_t>(gs->m_prim.tme)
-                      << " abe=" << static_cast<uint32_t>(gs->m_prim.abe)
-                      << " fst=" << static_cast<uint32_t>(gs->m_prim.fst)
-                      << " ctxt=" << static_cast<uint32_t>(gs->m_prim.ctxt)
+                      << " type=" << static_cast<uint32_t>(gs->m_registers.prim.prim)
+                      << " tme=" << static_cast<uint32_t>(gs->m_registers.prim.tme)
+                      << " abe=" << static_cast<uint32_t>(gs->m_registers.prim.abe)
+                      << " fst=" << static_cast<uint32_t>(gs->m_registers.prim.fst)
+                      << " ctxt=" << static_cast<uint32_t>(gs->m_registers.prim.ctxt)
                       << " fbp=" << ctx.frame.fbp
                       << " fbw=" << ctx.frame.fbw
                       << " psm=0x" << std::hex << static_cast<uint32_t>(ctx.frame.psm) << std::dec
@@ -276,9 +276,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
                       << " csa=" << static_cast<uint32_t>(ctx.tex0.csa)
                       << ")"
                       << " texclut=("
-                      << "cbw=" << static_cast<uint32_t>(gs->m_texclut.cbw)
-                      << " cou=" << static_cast<uint32_t>(gs->m_texclut.cou)
-                      << " cov=" << gs->m_texclut.cov
+                      << "cbw=" << static_cast<uint32_t>(gs->m_registers.texclut.cbw)
+                      << " cou=" << static_cast<uint32_t>(gs->m_registers.texclut.cou)
+                      << " cov=" << gs->m_registers.texclut.cov
                       << ")"
                       << " ofx=" << (ctx.xyoffset.ofx >> 4)
                       << " ofy=" << (ctx.xyoffset.ofy >> 4)
@@ -315,15 +315,15 @@ void GSRasterizer::drawPrimitive(GS *gs)
     });
 
     PS2_IF_AGRESSIVE_LOGS({
-        if ((gs->m_prim.ctxt != 0u || ctx.frame.fbp == 150u) &&
+        if ((gs->m_registers.prim.ctxt != 0u || ctx.frame.fbp == 150u) &&
             s_debugContext1PrimitiveCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
         {
             std::cout << "[gs:copy-prim]"
-                      << " type=" << static_cast<uint32_t>(gs->m_prim.type)
-                      << " tme=" << static_cast<uint32_t>(gs->m_prim.tme)
-                      << " abe=" << static_cast<uint32_t>(gs->m_prim.abe)
-                      << " fst=" << static_cast<uint32_t>(gs->m_prim.fst)
-                      << " ctxt=" << static_cast<uint32_t>(gs->m_prim.ctxt)
+                      << " type=" << static_cast<uint32_t>(gs->m_registers.prim.prim)
+                      << " tme=" << static_cast<uint32_t>(gs->m_registers.prim.tme)
+                      << " abe=" << static_cast<uint32_t>(gs->m_registers.prim.abe)
+                      << " fst=" << static_cast<uint32_t>(gs->m_registers.prim.fst)
+                      << " ctxt=" << static_cast<uint32_t>(gs->m_registers.prim.ctxt)
                       << " fbp=" << ctx.frame.fbp
                       << " fbw=" << ctx.frame.fbw
                       << " psm=0x" << std::hex << static_cast<uint32_t>(ctx.frame.psm) << std::dec
@@ -339,9 +339,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
                       << " csa=" << static_cast<uint32_t>(ctx.tex0.csa)
                       << ")"
                       << " texclut=("
-                      << "cbw=" << static_cast<uint32_t>(gs->m_texclut.cbw)
-                      << " cou=" << static_cast<uint32_t>(gs->m_texclut.cou)
-                      << " cov=" << gs->m_texclut.cov
+                      << "cbw=" << static_cast<uint32_t>(gs->m_registers.texclut.cbw)
+                      << " cou=" << static_cast<uint32_t>(gs->m_registers.texclut.cou)
+                      << " cov=" << gs->m_registers.texclut.cov
                       << ")"
                       << " ofx=" << (ctx.xyoffset.ofx >> 4)
                       << " ofy=" << (ctx.xyoffset.ofy >> 4)
@@ -540,25 +540,32 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
 
     if (ps2_diag::enabled())
     {
-        // [gs:pixels]: sampled after scissor/alpha/z rejection, right at the
-        // point a pixel is actually committed to VRAM. One sample per 2M
-        // writes -- this is a hot path, so keep it to a single gate check
-        // plus a counter increment when disabled has already short-circuited.
-        static std::atomic<uint64_t> s_pixelSampleCount{0};
-        const uint64_t n = s_pixelSampleCount.fetch_add(1, std::memory_order_relaxed);
-        if (ps2_diag::should_log(n, 0, 2000000))
+        // Per-frame pixel aggregates consumed by the [gs:frame] probe. The old
+        // 1-in-2,000,000 sampled probe was useless here: a full-screen clear is
+        // ~229k pixels at ~50Hz, so essentially every sample landed on a black
+        // screen-clear sprite and made all geometry look black. Aggregate
+        // instead, and break the counts down by textured/untextured so a real
+        // draw can never be hidden behind the clear.
+        gs->m_statPixelsWritten.fetch_add(1, std::memory_order_relaxed);
+
+        const uint32_t maxChannel = std::max({static_cast<uint32_t>(r),
+                                              static_cast<uint32_t>(g),
+                                              static_cast<uint32_t>(b)});
+        if (maxChannel != 0u)
         {
-            RUNTIME_LOG("[gs:pixels] n=" << n
-                                        << " x=" << x << " y=" << y
-                                        << " r=" << static_cast<uint32_t>(r)
-                                        << " g=" << static_cast<uint32_t>(g)
-                                        << " b=" << static_cast<uint32_t>(b)
-                                        << " a=" << static_cast<uint32_t>(a)
-                                        << " fbp=0x" << std::hex << ctx.frame.fbp
-                                        << " psm=0x" << static_cast<uint32_t>(ctx.frame.psm)
-                                        << std::dec
-                                        << " tme=" << static_cast<uint32_t>(gs->m_prim.tme ? 1u : 0u));
+            gs->m_statPixelsNonBlack.fetch_add(1, std::memory_order_relaxed);
+            // Approximate max -- a racy read/store is acceptable for a probe and
+            // avoids a CAS loop on the hottest path in the rasterizer.
+            if (maxChannel > gs->m_statPixelMaxRgb.load(std::memory_order_relaxed))
+                gs->m_statPixelMaxRgb.store(maxChannel, std::memory_order_relaxed);
         }
+
+        if (gs->m_registers.prim.tme)
+            gs->m_statPixelsTextured.fetch_add(1, std::memory_order_relaxed);
+
+        const uint32_t primKind = static_cast<uint32_t>(gs->m_registers.prim.prim) & 0x7u;
+        gs->m_statPrimMask.fetch_or(static_cast<uint32_t>(1u) << primKind,
+                                    std::memory_order_relaxed);
     }
 
     gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);

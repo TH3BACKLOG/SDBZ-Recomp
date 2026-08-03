@@ -26,6 +26,9 @@ USAGE
   analyze_run.py --probe RASLOT       # dump one family
   analyze_run.py --probe RASLOT --bad # ... only records with bad != 0
   analyze_run.py --signature          # one-line signature, for the run harness
+  analyze_run.py --coverage           # what the EE actually dispatched (PS2_COVERAGE=1)
+  analyze_run.py --coverage --band game   # ... game band only (default: both)
+  analyze_run.py --coverage --diff b.jsonl  # addresses in one run and not the other
   analyze_run.py -f path/to.jsonl     # non-default sink location
 
 Exit codes: 0 = query answered, 2 = sink missing/empty/unusable.
@@ -187,6 +190,164 @@ def cmd_signature(records):
             bad.get("entryRa", 0), bad.get("entrySp", 0))) if bad else "none"))
 
 
+# ---- coverage (PS2_COVERAGE=1) ---------------------------------------------
+#
+# Record shapes emitted by scanCoverage() in ps2_runtime.cpp:
+#   COVERAGE phase distinct game sdk calls slots   -- one per dump, periodic
+#   COVTOP   rank addr count game                  -- top 48, one per dump
+#   COVGAME  addr count                            -- EVERY game-band address,
+#                                                     shutdown dump only
+#
+# ASYMMETRY THAT MATTERS: COVGAME is the only exhaustive set, and it is
+# game-band only. The SDK band is visible ONLY through COVTOP's 48 rows, so
+# `--band sdk` is a top-48 view, never a census. Said out loud in the output
+# rather than left for the reader to rediscover.
+
+COVERAGE_CAVEAT = (
+    "NOTE: counts are TABLE-DISPATCHED calls only. A direct fn_* C++ call\n"
+    "      bypasses lookupFunction. Nonzero proves 'this ran'; ZERO proves\n"
+    "      only 'never dispatched', NOT 'never executed'. Do not argue\n"
+    "      absence from this data alone (ps2_runtime.cpp:404-408)."
+)
+
+
+def coverage_sets(records):
+    """Return (summaries, top, game) for one run's records.
+
+    summaries: COVERAGE rows in emission order (last is the shutdown dump).
+    top:       {addr: (count, is_game)} from the LAST COVTOP block.
+    game:      {addr: count} from COVGAME (exhaustive, game band only).
+    """
+    summaries = [r for r in records if r.get("probe") == "COVERAGE"]
+
+    # COVTOP is re-emitted every dump; keep only the final block, identified by
+    # rank restarting at 0. Mixing blocks would double-count the same address.
+    top = {}
+    for r in records:
+        if r.get("probe") != "COVTOP":
+            continue
+        if r.get("rank", 0) == 0:
+            top = {}
+        top[r.get("addr", 0)] = (r.get("count", 0), bool(r.get("game", 0)))
+
+    game = {}
+    for r in records:
+        if r.get("probe") == "COVGAME":
+            game[r.get("addr", 0)] = r.get("count", 0)
+    return summaries, top, game
+
+
+def cmd_coverage(records, band, limit, diff_path):
+    summaries, top, game = coverage_sets(records)
+
+    if not summaries and not top and not game:
+        print("no coverage records -- PS2_COVERAGE was not set for this run.")
+        print("Arm it with:  $env:PS2_COVERAGE = \"1\"")
+        return
+
+    if summaries:
+        print("coverage dumps: %d" % len(summaries))
+        for r in summaries:
+            print("  " + fmt(r, ["phase", "distinct", "game", "sdk", "calls",
+                                 "slots"]))
+        f = summaries[-1]
+        dist = f.get("distinct", 0)
+        if dist:
+            print("\nfinal: %d distinct addresses dispatched "
+                  "(%d game / %d sdk), %d total calls"
+                  % (dist, f.get("game", 0), f.get("sdk", 0), f.get("calls", 0)))
+            print("       %.1f%% of the %d-slot code span was ever entered"
+                  % (100.0 * dist / max(f.get("slots", 1), 1), f.get("slots", 0)))
+
+    if game:
+        print("\nCOVGAME census: %d distinct game-band addresses, %d calls"
+              % (len(game), sum(game.values())))
+    elif summaries:
+        print("\nno COVGAME rows -- the shutdown full dump did not run "
+              "(run killed before clean exit?).")
+
+    if diff_path is not None:
+        cmd_coverage_diff(records, diff_path, band)
+        return
+
+    rows = []
+    if band in ("game", None) and game:
+        rows += [(a, c, "game") for a, c in game.items()]
+    if band in ("sdk", None):
+        rows += [(a, c, "sdk") for a, (c, isg) in top.items() if not isg]
+        if band == "sdk":
+            print("\n(SDK band is COVTOP-only -- top 48, not a census.)")
+    if band == "game" and not game and top:
+        rows += [(a, c, "game") for a, (c, isg) in top.items() if isg]
+
+    rows.sort(key=lambda t: -t[1])
+    n = limit if limit else 40
+    print("\ntop %d by dispatch count:" % min(n, len(rows)))
+    for addr, count, b in rows[:n]:
+        print("  0x%08x  %10d  %s" % (addr, count, b))
+    if len(rows) > n:
+        print("  ... %d more (raise with --limit)" % (len(rows) - n))
+
+    print("\n" + COVERAGE_CAVEAT)
+
+
+def cmd_coverage_diff(records, other_path, band):
+    """Addresses present in one run and not the other.
+
+    This is the query that makes run-over-run comparison possible at all: after
+    a fix, the useful question is never 'what ran' but 'what runs NOW that did
+    not before' -- and the inverse, which catches a fix that silently removed
+    execution.
+    """
+    other_path = os.path.abspath(other_path)
+    if not os.path.exists(other_path):
+        sys.stderr.write("diff sink not found: %s\n" % other_path)
+        return
+    other, _ = load(other_path)
+    _, btop, bgame = coverage_sets(other)
+    _, atop, agame = coverage_sets(records)
+
+    # Union the exhaustive game census with COVTOP so an SDK-band address that
+    # appears in one run's top 48 and not the other's is still reported -- with
+    # its band labelled, so nobody reads a top-48 artefact as a census result.
+    def merged(gamemap, topmap):
+        out = {}
+        for a, c in gamemap.items():
+            out[a] = (c, "game")
+        for a, (c, isg) in topmap.items():
+            if a not in out:
+                out[a] = (c, "game" if isg else "sdk")
+        return out
+
+    a = merged(agame, atop)
+    b = merged(bgame, btop)
+    if band:
+        a = {k: v for k, v in a.items() if v[1] == band}
+        b = {k: v for k, v in b.items() if v[1] == band}
+
+    only_a = sorted(set(a) - set(b))
+    only_b = sorted(set(b) - set(a))
+    both = sorted(set(a) & set(b))
+
+    print("\ndiff vs %s" % other_path)
+    print("  this run: %d addrs   other: %d addrs   shared: %d"
+          % (len(a), len(b), len(both)))
+
+    print("\n  ONLY in this run (%d):" % len(only_a))
+    for addr in sorted(only_a, key=lambda x: -a[x][0]):
+        print("    +0x%08x  %10d  %s" % (addr, a[addr][0], a[addr][1]))
+
+    print("\n  ONLY in %s (%d):" % (os.path.basename(other_path), len(only_b)))
+    for addr in sorted(only_b, key=lambda x: -b[x][0]):
+        print("    -0x%08x  %10d  %s" % (addr, b[addr][0], b[addr][1]))
+
+    if not only_a and not only_b:
+        print("\n  identical executed sets. If a fix was expected to change "
+              "control flow, it did not.")
+
+    print("\n" + COVERAGE_CAVEAT)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -198,6 +359,12 @@ def main():
     ap.add_argument("--threads", action="store_true",
                     help="EE thread creation + stack-bounds violations (Phase C)")
     ap.add_argument("--signature", action="store_true")
+    ap.add_argument("--coverage", action="store_true",
+                    help="what the EE actually dispatched (needs PS2_COVERAGE=1)")
+    ap.add_argument("--band", choices=("game", "sdk"),
+                    help="with --coverage, restrict to one band (default: both)")
+    ap.add_argument("--diff", metavar="OTHER.jsonl",
+                    help="with --coverage, addresses present in one run and not the other")
     ap.add_argument("--limit", type=int, default=0, help="cap dumped records")
     args = ap.parse_args()
 
@@ -232,6 +399,8 @@ def main():
         cmd_threads(records)
     elif args.signature:
         cmd_signature(records)
+    elif args.coverage:
+        cmd_coverage(records, args.band, args.limit, args.diff)
     else:
         cmd_summary(records)
     return 0

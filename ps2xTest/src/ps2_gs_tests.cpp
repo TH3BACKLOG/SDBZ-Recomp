@@ -2255,6 +2255,218 @@ void register_ps2_gs_tests()
             t.Equals(out[1], static_cast<uint8_t>(0x43u), "packed nibble byte 1 should roundtrip");
         });
 
+        // BUG-028 regression. The real game frames large VRAM uploads with the IMAGE
+        // GIFtag as the *last* qword of its DMA packet and the payload arriving in the
+        // packets that follow. The old IMAGE branch clamped imageBytes to
+        // (sizeBytes - offset) == 0, so the payload was dropped AND the next packet's
+        // raw pixel data was then misparsed as GIFtags. Every image upload in the game
+        // moved 0 bytes, and 82 of 88 logged GIFtags were all-zero garbage.
+        tc.Run("GS IMAGE payload arriving in a later packet than its GIFtag is not dropped (BUG-028)", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            // 4x2 PSMCT32 = 8 texels = 32 bytes = 2 qwords.
+            const uint64_t bitblt =
+                (static_cast<uint64_t>(0u) << 0) |                        // SBP
+                (static_cast<uint64_t>(1u) << 16) |                       // SBW
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24) |              // SPSM
+                (static_cast<uint64_t>(0u) << 32) |                       // DBP
+                (static_cast<uint64_t>(1u) << 48) |                       // DBW
+                (static_cast<uint64_t>(GS_PSM_CT32) << 56);               // DPSM
+            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (2ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            uint8_t payload[32] = {};
+            for (uint32_t i = 0; i < sizeof(payload); ++i)
+                payload[i] = static_cast<uint8_t>(0xA0u + i);
+
+            // Packet A: the IMAGE GIFtag is the final qword. No payload at all.
+            std::vector<uint8_t> packetA;
+            appendU64(packetA, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packetA, 0ull);
+            t.Equals(packetA.size(), static_cast<size_t>(16),
+                     "sanity: packet A must be exactly one qword so the IMAGE tag ends the buffer");
+            gs.processGIFPacket(packetA.data(), static_cast<uint32_t>(packetA.size()));
+
+            const GSDebugSnapshot afterTagOnly = gs.getDebugSnapshot();
+            t.Equals(afterTagOnly.transferCopiedPixels, 0u,
+                     "a tag-only packet should copy nothing yet, but must not cancel the transfer");
+            t.Equals(afterTagOnly.trxdir, 0u,
+                     "transfer must still be active (trxdir=0) while payload is outstanding");
+            t.Equals(afterTagOnly.pendingImageBytes, static_cast<uint64_t>(32),
+                     "the whole declared payload should be recorded as debt when no payload trails the tag");
+
+            // Packets B and C: raw payload, no tag. These must be consumed as pixel
+            // data, never parsed as GIFtags.
+            std::vector<uint8_t> packetB(payload, payload + 16);
+            std::vector<uint8_t> packetC(payload + 16, payload + 32);
+
+            gs.processGIFPacket(packetB.data(), static_cast<uint32_t>(packetB.size()));
+
+            // Mid-flight is the only point where copied_pixels is observable:
+            // EndTransfer() zeroes m_transferState, so a completed transfer always
+            // reports copied=0. Assert the incremental progress here instead.
+            const GSDebugSnapshot afterB = gs.getDebugSnapshot();
+            t.Equals(afterB.transferCopiedPixels, 4u,
+                     "a tagless follow-up packet should be consumed as IMAGE payload, not re-parsed as a GIFtag");
+            t.Equals(afterB.trxdir, 0u, "transfer must stay active while payload is still outstanding");
+            t.Equals(afterB.pendingImageBytes, static_cast<uint64_t>(16),
+                     "debt should shrink by exactly the bytes consumed");
+
+            gs.processGIFPacket(packetC.data(), static_cast<uint32_t>(packetC.size()));
+
+            const GSDebugSnapshot snap = gs.getDebugSnapshot();
+            t.Equals(snap.trxdir, 3u,
+                     "transfer should deactivate once the carried-over payload completes it");
+            t.Equals(snap.pendingImageBytes, static_cast<uint64_t>(0),
+                     "no debt should remain once the declared payload has been delivered");
+
+            gs.writeRegister(GS_REG_TRXDIR, 1ull);
+            uint8_t out[32] = {};
+            const uint32_t outBytes = gs.consumeLocalToHostBytes(out, sizeof(out));
+            t.Equals(outBytes, 32u, "carried-over IMAGE upload should land the full byte range in VRAM");
+            bool bytesOk = true;
+            for (uint32_t i = 0; i < sizeof(out); ++i)
+            {
+                if (out[i] != payload[i])
+                    bytesOk = false;
+            }
+            t.IsTrue(bytesOk, "carried-over IMAGE upload should preserve byte order across the packet boundary");
+        });
+
+        // BUG-028, second framing: the tag is followed by *some* of its payload, with
+        // the remainder in the next packet. The debt must be exactly the shortfall.
+        tc.Run("GS IMAGE payload partially trailing its GIFtag carries only the shortfall (BUG-028)", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            const uint64_t bitblt =
+                (static_cast<uint64_t>(0u) << 0) |
+                (static_cast<uint64_t>(1u) << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24) |
+                (static_cast<uint64_t>(0u) << 32) |
+                (static_cast<uint64_t>(1u) << 48) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 56);
+            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (3ull << 32)); // 12 texels => 48 bytes
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            uint8_t payload[48] = {};
+            for (uint32_t i = 0; i < sizeof(payload); ++i)
+                payload[i] = static_cast<uint8_t>(0x11u + i);
+
+            // Packet A: tag declaring 3 qwords, but only 1 qword of payload present.
+            std::vector<uint8_t> packetA;
+            appendU64(packetA, makeGifTag(3u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packetA, 0ull);
+            packetA.insert(packetA.end(), payload, payload + 16);
+            gs.processGIFPacket(packetA.data(), static_cast<uint32_t>(packetA.size()));
+
+            // The shortfall must be exactly the declared bytes minus what trailed
+            // the tag -- not the whole declaration, and not zero.
+            const GSDebugSnapshot afterA = gs.getDebugSnapshot();
+            t.Equals(afterA.transferCopiedPixels, 4u,
+                     "the payload that does trail the tag should be consumed immediately");
+            t.Equals(afterA.trxdir, 0u, "transfer must stay active while the shortfall is outstanding");
+            t.Equals(afterA.pendingImageBytes, static_cast<uint64_t>(32),
+                     "carried debt should be exactly the shortfall (48 declared - 16 delivered)");
+
+            // Packet B: the remaining 2 qwords.
+            std::vector<uint8_t> packetB(payload + 16, payload + 48);
+            gs.processGIFPacket(packetB.data(), static_cast<uint32_t>(packetB.size()));
+
+            const GSDebugSnapshot snap = gs.getDebugSnapshot();
+            t.Equals(snap.trxdir, 3u, "transfer should deactivate once the shortfall is delivered");
+            t.Equals(snap.pendingImageBytes, static_cast<uint64_t>(0),
+                     "no debt should remain once the shortfall has been delivered");
+
+            gs.writeRegister(GS_REG_TRXDIR, 1ull);
+            uint8_t out[48] = {};
+            const uint32_t outBytes = gs.consumeLocalToHostBytes(out, sizeof(out));
+            t.Equals(outBytes, 48u, "partially-trailing IMAGE upload should land the full byte range");
+            bool bytesOk = true;
+            for (uint32_t i = 0; i < sizeof(out); ++i)
+            {
+                if (out[i] != payload[i])
+                    bytesOk = false;
+            }
+            t.IsTrue(bytesOk, "partially-trailing IMAGE upload should preserve byte order");
+        });
+
+        // BUG-028 guard: a new TRXDIR must supersede any stale debt, otherwise a
+        // truncated transfer would silently eat the head of the next packet.
+        tc.Run("GS IMAGE byte debt is dropped when a new transfer is started (BUG-028)", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            const uint64_t bitblt =
+                (static_cast<uint64_t>(0u) << 0) |
+                (static_cast<uint64_t>(1u) << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24) |
+                (static_cast<uint64_t>(0u) << 32) |
+                (static_cast<uint64_t>(1u) << 48) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 56);
+            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (2ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            // Declare 2 qwords, deliver none, then abandon the transfer.
+            std::vector<uint8_t> abandoned;
+            appendU64(abandoned, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(abandoned, 0ull);
+            gs.processGIFPacket(abandoned.data(), static_cast<uint32_t>(abandoned.size()));
+
+            const GSDebugSnapshot afterAbandon = gs.getDebugSnapshot();
+            t.Equals(afterAbandon.pendingImageBytes, static_cast<uint64_t>(32),
+                     "sanity: the abandoned transfer should leave stale debt behind");
+
+            // A fresh transfer supersedes the stale debt.
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (2ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            const GSDebugSnapshot afterRestart = gs.getDebugSnapshot();
+            t.Equals(afterRestart.pendingImageBytes, static_cast<uint64_t>(0),
+                     "starting a new transfer must clear stale debt, or it would eat the next packet's GIFtag");
+
+            uint8_t payload[32] = {};
+            for (uint32_t i = 0; i < sizeof(payload); ++i)
+                payload[i] = static_cast<uint8_t>(0x5Au + i);
+
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(2u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(packet, 0ull);
+            packet.insert(packet.end(), payload, payload + sizeof(payload));
+            gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            const GSDebugSnapshot snap = gs.getDebugSnapshot();
+            t.Equals(snap.trxdir, 3u, "the new transfer should complete normally");
+            t.Equals(snap.pendingImageBytes, static_cast<uint64_t>(0),
+                     "a self-contained packet should leave no debt");
+
+            gs.writeRegister(GS_REG_TRXDIR, 1ull);
+            uint8_t out[32] = {};
+            const uint32_t outBytes = gs.consumeLocalToHostBytes(out, sizeof(out));
+            t.Equals(outBytes, 32u, "the new transfer should land its full byte range");
+            bool bytesOk = true;
+            for (uint32_t i = 0; i < sizeof(out); ++i)
+            {
+                if (out[i] != payload[i])
+                    bytesOk = false;
+            }
+            t.IsTrue(bytesOk, "the new transfer's bytes should be intact");
+        });
+
         tc.Run("GS PSMT4 host-local upload keeps position across split IMAGE packets", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

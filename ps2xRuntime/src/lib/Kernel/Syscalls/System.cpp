@@ -411,6 +411,81 @@ namespace ps2_syscalls
                                                     uint32_t originalEnd,
                                                     uint32_t target);
 
+    static inline uint32_t normalizeKernelAlias(uint32_t addr)
+    {
+        if (addr >= 0x80000000u && addr < 0xC0000000u)
+        {
+            return addr & 0x1FFFFFFFu;
+        }
+        return addr;
+    }
+
+    static bool readGuestU32(uint8_t *rdram, uint32_t addr, uint32_t &out)
+    {
+        const uint8_t *ptr = getConstMemPtr(rdram, addr);
+        if (!ptr)
+        {
+            return false;
+        }
+        std::memcpy(&out, ptr, sizeof(out));
+        return true;
+    }
+
+    // HLE for the sce libkernel kernel-patch query entry (_InitTLBFunctions /
+    // _InitAlarm). The game copies a blob into kernel RAM (e.g. 0x80075000 /
+    // 0x80076000) via kernel Copy (syscall 0x5A) and installs its entry as
+    // syscall 0x5B. The entry function is a table lookup:
+    //   lui   $v0, HI
+    //   move  $a1, $zero
+    //   addiu $v1, $v0, LO      ; table = (HI << 16) + signext(LO)
+    //   loop over up to 6 { u32 syscallNum, u32 kernelHandlerAddr } pairs:
+    //     if (a0 == num) return addr; ...
+    //   return 0
+    // We cannot invoke the blob (no recompiled function exists in kernel RAM),
+    // so service the query directly from the table the blob carries with it.
+    static bool tryHleKernelQueryHandler(uint8_t *rdram, R5900Context *ctx, uint32_t handler, uint32_t &outV0)
+    {
+        const uint32_t base = normalizeKernelAlias(handler);
+
+        uint32_t w0 = 0u;
+        uint32_t w2 = 0u;
+        if (!readGuestU32(rdram, base + 0u, w0) || !readGuestU32(rdram, base + 8u, w2))
+        {
+            return false;
+        }
+
+        // lui $v0, HI followed by addiu $v1, $v0, LO
+        if ((w0 >> 16) != 0x3C02u || (w2 >> 16) != 0x2443u)
+        {
+            return false;
+        }
+
+        const uint32_t hi = w0 & 0xFFFFu;
+        const int32_t lo = static_cast<int16_t>(w2 & 0xFFFFu);
+        const uint32_t tableAddr = normalizeKernelAlias(static_cast<uint32_t>((hi << 16) + lo));
+
+        const uint32_t query = getRegU32(ctx, 4);
+        constexpr uint32_t kMaxQueryEntries = 6u;
+        for (uint32_t i = 0; i < kMaxQueryEntries; ++i)
+        {
+            uint32_t num = 0u;
+            uint32_t addr = 0u;
+            if (!readGuestU32(rdram, tableAddr + i * 8u, num) ||
+                !readGuestU32(rdram, tableAddr + i * 8u + 4u, addr))
+            {
+                break;
+            }
+            if (num == query)
+            {
+                outV0 = addr;
+                return true;
+            }
+        }
+
+        outV0 = 0u;
+        return true;
+    }
+
     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t handler = 0u;
@@ -427,6 +502,30 @@ namespace ps2_syscalls
         if (!runtime || !ctx || handler == 0u)
         {
             return false;
+        }
+
+        // Handlers copied into kernel RAM have no recompiled function; if the
+        // handler is the sce libkernel query entry, HLE it from its own table.
+        if (!runtime->hasFunction(normalizeKernelAlias(handler)))
+        {
+            uint32_t hleV0 = 0u;
+            if (tryHleKernelQueryHandler(rdram, ctx, handler, hleV0))
+            {
+                static std::atomic<uint32_t> s_kernelQueryLogs{0u};
+                constexpr uint32_t kMaxKernelQueryLogs = 32u;
+                const uint32_t logIndex = s_kernelQueryLogs.fetch_add(1u, std::memory_order_relaxed);
+                if (logIndex < kMaxKernelQueryLogs)
+                {
+                    std::cerr << "[SyscallOverride:kernel-query]"
+                              << " syscall=0x" << std::hex << syscallNumber
+                              << " handler=0x" << handler
+                              << " query=0x" << getRegU32(ctx, 4)
+                              << " result=0x" << hleV0
+                              << std::dec << std::endl;
+                }
+                setReturnU32(ctx, hleV0);
+                return true;
+            }
         }
 
         const uint32_t overrideA0 = getRegU32(ctx, 4);
@@ -483,7 +582,7 @@ namespace ps2_syscalls
         const bool invoked = rpcInvokeFunction(rdram,
                                                ctx,
                                                runtime,
-                                               handler,
+                                               normalizeKernelAlias(handler),
                                                getRegU32(ctx, 4),
                                                getRegU32(ctx, 5),
                                                getRegU32(ctx, 6),
@@ -792,15 +891,6 @@ namespace ps2_syscalls
         ctx->cop0_entryhi = 0u;
 
         setReturnS32(ctx, KE_OK);
-    }
-
-    static inline uint32_t normalizeKernelAlias(uint32_t addr)
-    {
-        if (addr >= 0x80000000u && addr < 0xC0000000u)
-        {
-            return addr & 0x1FFFFFFFu;
-        }
-        return addr;
     }
 
     static uint32_t computeBuiltinFindAddressResult(uint8_t *rdram,

@@ -1,13 +1,15 @@
 # build.ps1 - MSBuild wrapper with progress (works on Desktop and Laptop)
 # Usage: .\build.ps1 [Debug|RelWithDebInfo] [parallelism]
 # Example: .\build.ps1 Debug 2
+# Example: .\build.ps1 Debug -Test    # build the ps2x_tests unit-test runner
 
 param(
     [string]$Config = "Debug",
     [int]$Jobs = 2,
     [switch]$Recomp,    # Build the ps2xRecomp tool instead of the runtime
     [switch]$Studio,    # Build ps2xStudio instead of the runtime
-    [switch]$Debugger   # Build ps2xDebugger instead of the runtime
+    [switch]$Debugger,  # Build ps2xDebugger instead of the runtime
+    [switch]$Test       # Build the ps2x_tests unit-test runner instead of the runtime
 )
 
 $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -27,6 +29,9 @@ if ($Recomp) {
 } elseif ($Debugger) {
     $target = "$root\build\ps2xRuntime\RecompDebugger.vcxproj"
     $total  = 12
+} elseif ($Test) {
+    $target = "$root\build\ps2xTest\ps2x_tests.vcxproj"
+    $total  = 6
 } else {
     $target = "$root\build\ps2xRuntime\ps2EntryRunner.vcxproj"
     $total  = 12
@@ -214,7 +219,7 @@ Write-Host ""
 # reference graph when targeting a single vcxproj directly (no .sln) - build it explicitly first.
 $rlimguiTarget = "$root\build\ps2xRuntime\rlImGui.vcxproj"
 $preBuild = ""
-if (-not $Recomp -and -not $Studio -and -not $Debugger -and (Test-Path $rlimguiTarget)) {
+if (-not $Recomp -and -not $Studio -and -not $Debugger -and -not $Test -and (Test-Path $rlimguiTarget)) {
     $preBuild = "`"$msbuild`" `"$rlimguiTarget`" /p:Configuration=$Config /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m:$Jobs /v:minimal && "
 }
 $cmdLine = "`"$vsdev`" -arch=amd64 && $preBuild`"$msbuild`" `"$target`" /p:Configuration=$Config /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m:$Jobs /v:minimal"

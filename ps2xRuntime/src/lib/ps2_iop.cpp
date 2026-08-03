@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -19,6 +20,15 @@
 // (no header touched) so the LOADFILE path can hand it the module when the game
 // asks for it. Loads + relocates the IRX into IOP RAM and builds the import map.
 extern bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath);
+
+namespace
+{
+    bool mcservTraceEnabled()
+    {
+        const char *e = std::getenv("PS2X_MCSERV_TRACE");
+        return e && e[0] != '\0' && e[0] != '0';
+    }
+}
 
 ps2_iop::ps2_iop()
 {
@@ -49,6 +59,18 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
 {
     resultPtr = 0u;
     signalNowaitCompletion = false;
+    const bool traceMcserv = mcservTraceEnabled();
+
+    if (traceMcserv && (sid == IOP_SID_MCSERV || sid == IOP_SID_MCSERV_LEGACY))
+    {
+        static std::atomic<uint32_t> s_mcservRpcLogs{0u};
+        if (s_mcservRpcLogs.fetch_add(1u, std::memory_order_relaxed) < 96u)
+        {
+            std::fprintf(stderr,
+                         "[iop:mcserv-route] sid=0x%08X rpc=0x%X send=0x%08X/%u recv=0x%08X/%u\n",
+                         sid, rpcNum, sendBufAddr, sendSize, recvBufAddr, recvSize);
+        }
+    }
 
     if (ps2_syscalls::handleSoundDriverRpcService(m_rdram,
                                                   runtime,
@@ -119,6 +141,16 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                                        sendSize, recvBufAddr,
                                        recvSize, resultPtr))
     {
+        if (traceMcserv && (sid == IOP_SID_MCSERV || sid == IOP_SID_MCSERV_LEGACY))
+        {
+            static std::atomic<uint32_t> s_mcservHandledLogs{0u};
+            if (s_mcservHandledLogs.fetch_add(1u, std::memory_order_relaxed) < 96u)
+            {
+                std::fprintf(stderr,
+                             "[iop:mcserv-route] handled rpc=0x%X resultPtr=0x%08X\n",
+                             rpcNum, resultPtr);
+            }
+        }
         return true;
     }
 
@@ -368,6 +400,17 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
         }
         resultPtr = recvBufAddr;
         return true;
+    }
+
+    if (traceMcserv && (sid == IOP_SID_MCSERV || sid == IOP_SID_MCSERV_LEGACY))
+    {
+        static std::atomic<uint32_t> s_mcservMissLogs{0u};
+        if (s_mcservMissLogs.fetch_add(1u, std::memory_order_relaxed) < 96u)
+        {
+            std::fprintf(stderr,
+                         "[iop:mcserv-route] miss sid=0x%08X rpc=0x%X\n",
+                         sid, rpcNum);
+        }
     }
 
     return false;
