@@ -22,6 +22,11 @@ param(
     # default since 2026-07-28 -- it costs ~20% of the run's CPU. Turn it on
     # only when hunting a memory writer, never during a perf measurement.
     [switch]$HwWatch,
+    # Arm the standard guest-memory watch set as one unit (PS2X_WATCH). These five
+    # addresses are the boot state machine's vital signs and were previously pasted
+    # by hand from a markdown block -- forgetting one produced runs whose silence
+    # looked like a result. See the -Watch block below for what each address is.
+    [switch]$Watch,
     [switch]$Full,   # show EVERY console line (default: only important lines below)
     # Auto-stop the runner after N seconds so every diagnostic run is the same
     # length and comparable. 0 = run until closed by hand. 60 is the current
@@ -43,6 +48,20 @@ param(
 $Tracers = @{
     PS2_PC_WATCHDOG = 1
     PS2_ARKD_TRACE  = 1
+    # EE-side mirror of libsifcmd's _sif_sreg[] table (base 0x561880, installed by
+    # sceSifInitCmd at EE 0x177B00). WITHOUT THIS THE 08-01 ARKD/SREG COMPLETION
+    # FIX IS COMPLETELY INERT: SET_SREG lands in the host-side g_sifSregs copy, the
+    # guest never observes the completion word, and the run silently regresses to
+    # pre-fix behaviour while looking healthy. RPC.cpp:132 defaults it to OFF, so it
+    # has to be set here. It self-discloses in the log as
+    #   "<-- NOT MIRRORED (set PS2_SIF_EE_SREG_BASE)"
+    # which the post-run validity gate at the bottom of this script now checks for.
+    PS2_SIF_EE_SREG_BASE = if ($env:PS2_SIF_EE_SREG_BASE) { $env:PS2_SIF_EE_SREG_BASE } else { '0x561880' }
+    # Master gate for every GS diagnostic (ps2_diag::enabled(), ps2_diag.h:42):
+    # [gs:image], [gs:frame], [gs:frame-change], [gs:ad], [present]. Stage 5.8's
+    # exit test is stated in terms of these lines, so a run without this produces
+    # no evidence either way -- not a negative result.
+    PS2X_DIAG       = if ($env:PS2X_DIAG) { $env:PS2X_DIAG } else { 1 }
     # Phase 1 SIF-RPC diagnostic: dumps queue packet + RPC_SERVER_DATA tables and a
     # derail detector before/after the EE dispatcher runs. Instrumentation only.
     PS2_SIF_DIAG    = 1
@@ -156,6 +175,22 @@ if ($HwWatch) {
     Write-Host "[launch_recomp] -HwWatch: DR0 watchpoint armed -- adds ~20% CPU, do not trust perf numbers from this run" -ForegroundColor Yellow
 } else {
     Remove-Item Env:PS2X_HWWATCH -ErrorAction SilentlyContinue
+}
+
+# Standard guest-memory watch set (PS2X_WATCH=ADDR[:SIZE][:LABEL][,...], consumed
+# by ps2_watch::armWatchesFromEnv, ps2_runtime.cpp:2745). Same env-directly rule
+# as above. Confirm it took with "[watch] armed 5" in the log -- 0 armed means
+# every appinit/req12/snd00 conclusion from that run is void.
+#   0x5E5924 CAppInit state word   (sub_327810 CAppInit::Update; 0x3e8 = retired,
+#                                   the terminal value measured on real PCSX2)
+#   0x5618B0 _sif_sreg[12]         (SET_SREG index 0xc -- the ARKD completion word)
+#   0x5D6BA4 snd00                 (audio gate that held state 11)
+#   0x5A9380 pkt_snd / 0x5A9358 pkt_ccd  (SIF packet slots)
+if ($Watch) {
+    $env:PS2X_WATCH = '0x5E5924:2:appinit_state,0x5618B0:4:req12,0x5D6BA4:4:snd00,0x5A9380:4:pkt_snd,0x5A9358:4:pkt_ccd'
+    Write-Host "[launch_recomp] -Watch: 5 guest-memory watches queued (expect '[watch] armed 5' in the log)" -ForegroundColor Cyan
+} else {
+    Remove-Item Env:PS2X_WATCH -ErrorAction SilentlyContinue
 }
 
 Write-Host "[launch_recomp] tracers: $($Tracers.Keys -join ', ')" -ForegroundColor Cyan
@@ -306,5 +341,43 @@ if ($sampler) {
         }
     } elseif ($r) {
         Write-Host "[cputime] runner process was never found -- no CPU measurement this run." -ForegroundColor Yellow
+    }
+}
+
+# --- Post-run VALIDITY GATE ---------------------------------------------------
+# A run can fail in a way that produces a complete, healthy-looking log full of
+# nothing. Three documented cases, each of which has already cost a session:
+#   1. SREG not mirrored     -> the ARKD/SREG completion fix is inert; you are
+#                               measuring the PRE-fix build and will not know.
+#   2. no watches armed      -> "appinit never moved" is unfalsifiable, not false.
+#   3. a probe hit its cap   -> a saturated probe and an absent one look identical,
+#                               so the ABSENCE of that tag proves nothing.
+# In all three the danger is the same: absence of evidence reads as evidence of
+# absence. Say so loudly rather than leaving it to a grep nobody runs.
+if (Test-Path $Log) {
+    $gate = @()
+    $logText = Get-Content -LiteralPath $Log -Raw -ErrorAction SilentlyContinue
+
+    if ($logText -match 'NOT MIRRORED') {
+        $gate += 'SREG NOT MIRRORED -- PS2_SIF_EE_SREG_BASE did not take. The 08-01 ARKD/SREG completion fix was INERT this run.'
+    }
+    if ($Watch -and $logText -notmatch '\[watch\] armed') {
+        $gate += '-Watch was passed but no "[watch] armed" line appeared. No watch fired because none existed -- not because nothing changed.'
+    }
+    $caps = @([regex]::Matches($logText, '\[cap\][^\r\n]*') | ForEach-Object { $_.Value } | Select-Object -Unique)
+    if ($caps.Count -gt 0) {
+        $gate += "$($caps.Count) probe(s) hit their emit cap. The ABSENCE of those tags later in the log is meaningless:"
+        $gate += $caps | ForEach-Object { "      $_" }
+    }
+
+    if ($gate.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  ############################################################' -ForegroundColor Red
+        Write-Host '  #  RUN VALIDITY FAILURE -- do not draw conclusions from it  #' -ForegroundColor Red
+        Write-Host '  ############################################################' -ForegroundColor Red
+        foreach ($g in $gate) { Write-Host "  ! $g" -ForegroundColor Red }
+        Write-Host '  ############################################################' -ForegroundColor Red
+    } else {
+        Write-Host "[validity] run passes the validity gate (SREG mirrored$(if ($Watch) { ', watches armed' }), no capped probes)." -ForegroundColor Green
     }
 }
