@@ -6,6 +6,7 @@
 #include "runtime/ps2_iop.h"
 
 #include <map>
+#include <mutex>
 #include <string>
 #include <cstdlib>
 
@@ -16,6 +17,9 @@
 // through our code is the loadfile CALL send buffer in deliverSifRpcReply. We
 // trigger the loader there. Declared here (no header touched).
 extern bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath);
+// 5.15: SJX stream-ring lookup, populated by DTX_Create (sid 0x90000200 fno 2)
+// in ps2_iop.cpp. Declared here rather than in a header, per the .cpp-pair rule.
+extern bool ps2x_sjxLookupStreamByIopDest(uint32_t iopDest, uint32_t *outEeBase, uint32_t *outWkLen);
 // S2.2d-1: run one registered ARKD RPC service func in the persistent IopCpu and
 // copy its reply into the guest recv buffer. Returns true iff it delivered real
 // data (defined in ps2_iop_irx_loader.cpp; no header touched, per project rules).
@@ -586,6 +590,143 @@ namespace ps2_stubs
                                              recvAddr, recvSize, bridgeHandled ? 1u : 0u);
                             }
                         }
+
+                        // --- 5.15 PROBE: census of calls no IOP service answers --
+                        // Run 57 caught the guest binding sid 0x80000597 at the
+                        // exact instant it asked for "\MOVIE\OKR.SFD;1", and
+                        // handleRPC has no case for the 0x8000059x cdvd family
+                        // beyond 0x80000593. An unanswered call leaves the recv
+                        // buffer untouched, which the CRI file layer reads as a
+                        // failed open -- and nothing anywhere prints. That is the
+                        // exact shape of our symptom, so the census is
+                        // UNCONDITIONAL: an unserved service must never be
+                        // invisible.
+                        //
+                        // Consecutive repeats of the same (sid,func) collapse so a
+                        // retry spin cannot exhaust the cap, and the running total
+                        // rides every line so the collapse can never be misread as
+                        // low volume.
+                        //
+                        // RUN 58 CORRECTION -- two defects, both of which made the
+                        // probe report confidently about the wrong window:
+                        //
+                        //  (1) FALSE POSITIVES. handleRPC is not the only servicer.
+                        //      ARKD sids 0x500..0x503 are answered further down by
+                        //      ps2_iop_runArkdService (the real IRX in the R3000),
+                        //      so !bridgeHandled is NOT "unserved" for them. They
+                        //      are excluded here and counted instead.
+                        //  (2) STARVATION. Those same ARKD sids are the highest-
+                        //      volume traffic in the run: in run 58 they exhausted
+                        //      the flat 96-line cap at log line 2433, ~400 lines
+                        //      BEFORE MovieCreate. The movie window -- the only
+                        //      window this probe exists to observe -- was entirely
+                        //      past the cap, so 0x80000597's absence proved nothing.
+                        //
+                        // The cap is now PER-SID, and the first sighting of any sid
+                        // is unconditional. A novel service can therefore never be
+                        // starved by a chatty known one, whatever the volume.
+                        if (!bridgeHandled)
+                        {
+                            static std::atomic<uint32_t> s_missTotal{0u};
+                            static std::atomic<uint64_t> s_missLast{~0ull};
+                            static std::atomic<uint32_t> s_arkdSuppressed{0u};
+                            const uint32_t missTotal =
+                                s_missTotal.fetch_add(1u, std::memory_order_relaxed) + 1u;
+
+                            // Served downstream by the S2.2d-2 real-service bridge.
+                            const bool servedByArkd =
+                                (boundSid >= 0x500u && boundSid <= 0x503u);
+                            if (servedByArkd)
+                            {
+                                s_arkdSuppressed.fetch_add(1u, std::memory_order_relaxed);
+                            }
+
+                            const uint64_t key =
+                                (static_cast<uint64_t>(boundSid) << 32) | rpcNum;
+                            if (!servedByArkd &&
+                                s_missLast.exchange(key, std::memory_order_relaxed) != key)
+                            {
+                                // Per-sid budget. sidState maps sid -> lines logged.
+                                // Guarded because SIF packets are drained off more
+                                // than one host thread.
+                                // Per-sid budget. Raise with
+                                // PS2X_RPC_MISS_MAX (0 = unlimited).
+                                static const uint32_t kMissMax = []() -> uint32_t {
+                                    if (const char *e =
+                                            std::getenv("PS2X_RPC_MISS_MAX"))
+                                        return static_cast<uint32_t>(
+                                            std::strtoul(e, nullptr, 0));
+                                    return 24u;
+                                }();
+                                static std::mutex s_missMx;
+                                static std::map<uint32_t, uint32_t> s_perSid;
+                                uint32_t n = 0u;
+                                bool firstSighting = false;
+                                {
+                                    std::lock_guard<std::mutex> lk(s_missMx);
+                                    auto it = s_perSid.find(boundSid);
+                                    firstSighting = (it == s_perSid.end());
+                                    n = firstSighting ? 0u : it->second;
+                                    s_perSid[boundSid] = n + 1u;
+                                }
+                                if (kMissMax != 0u && n == kMissMax)
+                                {
+                                    std::cerr << "[cap] tag=sif:rpc-miss sid=0x"
+                                              << std::hex << boundSid << std::dec
+                                              << " saturated at " << kMissMax
+                                              << " -- later calls to"
+                                                 " THIS sid are invisible; absence past"
+                                                 " this point is NOT evidence. Other"
+                                                 " sids are unaffected (per-sid cap)."
+                                              << std::endl;
+                                }
+                                if (firstSighting)
+                                {
+                                    std::cerr << "[sif:rpc-miss:new-sid] first unserved"
+                                                 " call to sid=0x" << std::hex << boundSid
+                                              << std::dec << " at total=" << missTotal
+                                              << " arkdSuppressed="
+                                              << s_arkdSuppressed.load(
+                                                     std::memory_order_relaxed)
+                                              << std::endl;
+                                }
+                                if (kMissMax == 0u || n < kMissMax)
+                                {
+                                    std::cerr << "[sif:rpc-miss] sid=0x" << std::hex
+                                              << boundSid << " func=0x" << rpcNum
+                                              << " client=0x" << client
+                                              << " send=0x" << sendAddr
+                                              << " ssz=0x" << sendSize
+                                              << " recv=0x" << recvAddr
+                                              << " rsz=0x" << recvSize << std::dec
+                                              << " total=" << missTotal
+                                              << " arkdSup="
+                                              << s_arkdSuppressed.load(
+                                                     std::memory_order_relaxed);
+                                    // First four send words -- for a cdvd file
+                                    // service these carry the command and the
+                                    // path/LBA, which is what identifies WHICH
+                                    // open is going unanswered.
+                                    if (sendAddr != 0u && sendSize >= 16u)
+                                    {
+                                        if (const uint8_t *sp =
+                                                getConstMemPtr(rdram, sendAddr))
+                                        {
+                                            for (uint32_t k = 0; k < 4u; ++k)
+                                            {
+                                                uint32_t sw = 0u;
+                                                std::memcpy(&sw, sp + (k * 4u), 4u);
+                                                std::cerr << " s[" << std::dec << k
+                                                          << "]=0x" << std::hex << sw
+                                                          << std::dec;
+                                            }
+                                        }
+                                    }
+                                    std::cerr << std::endl;
+                                }
+                            }
+                        }
+                        // --- end 5.15 rpc-miss census ---------------------------
                     }
                 }
 
@@ -1511,6 +1652,102 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // ---- SJX stream-ring acknowledgement -----------------------------------
+    //
+    // 5.15, the sub_1305B0 stream-close deadlock. Decoded field by field from
+    // sub_130638 (the pump), which is the ONLY writer of the in-flight flag:
+    //
+    //   0x13066c  lw $v0,20($s0)     ; obj[20] = ring's uncached tail pointer
+    //   0x130670  lw $v1, 8($s0)     ; cursor
+    //   0x130674  lw $a0,60($v0)     ; ack = *(obj[20] + 0x3C)
+    //   0x130678  slt $v1,$v1,$a0    ; consumer path iff cursor < ack
+    //   0x1306b8  sb $zero,1($s0)    ; ... and only there is byte1 cleared
+    //
+    // and from the producer in the same function:
+    //
+    //   0x130718  sw $v1, 8($s0)     ; cursor = cursor + 1
+    //   0x13071c  sw $v1,60($v0)     ; ack    = THE SAME VALUE
+    //   0x13077c  jal 0x175060       ; sceSifSetDma(dest=obj[24], size=obj[28])
+    //   0x130790  sb $v0, 1($s0)     ; byte1 = 1, in flight
+    //
+    // So the EE stamps cursor == ack on every produce; the gate is false the
+    // instant a buffer is queued, and only the IOP-side stream consumer ever
+    // advances ack. That consumer lives in CRI_ADXI.IRX, which this runtime
+    // never loads -- we serve the SJX/DTX service locally -- so nothing has
+    // ever advanced it. Run 55 measured the consequence exactly: two produces
+    // in a 120 s run, one per open stream, both left with byte1 = 1 forever,
+    // and sub_1305B0 spinning on the drain at 0x1305e0.
+    //
+    // obj[20] is (eeBase + wkLen - 0x40) | 0x20000000, so the ack word is the
+    // ring's LAST WORD, at eeBase + wkLen - 4.
+    //
+    // This is an acknowledgement, not a payload: the only thing written is a
+    // count of transfers that genuinely were delivered, into a slot the IOP
+    // owns. No stream data is fabricated.
+    void ackSjxStreamRingIfMatched(uint8_t *rdram, uint32_t srcAddr, uint32_t destAddr,
+                                   uint32_t sizeBytes, R5900Context *ctx)
+    {
+        uint32_t eeBase = 0u;
+        uint32_t wkLen = 0u;
+        if (!ps2x_sjxLookupStreamByIopDest(destAddr, &eeBase, &wkLen))
+        {
+            return;
+        }
+
+        // The producer masks the source to a physical address (0x130760
+        // `and $v1,$v1,0x0FFFFFFF`), so compare on the same footing. Requiring
+        // the size to match the registered ring length as well keeps this from
+        // firing on any other transfer that happens to share a destination.
+        if ((srcAddr & 0x0FFFFFFFu) != (eeBase & 0x0FFFFFFFu) || sizeBytes != wkLen)
+        {
+            return;
+        }
+
+        const uint32_t ackAddr = eeBase + wkLen - 4u;
+        uint8_t *ackPtr = getMemPtr(rdram, ackAddr);
+        if (!ackPtr)
+        {
+            return;
+        }
+
+        uint32_t ack = 0u;
+        std::memcpy(&ack, ackPtr, sizeof(ack));
+        const uint32_t next = ack + 1u;
+        std::memcpy(ackPtr, &next, sizeof(next));
+
+        // Bounded, and never silent about saturating: if the address were wrong
+        // we would be incrementing an unrelated word, and `was` would not track
+        // the produce count. `was` should read 1, 2, 3 ... on successive lines.
+        //
+        // 5.15: this is the cap that actually saturates on EVERY run -- 32 acks
+        // is early boot, so "the SJX ring went quiet" was never observable.
+        // Raise with PS2X_SJX_ACK_MAX (0 = unlimited).
+        static const uint32_t kAckMax = []() -> uint32_t {
+            if (const char *e = std::getenv("PS2X_SJX_ACK_MAX"))
+                return static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+            return 32u;
+        }();
+        static std::atomic<uint32_t> s_ackLogs{0u};
+        const uint32_t n = s_ackLogs.fetch_add(1u, std::memory_order_relaxed);
+        if (kAckMax != 0u && n == kAckMax)
+        {
+            std::cerr << "[cap] tag=sjx:ack saturated at " << kAckMax
+                      << " -- later acks are invisible; absence past this point"
+                         " is NOT evidence. Raise with PS2X_SJX_ACK_MAX"
+                         " (0 = unlimited)." << std::endl;
+        }
+        if (kAckMax == 0u || n < kAckMax)
+        {
+            std::cerr << "[sjx:ack] dest=0x" << std::hex << destAddr
+                      << " eeBase=0x" << eeBase
+                      << " len=0x" << wkLen
+                      << " ackAddr=0x" << ackAddr
+                      << " was=" << std::dec << ack << " now=" << next
+                      << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec
+                      << std::endl;
+        }
+    }
+
     void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)runtime;
@@ -1565,9 +1802,27 @@ namespace ps2_stubs
         // control-packet contents (to decode the game's registered bind sema id).
         // Remove once the bind-reply hook is placed. Not gated on AGRESSIVE_LOGS (that
         // would need a header edit + full rebuild).
+        //
+        // 5.15: the fixed 64 saturates during boot, so it could not tell us whether
+        // transfers were still reaching the audio-stream rings at the sub_1305B0
+        // park (t=72s). Raise with PS2X_SIFDMA_DTX_MAX, and emit the [cap] line the
+        // block was missing -- without it, absence of a late record read as zero.
         {
+            static const uint32_t kDtxMax = []() -> uint32_t {
+                if (const char *e = std::getenv("PS2X_SIFDMA_DTX_MAX"))
+                    return static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+                return 64u;
+            }();
             static std::atomic<uint32_t> s_dtxDiagLogs{0u};
-            if (s_dtxDiagLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+            const uint32_t dtxN = s_dtxDiagLogs.fetch_add(1u, std::memory_order_relaxed);
+            if (dtxN == kDtxMax)
+            {
+                std::cerr << "[cap] tag=sceSifSetDma:DTX saturated at " << kDtxMax
+                          << " -- ALL LATER TRANSFERS ARE INVISIBLE. Absence of a"
+                             " record past this point is NOT evidence. Raise with"
+                             " PS2X_SIFDMA_DTX_MAX." << std::endl;
+            }
+            if (dtxN < kDtxMax)
             {
                 for (uint32_t i = 0; i < count; ++i)
                 {
@@ -1597,6 +1852,55 @@ namespace ps2_stubs
                     }
                     std::cerr << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl;
                 }
+            }
+        }
+
+        // 5.15 (stream-close deadlock @ sub_1305B0): per-destination census. The
+        // parked object DMAs its buffer to an IOP address held at obj+24, so the
+        // set of distinct `dest` values here should be the 16 DTX rings whose
+        // addresses we already saw as [iop:sjx] create args. Unlike the capped dump
+        // above this never blinds: one line per NEW destination, plus a rolling
+        // tally every 512 transfers, so late activity stays visible for a whole run.
+        {
+            static std::mutex s_destMx;
+            static std::map<uint32_t, uint32_t> s_destHits; // dest -> transfers seen
+            static uint64_t s_destTotal = 0u;
+            static uint64_t s_nextCensus = 512u;
+
+            std::lock_guard<std::mutex> lock(s_destMx);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t eAddr = dmatAddr + (i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer)));
+                const uint8_t *e = getConstMemPtr(rdram, eAddr);
+                if (!e) continue;
+                Ps2SifDmaTransfer x{};
+                std::memcpy(&x, e, sizeof(x));
+                const uint32_t dest = static_cast<uint32_t>(x.dest);
+                ++s_destTotal;
+                const auto it = s_destHits.find(dest);
+                if (it == s_destHits.end())
+                {
+                    s_destHits.emplace(dest, 1u);
+                    std::cerr << "[sifdma:dest] NEW dest=0x" << std::hex << dest
+                              << " src=0x" << x.src
+                              << " size=0x" << static_cast<uint32_t>(x.size)
+                              << " ra=0x" << getRegU32(ctx, 31) << std::dec
+                              << " distinct=" << s_destHits.size()
+                              << " total=" << s_destTotal << std::endl;
+                }
+                else
+                {
+                    ++it->second;
+                }
+            }
+            if (s_destTotal >= s_nextCensus)
+            {
+                s_nextCensus = s_destTotal + 512u;
+                std::cerr << "[sifdma:census] total=" << std::dec << s_destTotal
+                          << " distinct=" << s_destHits.size();
+                for (const auto &kv : s_destHits)
+                    std::cerr << " 0x" << std::hex << kv.first << "=" << std::dec << kv.second;
+                std::cerr << std::endl;
             }
         }
 
@@ -1758,6 +2062,8 @@ namespace ps2_stubs
                     xfer.src,
                     xfer.dest,
                     static_cast<uint32_t>(xfer.size));
+
+                ackSjxStreamRingIfMatched(rdram, xfer.src, xfer.dest, xferSize, ctx);
             }
         }
 
@@ -1906,8 +2212,36 @@ namespace ps2_stubs
 // which is exactly the map sceSifGetSreg above reads. g_sifSregs lives in this
 // TU's anonymous namespace, so this external-linkage forwarder is the only way
 // to reach it without touching a header (project rule).
+// Stage 5.17 probe instrumentation (measurement only -- the store below is
+// unchanged). The logo step machine's blocking gate is sceSifGetReg(13), which
+// reads GUEST RAM, not this host-side map; so whether this function is ever
+// called at all, and with which index, is the first thing the sreg probe has
+// to know. Counted and logged here rather than inferred from silence.
+static std::atomic<uint64_t> g_iopSetSregCalls{0u};
+static std::atomic<uint64_t> g_iopSetSregDetail{0u};
+
+extern "C" uint64_t ps2x_iop_setsreg_calls()
+{
+    return g_iopSetSregCalls.load(std::memory_order_relaxed);
+}
+
 void ps2_iop_sifSetEeSreg(uint32_t reg, uint32_t value)
 {
+    g_iopSetSregCalls.fetch_add(1u, std::memory_order_relaxed);
+    const uint64_t seq = g_iopSetSregDetail.fetch_add(1u, std::memory_order_relaxed);
+    if (seq < 64u)
+    {
+        std::cerr << "[sreg] iopSet seq=" << std::dec << seq
+                  << " reg=" << reg << std::hex << " val=0x" << value
+                  << std::dec
+                  << " (lands in a HOST std::map; the guest reads guest RAM)\n";
+    }
+    else if (seq == 64u)
+    {
+        std::cerr << "[cap] tag=sreg.iopSet limit=64"
+                     " -- detail lines stop, iopSetSreg keeps counting\n";
+    }
+
     std::lock_guard<std::mutex> lock(ps2_stubs::g_sifCmdStateMutex);
     ps2_stubs::g_sifSregs[reg] = value;
 }

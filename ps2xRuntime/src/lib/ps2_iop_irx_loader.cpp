@@ -103,9 +103,37 @@ namespace
     // Bump allocator handed to sceAllocSysMemory. Kept strictly ABOVE the module
     // image (~0x40000..0x55a50) and well below the top of IOP RAM so it never
     // overlaps the mapped module or the SIF DMA scratch the runtime uses.
+    // The end was 0x180000 (1.125 MB) until 2026-08-05. Once QueryMaxFreeMemSize
+    // (sysmem fid 7) started answering honestly, dword_B490 became the real 960 KB
+    // (0xF0000) chunk size instead of 0x800, and ONE correct init round needs
+    // 0x800 + 0x800 + 0x40000 (sub_9EAC) + 0x18000 (TOC) + 0xF0000 = 0x149000
+    // -- more than the old arena held. Deepest guest stack is kIopStackTop -
+    // 0x4000 * 4 = 0x1EFF00 (only the four generic-pass threads scale with i; the
+    // rest sit at -0x8000/-0x9000), so ending at 0x1D0000 leaves 128 KB of clear
+    // space below every stack pointer while giving the arena 1.44 MB.
     constexpr uint32_t kIopAllocBase = 0x00060000u;
-    constexpr uint32_t kIopAllocEnd  = 0x00180000u;
+    constexpr uint32_t kIopAllocEnd  = 0x001D0000u;
     uint32_t                                     g_arkdAllocCursor = kIopAllocBase;
+    // Armed the moment our InitLoadBuffers pre-run finishes, disarmed by the next
+    // AllocSysMemory, which rolls the cursor back to kIopAllocBase.
+    //
+    // Why: the pre-run below is loader SCAFFOLDING. The game afterwards executes
+    // the module's real init chain (+0x30: RpcReplyRetryLoop -> sub_6920 ->
+    // sub_9EAC -> InitLoadBuffers) in full, so every heap block the pre-run took
+    // is dead the instant that starts -- but a bump allocator with no free path
+    // never gets it back. Measured 2026-08-05: pre-run took 0x18000 + 0xF0000,
+    // leaving 0x17000; the game's round then hit AllocSysMemory FAIL on both
+    // 0x40000 and the 0x18000 TOC table, so dword_B304 came back 0. A NULL table
+    // base is why [ARKD:toc] read count=0 and every TocLookup missed.
+    //
+    // The one-shot trigger is exact, not heuristic: the log shows allocations
+    // 0x060000 and 0x078000 (pre-run) followed immediately by sub_9EAC's first
+    // 0x800 with nothing in between, so "next alloc after the pre-run" IS the
+    // first allocation of the game's own round. Recycling there models what real
+    // hardware sees -- a module initialising against a whole heap. The pre-run's
+    // pointers (dword_B304 / dword_B498) dangle for the few instructions before
+    // the game's init overwrites all three of B304/B490/B498.
+    bool                                         g_arkdAllocRecycleArmed = false;
     // Per-import-stub call counter (key = stub addr) for capped, per-key logging
     // so the full init import sequence is visible without the repeat-call flood.
     std::unordered_map<uint32_t, uint32_t>       g_arkdImportCalls;
@@ -176,6 +204,14 @@ namespace
     bool     g_arkdJobTickActive = false;
     bool     g_arkdPubTickActive = false;
     uint32_t g_arkdPubPasses     = 0u;
+
+    // Set only for the inline load-worker run (+0x21B0). The worker's idle-exit
+    // rule below matches WaitSema's $a0 against the sema captured from dword_B318
+    // at InitLoadBuffers time; when that match fails the run never ends and burns
+    // its whole budget re-calling WaitSema. This flag scopes a probe that prints
+    // the operands of the mismatching call so the real wait target is named
+    // rather than guessed.
+    bool     g_arkdWorkerTickActive = false;
 
     // EE address of libsifcmd's _sif_sreg[] array. Game-specific (SDBZ: 0x561880,
     // installed by the guest's own sceSifInitCmd at EE 0x177B00, which stores it
@@ -650,6 +686,32 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                     cpu.setPC(kIopHaltPc);
                     return true;
                 }
+                // The idle sema is read LIVE from dword_B318, not from the value
+                // cached at InitLoadBuffers time. The [ARKD:wait] probe showed the
+                // worker blocking on a0=0xd from +0x21e4 (sub_21B0's own top-of-loop
+                // wait) while the cached id was still 0x8 -- ARKD deletes and
+                // re-creates that sema after init, so the cached id never matches
+                // again and the inline run burned its whole budget re-entering this
+                // thunk. Keeping the cached value only as a fallback preserves the
+                // pre-init behaviour if B318 has not been written yet.
+                const uint32_t idleSema = cpu.busRead32(g_arkdLoadBase + 0xB318u);
+                if (idleSema != 0u) g_arkdWorkerSema = idleSema;
+
+                if (g_arkdWorkerTickActive)
+                {
+                    static uint32_t s_waitLogs = 0u;
+                    if (s_waitLogs < 8u)
+                    {
+                        ++s_waitLogs;
+                        std::fprintf(stderr,
+                            "[ARKD:wait] worker WaitSema a0=0x%x idleSema=0x%x "
+                            "B310=%08x B300=%08x ra=0x%08x off=+0x%06x\n",
+                            a0, idleSema,
+                            cpu.busRead32(g_arkdLoadBase + 0xB310u),
+                            cpu.busRead32(g_arkdLoadBase + 0xB300u),
+                            ra, (ra - g_arkdLoadBase) & 0x00FFFFFFu);
+                    }
+                }
                 if (a0 == g_arkdWorkerSema &&
                     cpu.busRead32(g_arkdLoadBase + 0xB310u) == 0u)
                 {
@@ -791,6 +853,34 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                 return true;
             }
 
+            // sceCdGetDiskType thunk (sub_ACB0 = cdvdman fid 12 / export 0Ch).
+            // Identified from the CALL SITE, not an ordinal table. sub_13E4
+            // (+0x13E4) switches this return over the libcdvd disc-type ladder
+            // verbatim:  0 -> |0x400, 1 -> plain, 16..17 -> |0x200,
+            // 18..19 -> |0x100, 20 -> |0x80, 253..254 -> |0x200, 255 -> |0x40
+            // i.e. SCECdIllegalMedia / DETCT / PSCD+PSCDDA / PS2CD+PS2CDDA /
+            // PS2DVD / CDDA+DVDV / NODISC. The unhandled default of $v0 = 0
+            // therefore reads as SCECdIllegalMedia, so every reader gated on the
+            // 0x80 (PS2 DVD) bit rejected the disc and retried forever. That
+            // spin burned the entire 4M instruction budget on the sid=0x500
+            // fno=0x1 service (31,746 calls in one run, lockstep with thbase
+            // fid=33 delay and sysmem fid=14): the service never halted, its
+            // reply was never delivered, no read was ever issued against
+            // GAME.DAT, and the EE's asset buffer at 0x89d400 kept the zeros
+            // GameInit's mem_fill wrote -- which is Stage 5.9's black menu.
+            // 20 = 0x14 = SCECdPS2DVD matches the mounted image (GAME.DAT is
+            // 0x2BA29000 bytes, far past CD capacity).
+            if (off == 0xACB0u)
+            {
+                static uint32_t typeSeen = 0;
+                if (typeSeen < 4 && ++typeSeen)
+                    std::fprintf(stderr,
+                                 "[ARKD:cdtype] fid=12 poll ra=0x%08x -> 20 (SCECdPS2DVD)\n", ra);
+                cpu.setGpr(2, 20u);
+                cpu.setPC(ra);
+                return true;
+            }
+
             // sceCdDiskReady thunk (sub_ACB8 = cdvdman fid 13 / export 0Dh).
             // sub_91C is `while (sceCdDiskReady(1) != 2) delay();` and it gates
             // InitLoadBuffers plus every read-retry path, so an unhooked default
@@ -800,6 +890,23 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             if (off == 0xACB8u)
             {
                 cpu.setGpr(2, 2u);
+                cpu.setPC(ra);
+                return true;
+            }
+
+            // cdvdman drive-state entry (import stub at off 0xAC88). Named from
+            // the CALL SITE rather than an ordinal, because the call site is what
+            // actually constrains the answer: sub_1EB0's disc-state switch does
+            //     case 3: if ( !sub_AC88(1) ) v1 = 0x80000130;
+            //     case 2:      sub_AC88(0);
+            // so the module treats NON-ZERO as success and folds the failure into
+            // v1, which sub_1EB0 hands to dword_B300 -- landing it in the
+            // 0x8xxxxxxx error band instead of 0x3xxxxxxx (ready). Unhooked we
+            // returned 0, i.e. "failed", on the one case-3 pass this run took.
+            // Case 2 ignores the result entirely, so 1 is safe for both arms.
+            if (off == 0xAC88u)
+            {
+                cpu.setGpr(2, 1u);
                 cpu.setPC(ra);
                 return true;
             }
@@ -827,6 +934,53 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                                   ? std::strcmp(lhs, rhs)
                                   : std::strncmp(lhs, rhs, size_t(a2));
                 cpu.setGpr(2, uint32_t(int32_t(r < 0 ? -1 : (r > 0 ? 1 : 0))));
+                cpu.setPC(ra);
+                return true;
+            }
+
+            // strlen (sysclib fid=27, stub +0xAE44). Measured 2026-08-05: 778
+            // unhandled calls from ra=0x40a8c, i.e. from inside TocLookup, each
+            // defaulting to 0. That is survivable but wrong: TocLookup uses
+            // `strlen(name) & ~3`, minus 8, as the offset of its 4-byte prefilter,
+            // so a 0 length collapses the filter onto the first 4 bytes and makes
+            // every "dis/*" candidate fall through to the full strcmp. Answer it
+            // properly rather than leave a known-wrong value in a hot path.
+            if (off == 0xAE44u)
+            {
+                char buf[128];
+                arkdReadIopString(a0, buf, sizeof(buf));
+                cpu.setGpr(2, uint32_t(std::strlen(buf)));
+                cpu.setPC(ra);
+                return true;
+            }
+
+            // printf (sysclib, stub +0xAE00). ARKD reports its own failures through
+            // this -- TocLookup's miss path is printf("file not found! : %s\n",
+            // name), and TocDecodeAndIndex's overflow guard is "TOC File len is
+            // Over at Max files len!!". Both were invisible while the stub
+            // defaulted, which is why a failed lookup has been indistinguishable
+            // from a zero-length file. No format engine here: emit the literal
+            // format string plus the four argument registers, and render any that
+            // point into IOP RAM as text. Unambiguous, and cannot fault on a bad
+            // %s. Capped like every other detail probe.
+            if (off == 0xAE00u)
+            {
+                static uint32_t s_prints = 0u;
+                if (s_prints < 128u)
+                {
+                    ++s_prints;
+                    char fmt[160];
+                    arkdReadIopString(a0, fmt, sizeof(fmt));
+                    // Trim the trailing newline so one message stays one log line.
+                    for (size_t n = std::strlen(fmt); n && (fmt[n - 1] == '\n' || fmt[n - 1] == '\r'); --n)
+                        fmt[n - 1] = '\0';
+                    char a1s[96];
+                    arkdReadIopString(a1, a1s, sizeof(a1s));
+                    std::fprintf(stderr,
+                        "[ARKD:print] \"%s\" a1=0x%08x(\"%s\") a2=0x%08x a3=0x%08x ra=0x%06x\n",
+                        fmt, a1, a1s, a2, a3, ra);
+                }
+                cpu.setGpr(2, 0u);
                 cpu.setPC(ra);
                 return true;
             }
@@ -868,6 +1022,50 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                     std::memmove(g_arkdIopRam + d, g_arkdIopRam + s, a2);
                 }
                 cpu.setGpr(2, a0); // memcpy returns dest
+                cpu.setPC(ra);
+                return true;
+            }
+
+            // sysclib memset(dest, c, n) thunk (import stub at off 0xAE2C).
+            // Identified from the CALL SITE, not an ordinal: InitLoadBuffers opens
+            // with sub_AE2C(dword_BEE0, 0, 108) -- (ptr, byte, len) -- and sub_46988
+            // calls sub_AE2C(0x52610, -1, 0x5c0) to paint a table 0xFF. Unhooked,
+            // this no-oped for the entire run, so every buffer ARKD believes it
+            // cleared kept whatever was there before. That is what stranded the
+            // 27-slot first-letter bucket array: InitLoadBuffers ran TWICE
+            // (measured 2026-08-05, ra=0x429e4 both times, TOC buffer 0x060000 then
+            // 0x0b9800), the second pass could not zero dword_BEE0, and the buckets
+            // kept pointing into the FIRST, abandoned table ~0x59400 lower. The
+            // bucket deltas still match INFO.DAT exactly (239/305/1/2/1/989/285/108
+            // per build_scripts/arkd_toc.py), so the index was computed correctly
+            // and only its base is stale -- TocLookup then scans dead memory, misses,
+            // returns -1, and sub_1348's `48 * (idx & 0x3FFF)` turns that into an
+            // out-of-bounds read of zeros that is indistinguishable from a genuine
+            // zero-length file. Hence "read succeeded, moved 0 bytes".
+            if (off == 0xAE2Cu)
+            {
+                const uint32_t d = a0 & kIopRamMask;
+                if (g_arkdIopRam && a2 && size_t(d) + a2 <= PS2Memory::IOP_RAM_SIZE)
+                    std::memset(g_arkdIopRam + d, int(a1 & 0xFFu), a2);
+                cpu.setGpr(2, a0); // memset returns dest
+                cpu.setPC(ra);
+                return true;
+            }
+
+            // sysclib strcpy(dest, src) thunk (import stub at off 0xAE3C). Call
+            // site is InitLoadBuffers' first statement, sub_AE3C(&unk_BDE0,
+            // "cd_root") -- the archive path prefix. Unhooked it left unk_BDE0 as
+            // whatever the BSS/heap held, so any path ARKD builds from that prefix
+            // is garbage. Bounded by the same NUL-scan helper the probes use.
+            if (off == 0xAE3Cu)
+            {
+                char src[128];
+                arkdReadIopString(a1, src, sizeof(src));
+                const uint32_t d = a0 & kIopRamMask;
+                const size_t n = std::strlen(src) + 1u;
+                if (g_arkdIopRam && size_t(d) + n <= PS2Memory::IOP_RAM_SIZE)
+                    std::memcpy(g_arkdIopRam + d, src, n);
+                cpu.setGpr(2, a0); // strcpy returns dest
                 cpu.setPC(ra);
                 return true;
             }
@@ -952,6 +1150,18 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             // bump allocator (ordinal 4, stable across the IOP SDK).
             if (lib == "sysmem" && fid == 4u)
             {
+                // First guest allocation after the loader's InitLoadBuffers
+                // pre-run: reclaim the scaffolding heap in one shot (see the
+                // g_arkdAllocRecycleArmed note at the top of this file).
+                if (g_arkdAllocRecycleArmed)
+                {
+                    g_arkdAllocRecycleArmed = false;
+                    std::fprintf(stderr,
+                                 "[iop:import]   heap recycle: cursor 0x%06x -> 0x%06x "
+                                 "(pre-run scaffolding released)\n",
+                                 g_arkdAllocCursor, kIopAllocBase);
+                    g_arkdAllocCursor = kIopAllocBase;
+                }
                 const uint32_t size = (a1 + 0xFFu) & ~0xFFu; // 256-byte align
                 if (g_arkdAllocCursor + size <= kIopAllocEnd && size != 0u)
                 {
@@ -966,6 +1176,34 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
                 }
                 if (seen < kImportMax)
                     std::fprintf(stderr, "[iop:import]   -> alloc 0x%06x (size 0x%x)\n", rv, size);
+            }
+            // sysmem QueryMaxFreeMemSize (7) / QueryTotalFreeMemSize (8). Both
+            // identified from their CALL SITES: InitLoadBuffers does
+            //     dword_B490 = sub_AD0C();                       // fid 7, no args
+            //     if (dword_B490 <= 0x100000)
+            //         dword_B490 = ((sub_AD0C() >> 12) + 1) << 11;
+            //     else
+            //         dword_B490 = 983040;
+            // and sub_40064 does printf("IOP FreeMem:0x%08lx", sub_AD14()) // fid 8.
+            // Unhandled, both returned 0, so the <= 0x100000 arm fired and
+            // dword_B490 -- the streaming LOAD-CHUNK SIZE -- came out as
+            // ((0 >> 12) + 1) << 11 = 0x800. Two kilobytes instead of the 960 KB
+            // (983040) a real IOP with its ~1.6 MB free would have taken: a 480x
+            // undersized load buffer, and sub_1A58 divides every file length by
+            // this to decide the chunk count. Measured 2026-08-05: the log's two
+            // "LoadBuff Addr:0x%x Size:0x%x" lines both read Size:0x800, and
+            // "IOP FreeMem:0x00000000" is the fid 8 default printed verbatim.
+            // Report what the bump allocator actually has left -- honest, and it
+            // puts us on the >= 0x100000 arm the way real hardware is.
+            else if (lib == "sysmem" && (fid == 7u || fid == 8u))
+            {
+                rv = (g_arkdAllocCursor < kIopAllocEnd)
+                         ? (kIopAllocEnd - g_arkdAllocCursor)
+                         : 0u;
+                if (seen < kImportMax)
+                    std::fprintf(stderr,
+                                 "[iop:import]   -> free 0x%06x (fid=%u cursor=0x%06x)\n",
+                                 rv, fid, g_arkdAllocCursor);
             }
             // thsemap CreateSema (ordinal 4) -> non-zero sema id (0 reads as fail).
             else if (lib == "thsemap" && fid == 4u)
@@ -1129,14 +1367,29 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             else
             {
                 auto &u = g_arkdUnhandled[{lib, fid}];
-                if (u.count++ == 0u)
+                const uint64_t n = ++u.count;
+                if (n == 1u)
                 {
                     u.firstPc = pc;
                     u.firstRa = ra;
+                }
+                // 2026-08-12 -- this used to print ONLY on the first call, which
+                // made the census structurally unable to answer the one question
+                // it exists to answer. Run 53's 24 entries all read "count 1" and
+                // therefore looked like 24 harmless one-shot inits; the line's own
+                // warning ("if the caller retries on 0, this spins") cannot be
+                // evaluated from a one-shot record, because a spin and a single
+                // init produce byte-identical output. Powers of two: dense enough
+                // to see the first few, sparse enough that a real spin costs ~log2
+                // lines instead of flooding -- the same idiom [ARKD:sifdma-total]
+                // and [ARKD:cdread-total] already use in this file. A fid whose
+                // count reaches the thousands IS the spin, and now says so.
+                if ((n & (n - 1u)) == 0u)
+                {
                     std::fprintf(stderr,
                         "[iop:unhandled] %-8s fid=%-3u @0x%06x ra=0x%06x -> $v0=0 "
-                        "(default). If the caller retries on 0, this spins.\n",
-                        lib.c_str(), fid, pc, ra);
+                        "(default) calls=%llu. If the caller retries on 0, this spins.\n",
+                        lib.c_str(), fid, pc, ra, (unsigned long long)n);
                 }
             }
 
@@ -1274,6 +1527,9 @@ bool ps2_iop_loadArkdIrx(PS2Runtime *runtime, const std::string &modulePath)
             if (g_iopTraceOn && (!g_arkdCpu->halted() || g_arkdCpu->pc() != kHaltPc))
                 dumpIopTrace("InitLoadBuffers did not reach halt sentinel", g_arkdCpu->pc());
             if (arkdStateEnabled()) dumpArkdState("after InitLoadBuffers");
+            // Everything this pre-run allocated is scaffolding the game's own
+            // init chain is about to redo from scratch. Hand the heap back.
+            g_arkdAllocRecycleArmed = true;
         }
 
         std::fprintf(stderr, "[ARKD:svc] captured %zu service(s)\n", g_arkdServices.size());
@@ -1373,7 +1629,25 @@ bool ps2_iop_runArkdService(PS2Runtime *runtime,
     g_iopTraceOn = iopTraceEnabled();
     if (g_iopTraceOn) iopTraceReset();
     if (arkdStateEnabled()) dumpArkdState("before service");
-    const uint32_t retired = g_arkdCpu->run(4u * 1000u * 1000u);
+    // Budget, not cost: a service that halts pays only what it retires (the
+    // 0x503 fno=0x2 status poll retires 46). 4M was too tight for sid=0x500
+    // fno=0x1, which is not spinning -- it is the TOC decode in sub_2C0.
+    // ARKD is invoked with "file=2047", so dword_B49C=2047 and the deobfuscate
+    // loop runs `for (i=16; i < 48*2047; i+=16)` x 16 inner, each inner doing
+    // three byte read-modify-writes (nibble swap, invert, subtract key). That
+    // is ~98,240 inner iterations at ~30 MIPS instructions each, ~3M on its
+    // own, before the 2047-entry index build and the two TOC reads. It ran off
+    // the end of a 4M budget every time, so the reply was never delivered.
+    // 64M matches the InitLoadBuffers budget above and leaves ~10x headroom.
+    static const uint32_t kInstrBudget = [] {
+        if (const char *e = std::getenv("PS2X_ARKD_INSTR_BUDGET"))
+        {
+            const unsigned long v = std::strtoul(e, nullptr, 0);
+            if (v > 0) return static_cast<uint32_t>(v);
+        }
+        return 64u * 1000u * 1000u;
+    }();
+    const uint32_t retired = g_arkdCpu->run(kInstrBudget);
 
     const bool     halted = g_arkdCpu->halted();
     const uint32_t rv     = g_arkdCpu->gpr(2); // $v0 -> IOP ptr to reply data
@@ -1400,14 +1674,115 @@ bool ps2_iop_runArkdService(PS2Runtime *runtime,
     if (halted && g_arkdWorkerSema &&
         g_arkdCpu->busRead32(g_arkdLoadBase + 0xB310u) != 0u)
     {
+        // The job KIND and the request descriptor must be sampled BEFORE the run:
+        // sub_21B0 clears dword_B310 as its first act in every branch, so reading it
+        // afterwards always yields 0 and cannot say which path ran. dword_BF50 is the
+        // EE destination and byte_BF54 the NUL-terminated filename that sub_1A58
+        // feeds to TocLookup -- a zero-length or not-found entry is the difference
+        // between "read succeeded" and "read succeeded and moved no bytes".
+        const uint32_t jobKind = g_arkdCpu->busRead32(g_arkdLoadBase + 0xB310u);
+        const uint32_t jobDest = g_arkdCpu->busRead32(g_arkdLoadBase + 0xBF50u);
+        char jobName[32];
+        {
+            size_t i = 0;
+            for (; i + 1u < sizeof(jobName); ++i)
+            {
+                const uint8_t c = g_arkdCpu->busRead8(g_arkdLoadBase + 0xBF54u + uint32_t(i));
+                if (!c) break;
+                jobName[i] = (c >= 0x20 && c < 0x7F) ? char(c) : '?';
+            }
+            jobName[i] = '\0';
+        }
+
+        // ---- S2.2d: TOC entry dump. sub_1A58 computes its transfer size as
+        // (sub_1348(TocLookup(name)) + 15) & ~15, and sub_1348 is just
+        // *(u32*)(dword_B304 + 48*idx + 44). Every observed read job DMAs 0 bytes
+        // yet lands in sub_21B0's success branch, which can only happen when that
+        // size dword reads 0. Replicate the lookup here (TocDecodeAndIndex builds
+        // 48-byte records: name at +0, size at +44; record 0 is the header whose
+        // +44 holds the file count) and dump the matched record verbatim, so the
+        // question "is the size field zero, or is the wrong record matching?" is
+        // answered by bytes rather than by inference.
+        static uint32_t s_tocDumps = 0u;
+        if (jobKind == 2u && jobName[0] && s_tocDumps < 4u)
+        {
+            ++s_tocDumps;
+            const uint32_t tocBase  = g_arkdCpu->busRead32(g_arkdLoadBase + 0xB304u);
+            const uint32_t maxFiles = g_arkdCpu->busRead32(g_arkdLoadBase + 0xB49Cu);
+            const uint32_t count    = tocBase ? g_arkdCpu->busRead32(tocBase + 44u) : 0u;
+            std::fprintf(stderr,
+                "[ARKD:toc] base=0x%06x maxFiles=%u count=%u (expect 1930) end=0x%06x\n",
+                tocBase, maxFiles, count,
+                g_arkdCpu->busRead32(g_arkdLoadBase + 0xBF48u));
+
+            // TocLookup scans records [BEE0[c-97] .. BEE0[c-96]) -- so a correct
+            // record table still resolves to "not found" if the 27-slot bucket
+            // array is wrong, and -1 then feeds sub_1348, whose `& 0x3FFF` turns
+            // it into an out-of-bounds read that lands on zeros and reads back as
+            // a legitimate zero-length file. Dumping the buckets as record
+            // INDICES (the same (addr - base)/48 the module computes) separates
+            // "TOC data is bad" from "TOC index is bad". Decoding INFO.DAT off
+            // disk gives the ground truth to compare against: 1930 files, first
+            // letters d=239 e=305 f=1 i=2 m=1 p=989 s=285 t=108, sorted -- so
+            // 'd' must span [1,240), 'e' [240,545), 'f' [545,546), and so on.
+            std::fprintf(stderr, "[ARKD:toc] buckets(idx):");
+            for (uint32_t b = 0u; b < 27u; ++b)
+            {
+                const uint32_t v = g_arkdCpu->busRead32(g_arkdLoadBase + 0xBEE0u + 4u * b);
+                if (!v) { std::fprintf(stderr, " %c=--", 'a' + int(b)); continue; }
+                std::fprintf(stderr, " %c=%d", 'a' + int(b),
+                             tocBase ? int((int32_t(v) - int32_t(tocBase)) / 48) : -1);
+            }
+            std::fprintf(stderr, "\n");
+
+            const uint32_t scanEnd = (count && count < maxFiles) ? count : 0u;
+            uint32_t hit = 0u;
+            for (uint32_t k = 1u; k <= scanEnd; ++k)
+            {
+                const uint32_t rec = tocBase + 48u * k;
+                uint32_t j = 0u;
+                for (; j < 44u; ++j)
+                {
+                    const uint8_t c = g_arkdCpu->busRead8(rec + j);
+                    if (c != uint8_t(jobName[j])) break;
+                    if (!c) { hit = k; break; }
+                }
+                if (hit) break;
+            }
+            // Record 1 is dumped unconditionally as a layout reference: if the
+            // match fails, its bytes still show where the size actually lives.
+            const uint32_t recs[2] = { hit ? hit : 1u, 1u };
+            for (uint32_t r = 0u; r < (hit && hit != 1u ? 2u : 1u); ++r)
+            {
+                const uint32_t rec = tocBase + 48u * recs[r];
+                char hex[48 * 3 + 1]; char asc[49];
+                for (uint32_t j = 0u; j < 48u; ++j)
+                {
+                    const uint8_t c = g_arkdCpu->busRead8(rec + j);
+                    std::snprintf(hex + j * 3u, 4u, "%02x ", c);
+                    asc[j] = (c >= 0x20 && c < 0x7F) ? char(c) : '.';
+                }
+                asc[48] = '\0';
+                std::fprintf(stderr,
+                    "[ARKD:toc]  rec[%u] @0x%06x size@+44=0x%08x |%s|\n"
+                    "[ARKD:toc]    %s\n",
+                    recs[r], rec, g_arkdCpu->busRead32(rec + 44u), asc, hex);
+            }
+            if (!hit)
+                std::fprintf(stderr, "[ARKD:toc]  NO MATCH for \"%s\" in %u records\n",
+                             jobName, scanEnd);
+        }
+
         g_arkdCpu->setGpr(29, kIopStackTop - 0x9000u); // worker stack slice
         g_arkdCpu->setGpr(31, kHaltPc);
         g_arkdCpu->setHaltPc(kHaltPc);
         g_arkdCpu->setPC(g_arkdLoadBase + 0x21B0u);
         if (g_iopTraceOn) iopTraceReset();
+        g_arkdWorkerTickActive = true;
         const uint32_t wret = g_arkdCpu->run(4u * 1000u * 1000u);
+        g_arkdWorkerTickActive = false;
         static uint32_t s_wlogs = 0u;
-        if (s_wlogs < 16u)
+        if (s_wlogs < 64u)
         {
             ++s_wlogs;
             const uint32_t wB300 = g_arkdCpu->busRead32(g_arkdLoadBase + 0xB300u);
@@ -1419,9 +1794,9 @@ bool ps2_iop_runArkdService(PS2Runtime *runtime,
             // the sector read (0xAC98) / SIF DMA (0xADD4). That is the stall.
             const uint32_t band = wB300 & 0xF0000000u;
             std::fprintf(stderr,
-                "[ARKD:worker] run: retired=%u finalPC=0x%08x off=+0x%06x halted=%d "
-                "B300=%08x B310=%08x%s\n",
-                wret, finalPc,
+                "[ARKD:worker] run: kind=%u name=\"%s\" dest=0x%08x retired=%u "
+                "finalPC=0x%08x off=+0x%06x halted=%d B300=%08x B310=%08x%s\n",
+                jobKind, jobName, jobDest, wret, finalPc,
                 (finalPc - g_arkdLoadBase) & 0x00FFFFFFu,
                 g_arkdCpu->halted() ? 1 : 0, wB300,
                 g_arkdCpu->busRead32(g_arkdLoadBase + 0xB310u),

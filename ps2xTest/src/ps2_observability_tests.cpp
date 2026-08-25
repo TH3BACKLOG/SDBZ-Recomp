@@ -30,6 +30,22 @@ namespace
         std::memcpy(rdram.data() + addr, &value, sizeof(value));
     }
 
+    // CSM1 VRAM scatter for a 256-entry (T8) palette, written from the spec
+    // layout rather than copied out of the runtime, so a divergence shows up
+    // as a failing round-trip instead of a tautology.
+    void csm1T8Coord(uint32_t i, uint32_t &x, uint32_t &y)
+    {
+        x = (i & 7u) + ((i & 0x10u) ? 8u : 0u);
+        y = ((i & 0xE0u) >> 4) + ((i & 8u) ? 1u : 0u);
+    }
+
+    // CSM1 VRAM scatter for a 16-entry (T4) palette.
+    void csm1T4Coord(uint32_t i, uint32_t &x, uint32_t &y)
+    {
+        x = i & 7u;
+        y = (i >> 3) & 1u;
+    }
+
     std::vector<ps2_log::RuntimeLogEntry> snapshotLog()
     {
         return ps2_log::snapshot_runtime_log_entries();
@@ -381,6 +397,444 @@ void register_ps2_observability_tests()
             // cld=4 with a changed cbp (kCbpB) must reload.
             gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, kCbpB, /*csm=*/0u, /*csa=*/0u, /*cld=*/4u);
             t.Equals(gs.ReadClutCache(GS_PSM_CT32, 0u, 0u), 0xBBu, "cld=4 must reload once cbp differs from the tracked m_cbp0");
+        });
+
+        // ---------------------------------------------------------------
+        // Stage 5.11 coverage: the index -> palette-entry lookup.
+        //
+        // The tests above only ever pass csa=0, which is exactly where the
+        // two known asymmetries between the CLUT loader and the CLUT reader
+        // are invisible:
+        //
+        //   * ReloadClutCacheCSM1 masks its cache offset with & 0x3FF, but
+        //     ReadClutCache computes (csa * 16 * bpp) + (index * bpp) with no
+        //     mask at all. For CT32 that read offset passes the end of the
+        //     1 KiB cache once csa >= 16.
+        //   * The CSM1 VRAM->cache scatter formula is only exercised at its
+        //     identity point when csa is 0.
+        //
+        // The coordinate formulas below are written from the CSM1 spec
+        // layout rather than copied out of the runtime, so a divergence
+        // between the two shows up as a failing round-trip instead of a
+        // tautology. The csm1T8Coord/csm1T4Coord helpers at the top of this
+        // file hold those spec layouts.
+        // ---------------------------------------------------------------
+
+        tc.Run("clut-cache: CSM1 T8 round-trips all 256 indices against an independently derived layout", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kCbp = 0x400u; // distinct from every other clut-cache test in this suite
+
+            auto expected = [](uint32_t i) { return 0x80000000u | (i * 0x00010101u) | 0x00000001u; };
+
+            for (uint32_t i = 0; i < 256u; ++i)
+            {
+                uint32_t x = 0, y = 0;
+                csm1T8Coord(i, x, y);
+                gs.WriteVram(GS_PSM_CT32, kCbp, 1u, x, y, expected(i));
+            }
+
+            gs.ReloadClutCache(GS_PSM_T8, GS_PSM_CT32, kCbp, /*csm=*/0u, /*csa=*/0u, /*cld=*/1u);
+
+            uint32_t mismatches = 0;
+            uint32_t firstBadIdx = 0xFFFFFFFFu;
+            uint32_t firstBadGot = 0;
+            for (uint32_t i = 0; i < 256u; ++i)
+            {
+                const u32 got = gs.ReadClutCache(GS_PSM_CT32, static_cast<u8>(i), /*csa=*/0u);
+                if (got != expected(i))
+                {
+                    if (firstBadIdx == 0xFFFFFFFFu)
+                    {
+                        firstBadIdx = i;
+                        firstBadGot = got;
+                    }
+                    ++mismatches;
+                }
+            }
+            t.Equals(mismatches, 0u,
+                     "every CSM1 T8 index must resolve to the palette entry the spec layout placed in VRAM "
+                     "(first mismatch idx=" + std::to_string(firstBadIdx) +
+                     " got=" + std::to_string(firstBadGot) + ")");
+        });
+
+        tc.Run("clut-cache: CSM1 T4 round-trips all 16 indices for every in-range csa", [](TestCase &t)
+        {
+            // CT32 cache is 1 KiB. ReadClutCache offsets by csa*64 + index*4,
+            // so csa 0..15 keeps both the loader and the reader in bounds and
+            // any failure here is a genuine loader/reader disagreement rather
+            // than an overrun.
+            constexpr uint32_t kMaxInRangeCsa = 16u;
+
+            uint32_t badCsa = 0xFFFFFFFFu;
+            uint32_t badIdx = 0;
+            uint32_t badGot = 0;
+            uint32_t badWant = 0;
+
+            for (uint32_t csa = 0; csa < kMaxInRangeCsa; ++csa)
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+                const uint32_t cbp = 0x500u + (csa * 0x10u);
+
+                // Tag the value with csa so a cache slot sourced from the
+                // wrong csa region is distinguishable from a plain miss.
+                auto expected = [csa](uint32_t i) { return 0x80000000u | (csa << 8) | i | 0x00010000u; };
+
+                for (uint32_t i = 0; i < 16u; ++i)
+                {
+                    uint32_t x = 0, y = 0;
+                    csm1T4Coord(i, x, y);
+                    gs.WriteVram(GS_PSM_CT32, cbp, 1u, x, y, expected(i));
+                }
+
+                gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, cbp, /*csm=*/0u, static_cast<u8>(csa), /*cld=*/1u);
+
+                for (uint32_t i = 0; i < 16u; ++i)
+                {
+                    const u32 got = gs.ReadClutCache(GS_PSM_CT32, static_cast<u8>(i), csa);
+                    if (got != expected(i) && badCsa == 0xFFFFFFFFu)
+                    {
+                        badCsa = csa;
+                        badIdx = i;
+                        badGot = got;
+                        badWant = expected(i);
+                    }
+                }
+            }
+
+            t.Equals(badCsa, 0xFFFFFFFFu,
+                     "ReadClutCache(index, csa) must resolve the entry ReloadClutCache wrote for that same csa "
+                     "(first failure csa=" + std::to_string(badCsa) +
+                     " idx=" + std::to_string(badIdx) +
+                     " got=" + std::to_string(badGot) +
+                     " want=" + std::to_string(badWant) + ")");
+        });
+
+        tc.Run("clut-cache: csa>=16 wraps on the loader's masked write but not on ReadClutCache's unmasked read", [](TestCase &t)
+        {
+            // ReloadClutCacheCSM1 masks its destination with & 0x3FF, so a
+            // CT32 load at csa=16 lands back at cache byte 0. ReadClutCache
+            // applies no such mask, so it would look for those bytes at
+            // offset 1024 -- one byte past a std::array<u8, 1024>.
+            //
+            // This test never issues that out-of-range read. It only reads at
+            // csa=0, which is in bounds either way, and asks whether the
+            // csa=16 load aliased on top of it.
+            //
+            // POLARITY (corrected after reading the loader): a pass here does
+            // NOT convict the asymmetry. At csa=16 the T4 loader computes
+            // offset = 256 and total_entries = min(1024/4, 16 + 256) = 256, so
+            // its loop `for (i = offset; i < total_entries; ++i)` runs zero
+            // times. The csa=16 load is a silent no-op and entry 0 survives
+            // trivially. The unmasked read in ReadClutCache is still a real
+            // out-of-bounds hazard -- this test simply does not convict it.
+            // Treat a FAILURE here as the conviction; a pass proves nothing.
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kCbpLow = 0x700u;
+            constexpr uint32_t kCbpHigh = 0x710u;
+            constexpr uint32_t kLowMarker = 0x80AAAAAAu;
+            constexpr uint32_t kHighMarker = 0x80BBBBBBu;
+
+            for (uint32_t i = 0; i < 16u; ++i)
+            {
+                uint32_t x = 0, y = 0;
+                csm1T4Coord(i, x, y);
+                gs.WriteVram(GS_PSM_CT32, kCbpLow, 1u, x, y, kLowMarker);
+                gs.WriteVram(GS_PSM_CT32, kCbpHigh, 1u, x, y, kHighMarker);
+            }
+
+            gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, kCbpLow, /*csm=*/0u, /*csa=*/0u, /*cld=*/1u);
+            t.Equals(gs.ReadClutCache(GS_PSM_CT32, 0u, 0u), kLowMarker,
+                     "baseline: a csa=0 load must be visible at csa=0");
+
+            gs.ReloadClutCache(GS_PSM_T4, GS_PSM_CT32, kCbpHigh, /*csm=*/0u, /*csa=*/16u, /*cld=*/1u);
+
+            const u32 afterHighLoad = gs.ReadClutCache(GS_PSM_CT32, 0u, 0u);
+            t.Equals(afterHighLoad, kLowMarker,
+                     "a csa=16 CT32 load must not alias onto csa=0 -- if it does, the loader's & 0x3FF mask "
+                     "and ReadClutCache's unmasked csa*64 offset disagree about where entry 0 lives");
+        });
+
+        tc.Run("clut-cache: CSM1 T8 at csa!=0 must not shift the VRAM source coordinate", [](TestCase &t)
+        {
+            // ReloadClutCacheCSM1 starts its loop at i = csa * 16 and uses that
+            // same i for BOTH the cache destination and the VRAM scatter
+            // coordinate. Only the destination should move with csa; the source
+            // should still walk logical entries 0..N-1.
+            //
+            // Why this is invisible at T4 (and so was not caught by the
+            // "T4 round-trips for every in-range csa" test above): the T4
+            // scatter is periodic with period 16, so shifting i by 16*csa maps
+            // to the identical (x, y). The T8 scatter has period 256, so the
+            // shift is observable.
+            //
+            // POLARITY, pre-registered:
+            //   FAIL, first mismatch at index 0 reading the value written for
+            //         index 16  -> convicts the source-coordinate shift.
+            //   FAIL, first mismatch at index 0 reading 0
+            //         -> the low entries were never loaded at all (the loop
+            //            also skips the first 16*csa iterations).
+            //   PASS  -> the loader separates source from destination and this
+            //            suspect is dead.
+            //
+            // Bounds: ReadClutCache offsets by csa*64 + index*4 with no mask,
+            // so at csa=1 only indices below 240 stay inside the 1 KiB cache.
+            // This test never reads past that.
+            constexpr uint32_t kCsa = 1u;
+            constexpr uint32_t kSafeIndexLimit = 240u;
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kCbp = 0x600u; // distinct from every other clut-cache test in this suite
+
+            auto expected = [](uint32_t i) { return 0x80000000u | (i << 8) | 0x00000041u; };
+
+            for (uint32_t i = 0; i < 256u; ++i)
+            {
+                uint32_t x = 0, y = 0;
+                csm1T8Coord(i, x, y);
+                gs.WriteVram(GS_PSM_CT32, kCbp, 1u, x, y, expected(i));
+            }
+
+            gs.ReloadClutCache(GS_PSM_T8, GS_PSM_CT32, kCbp, /*csm=*/0u, static_cast<u8>(kCsa), /*cld=*/1u);
+
+            uint32_t mismatches = 0;
+            uint32_t firstBadIdx = 0xFFFFFFFFu;
+            uint32_t firstBadGot = 0;
+            for (uint32_t i = 0; i < kSafeIndexLimit; ++i)
+            {
+                const u32 got = gs.ReadClutCache(GS_PSM_CT32, static_cast<u8>(i), kCsa);
+                if (got != expected(i))
+                {
+                    if (firstBadIdx == 0xFFFFFFFFu)
+                    {
+                        firstBadIdx = i;
+                        firstBadGot = got;
+                    }
+                    ++mismatches;
+                }
+            }
+
+            t.Equals(mismatches, 0u,
+                     "at csa=1 a T8 logical index must still resolve to the palette entry the spec layout put "
+                     "at that same logical index (first mismatch idx=" + std::to_string(firstBadIdx) +
+                     " got=" + std::to_string(firstBadGot) +
+                     " want=" + std::to_string(firstBadIdx == 0xFFFFFFFFu ? 0u : expected(firstBadIdx)) +
+                     " shifted-source-would-give=" +
+                     std::to_string(firstBadIdx == 0xFFFFFFFFu ? 0u : expected(firstBadIdx + kCsa * 16u)) + ")");
+        });
+
+        tc.Run("gs draw: CLUT-indexed T8 sprite resolves to palette colors rather than black", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 0x800u;
+            constexpr uint32_t kCbp = 0x840u;
+            constexpr uint32_t kFbp = 150u;              // FRAME FBP, in 2048-word units
+            constexpr uint32_t kFrameBase = kFbp * 32u;  // ... which is 32 blocks each
+            constexpr uint32_t kIndices[4] = {1u, 2u, 3u, 4u};
+
+            auto palette = [](uint32_t i) { return 0x80000000u | (i * 0x00112233u) | 0x00010101u; };
+
+            // Palette first, laid out per the CSM1 256-entry scatter.
+            for (uint32_t i = 0; i < 256u; ++i)
+            {
+                uint32_t x = 0, y = 0;
+                csm1T8Coord(i, x, y);
+                gs.WriteVram(GS_PSM_CT32, kCbp, 1u, x, y, palette(i));
+            }
+
+            // 4x4 index page: column x selects kIndices[x].
+            for (uint32_t y = 0; y < 4u; ++y)
+            {
+                for (uint32_t x = 0; x < 4u; ++x)
+                {
+                    gs.WriteVram(GS_PSM_T8, kTexTbp, 1u, x, y, kIndices[x]);
+                }
+            }
+
+            const uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |                                        // TBW
+                (static_cast<uint64_t>(GS_PSM_T8) << 20) |            // PSM
+                (2ull << 26) |                                        // TW  -> 4
+                (2ull << 30) |                                        // TH  -> 4
+                (1ull << 34) |                                        // TCC -> use texture alpha
+                (1ull << 35) |                                        // TFX -> DECAL
+                (static_cast<uint64_t>(kCbp) << 37) |                 // CBP
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |          // CPSM
+                (0ull << 55) |                                        // CSM1
+                (0ull << 56) |                                        // CSA
+                (1ull << 61);                                         // CLD=1, unconditional load
+            constexpr uint64_t kFrame =
+                (static_cast<uint64_t>(kFbp) << 0) |
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor =
+                (0ull << 0) | (3ull << 16) | (0ull << 32) | (3ull << 48);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) |
+                (1ull << 4) |   // TME
+                (1ull << 8);    // FST
+            constexpr uint64_t kXyz0 = 0ull;
+            constexpr uint64_t kXyz1 =
+                (static_cast<uint64_t>(4u << 4) << 0) |
+                (static_cast<uint64_t>(4u << 4) << 16);
+            constexpr uint64_t kUv0 = 0ull;
+            constexpr uint64_t kUv1 = ((4ull * 16ull) << 0) | ((4ull * 16ull) << 16);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            gs.writeRegister(GS_REG_TEXA, 0x80ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, kUv0);
+            gs.writeRegister(GS_REG_XYZ2, kXyz0);
+            gs.writeRegister(GS_REG_UV, kUv1);
+            gs.writeRegister(GS_REG_XYZ2, kXyz1);
+
+            uint32_t blackPixels = 0;
+            uint32_t wrongPixels = 0;
+            uint32_t firstWrongGot = 0;
+            uint32_t firstWrongWant = 0;
+            for (uint32_t y = 0; y < 4u; ++y)
+            {
+                for (uint32_t x = 0; x < 4u; ++x)
+                {
+                    const u32 got = gs.ReadVram(GS_PSM_CT32, kFrameBase, 1u, x, y) & 0x00FFFFFFu;
+                    const uint32_t want = palette(kIndices[x]) & 0x00FFFFFFu;
+                    if (got == 0u)
+                        ++blackPixels;
+                    if (got != want)
+                    {
+                        if (wrongPixels == 0)
+                        {
+                            firstWrongGot = got;
+                            firstWrongWant = want;
+                        }
+                        ++wrongPixels;
+                    }
+                }
+            }
+
+            // Split deliberately: "black" is the Stage 5.11 symptom, "wrong"
+            // is the broader correctness claim. A run that is non-black but
+            // wrong is a different bug from a run that is uniformly black.
+            t.Equals(blackPixels, 0u,
+                     "a CLUT-indexed T8 sprite drawn from a fully populated palette must not rasterize to black");
+            t.Equals(wrongPixels, 0u,
+                     "each drawn texel must equal its palette entry (first mismatch got=" +
+                     std::to_string(firstWrongGot) + " want=" + std::to_string(firstWrongWant) + ")");
+        });
+
+        tc.Run("gs draw: CLUT-indexed T4 sprite resolves to palette colors rather than black", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 0x900u;
+            constexpr uint32_t kCbp = 0x940u;
+            constexpr uint32_t kFbp = 150u;
+            constexpr uint32_t kFrameBase = kFbp * 32u;
+            constexpr uint32_t kIndices[4] = {1u, 5u, 9u, 13u};
+
+            auto palette = [](uint32_t i) { return 0x80000000u | (i * 0x00102030u) | 0x00010101u; };
+
+            for (uint32_t i = 0; i < 16u; ++i)
+            {
+                uint32_t x = 0, y = 0;
+                csm1T4Coord(i, x, y);
+                gs.WriteVram(GS_PSM_CT32, kCbp, 1u, x, y, palette(i));
+            }
+
+            for (uint32_t y = 0; y < 4u; ++y)
+            {
+                for (uint32_t x = 0; x < 4u; ++x)
+                {
+                    gs.WriteVram(GS_PSM_T4, kTexTbp, 1u, x, y, kIndices[x]);
+                }
+            }
+
+            const uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) |
+                (1ull << 14) |
+                (static_cast<uint64_t>(GS_PSM_T4) << 20) |
+                (2ull << 26) |
+                (2ull << 30) |
+                (1ull << 34) |
+                (1ull << 35) |
+                (static_cast<uint64_t>(kCbp) << 37) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 51) |
+                (0ull << 55) |
+                (0ull << 56) |
+                (1ull << 61);
+            constexpr uint64_t kFrame =
+                (static_cast<uint64_t>(kFbp) << 0) |
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor =
+                (0ull << 0) | (3ull << 16) | (0ull << 32) | (3ull << 48);
+            constexpr uint64_t kPrim =
+                static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8);
+            constexpr uint64_t kXyz1 =
+                (static_cast<uint64_t>(4u << 4) << 0) |
+                (static_cast<uint64_t>(4u << 4) << 16);
+            constexpr uint64_t kUv1 = ((4ull * 16ull) << 0) | ((4ull * 16ull) << 16);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            gs.writeRegister(GS_REG_TEXA, 0x80ull);
+            gs.writeRegister(GS_REG_TEX0_1, kTex0);
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, kUv1);
+            gs.writeRegister(GS_REG_XYZ2, kXyz1);
+
+            uint32_t blackPixels = 0;
+            uint32_t wrongPixels = 0;
+            for (uint32_t y = 0; y < 4u; ++y)
+            {
+                for (uint32_t x = 0; x < 4u; ++x)
+                {
+                    const u32 got = gs.ReadVram(GS_PSM_CT32, kFrameBase, 1u, x, y) & 0x00FFFFFFu;
+                    if (got == 0u)
+                        ++blackPixels;
+                    if (got != (palette(kIndices[x]) & 0x00FFFFFFu))
+                        ++wrongPixels;
+                }
+            }
+
+            t.Equals(blackPixels, 0u,
+                     "a CLUT-indexed T4 sprite drawn from a fully populated palette must not rasterize to black");
+            t.Equals(wrongPixels, 0u,
+                     "each drawn T4 texel must equal its palette entry");
         });
 
         tc.Run("gs:image: single IMAGE transfer logs the destination DBP and payload byte count", [](TestCase &t)

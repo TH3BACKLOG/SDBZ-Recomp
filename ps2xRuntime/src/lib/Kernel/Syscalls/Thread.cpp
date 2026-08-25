@@ -1,4 +1,5 @@
 #include "Common.h"
+#include <cstdlib>
 #include "Thread.h"
 #include "ps2_scheduler_internal.h"
 
@@ -14,6 +15,14 @@
 // touching a .h forces a full 30h+ rebuild (skill SS3 prohibition 3).
 extern "C" void ps2x_probe_kv(const char *name, int n,
                               const char *const *keys, const uint64_t *vals);
+
+// Defined in Kernel/Syscalls/Interrupt.cpp. Non-zero while this fiber is running
+// an IRQ handler body on a BORROWED stack -- a GuestScratchStack carved out of
+// the guest heap for the inline DMAC path, or the async callback pool for the
+// host-worker INTC path. In both cases $sp legitimately sits outside the stack
+// StartThread handed the fiber, so the guard below must not fire. Same extern-in-
+// .cpp rule as ps2x_probe_kv: a header edit costs a full rebuild.
+extern "C" uint32_t ps2x_on_irq_handler_stack();
 
 // ---------------------------------------------------------------------------
 // Phase C -- stack-bounds guard.
@@ -41,8 +50,32 @@ namespace
     // Bounded. An out-of-bounds sp usually stays out of bounds for every
     // subsequent call, so an unbounded guard would reproduce exactly the
     // 89,000-line flood the dispatch-miss path already produces.
-    std::atomic<int> g_stackOobReports{0};
-    constexpr int kStackOobMax = 16;
+    // Run 71 produced EXACTLY 16 STACKOOB records -- which is exactly the cap.
+    // The old code stopped emitting at 16 and said nothing about it, so "16
+    // violations" and "sixteen million violations" were indistinguishable in
+    // the log, and the run-71 sweep read the number as a total. A silent cap is
+    // the specific failure [[feedback_capped_probes_false_negatives]] exists to
+    // prevent: a saturated probe looks exactly like a bounded one. Three fixes,
+    // all cheap:
+    //   * the limit is tunable (PS2X_STACKOOB_MAX, 0 = unlimited)
+    //   * saturation emits one [cap] line, so absence past it is not evidence
+    //   * the running total is re-announced at each power of two past the cap,
+    //     which gives the ORDER OF MAGNITUDE without reopening the flood the
+    //     bound was added to stop
+    std::atomic<uint64_t> g_stackOobTotal{0};
+
+    int stackOobMax()
+    {
+        static const int kMax = []() -> int {
+            if (const char *e = std::getenv("PS2X_STACKOOB_MAX"))
+            {
+                const long parsed = std::strtol(e, nullptr, 0);
+                if (parsed >= 0) { return static_cast<int>(parsed); }
+            }
+            return 16;
+        }();
+        return kMax;
+    }
 }
 
 extern "C" void ps2x_stack_register(int tid, uint32_t lo, uint32_t hi)
@@ -56,6 +89,14 @@ extern "C" void ps2x_stack_register(int tid, uint32_t lo, uint32_t hi)
 // says WHERE the check ran without needing a second probe family.
 extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
 {
+    // An IRQ handler running on a borrowed stack is not a violation. Run 53
+    // reported four (sp=0x1f00000 = the guest-heap limit, i.e. the top of a
+    // 16 KB GuestScratchStack) against thread 0x4's range and they read as a
+    // context bleed. Checked first: the borrowed stack is never in range, so
+    // every one of those records would otherwise be a guaranteed false positive.
+    if (ps2x_on_irq_handler_stack() != 0u)
+        return 0;
+
     const int tid = g_currentThreadId;
     GuestStackRange r;
     {
@@ -68,14 +109,61 @@ extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
     if (r.hi == 0 || (sp >= r.lo && sp < r.hi))
         return 0;
 
-    if (g_stackOobReports.fetch_add(1, std::memory_order_relaxed) < kStackOobMax)
+    // One counter, not two: a separate int report-counter would keep climbing
+    // past INT_MAX in a long run, and the ordinal is already implied by total.
+    const uint64_t total = g_stackOobTotal.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const uint64_t max = static_cast<uint64_t>(stackOobMax());
+    if (max == 0u || total <= max)
     {
         static const char *const k[] = {"pc", "sp", "lo", "hi", "site", "thid"};
         const uint64_t v[] = {pc, sp, r.lo, r.hi, site,
                               static_cast<uint64_t>(static_cast<uint32_t>(tid))};
         ps2x_probe_kv("STACKOOB", 6, k, v);
     }
+    else if (total == max + 1u)
+    {
+        RUNTIME_LOG("[cap] tag=STACKOOB saturated at " << max
+                    << " -- LATER VIOLATIONS ARE INVISIBLE. Absence of a record"
+                       " past this point is NOT evidence. Raise with"
+                       " PS2X_STACKOOB_MAX (0 = unlimited).");
+    }
+    else if ((total & (total - 1u)) == 0u)
+    {
+        // Power-of-two only: 16 lines to reach a million, so the magnitude is
+        // always on the record and the flood never comes back.
+        RUNTIME_LOG("[cap] tag=STACKOOB total=" << total
+                    << " (still capped at " << max << ")");
+    }
     return 1;
+}
+
+namespace ps2sched { void force_reschedule(); }
+
+// Stage 5.17 -- equal-priority yield inside ReferThreadStatus, env-gated OFF.
+//
+// The guest's cross-thread handshake sub_11E690 sets [0x441924]=1, boosts the
+// worker to its OWN priority via 29h, then spins on 0x30 ReferThreadStatus until
+// the worker ACKs. Our 29h already calls force_reschedule() (below, ~line 1131),
+// so the FIRST handoff works. But once the worker blocks inside the pump and
+// later becomes Ready again, nothing can hand it the slot back: maybe_yield()
+// and yield_point() step 3 both select a STRICTLY higher-priority head, and 0x30
+// -- the only syscall inside the spin -- has no yield at all. Measured cost in
+// run 20260824-101518: one handshake takes 8 wall seconds with the worker
+// reading NOT-RUNNING for 3 consecutive seconds, and vbl/s collapses to 1 while
+// it holds.
+//
+// Gated rather than unconditional for two reasons: 0x30 does NOT reschedule on
+// real hardware (the release there comes from the interrupt-exit reschedule we
+// do not model), and an env gate lets one binary serve both arms of the A/B
+// instead of costing a second ~48-minute build.
+static bool refstatYieldEnabled()
+{
+    static const bool on = []() -> bool
+    {
+        const char *e = std::getenv("PS2X_REFSTAT_YIELD");
+        return e && *e && *e != '0';
+    }();
+    return on;
 }
 
 namespace ps2_syscalls
@@ -732,7 +820,12 @@ namespace ps2_syscalls
         setReturnS32(ctx, g_currentThreadId);
     }
 
-    void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // Shared body. Takes no scheduler action of any kind, so both 0x30 and the
+    // interrupt-context 0x31 can use it. The lock_guard is confined to its own
+    // scope: g_sched_mutex must never nest under a ThreadInfo::m (see
+    // SleepThread's "Drop info->m before ANY scheduler operation"), so any yield
+    // has to happen after this returns, not inside it.
+    static void referThreadStatusImpl(uint8_t *rdram, R5900Context *ctx)
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         uint32_t statusAddr = getRegU32(ctx, 5);
@@ -763,9 +856,24 @@ namespace ps2_syscalls
         setReturnS32(ctx, KE_OK);
     }
 
+    void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        referThreadStatusImpl(rdram, ctx);
+
+        // Outside referThreadStatusImpl, so info->m is already released. See
+        // refstatYieldEnabled() above for why this is gated and what it fixes.
+        if (refstatYieldEnabled())
+            ps2sched::force_reschedule();
+    }
+
     void iReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ReferThreadStatus(rdram, ctx, runtime);
+        // ps2tek 31h: the i-prefixed form runs in interrupt context and must NOT
+        // reschedule. Calls the impl directly rather than ReferThreadStatus, so
+        // the gate above can never leak into it.
+        (void)runtime;
+        referThreadStatusImpl(rdram, ctx);
     }
 
     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -986,14 +1094,28 @@ namespace ps2_syscalls
     {
         int tid = static_cast<int>(getRegU32(ctx, 4));
         int newPrio = static_cast<int>(getRegU32(ctx, 5));
+        const int callerTid = g_currentThreadId;
+
+        // [chgpri:enter] -- catches every call, including ones that bail
+        // before the [chgpri] line below (resolveSelfOrThread() miss, or
+        // DORMANT/illegal-priority early-return). Needed to tell "syscall
+        // 0x29 never executes" from "it executes and bails".
+        std::cerr << "[chgpri:enter] tid=" << tid << " newPrioArg=" << newPrio
+                   << " callerTid=" << callerTid << std::endl;
 
         auto info = resolveSelfOrThread(ctx, tid);
-        if (!info) return;
+        if (!info)
+        {
+            std::cerr << "[chgpri:enter] tid=" << tid << " resolveSelfOrThread MISS" << std::endl;
+            return;
+        }
 
+        int statusBefore = 0, waitTypeBefore = 0, waitIdBefore = 0;
         {
             std::lock_guard<std::mutex> lock(info->m);
             if (info->status == THS_DORMANT)
             {
+                std::cerr << "[chgpri:enter] tid=" << tid << " bail=DORMANT" << std::endl;
                 setReturnS32(ctx, KE_DORMANT);
                 return;
             }
@@ -1004,15 +1126,56 @@ namespace ps2_syscalls
             }
             if (newPrio <= 0 || newPrio >= 128)
             {
+                std::cerr << "[chgpri:enter] tid=" << tid << " bail=ILLEGAL_PRIORITY newPrioArg=" << newPrio << std::endl;
                 setReturnS32(ctx, KE_ILLEGAL_PRIORITY);
                 return;
             }
 
+            statusBefore = info->status;
+            waitTypeBefore = info->waitType;
+            waitIdBefore = info->waitId;
             info->currentPriority = newPrio;
         }
 
+        // [chgpri] -- Stage 5.17: names the boosted target unambiguously.
+        // getThreadDebugSnapshot()'s status field cannot be trusted to pick
+        // the target out of a crowd (three threads read THS_RUN
+        // simultaneously in the same 1 Hz sample, which cannot happen on a
+        // single EE core -- the field is not kept in sync with the real
+        // scheduler state on every transition). This logs the actual tid
+        // argument and its state AT THE MOMENT of the syscall that boosts it,
+        // which needs no inference. Uncapped: ChangeThreadPriority is a rare
+        // syscall (tens of calls per run, not per-tick), so volume is not a
+        // concern the way a per-instruction probe would be.
+        //
+        // Widened 2026-08-24 (run 87): the tid!=callerTid-only version fired
+        // ZERO times across a full 198s run whose [thsync] tick counter still
+        // reached 11 -- i.e. the handshake completes without ever calling
+        // ChangeThreadPriority on a thread other than the caller. That kills
+        // the "boosts the worker" reading outright; the raw disasm of
+        // sub_11E690 (0x11e6e0/0x11e744, both `jal 0x174b30` ->
+        // `addiu $v1,0x29; syscall`) confirms syscall 0x29 IS issued twice
+        // per call, so either every call is a self-boost (tid==callerTid) or
+        // resolveSelfOrThread()/DORMANT returns before reaching this line.
+        // Logging unconditionally (tagged self/other) distinguishes those
+        // without another blind round trip ([[feedback_probe_gate_on_shape_not_address]]).
+        {
+            std::cerr << "[chgpri] " << (tid == callerTid ? "SELF" : "OTHER")
+                       << " target=" << tid << " newPrio=" << newPrio
+                       << " callerTid=" << callerTid
+                       << " targetStatusBefore=0x" << std::hex << statusBefore
+                       << " targetWaitTypeBefore=" << std::dec << waitTypeBefore
+                       << " targetWaitIdBefore=" << waitIdBefore
+                       << std::endl;
+        }
+
         ps2sched::update_priority(tid, newPrio);
-        ps2sched::maybe_yield();
+        // ps2tek 29h: ChangeThreadPriority forces a thread reschedule. It is
+        // NOT maybe_yield() -- that only yields to a strictly higher-priority
+        // head, so boosting a worker to the CALLER's own priority never gave
+        // up the fiber (Stage 5.17: sub_11E690 boosts to 1 while running at 1,
+        // then spins on [0x441924] that only the boosted worker can clear).
+        ps2sched::force_reschedule();
 
         setReturnS32(ctx, KE_OK);
     }

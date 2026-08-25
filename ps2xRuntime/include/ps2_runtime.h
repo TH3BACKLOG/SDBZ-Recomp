@@ -464,6 +464,9 @@ public:
 
     bool initialize(const char *title = "PS2 Game");
     bool syncCoreSubsystems();
+
+    // Samples how much of VU1 code/data memory is actually populated at MSCAL time.
+    void probeVu1MemoryOccupancy();
     bool loadELF(const std::string &elfPath);
     void run();
 

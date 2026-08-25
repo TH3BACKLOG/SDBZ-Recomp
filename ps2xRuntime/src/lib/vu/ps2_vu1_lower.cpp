@@ -2,6 +2,7 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_pipeline_stats.h"
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
@@ -404,6 +405,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
 
             if (totalBytes == 0u)
                 return;
+
+            ps2_pipeline_stats::g_xgkicks.fetch_add(1, std::memory_order_relaxed);
+            ps2_pipeline_stats::g_xgkickBytes.fetch_add(totalBytes, std::memory_order_relaxed);
 
             if (addr + totalBytes <= dataSize)
             {

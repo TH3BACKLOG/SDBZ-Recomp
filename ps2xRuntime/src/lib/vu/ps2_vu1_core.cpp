@@ -1,5 +1,6 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_pipeline_stats.h"
 #include "ps2_vu1_detail.h"
 
 #include <cstring>
@@ -135,10 +136,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    uint64_t retired = 0;
     for (uint32_t cycle = 0; cycle < maxCycles; ++cycle)
     {
         if (m_state.pc + 8 > codeSize)
-            break;
+        {
+            ps2_pipeline_stats::g_vu1EndRange.fetch_add(1, std::memory_order_relaxed);
+            ps2_pipeline_stats::g_vu1Instrs.fetch_add(retired, std::memory_order_relaxed);
+            return;
+        }
+        ++retired;
 
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
 
@@ -193,9 +200,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         if (m_state.ebit)
-            break;
+        {
+            ps2_pipeline_stats::g_vu1EndEbit.fetch_add(1, std::memory_order_relaxed);
+            ps2_pipeline_stats::g_vu1Instrs.fetch_add(retired, std::memory_order_relaxed);
+            return;
+        }
 
         if (decoded.eBit)
             m_state.ebit = true;
     }
+
+    // Fell out of the loop: the microprogram never signalled E-bit and never ran
+    // off the end of code memory. A zero-filled VU1 code image lands here.
+    ps2_pipeline_stats::g_vu1EndCycleLimit.fetch_add(1, std::memory_order_relaxed);
+    ps2_pipeline_stats::g_vu1Instrs.fetch_add(retired, std::memory_order_relaxed);
 }

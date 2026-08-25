@@ -569,9 +569,14 @@ namespace ps2recomp
     std::string CodeGenerator::translatePCPYH(const Instruction &inst)
     {
         // Parallel Copy Halfword (Broadcast lower 16 bits of each 64-bit half)
+        // 2026-08-07: source is **rt**, not rs. PCPYH is encoded `MMI3 rd, rt` with
+        // rs unused (always 0), e.g. 0x70081ee9 = `pcpyh $v1, $t0` -> rs=0, rt=8, rd=3.
+        // Reading inst.rs broadcast $zero, so every pcpyh produced 0. That silently
+        // turned the guest's vector memset (sub_18E408) into a zero-fill, which is why
+        // the SDBZ glyphMap was never seeded with 0xFFFF. [[Stage 5.10]]
         return fmt::format("{{ __m128i src = GPR_VEC(ctx, {}); uint16_t l = _mm_extract_epi16(src, 0); uint16_t h = _mm_extract_epi16(src, 4); \n"
                            "   SET_GPR_VEC(ctx, {}, _mm_set_epi16(h,h,h,h, l,l,l,l)); }}",
-                           inst.rs, inst.rd);
+                           inst.rt, inst.rd);
     }
 
 

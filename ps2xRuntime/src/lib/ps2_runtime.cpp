@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/ps2_pipeline_stats.h"
 #include "ps2_dispatch_history.h"
 #include "ps2_scheduler.h"
 #include "ps2_log.h"
@@ -44,6 +45,12 @@ namespace ps2_stubs
 // to recompile. No-ops unless PS2X_PROFILE is set.
 extern "C" void ps2x_host_sampler_start(void);
 extern "C" void ps2x_host_sampler_stop(void);
+
+// Stage 5.12: emulates padman's per-vsync IOP->EE pad-state push straight into
+// the guest libpad buffer. Defined in ps2_pad.cpp; declared here for the same
+// header-cost reason as above. Must be called on the thread that polls raylib
+// input, i.e. right after EndDrawing().
+extern "C" void ps2x_pad_push_frame(uint8_t *rdram);
 
 namespace
 {
@@ -335,6 +342,33 @@ namespace
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
     constexpr uint32_t COP0_STATUS_BEV = 0x00400000u;
+    // IE (bit 0) and EIE (bit 16) are the only two Status bits the game's own
+    // kernel library ever tests -- 42 mfc0 $12 sites in the ELF, and every one
+    // in the 0x175xxx/0x17exxx SDK range masks with either `andi 0x1` or
+    // `lui 0x1, and`. Both must read as "interrupts enabled" for a thread to
+    // start; see the boot-state comment in PS2Runtime::PS2Runtime().
+    constexpr uint32_t COP0_STATUS_IE = 0x00000001u;
+    constexpr uint32_t COP0_STATUS_EIE = 0x00010000u;
+}
+
+// Address of the callback currently executing inside the 0x13c4f8 callback-list
+// runner, or 0 when that loop is not in a callback. Written by the override in
+// game_overrides.cpp, read by the watchdog below.
+//
+// Deliberately a single in-flight slot rather than a per-call log line: that
+// loop runs six slots at 60Hz, so logging each entry would emit six figures'
+// worth of lines and then hit a cap -- and a capped tag's absence proves
+// nothing. This costs one store per callback, cannot flood, and answers the
+// only question worth asking: if the guest stops, was it inside a callback,
+// and which one? A nonzero value on a parked watchdog names the callback that
+// entered and never came back; zero rules the loop out entirely.
+//
+// Defined here rather than in game_overrides.cpp so every target that links
+// ps2_runtime resolves it without depending on the overrides TU.
+std::atomic<uint32_t> g_sdbzCb13C4F8InFlight{0u};
+
+namespace
+{
     constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000080u;
     constexpr uint32_t EXCEPTION_VECTOR_TLB_REFILL = 0x80000000u;
     constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00200u;
@@ -362,10 +396,46 @@ namespace
     extern "C" uint64_t ps2x_guest_resumes();
     extern "C" uint64_t ps2x_vblank_ticks();
 
+    // Same no-header rule. Defined in ps2_scheduler.cpp. Returns 1 when no guest
+    // thread is runnable (run queue empty AND no running fiber). [thsync] uses it
+    // to separate "the worker is not runnable" from "the worker is runnable but
+    // never scheduled" -- those are different bugs with different fixes.
+    extern "C" int ps2x_guest_idle();
+
+    // Vblank tick provenance (stage 5.17). vbl/s alone cannot distinguish "the
+    // quantum path is pacing slowly" from "the quantum path fired zero times and
+    // a fallback carried the run" -- those want opposite fixes. Split counters,
+    // reported as vblSrc=q/i/s (quantum / guest-idle / frozen-stall).
+    extern "C" void ps2x_vblank_tick_sources(uint64_t *quantum, uint64_t *idle,
+                                             uint64_t *stall);
+
+    // Same no-header rule. Defined in ps2_scheduler.cpp, where they have existed
+    // since the EIE gate went in but were never printed anywhere -- so the one
+    // question they answer has never been asked of a run.
+    //
+    // yield_point() step 2b refuses to surrender the guest slot while the guest
+    // holds interrupts disabled, and only gives up after kIntrDisableYieldEscape
+    // (4096) samples == ~512K guest back-edges. Every escape is therefore a
+    // stretch where no fiber could be scheduled no matter what was Ready. On a
+    // healthy run intrEsc reads 0; any non-zero value means a critical section
+    // ran long enough that the gate stopped protecting and started stalling.
+    // intrStray > 0 would mean EIE is being cleared by something other than the
+    // section that set it -- the one way this single-bit model under-protects.
+    extern "C" uint64_t ps2x_guest_intr_disable_escapes();
+    extern "C" uint64_t ps2x_guest_intr_disable_sections();
+    extern "C" uint64_t ps2x_guest_intr_disable_stray();
+
     // Structured probe sink (Phase B), defined in game_overrides.cpp. Same
     // extern-between-.cpp rule as above -- no header, no 30h rebuild.
     extern "C" void ps2x_probe_kv(const char *name, int n,
                                   const char *const *keys, const uint64_t *vals);
+
+    // Periodic SRD histogram dump, also defined in game_overrides.cpp. The
+    // watchdog is the only thing in the process guaranteed to keep ticking when
+    // the guest stalls, so it -- not the SRD call sites -- is where a dump has
+    // to be driven from if it is to survive a run that gets killed rather than
+    // exiting (stage 5.17). No-op unless the SRD probe is enabled.
+    extern "C" void ps2x_srd_stat_tick();
 
     // Diagnostic-only (PS2_PC_WATCHDOG): the most recent guest PC handed to
     // lookupFunction(), globally across all threads. The outer-dispatch snapshot
@@ -425,6 +495,70 @@ namespace
     std::atomic<bool> g_coverageArmed{false};
     std::array<std::atomic<uint32_t>, kCoverageSlots> g_coverage{};
 
+    // ---- [order] ordered dispatch trace (env PS2X_ORDER=addr,addr,...) ------
+    //
+    // Coverage answers "how many times", and for Stage 5.17 that turned out to
+    // be the wrong question. The movie state ladder is a two-variable
+    // handshake: sub_165300 advances dec+72 (the state) only while dec+76 is
+    // 2..4 or 6, and every producer of dec+76 is itself gated on dec+72 having
+    // already advanced. Counts alone cannot distinguish "the value was never
+    // written" from "it was written and something reset it before the state
+    // machine next ticked" -- and the second reading is now the live one,
+    // because 0x164F78 (the sole writer of dec+76 = 3) DID run three times
+    // with its guard passing, while sub_165300 still read dec+76 < 2 on all
+    // three of its own ticks.
+    //
+    // A 1 Hz sampler cannot settle that either: a value that is written and
+    // overwritten between two samples is invisible to sampling, which is the
+    // exact false-negative shape this project has already paid for more than
+    // once. What is needed is ORDER, and order needs no memory reads at all --
+    // just the sequence in which these specific functions were dispatched:
+    //
+    //   0x164F78  writes dec+76 = 3   (bootstrap; guard 0x15B560)
+    //   0x166998  writes dec+76 = 4   (requires dec+72 == 3)
+    //   0x166190  writes dec+76 = 6   (state-4 path)
+    //   0x1663D0  writes dec+72 = 1, dec+76 = 1  AND dec+76 = 0
+    //   0x166A28  writes dec+76 = 0
+    //   0x166AB0  writes dec+72 = 1, dec+76 = 1
+    //   0x1668F0  writes dec+76 = 0
+    //   0x165300  READS dec+72 and dispatches the ladder
+    //   0x165458  state-1 handler (ran 3x)
+    //   0x165488  state-2 handler (never ran -- the thing we want to see fire)
+    //
+    // Interleave those and the answer is immediate: if a reset writer lands
+    // between 0x164F78 and the next 0x165300, the bug is ordering. If 0x164F78
+    // never appears before a 0x165300 at all, the bug is that the bootstrap
+    // runs too late. If 0x165300 simply stops appearing, the pump died.
+    //
+    // Address list is env-driven rather than hard-coded so the NEXT ordering
+    // question costs a run instead of a build -- the whole point of the method
+    // change this stage is built on. Cost when unarmed is one relaxed bool
+    // load, identical to the coverage contract above.
+    constexpr uint32_t kOrderMaxAddrs = 24u;
+    constexpr uint32_t kOrderLogSize = 16384u;
+    std::atomic<bool> g_orderArmed{false};
+    uint32_t g_orderAddrs[kOrderMaxAddrs] = {};
+    uint32_t g_orderAddrCount = 0;
+    std::atomic<uint32_t> g_orderNext{0};
+    std::array<std::atomic<uint32_t>, kOrderLogSize> g_orderLog{};
+
+    void orderRecord(uint32_t pc)
+    {
+        for (uint32_t i = 0; i < g_orderAddrCount; ++i)
+        {
+            if (g_orderAddrs[i] != pc)
+            {
+                continue;
+            }
+            const uint32_t n = g_orderNext.fetch_add(1u, std::memory_order_relaxed);
+            if (n < kOrderLogSize)
+            {
+                g_orderLog[n].store(pc, std::memory_order_relaxed);
+            }
+            return;
+        }
+    }
+
     void pushDispatchPc(uint32_t pc)
     {
         g_lastDispatchPc.store(pc, std::memory_order_relaxed);
@@ -438,6 +572,11 @@ namespace
             {
                 g_coverage[off >> 2].fetch_add(1u, std::memory_order_relaxed);
             }
+        }
+
+        if (g_orderArmed.load(std::memory_order_relaxed))
+        {
+            orderRecord(pc);
         }
 
         const uint32_t slot = g_globalDispatchNext.fetch_add(1u, std::memory_order_relaxed);
@@ -903,6 +1042,36 @@ PS2Runtime::PS2Runtime()
     // R0 is always zero in MIPS
     m_cpuContext.r[0] = _mm_set1_epi32(0);
 
+    // Boot Status: interrupts enabled, kernel mode, BEV clear (post-BIOS).
+    //
+    // The memset above wipes whatever R5900Context's constructor set, so this
+    // is the only place the boot value is actually decided -- editing the
+    // header's initializer would have had no effect at all.
+    //
+    // Leaving Status at zero silently breaks thread startup. The SDK's
+    // StartThread wrapper at 0x175de0 opens with two gates against this
+    // register, and a zeroed Status fails both:
+    //
+    //   0x175770  mfc0 $v0,$12 / xori 1 / andi 1  -> returns (IE^1)&1, i.e. 1
+    //             when IE is clear. 0x175e00 branches on nonzero straight to
+    //             the epilogue with $v0 = -1, so syscall 0x22 is never issued.
+    //   0x17ed60  DIntr(): masks Status & 0x10000 (EIE) and returns 0 when
+    //             already clear; 0x175e10 treats that 0 as failure and also
+    //             returns -1.
+    //
+    // Both paths return through the normal epilogue with no print, which is
+    // why run 52 showed four CreateThread calls, zero StartThread calls, and
+    // not one line of diagnostic output.
+    //
+    // Only these two bits are set, because only these two are ever read: a
+    // sweep of all 42 mfc0 $12 sites in the ELF found every SDK-range site
+    // masking with `andi 0x1` or `lui 0x1, and` (sites above 0x480000 are
+    // float data misdecoded as COP0 -- `lui 0x3333`, `lui 0x6666`). Nothing in
+    // this runtime gates interrupt delivery on IE/EIE; only BEV and EXL are
+    // consulted, in selectExceptionVector()/exception entry. So this is inert
+    // to the host side and satisfies exactly the guest's own checks.
+    m_cpuContext.cop0_status = COP0_STATUS_IE | COP0_STATUS_EIE;
+
     // Stack pointer (SP) and global pointer (GP) will be set by the loaded ELF
 
     m_loadedModules.clear();
@@ -992,6 +1161,30 @@ PS2Runtime::~PS2Runtime()
     }
 }
 
+namespace
+{
+    // Counts nonzero bytes in a buffer. Called once per MSCAL (~30/frame) over
+    // 16 KB + 16 KB, which is negligible next to the 65536-cycle VU1 run it
+    // precedes -- and unlike a log line it cannot be throttled into a false zero.
+    uint64_t countNonzeroBytes(const uint8_t *p, size_t n)
+    {
+        if (!p)
+            return 0;
+        uint64_t count = 0;
+        for (size_t i = 0; i < n; ++i)
+            count += (p[i] != 0) ? 1u : 0u;
+        return count;
+    }
+}
+
+void PS2Runtime::probeVu1MemoryOccupancy()
+{
+    ps2_pipeline_stats::noteMax(ps2_pipeline_stats::g_vu1CodeNonzero,
+                                countNonzeroBytes(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE));
+    ps2_pipeline_stats::noteMax(ps2_pipeline_stats::g_vu1DataNonzero,
+                                countNonzeroBytes(m_memory.getVU1Data(), PS2_VU1_DATA_SIZE));
+}
+
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
@@ -1011,11 +1204,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
-                                 { m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                 m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                 m_gs, &m_memory, startPC, top, itop, 65536); });
+                                 {
+                                     ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
+                                     ps2_pipeline_stats::g_lastMscalPC.store(startPC, std::memory_order_relaxed);
+                                     probeVu1MemoryOccupancy();
+                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, startPC, top, itop, 65536); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
-                                 { m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                 {
+                                     ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
+                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                 m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                 m_gs, &m_memory, top, itop, 65536); });
     m_iop.init(rdram);
@@ -1558,6 +1757,73 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     const uint32_t a1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0));
     const uint32_t v0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[2], 0));
     const uint32_t v1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[3], 0));
+
+    // ---- per-target hole census -------------------------------------------
+    // `firstReport` above is ONE global bool for the whole process, so the big
+    // [guest-branch:missing-target] dump names exactly one hole per run no
+    // matter how many are hit. That makes the absence of a second record look
+    // like "there is only one hole" when it actually means "the probe already
+    // fired". Run 61 hit 0x186310 and stopped reporting; nothing downstream of
+    // it could ever have been seen.
+    //
+    // This is the cheap complement: one short line per DISTINCT target, so a
+    // single run enumerates the whole set. The heavy GPR/stack/trace dump stays
+    // one-shot -- it is ~20 lines and only the first one is worth that.
+    {
+        static constexpr size_t kMaxDistinctHoles = 64;
+        static std::mutex s_holeCensusMutex;
+        static std::array<uint32_t, kMaxDistinctHoles> s_holeTargets{};
+        static size_t s_holeCount = 0;
+        static bool s_holeCapReported = false;
+
+        bool isNewTarget = false;
+        size_t index = 0;
+        bool capJustHit = false;
+        {
+            std::lock_guard<std::mutex> lock(s_holeCensusMutex);
+            for (; index < s_holeCount; ++index)
+            {
+                if (s_holeTargets[index] == targetPc)
+                {
+                    break;
+                }
+            }
+            if (index == s_holeCount)
+            {
+                if (s_holeCount < kMaxDistinctHoles)
+                {
+                    s_holeTargets[s_holeCount++] = targetPc;
+                    isNewTarget = true;
+                }
+                else if (!s_holeCapReported)
+                {
+                    s_holeCapReported = true;
+                    capJustHit = true;
+                }
+            }
+        }
+
+        if (capJustHit)
+        {
+            std::cerr << "[cap] tag=hole saturated at " << kMaxDistinctHoles
+                      << " distinct targets -- absence of a [hole] line past this"
+                         " point is NOT evidence."
+                      << std::endl;
+        }
+        if (isNewTarget)
+        {
+            std::ostringstream holeLine;
+            holeLine << "[hole] n=" << index
+                     << " target=0x" << std::hex << targetPc
+                     << " source=0x" << sourcePc
+                     << " ra=0x" << ra
+                     << " op=" << (debugName ? debugName : "<unknown>")
+                     << " kind=" << describeGuestBranchKind(kind)
+                     << " codeRegion=" << (m_memory.isCodeAddress(targetPc) ? "yes" : "no")
+                     << std::dec;
+            std::cerr << holeLine.str() << std::endl;
+        }
+    }
 
     auto readGuestU32At = [rdram](uint32_t addr, uint32_t &out) -> bool
     {
@@ -2800,6 +3066,57 @@ void PS2Runtime::run()
                   << std::dec << std::endl;
     }
 
+    // Ordered dispatch trace (env PS2X_ORDER=164f78,165300,...). Parsed once.
+    // A list that parses to zero usable addresses prints a loud line rather
+    // than arming a probe that would then report a confident, empty result --
+    // an empty trace must never be readable as "none of these ever ran".
+    if (const char *ord = std::getenv("PS2X_ORDER"); ord && *ord)
+    {
+        const char *c = ord;
+        while (*c != '\0' && g_orderAddrCount < kOrderMaxAddrs)
+        {
+            while (*c == ',' || *c == ' ')
+            {
+                ++c;
+            }
+            if (*c == '\0')
+            {
+                break;
+            }
+            char *end = nullptr;
+            const unsigned long v = std::strtoul(c, &end, 16);
+            if (end == c)
+            {
+                break;
+            }
+            if (v != 0ul)
+            {
+                g_orderAddrs[g_orderAddrCount++] = static_cast<uint32_t>(v);
+            }
+            c = end;
+        }
+        if (g_orderAddrCount == 0u)
+        {
+            std::cerr << "[order] PS2X_ORDER set but parsed 0 addresses -- NOT"
+                         " armed. Expected bare hex, comma separated, e.g."
+                         " 164f78,165300"
+                      << std::endl;
+        }
+        else
+        {
+            g_orderArmed.store(true, std::memory_order_relaxed);
+            std::cerr << "[order] armed -- tracing dispatch ORDER of "
+                      << std::dec << g_orderAddrCount << " addresses:"
+                      << std::hex;
+            for (uint32_t i = 0; i < g_orderAddrCount; ++i)
+            {
+                std::cerr << " 0x" << g_orderAddrs[i];
+            }
+            std::cerr << std::dec << " (log capacity " << kOrderLogSize << ")"
+                      << std::endl;
+        }
+    }
+
     // Optional R3000A IOP-core self-test (env PS2_IOP_CPU_SELFTEST=1): runs a
     // hand-assembled program in (still-zeroed) IOP RAM before the guest starts.
     if (const char *st = std::getenv("PS2_IOP_CPU_SELFTEST"); st && *st && *st != '0')
@@ -2877,6 +3194,7 @@ void PS2Runtime::run()
                 //            frame; if vbl/s is itself low the pacing thread is
                 //            the bottleneck and gif/s merely follows it.
                 uint64_t prevBusyNs = 0, prevResumes = 0, prevVbl = 0;
+                uint64_t prevVblQ = 0, prevVblI = 0, prevVblS = 0;
                 // Stage 5.7. Every rate field above measures the *render* loop,
                 // and they all read healthy while the screen stays black -- so
                 // none of them can answer the question that is actually open:
@@ -2910,6 +3228,21 @@ void PS2Runtime::run()
                     return static_cast<uint32_t>(std::strtoul(p, nullptr, 16));
                 };
 
+                // Counts, not addresses. envHex would read a probe budget of
+                // "1000" as 0x1000, so log caps get their own base-0 parser --
+                // a cap that silently means something other than what the user
+                // typed is the same false-negative machine the caps exist to
+                // stop. 0 means unlimited.
+                auto envDec = [](const char *name, uint32_t fallback) -> uint32_t
+                {
+                    const char *v = std::getenv(name);
+                    if (v == nullptr || *v == '\0')
+                    {
+                        return fallback;
+                    }
+                    return static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+                };
+
                 const uint32_t watchAddr = envHex("PS2_WATCH_ADDR", 0x005e6b3cu);
                 uint32_t prevWatch[4] = {0, 0, 0, 0};
                 bool havePrevWatch = false;
@@ -2941,6 +3274,96 @@ void PS2Runtime::run()
                 const size_t bssWords = (bssHi > bssLo) ? ((bssHi - bssLo) / 4u) : 0u;
                 std::vector<uint32_t> bssPrev(bssWords, 0u);
                 bool haveBssPrev = false;
+
+                // ---- Stage 5.15: the ADX stream table ---------------------
+                //
+                // The exit test for the whole .SFD movie stage is "entry 1 of
+                // the ADX stream table reaches state 3 with a live fd", and
+                // until now that has only ever been read in PCSX2 -- this
+                // runtime had no instrumentation for it at all. Every claim in
+                // the state file that we sit at "state 1, fd 0" is borrowed
+                // ground truth, not our own measurement.
+                //
+                // Layout, from the PCSX2 dump: base 0x0044beb8, 40 entries of
+                // 0x60. Word 0 packs three bytes little-endian --
+                //   [+0] active  [+1] state (1 init/idle, 3 streaming, 4 error)
+                //   [+2] pause
+                // -- so real hardware's first word reads 0x01000301 (state 3)
+                // and ours read 0x01000101 (state 1). [+8] is the fd, [+0x45]
+                // the command byte and [+0x49] the busy flag.
+                //
+                // Two deliberate design choices, both paid for by past runs:
+                //
+                // 1. SWEEP, DON'T SAMPLE. Gating on the single inferred address
+                //    0x44bf18 would report confidently about the wrong bytes if
+                //    the base or stride were off by anything. Walking all 40
+                //    entries and counting the nonzero ones means a wrong layout
+                //    shows up as nonzero=0/40 -- which convicts the probe, not
+                //    the game.
+                // 2. CARRY THE RIVAL READING. raw= is printed next to the
+                //    decoded fields so a mis-split of word 0 is visible in the
+                //    same line rather than being silently absorbed.
+                //
+                // The summary line is emitted every tick even when nothing is
+                // nonzero, so this probe can never be quietly absent.
+                const uint32_t adxBase = envHex("PS2_ADX_BASE", 0x0044beb8u) & ~3u;
+                const uint32_t adxStride = envHex("PS2_ADX_STRIDE", 0x60u);
+                const uint32_t adxCount = envHex("PS2_ADX_COUNT", 0x28u); // 40
+                // Watchdog thread only, so a plain counter is enough. Bounded
+                // for the same reason every other probe here is: a 10-minute
+                // run must not be able to bury the interesting first seconds.
+                uint32_t adxLogs = 0;
+                // Raise with PS2X_ADX_STREAM_MAX (0 = unlimited). At 1 Hz the
+                // fixed 600 was exactly 10 minutes, so any run longer than that
+                // went blind without the log saying so.
+                const uint32_t kAdxMax = envDec("PS2X_ADX_STREAM_MAX", 600u);
+                // High-water mark across the whole run. A 1 Hz sampler cannot
+                // see a state that comes and goes between ticks, so the peak is
+                // carried separately -- otherwise a stream that really did
+                // reach 3 for half a second would be indistinguishable from one
+                // that never left 1.
+                uint32_t adxMaxState = 0;
+                // Same reasoning as adxMaxState, for the two fields the static
+                // trace named as the actual gate.
+                //
+                // adxstmf_stat_exec (0x125898) reaches the file open ONLY when
+                // byte [+0x45] == 1:
+                //     v9 = *(char *)(a1 + 69);
+                //     if ( v9 != 1 ) goto LABEL_38;      // return state, do nothing
+                //     ...
+                //     *(_DWORD *)(a1 + 8) = cvfsOpen(*(int *)(a1 + 80), ...);
+                // and [+0x45] is written to 1 in exactly two places -- 0x124E38
+                // (which also stores the filename pointer into [+80]) and
+                // 0x1263B8. Both then SPIN until it clears, so a 1 Hz sample
+                // ought to catch it latched -- but "ought to" is not a probe.
+                // Peak-hold both, and read [+80]/[+84] so "the command never
+                // came" is distinguishable from "it came and was cleared".
+                uint32_t adxMaxCmd = 0;
+                uint32_t adxMaxFd = 0;
+
+                // Movie-player globals. Fixed addresses out of MovieCreate
+                // (0x113AA0) and the movie poll (0x113920):
+                //   0x54BD78/0x54BD7C  work adrs / size -- POSITIVE CONTROL, the
+                //                      game TTY already printed 0x1806c00/0x332100
+                //   0x54BD90           SofDec object ptr (0 => create failed)
+                //   0x54BE2C           second create result (0 => create failed)
+                //   0x54BE30           set to 1 once mwPlyGetMovieInfo returns a
+                //                      header -- i.e. once the .SFD was actually
+                //                      read. The render path (0x113860) is gated
+                //                      on `dword_54BE2C && dword_54BE30`.
+                //   0x54BE28           movie status byte; the caller treats
+                //                      (status - 1) >= 2 as "finished".
+                // Both create prints appeared in run 56 and neither failure
+                // print did, so 0x54BD90 and 0x54BE2C should read nonzero. If
+                // they don't, this probe is wrong before the game is.
+                const uint32_t movBase = envHex("PS2_MOVIE_BASE", 0x0054bd78u) & ~3u;
+                uint32_t movLogs = 0;
+                // Raise with PS2X_MOVIE_MAX (0 = unlimited). Same 1 Hz / 600
+                // = 10 minute blindness as [adx:stream].
+                const uint32_t kMovMax = envDec("PS2X_MOVIE_MAX", 600u);
+                uint32_t movMaxInfo = 0;
+                uint32_t movMaxStat = 0;
+
                 while (!isStopRequested())
                 {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2963,9 +3386,18 @@ void PS2Runtime::run()
                     const uint64_t dBusyNs = curBusyNs - prevBusyNs;
                     const uint64_t dResumes = curResumes - prevResumes;
                     const uint64_t dVbl = curVbl - prevVbl;
+                    uint64_t vblQ = 0, vblI = 0, vblS = 0;
+                    ps2x_vblank_tick_sources(&vblQ, &vblI, &vblS);
+                    const uint64_t dVblQ = vblQ - prevVblQ;
+                    const uint64_t dVblI = vblI - prevVblI;
+                    const uint64_t dVblS = vblS - prevVblS;
+                    prevVblQ = vblQ;
+                    prevVblI = vblI;
+                    prevVblS = vblS;
                     prevBusyNs = curBusyNs;
                     prevResumes = curResumes;
                     prevVbl = curVbl;
+                    ps2x_srd_stat_tick();
                     const uint64_t busyPct = dBusyNs / 10000000ull; // ns -> % of 1s
                     // Plain RDRAM, so read32 cannot re-enter the MMIO handlers;
                     // guarded anyway because the watchdog must never be the
@@ -3006,6 +3438,1732 @@ void PS2Runtime::run()
                         prevWatch[i] = w[i];
                     havePrevWatch = true;
 
+                    // Stage 5.15 ADX stream sweep. Same guard discipline as the
+                    // watch/BSS reads above: plain RDRAM, and wrapped anyway
+                    // because the watchdog must never be what takes a run down.
+                    // t is incremented by the watchdog emit further below, so
+                    // t+1 here labels the same tick as that line.
+                    if ((kAdxMax == 0u || adxLogs < kAdxMax) && adxCount != 0u &&
+                        adxStride != 0u)
+                    {
+                        std::ostringstream adx;
+                        uint32_t nonzero = 0;
+                        uint32_t detailed = 0;
+                        try
+                        {
+                            for (uint32_t i = 0; i < adxCount; ++i)
+                            {
+                                const uint32_t ent = adxBase + (i * adxStride);
+                                const uint32_t raw = m_memory.read32(ent);
+                                if (raw == 0u)
+                                {
+                                    continue;
+                                }
+                                ++nonzero;
+
+                                const uint32_t state = (raw >> 8) & 0xFFu;
+                                if (state > adxMaxState)
+                                {
+                                    adxMaxState = state;
+                                }
+
+                                // Only the first few get expanded; nonzero=
+                                // still counts them all, so a table that
+                                // suddenly fills up is visible even when the
+                                // detail is truncated.
+                                const uint32_t fd = m_memory.read32(ent + 8u);
+                                const uint32_t cmd = (m_memory.read32(ent + 0x44u) >> 8) & 0xFFu;
+                                if (cmd > adxMaxCmd)
+                                {
+                                    adxMaxCmd = cmd;
+                                }
+                                if (fd > adxMaxFd)
+                                {
+                                    adxMaxFd = fd;
+                                }
+
+                                if (detailed < 4u)
+                                {
+                                    ++detailed;
+                                    const uint32_t bsyWord = m_memory.read32(ent + 0x48u);
+                                    // [+80] is the filename pointer 0x124E38
+                                    // stores alongside cmd=1, and [+84] the
+                                    // companion size. Nonzero [+80] with cmd=0
+                                    // means the read WAS requested and cleared;
+                                    // both zero means it never was.
+                                    const uint32_t fname = m_memory.read32(ent + 80u);
+                                    const uint32_t fsize = m_memory.read32(ent + 84u);
+                                    adx << " | i=" << std::dec << i
+                                        << " raw=0x" << std::hex << raw
+                                        << " act=" << std::dec << (raw & 0xFFu)
+                                        << " st=" << state
+                                        << " pau=" << ((raw >> 16) & 0xFFu)
+                                        << " fd=0x" << std::hex << fd
+                                        << " cmd=0x" << cmd
+                                        << " bsy=" << std::dec << ((bsyWord >> 8) & 0xFFu)
+                                        << " f80=0x" << std::hex << fname
+                                        << " f84=0x" << fsize << std::dec;
+                                }
+                            }
+                        }
+                        catch (const std::exception &)
+                        {
+                        }
+
+                        ++adxLogs;
+                        if (kAdxMax != 0u && adxLogs == kAdxMax)
+                        {
+                            std::cerr << "[cap] tag=adx:stream saturated at "
+                                      << std::dec << kAdxMax << " --"
+                                         " later sweeps are invisible; absence past"
+                                         " this point is NOT evidence. Raise with"
+                                         " PS2X_ADX_STREAM_MAX (0 = unlimited)."
+                                      << std::endl;
+                        }
+                        // Emitted unconditionally, including the all-zero case.
+                        // nonzero=0/40 is the signature of a wrong base or
+                        // stride, and it must not look like "the probe was
+                        // never reached".
+                        std::cerr << "[adx:stream] t=" << std::dec << (t + 1) << "s"
+                                  << " nonzero=" << nonzero << "/" << adxCount
+                                  << " maxst=" << adxMaxState
+                                  << " maxcmd=" << adxMaxCmd
+                                  << " maxfd=0x" << std::hex << adxMaxFd
+                                  << " base=0x" << adxBase
+                                  << " stride=0x" << adxStride << std::dec
+                                  << adx.str()
+                                  << std::endl;
+                    }
+
+                    // Movie-player globals -- the layer ABOVE the ADX stream
+                    // table. Unconditional emit, same rule as [adx:stream]: an
+                    // all-zero line is a claim about the game only once the two
+                    // work-area fields (which the game itself printed) match.
+                    if (kMovMax == 0u || movLogs < kMovMax)
+                    {
+                        uint32_t wrkAdr = 0;
+                        uint32_t wrkSiz = 0;
+                        uint32_t obj = 0;
+                        uint32_t crt2 = 0;
+                        uint32_t info = 0;
+                        uint32_t stat = 0;
+                        uint32_t objState = 0;
+                        uint32_t objFile = 0;
+                        // mwPlySetFile's filename path (0x14F860) stamps a
+                        // fixed 4-word signature into the player object:
+                        //     a1[107] = 1;  a1[108] = 0;
+                        //     a1[109] = 0;  a1[110] = 0xFFFFF;
+                        // i.e. word offsets 428/432/436/440. The AFS path
+                        // (0x14F8D0) sets [107]=1 too but fills 108..110 with
+                        // real partition/file/size values, so the pair
+                        // (src=1, len=0xfffff) is specifically "a plain
+                        // filename was accepted". This is the cheapest
+                        // yes/no on whether the strcpy chain actually ran,
+                        // as opposed to the TTY merely not complaining.
+                        uint32_t objSrc = 0;
+                        uint32_t objLen = 0;
+                        try
+                        {
+                            wrkAdr = m_memory.read32(movBase + 0x00u);  // 0x54BD78
+                            wrkSiz = m_memory.read32(movBase + 0x04u);  // 0x54BD7C
+                            obj = m_memory.read32(movBase + 0x18u);     // 0x54BD90
+                            stat = m_memory.read32(movBase + 0xB0u) & 0xFFu; // 0x54BE28
+                            crt2 = m_memory.read32(movBase + 0xB4u);    // 0x54BE2C
+                            info = m_memory.read32(movBase + 0xB8u);    // 0x54BE30
+                            if (info > movMaxInfo)
+                            {
+                                movMaxInfo = info;
+                            }
+                            if (stat > movMaxStat)
+                            {
+                                movMaxStat = stat;
+                            }
+                            // Only chase the object pointer when it looks like
+                            // RDRAM; a garbage value must not be reported as if
+                            // it were player state.
+                            if (obj >= 0x00080000u && obj < 0x02000000u)
+                            {
+                                objState = m_memory.read32(obj + 8u);
+                                objFile = m_memory.read32(obj + 444u);
+                                objSrc = m_memory.read32(obj + 428u);
+                                objLen = m_memory.read32(obj + 440u);
+                            }
+                        }
+                        catch (const std::exception &)
+                        {
+                        }
+
+                        ++movLogs;
+                        if (kMovMax != 0u && movLogs == kMovMax)
+                        {
+                            std::cerr << "[cap] tag=movie saturated at "
+                                      << std::dec << kMovMax << " --"
+                                         " later samples are invisible; absence"
+                                         " past this point is NOT evidence. Raise"
+                                         " with PS2X_MOVIE_MAX (0 = unlimited)."
+                                      << std::endl;
+                        }
+                        std::cerr << "[movie] t=" << std::dec << (t + 1) << "s"
+                                  << " base=0x" << std::hex << movBase
+                                  << " wrkAdr=0x" << wrkAdr
+                                  << " wrkSiz=0x" << wrkSiz
+                                  << " obj=0x" << obj
+                                  << " crt2=0x" << crt2
+                                  << " info=" << std::dec << info
+                                  << " stat=" << stat
+                                  << " maxinfo=" << movMaxInfo
+                                  << " maxstat=" << movMaxStat
+                                  << " objSt=" << objState
+                                  << " objFile=0x" << std::hex << objFile
+                                  << " objSrc=0x" << objSrc
+                                  << " objLen=0x" << objLen << std::dec
+                                  << std::endl;
+
+                        // ---- [sfdc] the 144-byte SofDec info block ----------
+                        //
+                        // Run 75 closed the supply question the way run 74
+                        // closed the server question -- by clearing the layer.
+                        // [cvfs:stat] read calls=2 passable=2 retNz=2 armed=2
+                        // with all five rejection counters at zero and
+                        // devAfter=0x1, so 0x131190 -> 0x12E7B0 accepted every
+                        // request it was handed and armed the SRD object both
+                        // times. The devtype=0 that [crisrv:stat] reports is
+                        // the RESTING value after completion, not a stuck one.
+                        // Nothing below the movie layer is refusing work.
+                        //
+                        // What the movie layer itself reports has been the same
+                        // in every run and was never chased: info=0 maxinfo=0,
+                        // for all 298 samples of run 75 and all 298 of run 74.
+                        // That field is dword_54BE30, and MovieUpdate (0x113920)
+                        // writes it in exactly one place:
+                        //
+                        //     module_obj_init(&dword_54BD98, 0, 144);   // clear
+                        //     if ( dword_54BD90 ) {
+                        //         sub_14D2C0(dword_54BD90, &v6);        // fill
+                        //         if ( v6[0] ) {                        // GATE
+                        //             dword_54BD98 = v6[0];
+                        //             dword_54BE30 = 1;                 // info
+                        //             ...
+                        //         }
+                        //     }
+                        //
+                        // info==1 is therefore equivalent to v6[0]!=0, and
+                        // info==0 for an entire run says v6[0] was zero on
+                        // every single tick -- i.e. 0x14D2C0, the SofDec status
+                        // query, never once reported a decoded stream. The whole
+                        // body of MovieUpdate is skipped, which is why stat is
+                        // pinned at 1 and why the movie is torn down by its own
+                        // safety net after ~12 s (t=136..148) and again after
+                        // ~16 s (t=175..191).
+                        //
+                        // This dump is deliberately NOT a wrapper on 0x14D2C0.
+                        // The caller 0x113920 has two generated bodies --
+                        // fn_113920_0x113920.cpp with ZERO dispatchGuestBranch
+                        // calls and sub_00113920_0x113920.cpp with six -- and
+                        // which one the dispatch table actually holds is not
+                        // known. A replaceFunction wrapper that loses that coin
+                        // flip reports 0/1 forever and reads exactly like "the
+                        // status query is never called"
+                        // ([[feedback_registerfunction_bypass]]). Reading the
+                        // destination block instead has no such dependency: the
+                        // block is cleared to zero and refilled every tick, so
+                        //
+                        //   w0!=0 at any sample  -> the query DOES fill it and
+                        //                           the gate is passing; look
+                        //                           higher, at the consumer
+                        //   w0==0 with the rest
+                        //   also all-zero        -> 0x14D2C0 wrote nothing, or
+                        //                           was never reached
+                        //   w0==0 but w1..wB set -> the query ran and reported a
+                        //                           stream with status 0, which
+                        //                           is a DIFFERENT bug from the
+                        //                           two above and is invisible
+                        //                           without the extra words
+                        //
+                        // The last reading is the reason this prints twelve
+                        // words rather than one: a single-field probe cannot
+                        // tell "nobody wrote" from "somebody wrote a zero"
+                        // ([[feedback_degenerate_result_convicts_the_probe]]).
+                        // nz counts the nonzero words so that verdict is on the
+                        // line without decoding twelve hex fields by eye.
+                        {
+                            uint32_t w[12] = {0};
+                            uint32_t nz = 0;
+                            try
+                            {
+                                for (uint32_t i = 0; i < 12u; ++i)
+                                {
+                                    w[i] = m_memory.read32(movBase + 0x20u + i * 4u);
+                                    if (w[i] != 0u) { ++nz; }
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
+                            std::cerr << "[sfdc] t=" << std::dec << (t + 1) << "s"
+                                      << " nz=" << nz
+                                      << " blk=0x" << std::hex << (movBase + 0x20u)
+                                      << " w0=0x" << w[0]
+                                      << " w1=0x" << w[1]
+                                      << " w2=0x" << w[2]
+                                      << " w3=0x" << w[3]
+                                      << " w4=0x" << w[4]
+                                      << " w5=0x" << w[5]
+                                      << " w6=0x" << w[6]
+                                      << " w7=0x" << w[7]
+                                      << " w8=0x" << w[8]
+                                      << " w9=0x" << w[9]
+                                      << " wA=0x" << w[10]
+                                      << " wB=0x" << w[11]
+                                      << std::dec << std::endl;
+                        }
+
+                        // ---- [sfdcp] which gate inside 0x14D2C0 says no ------
+                        //
+                        // Run 76 answered [sfdc] with nz=0 in all 298 samples --
+                        // and in doing so proved the probe was REDUNDANT rather
+                        // than decisive. Re-reading MovieUpdate, every write into
+                        // the 144-byte block sits inside the same if (v6[0]) gate
+                        // that sets info, so "nz=0" and the info=0 we already had
+                        // are the same measurement wearing two hats. The third
+                        // reading that block was supposed to separate -- w0==0
+                        // with w1..wB set -- is unreachable by construction. That
+                        // is on the probe, not the run: a rival-reading field has
+                        // to be fed by a DIFFERENT writer to be a rival at all
+                        // ([[feedback_degenerate_result_convicts_the_probe]]).
+                        //
+                        // So walk into 0x14D2C0 instead. It has three separate
+                        // ways to zero the caller's block, and they mean entirely
+                        // different things:
+                        //
+                        //   if ( sub_1505D0(a1) != 1 )        // *(u32*)obj != 1
+                        //       err(aE1122614Mwplyg); *a2 = 0; return;
+                        //   v5 = sub_150008(a1);              // = *(int*)(obj+60)
+                        //   if ( !v5 ) { *a2 = 0; return; }
+                        //   sub_167320(v5, v11);              // decode one frame
+                        //   if ( !v11[0] ) { *a2 = 0; return; }
+                        //   ...
+                        //   *(obj+120) = v11[0];  ++*(obj+124);   // FRAME COUNTER
+                        //
+                        // Note what did NOT happen in run 76: aE1122614Mwplyg
+                        // never appears in the log. That is not evidence the first
+                        // gate passed. The error printer is 0x1548B8, which
+                        // formats into dword_55A780 and hands it to
+                        // callback_dispatch_fmt_c_0 -- a user-installed handler.
+                        // If the game never installs one the message is formatted
+                        // and dropped, so its absence says nothing at all. Read
+                        // the gate inputs directly rather than waiting for a
+                        // complaint that may have nowhere to go.
+                        //
+                        //   p0 != 1              -> gate 1: the player object is
+                        //                           not in the live state; the
+                        //                           handle is stale or was torn
+                        //                           down under us
+                        //   p0 == 1, dec == 0    -> gate 2: obj+60 was never set,
+                        //                           i.e. the decoder was never
+                        //                           attached to the player -- the
+                        //                           failure is at OPEN time, one
+                        //                           layer above the streaming
+                        //   dec != 0, fcnt flat  -> gate 3: the decoder exists and
+                        //                           is being asked every tick but
+                        //                           yields no frame -- starved, so
+                        //                           the question returns to who
+                        //                           feeds it
+                        //   fcnt RISING          -> frames ARE decoding and the
+                        //                           bug is above 0x14D2C0 in the
+                        //                           consumer; every conclusion
+                        //                           drawn from info=0 so far would
+                        //                           need re-reading
+                        //
+                        // fcnt (obj+124) and drop (obj+132) are the two counters
+                        // that only ever move on a real decode, so they are the
+                        // fields that can tell "slow" from "dead" -- an unsampled
+                        // counter cannot ([[feedback_measure_dont_infer_rates]]).
+                        // Everything is read from the same cached m_memory as the
+                        // rest of this block, so a zero obj still prints a full
+                        // row rather than vanishing.
+                        if (obj >= 0x00080000u && obj < 0x02000000u)
+                        {
+                            uint32_t p0 = 0, dec = 0, skip = 0, n24 = 0;
+                            uint32_t frm = 0, fcnt = 0, drop = 0, p184 = 0, lat = 0;
+                            uint32_t d2408 = 0, d2412 = 0, d0 = 0;
+                            uint32_t cb = 0;
+                            try
+                            {
+                                p0 = m_memory.read32(obj + 0u);
+                                n24 = m_memory.read32(obj + 24u);
+                                dec = m_memory.read32(obj + 60u);
+                                skip = m_memory.read32(obj + 84u);
+                                frm = m_memory.read32(obj + 120u);
+                                fcnt = m_memory.read32(obj + 124u);
+                                drop = m_memory.read32(obj + 132u);
+                                p184 = m_memory.read32(obj + 184u);
+                                lat = m_memory.read32(obj + 724u);
+                                cb = m_memory.read32(0x004611ACu);
+                                if (dec >= 0x00080000u && dec < 0x02000000u)
+                                {
+                                    d0 = m_memory.read32(dec + 0u);
+                                    d2408 = m_memory.read32(dec + 2408u);
+                                    d2412 = m_memory.read32(dec + 2412u);
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
+                            std::cerr << "[sfdcp] t=" << std::dec << (t + 1) << "s"
+                                      << " obj=0x" << std::hex << obj
+                                      << " p0=0x" << p0
+                                      << " dec=0x" << dec
+                                      << " skip=0x" << skip
+                                      << " n24=0x" << n24
+                                      << " frm=0x" << frm
+                                      << std::dec << " fcnt=" << fcnt
+                                      << " drop=" << drop
+                                      << std::hex
+                                      << " p184=0x" << p184
+                                      << " lat=0x" << lat
+                                      << " d0=0x" << d0
+                                      << " dRd=0x" << d2408
+                                      << " dWr=0x" << d2412
+                                      << " cb=0x" << cb
+                                      << std::dec << std::endl;
+                        }
+
+                        // ---- [sfdvt] the two-level table 0x14D2C0 dies in ------
+                        //
+                        // Run 77 answered [sfdcp] and cleared two of the three
+                        // gates outright, in all 52 samples across all three
+                        // movie sessions (t=82..93, t=117..132, t=275..298):
+                        //
+                        //   p0  = 0x1          gate 1 passes; the player object
+                        //                      IS in the live state
+                        //   dec = 0x1b12cc0    gate 2 passes; a decoder IS
+                        //                      attached, and the address sits
+                        //                      inside the movie work buffer
+                        //                      (wrkAdr=0x1806c00 + wrkSiz=
+                        //                      0x332100 -> ..0x1b38d00), so it
+                        //                      is a real allocation, not junk
+                        //   fcnt= 0, drop = 0  gate 3 FAILS, every tick, and it
+                        //                      is not even dropping frames -- it
+                        //                      produces nothing at all
+                        //
+                        // So the failure is exactly one call deep now:
+                        //
+                        //     v5 = vtable_dispatch(dec, 6, 11, a2, 0);
+                        //     if ( !*(_DWORD *)a2 ) -> caller writes info=0
+                        //
+                        // and vtable_dispatch (0x16B318) is a TWO-LEVEL table:
+                        //
+                        //     slot = *(u32 *)(a1 + 68 * a2 + 7996);   // a2 = 6
+                        //     if ( !slot ) return 0;                  // silent
+                        //     return ((fn)*(u32 *)(slot + 4 * a3))(); // a3 = 11
+                        //
+                        // 68*6 + 7996 = 8404, so the handler-table pointer for
+                        // stream slot 6 is dec+8404 and the method pointer is
+                        // slot+44. Both levels return "no frame" the same way
+                        // from the caller's side, and they are completely
+                        // different bugs:
+                        //
+                        //   vt6 == 0           the demux never registered a
+                        //                      handler for this stream type --
+                        //                      an SFD-header / stream-open bug,
+                        //                      nothing to do with decoding
+                        //   vt6 != 0, fn11 = 0 the table exists with a hole in
+                        //                      it; registration ran but partly
+                        //   fn11 != 0, body=0  fn11 is a real guest address that
+                        //                      HAS NO RECOMPILED BODY -- the
+                        //                      Stage 5.11 class exactly
+                        //                      ([[project_stage511_gsdump_replay]]):
+                        //                      a function only ever taken as a
+                        //                      pointer, never a jal target, so
+                        //                      the recompiler emitted nothing
+                        //                      and the JALR returns a stale v0.
+                        //                      That cost ~38 run cycles last
+                        //                      time because the symptom pointed
+                        //                      at the consumer, not the callee.
+                        //   fn11 != 0, body=1  the pointer is live and callable;
+                        //                      the frame really is being asked
+                        //                      for and refused inside real
+                        //                      guest code, and the question
+                        //                      moves into that function
+                        //
+                        // body is answered with hasFunction() rather than left
+                        // for a later run: the runtime already knows whether an
+                        // address has a body, so asking costs nothing and turns
+                        // a whole run cycle into a field on this line.
+                        //
+                        // slots= dumps the same pointer for a2 = 0..11 so a
+                        // vt6 == 0 reading arrives with its own context. If
+                        // every slot is zero the table was never built at all;
+                        // if slots 0..5 are populated and only 6 is empty then
+                        // registration ran and skipped this stream type, which
+                        // are again different repairs. A single-slot probe
+                        // could not tell those apart
+                        // ([[feedback_degenerate_result_convicts_the_probe]]),
+                        // and the geometry -- 68 bytes per slot, +7996 -- comes
+                        // from the decompiled accessors at 0x16B380/0x16B3B0/
+                        // 0x16B3C8, not from an inferred constant
+                        // ([[feedback_probe_gate_on_shape_not_address]]).
+                        if (obj >= 0x00080000u && obj < 0x02000000u)
+                        {
+                            uint32_t dcx = 0, vt6 = 0, fn11 = 0;
+                            uint32_t f7984 = 0, f7988 = 0;
+                            uint32_t slots[12] = {0};
+                            int body = -1;
+                            try
+                            {
+                                dcx = m_memory.read32(obj + 60u);
+                                if (dcx >= 0x00080000u && dcx < 0x02000000u)
+                                {
+                                    for (uint32_t i = 0; i < 12u; ++i)
+                                    {
+                                        slots[i] = m_memory.read32(dcx + 68u * i + 7996u);
+                                    }
+                                    vt6 = slots[6];
+                                    f7984 = m_memory.read32(dcx + 68u * 6u + 7984u);
+                                    f7988 = m_memory.read32(dcx + 68u * 6u + 7988u);
+                                    if (vt6 >= 0x00080000u && vt6 < 0x02000000u)
+                                    {
+                                        fn11 = m_memory.read32(vt6 + 4u * 11u);
+                                        if (fn11 != 0u)
+                                        {
+                                            body = hasFunction(fn11) ? 1 : 0;
+                                        }
+                                    }
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
+                            std::cerr << "[sfdvt] t=" << std::dec << (t + 1) << "s"
+                                      << " dec=0x" << std::hex << dcx
+                                      << " vt6=0x" << vt6
+                                      << " fn11=0x" << fn11
+                                      << std::dec << " body=" << body
+                                      << std::hex
+                                      << " f7984=0x" << f7984
+                                      << " f7988=0x" << f7988
+                                      << " slots=";
+                            for (uint32_t i = 0; i < 12u; ++i)
+                            {
+                                std::cerr << (i != 0u ? "," : "") << "0x" << slots[i];
+                            }
+                            std::cerr << std::dec << std::endl;
+                        }
+
+                        // ---- [sfdst] the SofDec state machine at 0x165300 -------
+                        //
+                        // Run 78 answered [sfdvt] and it came back the GOOD way,
+                        // identically in all 53 samples:
+                        //
+                        //   vt6  = 0x4bf780   the handler table for stream slot 6
+                        //                     IS registered
+                        //   fn11 = 0x16c620   the method pointer is real
+                        //   body = 1          and it HAS a recompiled body, so
+                        //                     this is NOT the Stage 5.11 class
+                        //                     ([[project_stage511_gsdump_replay]])
+                        //                     -- the call really is being made and
+                        //                     really is returning
+                        //   slots= 0x4bf220,0x4bf258,0x4bf2a0,0x4befe8,0,0,
+                        //          0x4bf780,0x4bf040,0x4bf748,0,0,0
+                        //                     the table is built, not half-built
+                        //
+                        // So read what 0x16C620 actually does:
+                        //
+                        //     if ( (u64)(*(u32 *)(a1 + 72) - 3) < 2 )
+                        //         return wrap_sub_unk_k(a1, *(u32 *)(a1 + 8408));
+                        //     *a2 = 0;                      // <-- our symptom
+                        //     return 0;
+                        //
+                        // dec+72 must be 3 or 4. Anything else zeroes the caller's
+                        // word silently, which is exactly the "no frame, no error,
+                        // no drop" reading [sfdcp] gave. dec+72 is the CURRENT
+                        // state of the machine at 0x165300 and dec+76 is the
+                        // REQUESTED one:
+                        //
+                        //     if ( (u64)(state - 1) < 4 && *(u32 *)(a1 + 68) ) {
+                        //         *(u32 *)(a1 + 68) = 0;    // one-shot tick flag
+                        //         switch ( state ) { 1: ..f  2: ..g  3: ..m
+                        //                            4: ..s2 6: ..129 }
+                        //     }
+                        //
+                        // Note the machine does not run at all unless state is in
+                        // 1..4, so a state of 0 or 5 is terminal by construction --
+                        // no amount of ticking recovers it.
+                        //
+                        // 1 -> 2 needs only a request (0x165458: req in {2,3,4,6}).
+                        // 2 -> 3/4 is the real gate (0x165488): it first calls the
+                        // preroll-ready check 0x165548, and STAYS AT 2 forever if
+                        // that returns 0. And that check reads precisely the two
+                        // fields [sfdvt] already measured as zero:
+                        //
+                        //     v3 = 1;
+                        //     if ( *(u32 *)(a1 + 2572 + 4*5) )
+                        //         v3 = f7984(6) | f7988(6);   // BOTH 0 in run 78
+                        //     v6 = 1;
+                        //     if ( *(u32 *)(a1 + 2572 + 4*6) )
+                        //         v6 = f7984(7) | f7988(7);
+                        //     if ( v3 ) return v6 != 0;
+                        //     return 0;
+                        //
+                        // If en5 is nonzero then v3 = 0|0 = 0 and the check returns
+                        // 0 on every tick -- state pins at 2, dec+72 never reaches
+                        // 3, and 0x16C620 zeroes the word for the rest of the run.
+                        // That would explain the whole stall end to end. But it is
+                        // a hypothesis with an untested premise (en5), and a probe
+                        // that only printed the fields supporting it would confirm
+                        // itself no matter what
+                        // ([[feedback_degenerate_result_convicts_the_probe]]).
+                        //
+                        // So print the state FIRST and let it referee:
+                        //
+                        //   st == 3 or 4      -> the premise above is WRONG. The
+                        //                        gate is passing and the refusal is
+                        //                        inside wrap_sub_unk_k (0x159090),
+                        //                        one layer further in. sIdx says
+                        //                        which stream it was asked about
+                        //   st == 2           -> pinned in preroll; en5/en6 and the
+                        //                        four a*_84/a*_88 counters say which
+                        //                        arm of 0x165548 is the zero, and
+                        //                        rdy re-evaluates it here so the
+                        //                        verdict does not depend on reading
+                        //                        six hex fields by eye
+                        //   st == 1           -> stopped and never asked to play;
+                        //                        req names who should have asked
+                        //   st == 0 or 5      -> terminal, the machine is not even
+                        //                        eligible to tick -- a teardown ran
+                        //   tick == 0 always  -> the state is irrelevant: nobody is
+                        //                        driving 0x165300 at all, and the
+                        //                        question moves to its caller
+                        //
+                        // tick is the one field here that is a one-shot: 0x165300
+                        // clears dec+68 the moment it runs, so sampling it once a
+                        // second will read 0 on a HEALTHY machine too. It is dumped
+                        // for the all-zero-forever case only, and must not be read
+                        // as "not ticking" on its own
+                        // ([[feedback_probe_the_final_value]]).
+                        if (obj >= 0x00080000u && obj < 0x02000000u)
+                        {
+                            uint32_t dcx = 0;
+                            uint32_t st = 0xFFFFFFFFu, req = 0xFFFFFFFFu, tick = 0;
+                            uint32_t sIdx = 0, d8392 = 0, d8396 = 0;
+                            uint32_t en[8] = {0};
+                            uint32_t a5_84 = 0, a5_88 = 0, a7_84 = 0, a7_88 = 0;
+                            int rdy = -1;
+                            try
+                            {
+                                dcx = m_memory.read32(obj + 60u);
+                                if (dcx >= 0x00080000u && dcx < 0x02000000u)
+                                {
+                                    st = m_memory.read32(dcx + 72u);
+                                    req = m_memory.read32(dcx + 76u);
+                                    tick = m_memory.read32(dcx + 68u);
+                                    sIdx = m_memory.read32(dcx + 8408u);
+                                    d8392 = m_memory.read32(dcx + 8392u);
+                                    d8396 = m_memory.read32(dcx + 8396u);
+                                    for (uint32_t i = 0; i < 8u; ++i)
+                                    {
+                                        en[i] = m_memory.read32(dcx + 2572u + 4u * i);
+                                    }
+                                    a5_84 = m_memory.read32(dcx + 68u * 6u + 7984u);
+                                    a5_88 = m_memory.read32(dcx + 68u * 6u + 7988u);
+                                    a7_84 = m_memory.read32(dcx + 68u * 7u + 7984u);
+                                    a7_88 = m_memory.read32(dcx + 68u * 7u + 7988u);
+
+                                    // Re-run 0x165548 exactly as written, so the
+                                    // verdict on the line is the guest's own
+                                    // arithmetic and not a paraphrase of it.
+                                    uint32_t v3 = 1u;
+                                    if (en[5] != 0u) { v3 = a5_84 | a5_88; }
+                                    uint32_t v6 = 1u;
+                                    if (en[6] != 0u) { v6 = a7_84 | a7_88; }
+                                    rdy = (v3 != 0u) ? ((v6 != 0u) ? 1 : 0) : 0;
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
+                            std::cerr << "[sfdst] t=" << std::dec << (t + 1) << "s"
+                                      << " dec=0x" << std::hex << dcx
+                                      << std::dec
+                                      << " st=" << (int)st
+                                      << " req=" << (int)req
+                                      << " tick=" << tick
+                                      << " rdy=" << rdy
+                                      << std::hex
+                                      << " sIdx=0x" << sIdx
+                                      << " d8392=0x" << d8392
+                                      << " d8396=0x" << d8396
+                                      << " a5_84=0x" << a5_84
+                                      << " a5_88=0x" << a5_88
+                                      << " a7_84=0x" << a7_84
+                                      << " a7_88=0x" << a7_88
+                                      << " en=";
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                std::cerr << (i != 0u ? "," : "") << "0x" << en[i];
+                            }
+                            std::cerr << std::dec << std::endl;
+                        }
+
+                        // ---- [sfdbuf] is there any MOVIE in the movie buffer ----
+                        //
+                        // Run 79 answered [sfdst] and the hypothesis held, with the
+                        // probe's own referee field agreeing. 30 of 32 samples read
+                        // identically:
+                        //
+                        //   st=2 req=3 rdy=0 sIdx=0x3
+                        //   a5_84=0 a5_88=0 a7_84=0 a7_88=0
+                        //   en=0,1,1,1,1,1,1,1
+                        //
+                        // st printed FIRST and it came back 2, not 3/4 -- so the
+                        // premise was not assumed, it was measured. req=3 means play
+                        // WAS requested. en5=1 and en6=1 mean both arms of 0x165548
+                        // are live, and all four counters they read are zero, so
+                        //
+                        //     v3 = a5_84 | a5_88 = 0   ->  return 0, every tick
+                        //
+                        // and the machine can never leave state 2. dec+72 stays 2,
+                        // 0x16C620 keeps taking its *a2 = 0 path, MovieUpdate keeps
+                        // skipping its whole body, info stays 0, and the movie layer
+                        // times out after ~12-16 s. That is the entire stall, end to
+                        // end, and it is now measured rather than inferred.
+                        //
+                        // One sample read st=1 req=1 and one read tick=0. Those are
+                        // the pre-roll and the teardown edges, not a second failure.
+                        //
+                        // So the question is who was supposed to fill slot 6 and
+                        // slot 7. The slot record is dec + 7984 + 68*i; +0 and +4 are
+                        // zeroed by 0x16ADD0 at construction and never written by any
+                        // expression of the form (base + 68*n + 7984) anywhere in the
+                        // image -- they are filled by the per-stream handler in the
+                        // vtable at slot+12, i.e. by the DEMUXER as it consumes data.
+                        // Both being zero says no stream ever received a byte.
+                        //
+                        // And that lines up with the one number in the supply layer
+                        // that has been odd since run 74 and was never chased: 365 of
+                        // 22659 sectors, 1.6%, with oReq=0x0. Those 365 sectors were
+                        // issued=3 done=3 err=0 -- the read layer says it delivered
+                        // them. But "the transfer completed" and "the bytes arrived
+                        // in EE RAM" are different claims, and this project has
+                        // already been caught conflating them once: mcserv reported
+                        // success while writing nothing, because the payload goes to
+                        // an EE block named in the send struct and our recv path was
+                        // only four bytes wide ([[project_stage512_memory_card]]).
+                        // A starved demuxer downstream of a "successful" read is
+                        // exactly that shape again.
+                        //
+                        // So look at the bytes. An .SFD is an MPEG program stream:
+                        // every 2048-byte pack begins 00 00 01 BA, which read32 sees
+                        // as 0xBA010000 on this little-endian host. The scan is
+                        // 4-aligned across the whole work buffer rather than only at
+                        // sector boundaries, because the read target (0x1868a40 in
+                        // run 78) is not 2048-aligned relative to wrkAdr and an
+                        // aligned-only scan would report zero packs on a buffer that
+                        // is completely fine ([[feedback_probe_gate_on_shape_not_address]]).
+                        //
+                        //   nzw == 0            -> the buffer is empty. The read
+                        //                          "completed" and delivered nothing,
+                        //                          and the whole SofDec chain is
+                        //                          starved for a reason that has
+                        //                          nothing to do with SofDec
+                        //   nzw > 0, ba == 0    -> bytes are present but they are not
+                        //                          a program stream: wrong LSN, wrong
+                        //                          sector geometry, or a buffer that
+                        //                          only ever held decoder scratch
+                        //   ba > 0              -> the data IS there and IS valid.
+                        //                          Nothing is wrong with the read
+                        //                          path, and the question becomes who
+                        //                          was supposed to hand the buffer to
+                        //                          the demuxer and never did
+                        //
+                        // nzw alone proves nothing in either direction -- the work
+                        // buffer holds decoder state as well as stream data, so it is
+                        // nonzero on a starved machine too. ba is the discriminator;
+                        // nzw is there so a ba==0 reading arrives knowing whether it
+                        // is looking at an empty buffer or a wrong one
+                        // ([[feedback_degenerate_result_convicts_the_probe]]). bb/bd/
+                        // e0 are the system-header and PES codes, carried so that a
+                        // buffer holding stream data with a damaged FIRST pack still
+                        // reports as a program stream instead of as garbage.
+                        //
+                        // The gate is on geometry, and a failed gate still prints a
+                        // full row with gate=0 rather than vanishing.
+                        {
+                            uint32_t nzw = 0, ba = 0, bb = 0, bd = 0, e0 = 0;
+                            uint32_t fnz = 0xFFFFFFFFu, fba = 0xFFFFFFFFu;
+                            uint32_t h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+                            int gate = 0;
+                            uint32_t lim = 0;
+                            if (wrkAdr >= 0x00080000u && wrkAdr < 0x02000000u &&
+                                wrkSiz >= 0x1000u && wrkSiz <= 0x00400000u &&
+                                (wrkAdr + wrkSiz) <= 0x02000000u)
+                            {
+                                gate = 1;
+                                lim = wrkSiz & ~3u;
+                                try
+                                {
+                                    for (uint32_t o = 0; o < lim; o += 4u)
+                                    {
+                                        uint32_t w = m_memory.read32(wrkAdr + o);
+                                        if (w == 0u) { continue; }
+                                        ++nzw;
+                                        if (fnz == 0xFFFFFFFFu) { fnz = o; }
+                                        if (w == 0xBA010000u)
+                                        {
+                                            ++ba;
+                                            if (fba == 0xFFFFFFFFu) { fba = o; }
+                                        }
+                                        else if (w == 0xBB010000u) { ++bb; }
+                                        else if (w == 0xBD010000u) { ++bd; }
+                                        else if (w == 0xE0010000u) { ++e0; }
+                                    }
+                                    uint32_t hb = (fba != 0xFFFFFFFFu)
+                                                      ? fba
+                                                      : ((fnz != 0xFFFFFFFFu) ? fnz : 0u);
+                                    h0 = m_memory.read32(wrkAdr + hb + 0u);
+                                    h1 = m_memory.read32(wrkAdr + hb + 4u);
+                                    h2 = m_memory.read32(wrkAdr + hb + 8u);
+                                    h3 = m_memory.read32(wrkAdr + hb + 12u);
+                                }
+                                catch (const std::exception &)
+                                {
+                                }
+                            }
+                            std::cerr << "[sfdbuf] t=" << std::dec << (t + 1) << "s"
+                                      << " gate=" << gate
+                                      << " wA=0x" << std::hex << wrkAdr
+                                      << " wS=0x" << wrkSiz
+                                      << std::dec
+                                      << " nzw=" << nzw
+                                      << " ba=" << ba
+                                      << " bb=" << bb
+                                      << " bd=" << bd
+                                      << " e0=" << e0
+                                      << std::hex
+                                      << " fnz=0x" << fnz
+                                      << " fba=0x" << fba
+                                      << " h0=0x" << h0
+                                      << " h1=0x" << h1
+                                      << " h2=0x" << h2
+                                      << " h3=0x" << h3
+                                      << std::dec << std::endl;
+                        }
+
+                        // ---- [sfdsup] does anyone HAND the data to the demuxer --
+                        //
+                        // Run 80 answered [sfdbuf] and it came back the third way,
+                        // the one that moves the whole investigation:
+                        //
+                        //   gate=1 wA=0x1806c00 wS=0x332100
+                        //   nzw=256207 ba=366 bb=3 e0=307
+                        //   fba=0x61e40
+                        //   h0=0xba010000 h1=0x10021 h2=0x5278801 h3=0xbb010000
+                        //
+                        // 366 MPEG pack headers, 3 system headers, 307 video PES.
+                        // fba=0x61e40 is EXACTLY the offset of the read target
+                        // (0x1868a40 - 0x1806c00), so the sectors landed precisely
+                        // where they were aimed. And the first sixteen bytes decode
+                        // cleanly by hand: 00 00 01 BA, then 0x21, whose top nibble
+                        // 0010 is the MPEG-1 pack marker, then the SCR, then at
+                        // +12 -- the exact length of an MPEG-1 pack header -- the
+                        // system header 00 00 01 BB. This is not "some bytes are
+                        // present". This is a byte-exact, well-formed MPEG-1
+                        // program stream sitting in RAM.
+                        //
+                        // It is also LIVE. The counts step at t=128 (ba 360->366,
+                        // e0 246->307), drop to ba=0 at t=289, and refill at t=290
+                        // (ba=366, e0=313). Three movies, three fills. The read
+                        // path works, the SRD layer works, the sectors are real.
+                        //
+                        // So every one of the "starved" readings is dead. The data
+                        // is there and nobody eats it. That kills the reading the
+                        // 365-of-22659 oReq=0x0 anomaly was pointing at, and it is
+                        // worth saying plainly rather than quietly dropping it: the
+                        // supply layer was not the bug, and the memory-card-shaped
+                        // theory built on top of it was wrong.
+                        //
+                        // Which makes the question narrow and mechanical. The
+                        // decoder is told about new data in exactly one place --
+                        // sub_168320 @ 0x168320:
+                        //
+                        //     v5 = *(u32 *)(a1 + 14000);            // stream info
+                        //     if ( v5 && !obj_set_unk_z_j(a1) ) {
+                        //         table_set_by_stride(a1, 47, 0);
+                        //         if ( !*(u32 *)(v5 + 3512) ) table_set_by_stride(a1, 5, 0);
+                        //         if ( !*(u32 *)(v5 + 3516) ) table_set_by_stride(a1, 6, 0);
+                        //         *(u64 *)(a1 + 14004) = *(u64 *)a2;   // buf, size
+                        //         *(u32 *)(a1 + 14012) = *(u32 *)(a2 + 8);
+                        //         return noop_sub_b280(a1, 13);        // BROADCAST
+                        //     }
+                        //
+                        // That is the only writer of dec+14004/14008/14012 anywhere
+                        // in the image, and method 13 broadcast to all nine slots is
+                        // the only thing that could plausibly move slot+7984. If it
+                        // never runs, the slots stay zero, 0x165548 keeps returning
+                        // 0, dec+72 stays 2, and every symptom from run 74 onward
+                        // follows -- with a perfectly good buffer sitting untouched.
+                        //
+                        // There is already circumstantial evidence it never runs:
+                        // en[] read 0,1,1,1,1,1,1,1 in runs 79 and 80, and en[] is a
+                        // 400-byte template memcpy'd from dword_460F60 at
+                        // construction. If 0x168320 had ever executed it would have
+                        // called table_set_by_stride on index 5 or 6 (or 47) and we
+                        // would expect to see the template disturbed. But that is an
+                        // inference from an unread template, which is precisely the
+                        // kind of reasoning that has cost this project run cycles
+                        // before ([[feedback_gate_probe_on_shape_not_address]]), so
+                        // read the single-writer fields directly instead:
+                        //
+                        //   b0/b1/b2 all zero    -> 0x168320 NEVER RAN. The decoder
+                        //                           was never told the data exists.
+                        //                           The bug is entirely above it, in
+                        //                           whoever owns the read completion
+                        //                           and should be forwarding it
+                        //   b0 nonzero, slots 0  -> it DID run, the broadcast went
+                        //                           out, and the per-slot method 13
+                        //                           refused or dropped the data. The
+                        //                           bug moves inside that handler
+                        //   b0 nonzero and MOVING-> supply is running repeatedly and
+                        //                           being consumed, which would mean
+                        //                           slot+7984 is not the counter we
+                        //                           think it is and the geometry
+                        //                           needs re-deriving
+                        //
+                        // m[] and the mb bitmask answer the other half in the same
+                        // line. [sfdvt] proved method 11 has a recompiled body, but
+                        // method 11 is the frame FETCH; method 13 is the data
+                        // SUPPLY, and nothing has ever checked it. A method that is
+                        // only ever reached through a vtable and never as a jal
+                        // target is exactly the Stage 5.11 shape -- the unrecompiled
+                        // qsort comparator that returned a stale v0 for every call
+                        // and cost ~38 run cycles
+                        // ([[project_stage511_gsdump_replay]]). Dumping all sixteen
+                        // pointers with a hasFunction bit each settles it for the
+                        // whole handler at once instead of one method per run.
+                        //
+                        // sup=1 means dec+14000 is populated, i.e. 0x168320 would
+                        // pass its own first gate if it were called. s3512/s3516 are
+                        // the two fields that decide whether en[5]/en[6] get cleared,
+                        // so a b0==0 reading still arrives knowing what WOULD have
+                        // happened. The gate is on address shape and a failed gate
+                        // prints a full row rather than vanishing.
+                        if (obj >= 0x00080000u && obj < 0x02000000u)
+                        {
+                            uint32_t dcx = 0, sup = 0, vt6 = 0;
+                            uint32_t b0 = 0, b1 = 0, b2 = 0;
+                            uint32_t s3496 = 0, s3512 = 0, s3516 = 0, s3520 = 0;
+                            uint32_t m[16] = {0};
+                            uint32_t mb = 0;
+                            int gate = 0;
+                            try
+                            {
+                                dcx = m_memory.read32(obj + 60u);
+                                if (dcx >= 0x00080000u && dcx < 0x02000000u)
+                                {
+                                    gate = 1;
+                                    b0 = m_memory.read32(dcx + 14004u);
+                                    b1 = m_memory.read32(dcx + 14008u);
+                                    b2 = m_memory.read32(dcx + 14012u);
+                                    sup = m_memory.read32(dcx + 14000u);
+                                    if (sup >= 0x00080000u && sup < 0x02000000u)
+                                    {
+                                        s3496 = m_memory.read32(sup + 3496u);
+                                        s3512 = m_memory.read32(sup + 3512u);
+                                        s3516 = m_memory.read32(sup + 3516u);
+                                        s3520 = m_memory.read32(sup + 3520u);
+                                    }
+                                    vt6 = m_memory.read32(dcx + 68u * 6u + 7996u);
+                                    if (vt6 >= 0x00080000u && vt6 < 0x02000000u)
+                                    {
+                                        for (uint32_t i = 0; i < 16u; ++i)
+                                        {
+                                            m[i] = m_memory.read32(vt6 + 4u * i);
+                                            if (m[i] != 0u && hasFunction(m[i]))
+                                            {
+                                                mb |= (1u << i);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
+                            std::cerr << "[sfdsup] t=" << std::dec << (t + 1) << "s"
+                                      << " gate=" << gate
+                                      << " dec=0x" << std::hex << dcx
+                                      << " b0=0x" << b0
+                                      << " b1=0x" << b1
+                                      << " b2=0x" << b2
+                                      << " sup=0x" << sup
+                                      << " s3496=0x" << s3496
+                                      << " s3512=0x" << s3512
+                                      << " s3516=0x" << s3516
+                                      << " s3520=0x" << s3520
+                                      << " vt6=0x" << vt6
+                                      << " mb=0x" << mb
+                                      << " m13=0x" << m[13]
+                                      << " m=";
+                            for (uint32_t i = 0; i < 16u; ++i)
+                            {
+                                std::cerr << (i != 0u ? "," : "") << "0x" << m[i];
+                            }
+                            std::cerr << std::dec << std::endl;
+                        }
+
+                        // ---- [sfdapi] body check + pointer hunt ---------------
+                        //
+                        // Run 81 closed [sfdsup] as cleanly as this project has
+                        // ever closed anything. The reading, all 69 samples,
+                        // t=80 through t=295, not one variation:
+                        //
+                        //   gate=1 dec=0x1b12cc0
+                        //   b0=0x0 b1=0xfffffffd b2=0x1 sup=0x0
+                        //   vt6=0x4bf780 mb=0x3fff m13=0x16c690
+                        //
+                        // Compare that against the constructor for those exact
+                        // four words, sub_1679D8 @ 0x1679D8, which the object
+                        // constructor calls as mem_fill_unk_z_z_8(dec + 14000):
+                        //
+                        //     a1[0] = 0;   a1[1] = 0;
+                        //     a1[2] = -3;  a1[3] = 1;
+                        //
+                        // dec+14000 = 0, dec+14004 = 0, dec+14008 = 0xfffffffd
+                        // (= -3), dec+14012 = 1. Word for word, sign and all,
+                        // the values sub_1679D8 leaves behind. Not "looks
+                        // uninitialised" -- provably untouched since
+                        // construction. Nothing in the guest has written a
+                        // single one of those four words in five minutes of
+                        // runtime, across three separate movies.
+                        //
+                        // So the three-way split resolves to branch one, and it
+                        // resolves harder than expected. sub_168320 never ran.
+                        // But neither did sub_167B68 @ 0x167B68, the only writer
+                        // of dec+14000 in the image -- so even if 0x168320 were
+                        // called this instant it would read v5 = 0, fail its
+                        // first gate, and return without storing the buffer. The
+                        // supply path is not merely idle, it is structurally
+                        // unable to run: its precondition was never established.
+                        //
+                        // Two things are now ruled out and should not be
+                        // re-derived. mb=0x3fff means methods 0..13 of the slot
+                        // 6 vtable all have recompiled bodies, so method 13 is
+                        // not a Stage 5.11 casualty. And m[11]=0x16c620 is
+                        // wrap_sub_159090, the frame-fetch we identified
+                        // independently runs ago -- which means the slot
+                        // geometry (dec + 7984 + 68*i, +12 vtable) is correct.
+                        // Two hypotheses dead, one of them cheaply.
+                        //
+                        // Where it goes next is the awkward part. Both
+                        // 0x167B68 and 0x168320 have zero call sites in the
+                        // decompile, and so does 0x1679F8, which walks a pool at
+                        // stride 3544 -- exactly the size of the object
+                        // dec+14000 points to, given its fields run to +3540.
+                        // Three functions of one cluster, none of them called by
+                        // anything. That is not three separate accidents; that
+                        // is an entry-point family reached some other way. The
+                        // slot 6 vtable holds 0x16Cxxx thunks, not these, so
+                        // it is some other table.
+                        //
+                        // Which raises the question that has to be answered
+                        // before another theory gets built: does 0x168320 even
+                        // HAVE a body? Every hasFunction check so far has gone
+                        // through the slot vtables. This cluster has never been
+                        // asked. If the answer is no, then a JALR through
+                        // whatever table holds the pointer returns a stale v0
+                        // and writes nothing -- which is precisely the shape
+                        // that cost this project thirty-eight run cycles at
+                        // Stage 5.11, and it would explain the virgin fields
+                        // without needing a caller at all
+                        // ([[project_stage511_gsdump_replay]]).
+                        //
+                        // The scan is the other half. If a body exists, the
+                        // pointer has to live somewhere, and the address holding
+                        // it names the table -- and the table names the caller.
+                        // One pass over RDRAM, once per process, is cheap
+                        // compared to another run spent guessing. Both target
+                        // words are scanned rather than one, because finding
+                        // 0x167B68 in a table 0x168320 is absent from (or the
+                        // reverse) is itself a strong signal about which entry
+                        // point the game is wired to reach.
+                        {
+                            static const uint32_t kApi[16] = {
+                                0x1679D8u, 0x1679F8u, 0x167B68u, 0x167BC0u,
+                                0x167D38u, 0x168288u, 0x168320u, 0x168938u,
+                                0x16B280u, 0x16B318u, 0x165300u, 0x165458u,
+                                0x165488u, 0x165548u, 0x16C620u, 0x16C690u};
+                            static bool apiDone = false;
+                            if (!apiDone)
+                            {
+                                apiDone = true;
+                                uint32_t hb = 0;
+                                for (uint32_t i = 0; i < 16u; ++i)
+                                {
+                                    if (hasFunction(kApi[i]))
+                                    {
+                                        hb |= (1u << i);
+                                    }
+                                }
+                                std::cerr << "[sfdapi] t=" << std::dec << (t + 1)
+                                          << "s hb=0x" << std::hex << hb
+                                          << " (bit6=0x168320 bit2=0x167B68)"
+                                          << std::dec << std::endl;
+
+                                // One-shot pointer hunt. A word equal to an
+                                // entry point is either a dispatch table slot or
+                                // a jal-encoded immediate; either way the
+                                // address is a lead, and zero hits is itself the
+                                // answer that nothing in RAM refers to it.
+                                uint32_t n320 = 0, nB68 = 0;
+                                uint32_t a320[8] = {0}, aB68[8] = {0};
+                                try
+                                {
+                                    for (uint32_t a = 0x00080000u;
+                                         a < 0x02000000u; a += 4u)
+                                    {
+                                        uint32_t w = m_memory.read32(a);
+                                        if (w == 0x00168320u)
+                                        {
+                                            if (n320 < 8u)
+                                            {
+                                                a320[n320] = a;
+                                            }
+                                            ++n320;
+                                        }
+                                        else if (w == 0x00167B68u)
+                                        {
+                                            if (nB68 < 8u)
+                                            {
+                                                aB68[nB68] = a;
+                                            }
+                                            ++nB68;
+                                        }
+                                    }
+                                }
+                                catch (const std::exception &)
+                                {
+                                }
+                                std::cerr << "[sfdptr] n320=" << std::dec << n320
+                                          << " nB68=" << nB68 << std::hex;
+                                std::cerr << " a320=";
+                                for (uint32_t i = 0; i < 8u; ++i)
+                                {
+                                    std::cerr << (i != 0u ? "," : "")
+                                              << "0x" << a320[i];
+                                }
+                                std::cerr << " aB68=";
+                                for (uint32_t i = 0; i < 8u; ++i)
+                                {
+                                    std::cerr << (i != 0u ? "," : "")
+                                              << "0x" << aB68[i];
+                                }
+                                std::cerr << std::dec << std::endl;
+                            }
+                        }
+                    }
+
+                    // ---- [mvgate] which gate stops the movie tick ------------
+                    //
+                    // Run 84 moved this from a value question to a structural
+                    // one, and the numbers are not close. The class-5/6 callback
+                    // registry is alive and hammering: sub_155320 -- the movie
+                    // per-object update -- was dispatched 909,186 times in 300 s
+                    // (8 slots x 113,719 ticks). It reached the state machine
+                    // sub_165300 exactly THREE times. Once per movie.
+                    //
+                    // That kills the run-83 reading outright, and it should be
+                    // said plainly rather than quietly dropped: we were never
+                    // "stuck in state 1 with dec+76 < 2". [sfdst] reads dec+72=2
+                    // from t=83 s onward, which is exactly what PCSX2 shows on
+                    // real hardware. The single tick we get DOES advance the
+                    // ladder 1 -> 2, correctly. State 2's handler 0x165488 then
+                    // never runs for one reason only: dispatching it requires a
+                    // SECOND tick, and no second tick ever happens.
+                    //
+                    // Five gates stand between sub_155320 and the tick:
+                    //
+                    //   1. [0x45F674] == 1        global "movie system enabled"
+                    //   2. obj != 0
+                    //   3. obj->+0  == 1          this slot is playing
+                    //   4. obj->+96 != 1          per-object re-entrancy latch
+                    //   5. [0x45F69C] != 1        global pause  (0x14E4D0()+36)
+                    //
+                    // Coverage places the failure precisely. 0x155520 -- the
+                    // one-instruction getter for gate 4 -- ran 113,711 times, so
+                    // gates 1..3 pass on essentially every tick. And 0x155518,
+                    // the ONLY writer of +96, ran 9 times: three from 0x14C598
+                    // (which passes a1=0, always a clear) and 2N from the tail
+                    // block, one set and one clear per entry. 2N + 3 = 9 gives
+                    // N = 3, matching the three dispatches of 0x165250 exactly.
+                    // So the tail was entered 3 times out of 113,711 chances,
+                    // and gate 4 or gate 5 ate the other 113,708.
+                    //
+                    // Static cannot finish this one. Both gates read balanced:
+                    // every setPause site (0x14E92C, 0x154A1C, 0x155648) is a
+                    // matched set(1) ... work ... set(0) pair, 0x1555A0 ran an
+                    // even 18 times, and 0x14C598 only ever clears. On paper
+                    // both words end at 0. One of them does not, at runtime.
+                    //
+                    // Counts cannot say which -- 0x155520 and 0x1555E8 each have
+                    // two call sites, and BOTH attributions fit the totals to the
+                    // digit (113,711 + 9 = 113,720). That is the same wall the
+                    // order trace was built for, except order cannot separate two
+                    // callers of one address either. So read the words.
+                    //
+                    // The geometry is unusually safe here, which is the point.
+                    // sub_155210 computes the slot array as s1+108 where s1 is
+                    // the return of 0x14E4D0 -- and 0x14E4D0 is three
+                    // instructions, "lui v0,0x46; jr ra; addiu v0,v0,-2440", a
+                    // constant. So the eight objects sit at 0x45F6E4 + 772*i,
+                    // fixed, with no pointer chase and nothing inferred from a
+                    // live value ([[feedback_probe_gate_on_shape_not_address]]).
+                    //
+                    // f0 is the shape gate and it referees the whole probe: gates
+                    // 1..3 passing 113,711 times per run means EXACTLY ONE slot
+                    // must read f0=1. If none do, or several do, the stride or
+                    // the base is wrong and every other column here is fiction --
+                    // so print all eight rows and let them convict the probe if
+                    // they disagree ([[feedback_degenerate_result_convicts_the_probe]]).
+                    //
+                    // Printed every sample rather than once, because the failure
+                    // mode we are chasing IS a value that changes: a latch that
+                    // is set and never cleared looks identical to one that was
+                    // never set if you only ever see the end state.
+                    //
+                    //   g36 == 1 persistently  -> gate 5. The global pause is
+                    //                             stuck, and the culprit is
+                    //                             whichever setPause pair had its
+                    //                             middle call fail to return
+                    //   +96 == 1 persistently  -> gate 4. The re-entrancy latch
+                    //                             never got cleared; a tick that
+                    //                             unwound early would do it
+                    //   both 0, f0 == 1        -> gates 1..5 all pass and the
+                    //                             tick SHOULD be happening; the
+                    //                             bug is then in our dispatch of
+                    //                             0x165250, not in the guest
+                    //   no slot with f0 == 1   -> probe geometry is wrong, stop
+                    //
+                    // Added after the 08-21 PCSX2 session, which turned the
+                    // gate-4-or-gate-5 question into a sharper one. Counting
+                    // settled it on paper: 0x1551E0 and 0x155178 each have
+                    // exactly ONE caller, so their counts are clean, and every
+                    // consistent split of 0x1555E8's 113,720 reads ends the
+                    // same way -- [0x45F69C] returns 1 for essentially every
+                    // read of the run. Gate 5 is shut.
+                    //
+                    // But the WRITE side flatly contradicts that, and the
+                    // contradiction is the actual finding. 0x1555A0 is the only
+                    // writer of that word in the whole image (eeref finds no
+                    // direct-addressed store either), it ran 18 times, and 18
+                    // is exactly what its three call sites account for:
+                    // 0x155630 ran 7 (x2 = 14) and sub_14E8B0 ran 2 (x2 = 4),
+                    // with sub_1549C0 never running at all. Every set(1) has
+                    // its matching set(0). The game cannot be leaving its own
+                    // pause flag at 1.
+                    //
+                    // So something that is not the game is writing 0x45F69C,
+                    // and rate/g80 are here to say so without costing a run.
+                    // PCSX2 at the main menu holds these EXACT values:
+                    //
+                    //   [0x45F674] = 1           [0x45F678] = 0
+                    //   [0x45F67C] = 0x426FC28F  (59.94f, the frame rate)
+                    //   [0x45F680] = 1           [0x45F69C] = 0
+                    //
+                    // 0x426FC28F is a specific float sitting six words from the
+                    // flag, so it is a good canary: a stray memset, a misaimed
+                    // DMA or an OOB store big enough to reach the flag will
+                    // almost certainly take the frame rate with it.
+                    //
+                    //   rate wrong (REGION-CLOBBERED) -> foreign bulk write;
+                    //                                   go arm a data
+                    //                                   breakpoint on 0x45F69C
+                    //   rate right but g36 == 1       -> a single targeted store;
+                    //                                   the imbalance is real and
+                    //                                   0x1555A0's own count is
+                    //                                   what to distrust next
+                    //   g36 == 0 throughout          -> the read-side arithmetic
+                    //                                   above is wrong; gate 4 is
+                    //                                   back on the table
+                    {
+                        uint32_t g36 = 0, gEn = 0, gRate = 0, g80 = 0;
+                        uint32_t f0[8] = {0}, f92[8] = {0}, f96[8] = {0}, f100[8] = {0};
+                        int live = -1;
+                        int nLive = 0;
+                        try
+                        {
+                            gEn = m_memory.read32(0x0045F674u);
+                            g36 = m_memory.read32(0x0045F69Cu);
+                            // Neighbours of the pause word, used as a
+                            // clobber canary -- see the note above.
+                            gRate = m_memory.read32(0x0045F67Cu);
+                            g80 = m_memory.read32(0x0045F680u);
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                const uint32_t o = 0x0045F6E4u + 772u * i;
+                                f0[i] = m_memory.read32(o + 0u);
+                                f92[i] = m_memory.read32(o + 92u);
+                                f96[i] = m_memory.read32(o + 96u);
+                                f100[i] = m_memory.read32(o + 100u);
+                                if (f0[i] == 1u)
+                                {
+                                    ++nLive;
+                                    if (live < 0)
+                                    {
+                                        live = static_cast<int>(i);
+                                    }
+                                }
+                            }
+                        }
+                        catch (const std::exception &)
+                        {
+                        }
+                        std::cerr << "[mvgate] t=" << std::dec << (t + 1) << "s"
+                                  << " en=" << gEn
+                                  << " g36=" << g36
+                                  << " rate=0x" << std::hex << gRate << std::dec
+                                  << " g80=" << g80
+                                  << (gRate != 0x426FC28Fu ? " REGION-CLOBBERED" : "")
+                                  << " nLive=" << nLive
+                                  << " live=" << live;
+                        if (nLive != 1)
+                        {
+                            std::cerr << " GEOMETRY-SUSPECT(expected exactly one"
+                                         " f0==1; treat every field below as"
+                                         " unverified)";
+                        }
+                        if (live >= 0)
+                        {
+                            std::cerr << " L.f92=" << f92[live]
+                                      << " L.f96=" << f96[live]
+                                      << " L.f100=" << f100[live];
+                        }
+                        std::cerr << " f0=";
+                        for (uint32_t i = 0; i < 8u; ++i)
+                        {
+                            std::cerr << (i != 0u ? "," : "") << f0[i];
+                        }
+                        std::cerr << " f96=";
+                        for (uint32_t i = 0; i < 8u; ++i)
+                        {
+                            std::cerr << (i != 0u ? "," : "") << f96[i];
+                        }
+                        std::cerr << std::endl;
+                    }
+
+                    // ---- [mvslot] MovieCreate's own failure ladder, not the
+                    // MovieUpdate gates above --
+                    //
+                    // 0x54BD90 (our [movie] obj field) reads 0 across every
+                    // sample despite wrkAdr=0x1806c00 being populated, so
+                    // MovieCreate (0x113AA0) is running and its own callee,
+                    // module_obj_init_z_42 (0x14C328), is returning 0. That
+                    // function has one silent failure path (complex_init_m()
+                    // != 1, no Printf at all) plus several that DO Printf --
+                    // but the game's own Printf() is not wired into our log
+                    // (confirmed: none of its E-codes, e.g. "E4061801",
+                    // appear anywhere in a run that shows the [movie] probe's
+                    // OWN hardcoded cerr text), so an absent error string is
+                    // not evidence either way here.
+                    //
+                    // What IS readable: module_obj_init_z_42 allocates its
+                    // object at a FIXED pool slot, not a heap pointer. The
+                    // pool base is a compiled-in constant (0x45F678, see the
+                    // [mvgate] note above -- get_data_ptr() is a 3-instruction
+                    // "return literal", not a load), slot stride is 772, and
+                    // MovieCreate's own free-slot search enters its walk only
+                    // when slot 0 already reads occupied (f0[0]==1); every
+                    // [mvgate] sample this run shows f0[0]==0, so it takes the
+                    // fast path and uses slot 0 (0x45F6E4) directly -- no
+                    // pointer chase needed here either.
+                    //
+                    // Inside module_obj_init_z_42, once complex_init_m()
+                    // passes, execution writes breadcrumbs into that same
+                    // slot IN ORDER before any of them are checked:
+                    //   +60   = mem_fill_z(v7,a1)              result
+                    //           (also reused as a SIF bind handle two lines
+                    //           later -- 0 here means the very first
+                    //           allocation/bind call already failed)
+                    //   +448  = wrap_noop_wrapper_k_0(v7)       result
+                    //   +480  = noop_wrapper___315(0,0)         result
+                    //   +64   = noop_wrapper___480(v7+448)      result (silent
+                    //           fail if 0 -- no error string exists for this
+                    //           one in the ELF)
+                    //   +168  = wrap_noop_wrapper_unk_z_z_152(...) result
+                    // and on full success the function finally does
+                    // `*(u32*)v7 = 1`, i.e. f0[slot] flips to 1 -- which we
+                    // already know never happens this run.
+                    //
+                    // These are unconditional stores made before each gate
+                    // reads them back, so whichever of the five reads 0 while
+                    // everything before it is nonzero is the exact failing
+                    // call -- no build-time branch tracing needed, just RAM.
+                    {
+                        uint32_t mc60 = 0, mc448 = 0, mc480 = 0, mc64 = 0, mc168 = 0;
+                        try
+                        {
+                            const uint32_t slot = 0x0045F6E4u;
+                            mc60 = m_memory.read32(slot + 60u);
+                            mc448 = m_memory.read32(slot + 448u);
+                            mc480 = m_memory.read32(slot + 480u);
+                            mc64 = m_memory.read32(slot + 64u);
+                            mc168 = m_memory.read32(slot + 168u);
+                        }
+                        catch (const std::exception &)
+                        {
+                        }
+                        std::cerr << "[mvslot] t=" << std::dec << (t + 1) << "s"
+                                  << " slot0+60(allocBind)=" << mc60
+                                  << " +448(k0)=" << mc448
+                                  << " +480(315)=" << mc480
+                                  << " +64(480,silent)=" << mc64
+                                  << " +168(152)=" << mc168
+                                  << std::endl;
+                    }
+
+                    // ---- [thsync] the handshake sub_11E690 actually spins on --
+                    //
+                    // Stage 5.17, run 86. This replaces the run-85 reading, which
+                    // said the game was "alternately resuming and waking a worker
+                    // thread indefinitely" and sent the next lane at Thread.cpp.
+                    // The log it was drawn from says otherwise: across t=132..137
+                    // the trace contains 0x174ba0 (ReferThreadStatus) and NEITHER
+                    // 0x174bd0 (WakeupThread) NOR 0x174c30 (ResumeThread). No kick
+                    // was ever issued, so "the kick never lands" was never tested.
+                    //
+                    // Decoded from the ELF, the two helpers are conditional:
+                    //   0x11ed28  if (status == 4 || status == 0xc) WakeupThread
+                    //   0x11ed90  if (status == 8 || status == 0xc) ResumeThread
+                    // Neither firing means the worker's status is not WAIT and not
+                    // SUSPEND -- i.e. the game believes it is already runnable.
+                    //
+                    // sub_11E690 is a synchronous cross-thread handshake:
+                    //   [0x441924] = 1                 raise request
+                    //   ChangeThreadPriority(tid, [0x4418F0])   boost worker
+                    //   loop: kick; if ([0x441924] == 0) break;
+                    //         if (++n > 199,999,999) -> error 0x4B8720
+                    // and sub_11EAC8 is the other half -- the acknowledger:
+                    //   if ([0x4419D8] != 0) return;   <-- skips the ACK entirely
+                    //   [0x441960]++; [0x441934] = 1;
+                    //   jal 0x13c6e8                   <-- the work (calls 0x155320)
+                    //   [0x441934] = 0;
+                    //   if ([0x441924] == 1) [0x441924] = 0;   <-- the ACK
+                    //
+                    // So the movie gate and this spin are ONE mechanism: 0x13c6e8
+                    // is what drives the movie pump. The spin's only syscall is
+                    // ReferThreadStatus, which does not yield, and the one call
+                    // that does (ChangeThreadPriority) sits OUTSIDE the loop. On
+                    // real EE the boosted worker preempts the spinner; we have no
+                    // preemption, and yield_point's maybe_yield() only switches to
+                    // a higher-priority READY fiber -- a Blocked worker is
+                    // invisible to it. Corroborated in the same log: res/s falls to
+                    // 1-3 while progress climbs ~40x, i.e. yield_point is sampled
+                    // ~21,000x/s and yields ~1-3x/s.
+                    //
+                    // Every address here is a fixed absolute materialized by a
+                    // lui+addiu pair in the image (eeref: 3 sites, all lui+lo), so
+                    // there is no pointer chase and nothing inferred from a live
+                    // value ([[feedback_probe_gate_on_shape_not_address]]).
+                    //
+                    // Printed unconditionally every sample, with no gate: a probe
+                    // that only speaks when it thinks something is wrong cannot be
+                    // told from a probe that did not compile in
+                    // ([[feedback_capped_probes_false_negatives]]). inWork is the
+                    // rival-reading field -- it is set only for the duration of the
+                    // work call, so it separates "worker never ran" from "worker
+                    // ran and is stuck inside" without a second run
+                    // ([[feedback_degenerate_result_convicts_the_probe]]).
+                    {
+                        uint32_t req = 0u, inWork = 0u, gateLo = 0u, gateHi = 0u;
+                        uint32_t tickLo = 0u, tickHi = 0u, boost = 0u;
+                        bool memOk = true;
+                        try
+                        {
+                            req    = m_memory.read32(0x00441924u); // request flag
+                            inWork = m_memory.read32(0x00441934u); // set around the work call
+                            gateLo = m_memory.read32(0x004419D8u); // 64-bit early-out gate
+                            gateHi = m_memory.read32(0x004419DCu);
+                            tickLo = m_memory.read32(0x00441960u); // 64-bit worker tick counter
+                            tickHi = m_memory.read32(0x00441964u);
+                            boost  = m_memory.read32(0x004418F0u); // priority handed to the boost
+                        }
+                        catch (const std::exception &)
+                        {
+                            memOk = false;
+                        }
+
+                        const uint64_t tick =
+                            (static_cast<uint64_t>(tickHi) << 32) | tickLo;
+                        const bool gated = (gateLo != 0u) || (gateHi != 0u);
+
+                        static bool s_thsyncArmed = false;
+                        static uint32_t s_prevReq = 0xFFFFFFFFu;
+                        static uint64_t s_prevTick = 0ull;
+                        static bool s_havePrev = false;
+
+                        if (!s_thsyncArmed)
+                        {
+                            s_thsyncArmed = true;
+                            std::cerr << "[thsync] armed req@0x441924 inWork@0x441934"
+                                         " gate@0x4419D8 tick@0x441960 boost@0x4418F0"
+                                         " spinner=sub_11E690 acker=sub_11EAC8"
+                                      << std::endl;
+                        }
+
+                        const uint64_t dTick = s_havePrev ? (tick - s_prevTick) : 0ull;
+
+                        std::cerr << "[thsync] t=" << std::dec << (t + 1) << "s"
+                                  << (memOk ? "" : " MEM-UNREADABLE")
+                                  << " req=" << req
+                                  << " inWork=" << inWork
+                                  << " gate=0x" << std::hex << gateHi << "_"
+                                  << gateLo << std::dec
+                                  << " tick=" << tick
+                                  << " dTick=" << dTick
+                                  << " boost=" << boost
+                                  << " idle=" << ps2x_guest_idle()
+                                  << " tokW=" << ps2sched::host_token_waiters();
+
+                        if (s_havePrev && req != s_prevReq)
+                        {
+                            std::cerr << " REQ-CHANGED(" << s_prevReq << "->" << req << ")";
+                        }
+
+                        // The pre-committed decision table, evaluated inline so the
+                        // log states its own conclusion. Written before the run, so
+                        // a later reading cannot be fitted to whatever came back.
+                        if (memOk && req == 1u)
+                        {
+                            if (gated)
+                            {
+                                std::cerr << " VERDICT=WORKER-GATED"
+                                             "(acker early-outs before the ACK;"
+                                             " fix the gate's producer, not the scheduler)";
+                            }
+                            else if (inWork == 1u)
+                            {
+                                std::cerr << " VERDICT=WORKER-INSIDE-WORK"
+                                             "(stuck in 0x13c6e8; blocker moved into"
+                                             " the movie pump)";
+                            }
+                            else if (dTick == 0ull && s_havePrev)
+                            {
+                                std::cerr << " VERDICT=WORKER-NOT-RUNNING"
+                                             "(request up, worker never ticked;"
+                                             " read the thread table below)";
+                            }
+                        }
+
+                        // Thread table. getThreadDebugSnapshot() already exists for
+                        // the RecompDebugger and returns exactly these fields, but
+                        // its only caller sits inside the RecompDbg block, which is
+                        // dead under -NoDebugger -- so the data source was already
+                        // here and only the emit was missing. status/waitType are
+                        // what separate "Blocked on something" from "Ready but never
+                        // scheduled"; currentPriority checks whether the guest's
+                        // boost actually outranks the spinner.
+                        const std::vector<ps2_syscalls::ThreadDebugSnapshot> th =
+                            ps2_syscalls::getThreadDebugSnapshot();
+                        std::cerr << " nTh=" << th.size();
+                        for (const ps2_syscalls::ThreadDebugSnapshot &s : th)
+                        {
+                            std::cerr << " [" << std::dec << s.tid
+                                      << ":st=" << s.status
+                                      << ",wt=" << s.waitType
+                                      << ",wid=" << s.waitId
+                                      << ",pri=" << s.currentPriority
+                                      << ",pc=0x" << std::hex << s.currentPc
+                                      << std::dec << "]";
+                        }
+                        std::cerr << std::endl;
+
+                        s_prevReq = req;
+                        s_prevTick = tick;
+                        s_havePrev = true;
+                    }
+
+                    // ---- [cblist] what 0x13c6e8 actually runs -----------------
+                    //
+                    // Stage 5.17, runs A-D (2026-08-24). [thsync] reports
+                    // inWork=1 for seconds at a time and its verdict string calls
+                    // 0x13c6e8 "the movie pump". Decoding it says otherwise:
+                    //
+                    //   0x13c6d0  addiu $a0,$zero,5 ; j 0x13c4f8   (24 bytes)
+                    //   0x13c6e8  addiu $a0,$zero,6 ; j 0x13c4f8   (24 bytes)
+                    //   0x13c700  addiu $a0,$zero,7 ; j 0x13c4f8   (24 bytes)
+                    //
+                    // 0x13c6e8 is a thunk. The real body is 0x13c4f8, a generic
+                    // "run callback list N" dispatcher, decoded field by field
+                    // ([[feedback_verify_translations_by_decoding]]):
+                    //
+                    //   v0 = ((a0<<3)+a0)<<3        = a0*72   list stride
+                    //   s0 = 0x54E960 + a0*72                 list base
+                    //   s1 = 0x45EFE8 + a0*4                  per-list busy flag
+                    //   s2 = 5 ; loop while --s2 >= 0         => SIX entries
+                    //   each entry is 12 bytes: {fn, arg, ?}
+                    //   if (fn) { [s1]=1; v0 = fn(arg); [s1]=0; s3 |= v0; }
+                    //   [0x45EFC8 + a0*4]++                   per-list tick
+                    //   return s3
+                    //
+                    // So the six function pointers in list 6 ARE the work, they are
+                    // registered at runtime, and no run has ever read them. That is
+                    // the difference between "the pump is slow" and "the pump has a
+                    // null slot where a callback should be" -- and [ipu:cmd] says
+                    // the IPU gets SETIQ/SETVQ/SETTH and then never a decode, which
+                    // is exactly what a missing pump callback would look like.
+                    //
+                    // Every address here is a fixed absolute materialized by lui+addiu
+                    // in the image, not a live pointer chase
+                    // ([[feedback_probe_gate_on_shape_not_address]]). Printed
+                    // unconditionally so a silent probe cannot pass for a null result
+                    // ([[feedback_capped_probes_false_negatives]]).
+                    {
+                        constexpr uint32_t kListBase = 0x0054E960u; // + N*72
+                        constexpr uint32_t kTickBase = 0x0045EFC8u; // + N*4
+                        constexpr uint32_t kBusyBase = 0x0045EFE8u; // + N*4
+
+                        static bool s_cbArmed = false;
+                        if (!s_cbArmed)
+                        {
+                            s_cbArmed = true;
+                            std::cerr << "[cblist] armed dispatcher=0x13c4f8"
+                                         " lists@0x54E960 stride=72 entries=6 esz=12"
+                                         " tick@0x45EFC8 busy@0x45EFE8"
+                                         " thunks 0x13c6d0/0x13c6e8/0x13c700 = list 5/6/7"
+                                      << std::endl;
+                        }
+
+                        bool cbOk = true;
+                        auto rd = [&](uint32_t a) -> uint32_t {
+                            try { return m_memory.read32(a); }
+                            catch (const std::exception &) { cbOk = false; return 0u; }
+                        };
+
+                        std::cerr << "[cblist] t=" << std::dec << (t + 1) << "s"
+                                  << (cbOk ? "" : " MEM-UNREADABLE");
+
+                        // All eight lists, compactly: tick + how many of the six
+                        // slots hold a non-null fn. A list whose tick climbs but
+                        // whose fill is 0 is being dispatched into nothing.
+                        for (uint32_t n = 0; n < 8u; ++n)
+                        {
+                            uint32_t fill = 0u;
+                            for (uint32_t e = 0; e < 6u; ++e)
+                            {
+                                if (rd(kListBase + n * 72u + e * 12u) != 0u) ++fill;
+                            }
+                            std::cerr << " L" << n << "=" << std::dec
+                                      << rd(kTickBase + n * 4u) << "/" << fill
+                                      << (rd(kBusyBase + n * 4u) ? "*" : "");
+                        }
+
+                        // List 6 in full -- the one [thsync] catches the worker in.
+                        std::cerr << " L6:";
+                        for (uint32_t e = 0; e < 6u; ++e)
+                        {
+                            const uint32_t base = kListBase + 6u * 72u + e * 12u;
+                            std::cerr << " [" << std::dec << e << "]fn=0x" << std::hex
+                                      << rd(base) << ",a=0x" << rd(base + 4u)
+                                      << std::dec;
+                        }
+                        std::cerr << std::endl;
+
+                        // ---- [pump] which gate the movie pump bails at ----------
+                        //
+                        // Run 2026-08-24 15:57 proved [cblist] L6 tick IS [thsync]
+                        // tick (t=124->1/1, 127->3/3, 142->5/5, 147->6/6), and that
+                        // list 6 holds exactly ONE callback: 0x154fa8. So the entire
+                        // "movie pump" is that one function. Decoded field by field
+                        // ([[feedback_verify_translations_by_decoding]]):
+                        //
+                        //   0x14e4d0: return 0x45F678                  <- movie base
+                        //   0x154ff0: return [base+0x10]               = [0x45F688]
+                        //   0x1556f8: return [base+0x188C]             = [0x460F04]
+                        //
+                        //   0x154fa8 (the registered callback):
+                        //     if ([0x45F688] == 1) return 0;           // SKIP flag
+                        //     return f_155210();
+                        //
+                        //   0x155210 (the body):
+                        //     if ([0x45F674] != 1) return 0;           // master enable
+                        //     if (f_1548a0(base+0x58) != 1) return 0;  // object state
+                        //     f_155148();
+                        //     if (f_1556f8() == 1) skip stream loop;   // [0x460F04]
+                        //     for (i=7;i>=0;--i) f_155320(0x45F6E4 + i*0x304);
+                        //
+                        //   0x1548a0 tail-jumps 0x13c880, which is:
+                        //     v0 = [0x54EBF8];                         // runtime fn ptr
+                        //     if (v0) return v0(a0); else return f_13bc10(a0);
+                        //
+                        // The t=190 watchdog trace reads "0x13c880 -> 0x13bc10",
+                        // i.e. the NULL-pointer fallback -- hypothesis, and hook=0x0
+                        // below is what confirms or kills it.
+                        //
+                        // Every address is a fixed absolute materialized by lui+addiu
+                        // in the image, not a live pointer chase
+                        // ([[feedback_probe_gate_on_shape_not_address]]). Printed
+                        // unconditionally so silence cannot pass for a null result
+                        // ([[feedback_capped_probes_false_negatives]]).
+                        {
+                            constexpr uint32_t kMovieBase = 0x0045F678u;
+                            constexpr uint32_t kEnable    = 0x0045F674u; // base-4
+                            constexpr uint32_t kSkip      = kMovieBase + 0x10u;
+                            constexpr uint32_t kNoStream  = kMovieBase + 0x188Cu;
+                            constexpr uint32_t kObj       = kMovieBase + 0x58u;
+                            constexpr uint32_t kStream0   = kMovieBase + 0x6Cu;
+                            constexpr uint32_t kHook13c880 = 0x0054EBF8u;
+
+                            // ---- second hook, added after the 16:13 run --------
+                            //
+                            // hook(0x54EBF8)=0x0 held for all 202 samples, but that
+                            // is the DESIGNED state, not a missing registration:
+                            // its only writer 0x13c8fc sits in 0x13c8e8, whose only
+                            // caller 0x13c920 passes a0=0, and eeref reports 0x13c910
+                            // UNREACHABLE. So 0x13c880 always takes its fallback
+                            // 0x13bc10 -> 0x13bb20, and THAT is the real gate:
+                            //
+                            //   0x13bb20:  v0 = 0x54EBE0
+                            //              if ([v0] == 0) goto 0x13bb70;  // v0 kept
+                            //              jalr [v0] (a0 = [v0+4])
+                            //              if ([0x45EFC0] == 0) [0x45EFC4] = arg;
+                            //              v0 = [0x45EFC0] + 1; [0x45EFC0] = v0;
+                            //   0x13bb70:  jr $ra          // $v0 NEVER set here
+                            //
+                            // Null  -> returns 0x54EBE0 (the address itself).
+                            // Bound -> first call returns exactly 1.
+                            // 0x155264 daddu $s0,$v0 then bne $s0,$s2 (s2=1), so the
+                            // movie body bails to 0x155308 on anything but 1.
+                            //
+                            // Registrar is 0x13c4c8 (sw a0,0(v0); sw a1,4(v0)),
+                            // called from ADX_Init+0x50, sub_11F448+0x64,
+                            // sub_11FE90+0x44, sub_120080+0x74. 0x13c750 memsets
+                            // 0x54EBE0 for 8 bytes -- if that init runs AFTER the
+                            // ADX registration it wipes it, which h2/h2a distinguish
+                            // from "never registered" by whether they are ever
+                            // non-zero at any sample.
+                            constexpr uint32_t kHook13bb20 = 0x0054EBE0u;
+                            constexpr uint32_t kHook13bb20Arg = 0x0054EBE4u;
+                            constexpr uint32_t kCallCount  = 0x0045EFC0u;
+
+                            std::cerr << "[pump] t=" << std::dec << (t + 1) << "s"
+                                      << " en=" << rd(kEnable)
+                                      << " skip=" << rd(kSkip)
+                                      << " nostream=" << rd(kNoStream)
+                                      << " hook=0x" << std::hex << rd(kHook13c880)
+                                      << " h2=0x" << rd(kHook13bb20)
+                                      << " h2a=0x" << rd(kHook13bb20Arg)
+                                      << " n=0x" << rd(kCallCount)
+                                      << " obj=0x" << rd(kObj) << std::dec;
+                            std::cerr << " s:";
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                std::cerr << " " << std::hex
+                                          << rd(kStream0 + i * 0x304u) << std::dec;
+                            }
+                            std::cerr << std::endl;
+                        }
+                    }
+
                     // Coverage is scanned every tick for the inline cov= fields,
                     // but only written to the structured sink every 10s -- the
                     // summary is what the watchdog line needs, and the sink is
@@ -3040,12 +5198,25 @@ void PS2Runtime::run()
                               << " busy%=" << busyPct
                               << " res/s=" << dResumes
                               << " vbl/s=" << dVbl
+                              << " vblSrc=" << dVblQ << "/" << dVblI << "/" << dVblS
                               << " progress=" << ps2x_guest_progress()
                               << " gif/s=" << dGif
                               << " dma/s=" << dDma
                               << " stuckSecs=" << stuck
+                              // Cumulative, not per-second: intrEsc is expected
+                              // to be 0 for a whole run, so a running total is
+                              // the readable form. Placed before trace= so
+                              // console truncation cannot clip it.
+                              << " intrEsc=" << ps2x_guest_intr_disable_escapes()
+                              << " intrSec=" << ps2x_guest_intr_disable_sections()
+                              << " intrStray=" << ps2x_guest_intr_disable_stray()
                               << std::hex << " pc=0x" << pc
                               << " ra=0x" << ra << " lastCall=0x" << lastCall
+                              // 0 unless the 0x13c4f8 callback list is mid-callback
+                              // right now; nonzero on a parked watchdog names the
+                              // callback that entered and never returned.
+                              << " cb=0x"
+                              << g_sdbzCb13C4F8InFlight.load(std::memory_order_relaxed)
                               << std::dec
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
                 }
@@ -3055,6 +5226,51 @@ void PS2Runtime::run()
                 // dispatched. Written here, on the way out, so a run stopped by
                 // -RunSeconds still leaves the set on disk instead of only in a
                 // console buffer that gets clipped.
+                // Ordered dispatch trace, emitted before the coverage
+                // summary so the two land together in the same tail. Printed
+                // as a run-length-compressed sequence: a movie tick that hits
+                // the same node 400 times in a row is one line, and the thing
+                // being looked for -- a producer landing between two ticks of
+                // the state machine -- stays visible instead of being buried.
+                //
+                // The saturation line is not optional. A trace that filled its
+                // log is a trace whose TAIL is missing, and absence in a
+                // truncated trace is not evidence of anything.
+                if (g_orderArmed.load(std::memory_order_relaxed))
+                {
+                    const uint32_t raw = g_orderNext.load(std::memory_order_relaxed);
+                    const uint32_t have = raw < kOrderLogSize ? raw : kOrderLogSize;
+                    std::cerr << "[order] total=" << std::dec << raw
+                              << " logged=" << have;
+                    if (raw > kOrderLogSize)
+                    {
+                        std::cerr << " [cap] TRUNCATED -- the tail of this"
+                                     " sequence is missing; do not read"
+                                     " absence from it";
+                    }
+                    std::cerr << std::endl;
+
+                    uint32_t i = 0;
+                    while (i < have)
+                    {
+                        const uint32_t pc = g_orderLog[i].load(std::memory_order_relaxed);
+                        uint32_t run = 1;
+                        while (i + run < have &&
+                               g_orderLog[i + run].load(std::memory_order_relaxed) == pc)
+                        {
+                            ++run;
+                        }
+                        std::cerr << "[order] #" << std::dec << i
+                                  << " 0x" << std::hex << pc << std::dec;
+                        if (run > 1u)
+                        {
+                            std::cerr << " x" << run;
+                        }
+                        std::cerr << std::endl;
+                        i += run;
+                    }
+                }
+
                 const CoverageSummary fin = scanCoverage(true, 2u, true);
                 if (g_coverageArmed.load(std::memory_order_relaxed))
                 {
@@ -3256,6 +5472,10 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+
+        // EndDrawing() has just run raylib's PollInputEvents(), so host key /
+        // gamepad state is fresh on this thread. Push it to the guest now.
+        ps2x_pad_push_frame(m_memory.getRDRAM());
 
         // RecompDebugger IPC: once-per-video-frame extended telemetry (GS
         // regs, pad state, runtime log ring, guest thread scheduler snapshot).

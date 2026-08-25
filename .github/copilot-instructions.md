@@ -45,8 +45,8 @@ If you learn something durable, say so in your answer so the user can have it wr
 
 Two entries worth knowing up front:
 
-- **`command_log.md` does not exist.** Older notes reference it. Ignore them.
-- **`PS2_PROJECT_STATE.md` is ~365 KB** — larger than most read limits. Grep it or read it in ranges; never load the whole file.
+- **`command_log.md` is the canonical source for paths and invocations.** (An older revision of this file claimed it did not exist — that was wrong.) Read it rather than reconstructing any path from memory.
+- **`PS2_PROJECT_STATE.md` is ~500 KB** — larger than most read limits. Grep it or read it in ranges; never load the whole file.
 
 ## Where the state is
 
@@ -67,6 +67,8 @@ cd "F:\SDBZ Recomp"
 ```powershell
 & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
 ```
+
+⚠️ **`-Exe` is mandatory.** `launch_recomp.ps1` defaults to the *Debug* exe, and `build.ps1` defaults to the *Debug* config. Three sessions were lost to runs that silently measured the wrong build. Always pass both explicitly, exactly as written above.
 
 **Always run the RelWithDebInfo exe.** It executes **109×** more guest work than the Debug build for the same CPU seconds (measured 2026-07-28). A Debug run covers ~1 % of the guest execution for the same wall-clock wait. The Debug tree must not be deleted — it is a control arm — but there is no reason to run it.
 
@@ -105,17 +107,28 @@ This project has produced a lot of confident wrong answers. The corrections that
 - Do not work on `ps2xStudio` — it is out of scope. "The debugger" means `RecompDebugger.exe` or PCSX2's built-in debugger.
 - Prefer one batched request over drip-feeding (e.g. give every disassembly address at once).
 
-## Current situation
+## Current situation — 2026-08-04
 
-**Phase 5** — boot to and pass the memory-card prompt.
+**Phase 5, Stage 5.9 is the live blocker.** Everything below this heading was rewritten on 2026-08-04; anything you find elsewhere describing Stage 5.7 or 5.8 as open is stale.
 
-**The performance investigation is CLOSED (2026-07-28).** It was the Debug build the whole time: RelWithDebInfo does **109×** the guest work for the same CPU seconds, and the game now runs at ~47 fps with `gif/s` in the normal 30–60 band.
+**Symptom:** the game boots, reaches MainMenu, and renders — but the screen presents black with a flashing, empty text box. Glyphs are drawn in `PSMT4` (the PS2's standard 4-bit indexed font format) and come out blank.
 
-⚠️ **Stage 5.7's original framing (tight self-loop at `pc=0x421f10`/`sceDmaSync`) and the later `gstate@0x5e6b3c`/`gchg=` "frozen state machine" probe are BOTH retracted and closed.** `0x421f10` is a `jal` inside a straight-line function, not a loop — `stuckSecs` was a dispatch-boundary sampling artifact. The `gstate@` watched words turned out to be static singleton pointers baked into `.data`, never reassigned — "frozen" told us nothing about liveness. Do not reopen either thread.
+**The finding that relocated the whole investigation.** The `[gifsrc]` probe in `PS2Memory::submitGifPacket` shows a 256 KB Path3 upload issued every frame from EE RAM `0x89d400` that is **entirely zero**, and the surrounding 384 KB (`0x88d400`–`0x8fd400`) is zero as well. A blank glyph sheet would still sit in a populated neighbourhood; 384 KB of consecutive zeros means **the asset was never loaded into RAM at all**. Stage 5.9 is therefore an **asset-load problem, not a render problem**.
 
-**Confirmed symptom (still true):** the EE guest never submits a textured draw. `primmask=0x40` (SPRITE only) every run, `tme` never 1, `tex0.tbp` always 0, `nonblack=0` across ~24M sampled pixels. The render loop itself is healthy — ~46 fps, double-buffered `fbp 0x0↔0x70` — it just clears to black forever. The fault is in the guest state machine, upstream of GS and upstream of IOP. IOP/SIF/asset-streaming has since been fully cleared as a cause (BUG-030, closed 2026-07-30).
+**Closed — do not reopen any of these:**
 
-**Live lead: BUG-009 `rpc_handle_valid`** (`0x178de8`). The boot state machine `sub_327810` is frozen at state 1, gated over 5 client handles; source is `v1 = *a1; return v1 && a1[1] == *(u32*)(v1+24) && (*(u32*)(v1+16) & 1);`. The `[rpcValid]` diagnostic IS in the current build (`sdbzDiagRpcHandleValid178DE8` in `game_overrides.cpp`) and confirms `pktAddr=0x0` on every poll. **`SifBindRpc` is confirmed dead code — zero call sites in `src/runner/` — do not fix it further.** A hardware watchpoint on `client->hdr.pkt_addr` is now wired (opt-in via `PS2X_HWWATCH=1`); see the 2026-07-30 HANDOFF in `PS2_PROJECT_STATE.md`.
+| Thread | Verdict |
+|---|---|
+| Performance / framerate | CLOSED 07-28. It was the Debug build: RelWithDebInfo does **109×** the guest work per CPU second. |
+| `pc=0x421f10` self-loop (Stage 5.7) | RETRACTED. A `jal` in straight-line code; `stuckSecs` was a sampling artifact. |
+| `gstate@0x5e6b3c` "frozen state machine" | RETRACTED. The watched words are static singleton pointers in `.data`, never reassigned. |
+| BUG-009 `rpc_handle_valid` / `SifBindRpc` | CLOSED, BENIGN. It is `sceSifCheckStatRpc`, a BUSY-check; our always-0 answer is correct. Four sessions lost to a misleading function-map name. |
+| Stage 5.8 VU1 microcode | PASSED 08-04 (`tme=1`, `tex0.tbp=0x2b60`). VU1 sitting idle is **correct** — MainMenu is all 2D sprites. |
+| DISPFB page-flipping / dropped frames | DISPROVEN 08-04. `[gsreg]` shows DISPFB1 and DISPFB2 alternating `0x1070`↔`0x1000` in lockstep with FRAME.FBP, 32× each. The flip works. |
+| `tme=0` in `[gs:frame-change]` | SAMPLING ARTIFACT. That probe fires on FRAME/TEX0 *change* and happens to snapshot the untextured `prim=0x6` clear sprites (TME is bit 4). The rasterizer honours per-primitive `prim.tme` correctly. |
+| GS write path / swizzle / FBMSK / Z-alias / addressing | All exonerated. Interleaved PSMT8 uploads land non-zero, so DMA and GIF plumbing are fine. |
+
+**Next step (wired, not yet run).** `PS2X_HWWATCH_ADDR` was added to `game_overrides.cpp` on 08-04 so the existing DR0/VEH hardware-watchpoint machinery can be parked on a fixed address instead of a guest-derived one. See [COPILOT_PLAYBOOK.md](COPILOT_PLAYBOOK.md) Plan A for how to run it and how to read the three possible outcomes.
 
 Fast-iteration method: use `ps2xTest`, not a full game run —
 ```powershell
@@ -124,6 +137,10 @@ Fast-iteration method: use `ps2xTest`, not a full game run —
 ```
 Always pass a filter — a bare invocation hangs and silently skips ~40 suites (BUG-031). Baseline is 27/28 passing; the 1 failure (BUG-032, `sceSifSetDma` multi-descriptor validation) is untriaged and probably unrelated.
 
-**Do not re-litigate performance, the `0x421f10` self-loop, the `gstate@` probe, or IOP asset streaming.** All four are closed. Any statement reopening them is obsolete.
+**Do not re-litigate anything in the closed table above.** Any statement reopening those threads is obsolete, wherever you find it.
 
 **Read the ★★ HANDOFF section (newest, top of file) of [PS2_PROJECT_STATE.md](../PS2_PROJECT_STATE.md)** for the full closed-threads table and ordered next steps.
+
+## Pick up work here
+
+[COPILOT_PLAYBOOK.md](COPILOT_PLAYBOOK.md) holds the ordered, self-contained work plans for this project — what to do, in what order, with the exit test for each. Start there when the user asks you to make progress and has not named a specific task. It also carries the conventions (probe idiom, header-avoidance pattern, how to read a run) that this file only summarises.

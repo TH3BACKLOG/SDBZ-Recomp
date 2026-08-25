@@ -288,6 +288,32 @@ namespace ps2_syscalls
             setReturnU32(ctx, 0u);
             return true;
         }
+        case 0x6B:
+        case static_cast<uint32_t>(-0x6B):
+        {
+            // EE kernel syscall 0x6B, run 53's single [Syscall TODO]. Same shape
+            // as 0x68 above and settled the same way -- by reading the ONE call
+            // site rather than guessing what the number means:
+            //
+            //   0x0017e230  jal  0x174f70      <- the 0x6B stub, no args set up
+            //   0x0017e234  nop
+            //   0x0017e238  jal  0x1750b0      <- syscall 0x7A, GetOsdConfigParam2
+            //   0x0017e244  daddu $t3, $v0, $zero   <- $v0 captured from 0x7A, not 0x6B
+            //
+            // Two facts make this safe. Its arguments are stale: the log shows
+            // a0=0x1 a1=0x0, which are left over from the `jal 0x180ee8` two
+            // instructions earlier, so it takes none. And its result is never
+            // read -- the only `daddu $t3,$v0` follows the NEXT call. It is also
+            // called exactly once in the whole ELF (one hit, one caller: the
+            // DECI2 init at 0x17E200, whose neighbours are the OSD-config family
+            // 0x79/0x7A that 0x6E/0x6F already implement here).
+            //
+            // Returning 0 is therefore not a guess about the syscall's semantics;
+            // it is strictly better than the fallback, which prints and leaves
+            // $v0 holding whatever the caller had (0x503070 in run 53).
+            setReturnU32(ctx, 0u);
+            return true;
+        }
         case 0x6E:
             SetOsdConfigParam2(rdram, ctx, runtime);
             return true;

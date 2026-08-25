@@ -16,6 +16,33 @@ extern "C" uint32_t ps2x_guest_intr_disable_depth();
 extern "C" void ps2x_probe_kv(const char *name, int n,
                               const char *const *keys, const uint64_t *vals);
 
+// Set while this fiber is executing an IRQ handler body on a borrowed stack
+// (GuestScratchStack out of the guest heap, or the async callback pool) rather
+// than on its own thread stack. Read by ps2x_stack_check() in Thread.cpp, which
+// otherwise reports every such handler as a stack-bounds violation for whichever
+// EE thread happened to own the fiber -- run 53 produced four STACKOOB records
+// that way (sp=0x1f00000, i.e. the guest-heap limit, blamed on thread 0x4) and
+// they were carried into the handoff as a suspected context bleed. Thread-local
+// and nesting-safe: handlers in one dispatch run sequentially, but a handler can
+// yield at a back-edge and another fiber can dispatch inline on top of it.
+static thread_local uint32_t tls_on_irq_handler_stack = 0u;
+
+extern "C" uint32_t ps2x_on_irq_handler_stack()
+{
+    return tls_on_irq_handler_stack;
+}
+
+namespace
+{
+    struct IrqHandlerStackScope
+    {
+        IrqHandlerStackScope() { ++tls_on_irq_handler_stack; }
+        ~IrqHandlerStackScope() { --tls_on_irq_handler_stack; }
+        IrqHandlerStackScope(const IrqHandlerStackScope &)            = delete;
+        IrqHandlerStackScope &operator=(const IrqHandlerStackScope &) = delete;
+    };
+}
+
 namespace ps2_syscalls
 {
     namespace interrupt_state
@@ -155,20 +182,60 @@ namespace ps2_syscalls
         // sceSifSetDma / sceDmaSend / drainCompletedDmacHandlers can still run
         // inside a guest critical section.
         //
-        // No evidence yet that this happens (0x178428's section makes no syscall),
-        // so this only reports rather than defers: deferring would need a queue and
-        // would change delivery ordering on a path that has not been shown broken.
-        // If DEFERINL ever appears in run_probe.jsonl, that assumption is wrong and
-        // the inline path needs the same treatment as the token path.
+        // 2026-08-12 -- run 53 fired this four times (causes 0x1 and 0x5), so the
+        // "no evidence yet" above is retired: the inline path DOES run handlers
+        // inside a guest critical section. It still only reports, and that is a
+        // deliberate choice rather than an unfinished one. The obvious repair --
+        // queue here and drain in ps2x_guest_intr_disable_leave() -- is unsafe as
+        // long as the disable shadow can stay set indefinitely, which it can:
+        // ps2_scheduler.cpp's escape valve (kIntrDisableYieldEscape) only lets the
+        // YIELD through, it never clears tls_intr_disabled. A queue behind a gate
+        // that may never open turns four benign inline dispatches into four
+        // permanently lost DMAC completions -- strictly worse, and silent.
+        //
+        // So this records what a fix would need instead: WHICH controller (dmac vs
+        // intc) and whether the caller really is the guest fiber. cause is only
+        // meaningful once paired with dmac -- DMAC 5 is SIF0 (the RPC reply path we
+        // are actively debugging), INTC 5 is VIF1. Note also that the STACKOOB
+        // records that accompany these are NOT a second bug: the inline branch
+        // below runs handlers on a fresh GuestScratchStack out of the guest heap
+        // (top == kGuestHeapHardLimit == 0x01F00000), while ps2x_stack_check
+        // compares against the fiber's own registered thread stack. That false
+        // positive is suppressed via ps2x_on_irq_handler_stack() below.
         if (ps2x_guest_intr_disable_depth() != 0u)
         {
-            static std::atomic<uint32_t> s_inlineInSection{0};
-            const uint32_t n = s_inlineInSection.fetch_add(1, std::memory_order_relaxed) + 1u;
-            if (n <= 16u)
+            static std::atomic<uint64_t> s_inlineInSection{0};
+            const uint64_t n = s_inlineInSection.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if (n <= 64u)
             {
-                static const char *const k[] = {"n", "cause", "depth"};
-                const uint64_t v[] = {n, cause, ps2x_guest_intr_disable_depth()};
-                ps2x_probe_kv("DEFERINL", 3, k, v);
+                static const char *const k[] = {"n", "cause", "depth", "dmac", "guest"};
+                const uint64_t v[] = {n, cause, ps2x_guest_intr_disable_depth(),
+                                      (tag != nullptr && tag[0] == 'D') ? 1u : 0u,
+                                      ps2sched::is_guest_thread() ? 1u : 0u};
+                ps2x_probe_kv("DEFERINL", 5, k, v);
+            }
+            else if (n == 65u)
+            {
+                // Run 71 produced EXACTLY 64 DEFERINL records, i.e. the bound,
+                // and the sweep read that as a total. It is not one: past 64
+                // this probe went silent with no [cap] line, so "64 inline
+                // dispatches inside a critical section" and "64 thousand" were
+                // the same log. That is the failure
+                // [[feedback_capped_probes_false_negatives]] names -- a
+                // saturated probe is indistinguishable from a bounded one --
+                // and it matters here more than most, because the count IS the
+                // finding: four benign dispatches and forty thousand argue for
+                // completely different repairs to the queue-and-drain question
+                // discussed above.
+                RUNTIME_LOG("[cap] tag=DEFERINL saturated at 64 -- LATER INLINE"
+                            " DISPATCHES ARE INVISIBLE. Absence of a record past"
+                            " this point is NOT evidence; read the totals below.");
+            }
+            else if ((n & (n - 1u)) == 0u)
+            {
+                // Power-of-two only: the magnitude stays on the record without
+                // reopening the flood the bound was added to stop.
+                RUNTIME_LOG("[cap] tag=DEFERINL total=" << n << " (capped at 64)");
             }
         }
 
@@ -269,6 +336,10 @@ namespace ps2_syscalls
             // reservation for the whole dispatch is correct; guestFree fires
             // here when the dispatch (and any yield inside it) completes.
             GuestScratchStack handlerStack(runtime, kAsyncHandlerStackSize);
+            // The handler runs with $sp pointing into the guest heap, not into
+            // this fiber's registered EE-thread stack; tell ps2x_stack_check to
+            // stand down for the duration (see the STACKOOB note above).
+            IrqHandlerStackScope onBorrowedStack;
             runHandlers(handlerStack.valid() ? handlerStack.top()
                                              : getAsyncHandlerStackTop(runtime));
         }
@@ -279,6 +350,7 @@ namespace ps2_syscalls
             // safe, including its failure fallback (kAsyncCallbackFallbackSp
             // when the pool is exhausted or runtime is null).
             AsyncGuestScope guestScope; // token released on any exit path
+            IrqHandlerStackScope onBorrowedStack; // pool stack, same rationale
             runHandlers(getAsyncHandlerStackTop(runtime));
         }
     }
@@ -499,6 +571,13 @@ namespace ps2_syscalls
     extern "C" uint64_t ps2x_guest_progress();
     extern "C" int ps2x_determinism_enabled();
 
+    // ps2x_guest_idle() -> 1 when the scheduler has no runnable guest thread
+    // and none running. This is the condition the deterministic vblank pacer
+    // actually needs: a vsync-gated guest stops retiring back-edges BECAUSE it
+    // is parked waiting for the tick, so pacing purely off progress starves the
+    // very interrupt that would unpark it (stage 5.17). Same no-header rule.
+    extern "C" int ps2x_guest_idle();
+
     // Delivered vblank ticks (stage 5.6.2). gif/s ~3 against an expected ~60
     // has two readings -- the guest renders one frame per ~20 vblanks, or the
     // vblank tick itself is not arriving at 60Hz -- and nothing measured so far
@@ -506,6 +585,23 @@ namespace ps2_syscalls
     // so it reflects ticks the guest actually saw. Read by the watchdog via a
     // local extern "C" (no header change; §3 prohibition).
     static std::atomic<uint64_t> g_vblankTicks{0};
+
+    // Which pacing rule produced each tick (stage 5.17). Without this split,
+    // "vbl/s=3" is the same number whether the quantum path is firing slowly or
+    // not firing at all and the stall fallback is carrying the whole run -- two
+    // states that call for opposite fixes. Read by the watchdog via a local
+    // extern "C" (no header change).
+    static std::atomic<uint64_t> g_vblankFromQuantum{0};
+    static std::atomic<uint64_t> g_vblankFromIdle{0};
+    static std::atomic<uint64_t> g_vblankFromStall{0};
+
+    extern "C" void ps2x_vblank_tick_sources(uint64_t *quantum, uint64_t *idle,
+                                             uint64_t *stall)
+    {
+        if (quantum) *quantum = g_vblankFromQuantum.load(std::memory_order_relaxed);
+        if (idle) *idle = g_vblankFromIdle.load(std::memory_order_relaxed);
+        if (stall) *stall = g_vblankFromStall.load(std::memory_order_relaxed);
+    }
 
     // Defined inside ps2_syscalls deliberately: extern "C" gives the symbol C
     // language linkage, so the enclosing namespace does not decorate its name
@@ -552,6 +648,17 @@ namespace ps2_syscalls
         // the interrupt to interleave with.
         constexpr auto kDetPollPeriod = std::chrono::microseconds(250);
         constexpr int kDetStallPolls = 200; // ~50 ms of no guest progress
+
+        // Idle-tick arming (stage 5.17). An idle guest would otherwise take a
+        // tick every poll (4 kHz), so a delivered idle tick disarms itself and
+        // only re-arms once the guest has demonstrably acted on it -- either it
+        // retired more back-edges, or a fiber became runnable. Vblank rate then
+        // equals the rate the guest can consume frames, which is the intended
+        // semantics, and it stays a pure function of guest state (no wall
+        // clock), so the determinism argument is the same one the stall
+        // fallback already relies on.
+        bool idleTickArmed = true;
+        uint64_t progressAtIdleTick = 0;
 
         if (deterministic)
         {
@@ -603,12 +710,37 @@ namespace ps2_syscalls
                     {
                         nextProgressTick = progress + quantum;
                     }
+                    g_vblankFromQuantum.fetch_add(static_cast<uint64_t>(ticksToProcess),
+                                                  std::memory_order_relaxed);
                 }
                 else if (stalledPolls >= kDetStallPolls)
                 {
+                    // Last-resort escape: guest frozen outright, nobody to wake.
                     ticksToProcess = 1;
                     stalledPolls = 0;
                     nextProgressTick = progress + quantum;
+                    g_vblankFromStall.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                // Idle delivery. Checked after the quantum path so a compute-
+                // bound guest is unaffected: it is never idle for long enough to
+                // matter, and when it is, this only fills gaps the quantum path
+                // left. Re-arm on either signal that the guest reacted.
+                const int idle = ps2x_guest_idle();
+                if (!idleTickArmed && (idle == 0 || progress != progressAtIdleTick))
+                {
+                    idleTickArmed = true;
+                }
+                if (ticksToProcess == 0 && idle != 0 && idleTickArmed)
+                {
+                    ticksToProcess = 1;
+                    idleTickArmed = false;
+                    progressAtIdleTick = progress;
+                    stalledPolls = 0;
+                    // Resync the quantum deadline: the guest was parked, so the
+                    // progress it did not make is not a debt to burn down later.
+                    nextProgressTick = progress + quantum;
+                    g_vblankFromIdle.fetch_add(1, std::memory_order_relaxed);
                 }
 
                 if (ticksToProcess == 0)

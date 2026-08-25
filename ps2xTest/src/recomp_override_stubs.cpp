@@ -61,3 +61,10 @@ void fn_22C8F0_0x22c8f0(uint8_t *, R5900Context *, PS2Runtime *)
 {
     ps2xTestGuestStub("fn_22C8F0_0x22c8f0");
 }
+
+// Not an fn_* name, but the same situation: the Stage 5.10 [poolbase] probe in
+// game_overrides.cpp wraps this generated body, so ps2_runtime references it.
+void singleton_get_camera_0x199db0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("singleton_get_camera_0x199db0");
+}

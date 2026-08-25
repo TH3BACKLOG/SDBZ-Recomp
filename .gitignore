@@ -145,3 +145,8 @@ ida_scripts/*
 ida_scripts/idapy_ps2/*
 !ida_scripts/idapy_ps2/*.py
 !ida_scripts/idapy_ps2/*.md
+
+# GS-dump replay harness inputs/outputs. The .gsr is a re-derivable export of a
+# PCSX2 dump (build_scripts/gsdump_parse.py --emit-replay) and runs to megabytes.
+gsdump/*
+gsdump_replay*.bmp

@@ -91,6 +91,11 @@ if(PS2X_BUILD_RECOMP)
 endif()
 
 if(PS2X_BUILD_RUNTIME)
+    # ps2xIOP (upstream #170): self-contained static lib of IOP HLE service
+    # modules. Built but NOT yet linked into ps2_runtime -- our own R3000
+    # interpreter (ps2_iop_cpu.cpp) still owns the IOP path. This exists so
+    # cri_dtx/sdrdrv/tsnddrv can be ported across module by module.
+    add_subdirectory("ps2xIOP")
     add_subdirectory("ps2xRuntime")
 endif()
 

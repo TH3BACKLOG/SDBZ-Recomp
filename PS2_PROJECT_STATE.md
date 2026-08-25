@@ -1,4 +1,9193 @@
+## HANDOFF 2026-08-24h (PS2X_ORDER, 12 wrappers + 2 anchors) - CORRECTED 08-24. THE "CONTRADICTION" WAS NEVER ONE.
+
+**UNCAPPED.** `[order] total=14192 logged=14192`. Both anchors fired twice
+(`11f268` @ idx 0 and 5306; `11f448` @ idx 5305 and 14191), so the log brackets
+BOTH ADX sessions end to end. No cap caveat this run.
+
+### Result: wrapper balance NEVER goes negative
+
+| wrapper | type | count |
+|---|---|---|
+| 0x13bc10 | LOCK 1 | 7096 |
+| 0x13bc28 | UNLOCK 1 | 7078 |
+| 0x13bc40 | LOCK 2 | 10 |
+| 0x13bcb8 | UNLOCK 2 | 4 |
+| types 3,4,5,1000 | - | **0 - never fired** |
+
+Running balance over all 12 wrappers: **final +24, minimum 0, zero negative
+dips.** Per-type net: t1 = +18, t2 = +6. Both positive.
+
+Correction to 24g: the log does NOT start at run start. Its first event is
+`11f268`, so SVM traffic begins at ADX init exactly as originally assumed.
+24g's contrary claim was inference from a capped log, not measurement.
+
+### ⚠️ RETRACTED: "the contradiction is airtight"
+
+The original text of this section claimed the balanced call counts plus a
+negative counter formed an airtight contradiction. **They do not form a
+contradiction at all.** Retracted 2026-08-24 under [[feedback_no_guessing]].
+
+**What is VERIFIED** (re-decoded from the ELF this session, `svm_lock`
+`0x13bb20`+0x18):
+
+```
+0x13bb34  lw    $v1, 0($v0)          ; [0x54EBE0] LOCK hook
+0x13bb38  beq   $v1, $zero, 0x13bb70 ; null -> skip the ENTIRE block
+...
+0x13bb68  addiu $v0, $v0, 0x1        ; the increment, reached only if hook live
+0x13bb6c  sw    $v0, 0($v1)          ; -> 0x45EFC0
+```
+
+`svm_unlock` is gated the same way on `[0x54EBE8]`. The gates are real and
+independent.
+
+**Why that kills the framing.** The gate is *designed* to decouple the counter
+from the call balance. A lock fired while its hook is null legitimately writes
+nothing. So net +18 calls alongside a -2 counter is what correct code produces.
+The only balance the counter tracks is the balance **inside the hook-live
+windows**, which this run cannot compute - only 2 of the 4 registrar sites were
+armed. That is the actual open question, not a paradox.
+
+### Three coverage holes the retracted claim ignored
+
+- **(a) Dispatch invisibility.** `PS2X_ORDER` sees dispatch-loop calls only;
+  direct `fn_`->`fn_` calls bypass it ([[feedback_registerfunction_bypass]]).
+  The call census is partial **by construction**. 24h flagged this for types
+  3/4/5/1000 and then ignored it for types 1/2 in the next breath.
+- **(b) eeref's indirect blind spot.** `eeref refs 0x45efc0` returned
+  `IMM 0x13bb54` + `IMM 0x13bba4`, i.e. two `lui`/`addiu` address-formations.
+  A write through a register-held pointer (a `memset` over a range) is
+  **invisible** to that scan. Read it as "two writers eeref can see", never
+  "two writers" ([[project_eeref_static_xref]]).
+- **(c) Unknown live-window boundaries.** See above.
+
+### The wrapper model was also too tidy
+
+`eeref refs 0x13bc10` -> **17 callers**; `eeref refs 0x13bc28` -> **19 callers**
+(`VU0_RunMicro`, `sub_12EB28`, `sub_12F4A8`, `sub_13C880`, and others). These
+are general-purpose lock/unlock wrappers, **not an SVM-private pair**, and the
+static caller sets are **asymmetric** (`sub_12EB28` and `sub_12F4A8` each call
+unlock twice against one lock - the early-return pattern). There is therefore
+no construction-level balance guarantee to appeal to.
+
+What *does* still hold: `eeref refs 0x13bb20` / `0x13bb80` -> `call=6` each,
+all six being wrapper tail-jumps. The core is only reached through wrappers
+**within eeref's coverage**.
+
+### No re-zero path FOUND (not: none exists)
+
+`0x13c740` memsets `0x45EFE8`+0x20, `0x54EBE0`+8, `0x54EBE8`+8, `0x54EC00`+8,
+`0x54EC08`+8. It clears **both hooks** but the `0x45EFE8` block does **not**
+cover `0x45EFC0`. ⚠️ That rules out **this** memset only. Per hole (b), other
+range writes would not appear in the eeref scan at all, so "nothing ever
+re-zeros the counter" is unproven. The observation that `n` *holds* -1 across a
+full teardown and re-init is the real evidence here, and it is measured.
+
+### The four registrar sites, read off the ELF
+
+| site | lock hook <- | unlock hook <- | order |
+|---|---|---|---|
+| `ADX_Init` 0x11f2b8/0x11f2c8 | 0x11E598 | 0x11E620 | lock first |
+| `sub_11FE90` 0x11fed4/0x11fee4 | 0x11E598 | 0x11E620 | lock first |
+| `sub_11F448` 0x11f4ac/0x11f4b8 | **0** | **0** | lock first |
+| `sub_120080` 0x1200f4/0x120100 | **0** | **0** | lock first |
+
+Both teardown sites clear the LOCK hook first and the UNLOCK hook second. In
+that gap: locks skip, unlocks still decrement -> **-1, permanently**. That is
+the correct sign. ⚠️ HYPOTHESIS, not verified - the gap is ~3 instructions and
+the scheduler is cooperative, so a straddling pair needs an interrupt-context
+caller. Only two of the four sites (`11f268`, `11f448`) were armed this run.
+
+### `[pump]` reproduced, shifted ~18 s later
+
+```
+t=144  h2=0x11e598  n=0           nostream=1   <- register
+t=148  h2=0x11e598  n=-1          nostream=0   <- DRIFT, 4 s later
+t=170  h2=0x0       n=-1                       <- teardown, n does not move
+t=206  h2=0x11e598  n=-1          nostream=1   <- register
+t=210  h2=0x11e598  n=-2          nostream=0   <- DRIFT, 4 s later
+t=235  h2=0x0       n=-2                       <- teardown, n does not move
+```
+
+Two things this kills and one it raises:
+- **Kills the teardown-gap timing.** The drift is 4 s AFTER registration and
+  ~22 s BEFORE teardown, in both sessions. The lock hook is live at the samples
+  on both sides of it.
+- **Kills "the drift is noise."** Identical offset (+4 s) in both sessions.
+- **Raises:** the drift sample is exactly the sample where `nostream`
+  (`0x460F04`) flips 1 -> 0, both times. Co-occurrence, not causation - noted.
+
+⚠️ `[0x54EBE8]`, the UNLOCK hook, has **never been measured**. `[pump]` prints
+`h2` = `[0x54EBE0]` (lock) and `h2a` = `[0x54EBE4]` (its arg) only. The one
+field the mechanism turns on is the one field with no data.
+
+### NEXT ARM - still NO BUILD. 16 addresses.
+
+12 wrappers + all FOUR registrar call sites. The sites are what change hook
+state, so their positions in the order stream are the missing variable; with
+them the counter can be replayed exactly.
+
+`PS2X_ORDER=13bc10,13bc28,13bc40,13bcb8,13bc58,13bcd0,13bc70,13bce8,13bc88,13bd00,13bca0,13bd18,11f268,11f448,11fe90,120080`
+
+Event volume was 14192 of 16384 with 14 armed; the two added sites are
+low-frequency, so the headroom holds. If `logged` == 16384 the run is capped
+again and absence past it is not evidence.
+
+**Pre-registered reading:**
+- Locate each `11f448`/`120080` event. Any lock/unlock pair straddling one
+  confirms the teardown-gap hypothesis and names the drift event exactly.
+- **Corrected goal (08-24).** The arm is NOT "reproduce the contradiction" -
+  there is no contradiction. It is: **establish hook state at every event**, so
+  gated calls can be excluded and the live-window balance computed for the
+  first time.
+- Replay the counter: +1 per lock while the last hook-state event was a
+  register, -1 per unlock likewise, skipping gated calls. If it reaches -1 then
+  -2, the event index that first goes negative is the answer.
+- ⚠️ The replay is **bounded by holes (a) and (b)** regardless of outcome. It
+  cannot see direct `fn_`->`fn_` calls, and it assumes the unlock hook's state
+  rather than reading it - nothing has ever sampled `[0x54EBE8]`.
+- **If the replay does not go negative**, that is the expected-and-uninformative
+  outcome, not a surprise. Escalate to a built probe: read `[0x54EBE0]`,
+  `[0x54EBE8]` and `[0x45EFC0]` at both core entries in `game_overrides.cpp`.
+  That costs a build, and it is now the **more likely** branch.
+
+⚠️ Types 3/4/5/1000 have now been silent across two runs. Their wrappers are
+NOT confirmed dispatch-visible, so this is not yet proof of absence
+([[feedback_registerfunction_bypass]]).
+
+## HANDOFF 2026-08-24g (PS2X_ORDER, 6 addrs) — ★★★ THE ARM WAS AIMED AT 1 OF 6 LOCK TYPES. `svm_lock` HAS A **12-ENTRY WRAPPER TABLE**; I TRACED ONE PAIR THREE TIMES OVER.
+
+Run: `PS2X_ORDER=13bc10,13bc28,126440,126458,118d98,118db0`, det=1, 260 s, no rebuild
+(same exe as 24d/24e/24f). `[order] armed -- tracing dispatch ORDER of 6 addresses`. All six
+addresses appeared ⇒ **no dispatch bypass** for any of them; the order trace sees this layer.
+
+### ⚠️ CAPPED — `[order] total=25784 logged=16384` (63.5%)
+Absence past the cap is NOT evidence ([[feedback_capped_probes_false_negatives]]).
+No timestamps in the order log, so the window's end is unbounded by measurement.
+Uniform-rate ESTIMATE ⇒ ~165 s. **HYPOTHESIS, not verified.** Next arm fixes this with an anchor.
+
+### RESULT — type-1 lock/unlock is PERFECTLY BALANCED
+Expanded 16384 events: `13bc10`=4610, `13bc28`=4598, `126440`=2233, `126458`=2195,
+`118d98`=1833, `118db0`=915.
+Running balance over the innermost pair (9208 events):
+**final=+12, min=0, negative dips=0.**
+The counter never went below zero on type 1. It cannot be the source of a NEGATIVE nest count
+— *provided* the logged window covers t=129 s (see cap caveat).
+
+### ★★★ WHY THE ARM WAS TOO NARROW — the three traced layers are ONE path
+Disassembly proves they are a tail-jump chain, not three independent probes:
+```
+0x126440  j 0x118d98      ; thunk
+0x118d98  j 0x13bc10      ; thunk
+0x13bc10  addiu $a0,$zero,1 ;  <-- TYPE = 1
+          j 0x13bb20      ; svm_lock core
+```
+So all six armed addresses were **type 1 only**. Five other lock types were never observed.
+
+### ★★★ THE FULL WRAPPER TABLE (0x13bc10–0x13bd2c) — 6 types, 12 wrappers, symmetric
+Each wrapper sets `$a0` = lock type, then tail-jumps to the core
+(`0x13bb20` = lock, `0x13bb80` = unlock).
+
+| type | LOCK | UNLOCK | static callers (lock/unlock) |
+|---|---|---|---|
+| 1     | `0x13bc10` | `0x13bc28` | (traced — balanced) |
+| 2     | `0x13bc40` | `0x13bcb8` | 8 / 8 |
+| 3     | `0x13bc58` | `0x13bcd0` | 1 / 1 |
+| 4     | `0x13bc70` | `0x13bce8` | 5 / 5 |
+| 5     | `0x13bc88` | `0x13bd00` | 1 / 1 |
+| 1000  | `0x13bca0` | `0x13bd18` | 0 / 0 — UNREACHABLE statically |
+
+Caller counts are symmetric per type — no static smoking gun. Type 2's callers live in
+`0x12E688`–`0x132610`; types 3/4/5 route through `0x1547c8`–`0x154894`, i.e. **the SofDec/movie
+region** (the movie gate is `0x155268`).
+
+### ★★★ CORRECTED COUNTER SEMANTICS — read off the ELF, replaces the 24e/24f paraphrase
+`svm_lock` @ `0x13bb20`:
+```
+v0 = 0x54EBE0 ; v1 = [v0]              ; lock hook fn
+beq v1,0 -> 0x13bb70                    ; NULL HOOK: return, NO increment, NO WRITE
+jalr v1  (a0 = [0x54EBE4])              ; call the hook
+lw  v0,[0x45EFC0] ; beql v0,0 -> sw s0,[0x45EFC4]   ; record TYPE only on 0->1
+lw  v0,[0x45EFC0] ; addiu +1 ; sw [0x45EFC0]        ; increment
+```
+`svm_unlock` @ `0x13bb80`:
+```
+v0 = [0x54EBE8]                         ; unlock hook fn
+beq v0,0 -> 0x13bbf8                    ; NULL HOOK: return, NO decrement
+lw v1,[0x45EFC0]; addiu -1; sw          ; DECREMENT FIRST, unconditionally
+bne [0x45EFC0],0 -> 0x13bbec            ; still nested: just call the hook
+  lw v1,[0x45EFC4] ; beq v1,a2 -> skip  ; count hit 0: TYPE MUST MATCH
+  jal 0x13bd40 (str @ 0x4BC7C0)         ; <-- MISMATCH = ERROR PRINTER
+  sw zero,[0x45EFC4]
+lw v0,[0x54EBE8] ; jalr v0 (a0=[0x54EBEC])
+```
+Two consequences, both new:
+1. **`0x45EFC4` is a single shared type slot** guarding a single shared counter across all 6
+   types. Interleaving two different types is a guest-visible error condition.
+2. **The guest has its own assert at `0x13bd40`.** If it ever fires we should see its string
+   (`0x4BC7C0`) in the log. Not yet checked — do it.
+
+### The guest's OWN assert — found, and structurally unable to fire here
+String at `0x4BC7C0` (referenced ONLY from `0x13bbe0`, the mismatch path):
+```
+2103102:SVM:svm_unlock:lock type miss match.(type org=%d, type now=%d)
+```
+This confirms the whole model from CRI's own text: one shared counter, one shared type slot,
+mixing types is an error they explicitly guard.
+
+**It never appears in `run_log.txt` (0 hits) and that is NOT evidence.** The check sits behind
+`bne [0x45EFC0],0 -> 0x13bbec` — it runs *only* when the decrement lands exactly on 0. The very
+first unmatched unlock takes the count 0 -> -1, which is non-zero, so the check is skipped; every
+subsequent unlock sees a non-zero count too. **The assert is structurally incapable of catching
+this failure.** Do not read its silence as a clean bill of health.
+
+### `[pump]` REPRODUCED, ~4 s earlier than 24f — the shape is stable
+| t | hook | n | |
+|---|---|---|---|
+| 126 s | registered | 0 | ADX_Init |
+| **129 s** | registered | **-1** | drift, **3 s after** register, both hooks live |
+| 148 s | cleared | -1 | `sub_11F448` teardown — **count does not move** |
+| 181 s | registered | -1 | ADX_Init |
+| **185 s** | registered | **-2** | drift, **4 s after** register |
+| 206 s | cleared | -2 | teardown — count does not move |
+Ends at -2, matching 24f. 24e's terminal `n=0` remains unreproduced ⇒ noise, as recorded.
+
+### STANDING CONCLUSION (unchanged, now better founded)
+One unlock-without-lock per ADX session, ~3–4 s into it, while both hooks are live.
+Not the registrar window. Not the teardown window. With `n` ≤ 0, `svm_lock` returns ≤ 0 and the
+movie gate `bne $s0,$s2` @ `0x155268` cannot pass.
+
+### NEXT ARM — again NO BUILD. All 12 wrappers + a WINDOW ANCHOR.
+The cap caveat is removed by arming two addresses that fire exactly twice each at known
+wall-clock seconds, giving the order log the timestamps it lacks:
+- `11f268` = `ADX_Init` — fires at t=126 s and t=181 s
+- `11f448` = teardown — fires at t=148 s and t=206 s
+
+**Pre-registered reading, declared before the run:**
+- Count `11f268` occurrences. **2 ⇒ the window covers both drifts. 1 ⇒ it covers only t=129 s**
+  (still enough — drift #1 is inside). **0 ⇒ the window ends before ADX init and the whole
+  trace is uninformative**; rerun with a shorter `-RunSeconds` to move the cap earlier.
+- Between the 1st `11f268` and the 1st `11f448`, compute the running balance over all 12
+  wrappers. **The first event that drives it below zero is the unmatched unlock — and its
+  wrapper address names the lock type.**
+- The three redundant thunk layers (`126440/126458/118d98/118db0`) are DROPPED: they are
+  type-1 duplicates and consumed 7176 of 16384 slots for no information.
+- ⚠️ Type-1 wrappers are confirmed dispatch-visible. The other five are NOT yet confirmed —
+  if a type never appears, that may be `registerFunction` bypass
+  ([[feedback_registerfunction_bypass]]), not absence.
+
+```
+$env:PS2X_ORDER="13bc10,13bc28,13bc40,13bcb8,13bc58,13bcd0,13bc70,13bce8,13bc88,13bd00,13bca0,13bd18,11f268,11f448"
+```
+
+## HANDOFF 2026-08-24f (HWWATCH on 0x54EBE0) — ★★★ TEARDOWN OWNER IDENTIFIED = `sub_11F448`. DRIFT IS **NOT** AT REGISTER OR TEARDOWN — IT IS ~4 s INTO EACH ADX SESSION.
+
+Run `20260824-171409`, `exeWritten=2026-08-24 16:33:12` (SAME exe as 24d/24e — no rebuild),
+260 s, `hwWatch=True`, `PS2X_HWWATCH_ADDR=0x54EBE0`, `PS2X_HWWATCH_VAL=0xFFFFFFFF`,
+`PS2X_DETERMINISM=1`, quantum 20000, `PS2X_IPUTRACE=64`.
+
+### Coverage — CLEAN, no saturation
+
+**8 hits** (cap is 16384). Full 260 s covered. Unlike 24e, absence IS evidence here.
+`[HWSTAT] records=0` again — the stat tag is simply never emitted; not a negative result.
+
+### CONFIRMED — two writers of `0x54EBE0`, and two complete ADX life cycles
+
+| vbl | order | store site | newval | guest path |
+|---|---|---|---|---|
+| 750  | #0 | `0x18e408` memset | 0 | `ADX_Init+0x73b` → `0x13c7e8` → `0x13c740` |
+| 750  | #1 | `0x13c4c8` registrar | **0x11E598** | `ADX_Init+0x7f4` ← `sub_113F40` ← `sub_113D30` |
+| 1019 | #2 | `0x13c4c8` registrar | 0 | **`sub_11F448+0x8c4`** ← `0x113ee0` ← `0x113c60` ← dispatchLoop |
+| 1019 | #3 | `0x18e408` memset | 0 | `sub_11F448+0xa4a` → `0x13c828` → `0x13c740` |
+| 1217 | #4/#5 | — | 0 then 0x11E598 | identical repeat of vbl 750 |
+| 1665 | #6/#7 | — | 0 then 0 | identical repeat of vbl 1019 |
+
+⇒ **`sub_11F448` is the ADX teardown function.** This is the thing static xrefs could not
+answer. `sub_11FE90` and `sub_120080` — the two statically-unreachable candidates — were
+**NOT** observed. They are not on the live path.
+⇒ The game runs **ADX_Init → sub_11F448 → ADX_Init → sub_11F448** twice in 260 s.
+
+### CONFIRMED — hook values, from the ELF
+
+`eeref refs` gives four callers for each registrar, and they are the SAME four
+(`ADX_Init+0x50/0x60`, `sub_11F448+0x64/0x70`, `sub_11FE90+0x44/0x54`, `sub_120080+0x74/0x84`)
+— lock registrar then unlock registrar, **3 instructions apart** in every case.
+
+```
+0x11f2b8  jal 0x13c4c8   a0 = 0x11E598   ; register lock hook
+0x11f2c8  jal 0x13c4e0   a0 = 0x11E620   ; register unlock hook
+0x11f4ac  jal 0x13c4c8   a0 = 0          ; deregister lock hook
+0x11f4b8  jal 0x13c4e0   a0 = 0          ; deregister unlock hook
+```
+
+### ★★★ REFUTED — the register/teardown window is NOT the drift mechanism
+
+`[pump]` (256 records, no cap) correlates 1:1 with the watchpoints and kills it:
+
+| t | h2 (`0x54EBE0`) | n (`0x45EFC0`) | matches |
+|---|---|---|---|
+| 1   | 0 | 0 | — |
+| 130 | **0x11e598** | 0 | hwwatch vbl=750 register |
+| 134 | 0x11e598 | **-1** | **drift, 4 s AFTER register, both hooks LIVE** |
+| 154 | 0 | -1 | hwwatch vbl=1019 teardown — count does NOT move |
+| 189 | **0x11e598** | -1 | hwwatch vbl=1217 register |
+| 192 | 0x11e598 | **-2** | **drift, 3 s AFTER register** |
+| 217 | 0 | -2 | hwwatch vbl=1665 teardown — count does NOT move |
+| 256 | 0 | -2 | end of run |
+
+⇒ The count loses **exactly one increment per ADX session**, ~3–4 s in, while both hooks are
+registered. Neither the 3-instruction register window nor the teardown window is responsible.
+
+⚠️ **CORRECTION to 24e.** 24e's final sample read `n=0x0`; this run ends at `n=-2`. That
+"climb back to 0" was run-specific and did **not** reproduce. Treat it as noise, not a fact.
+
+### The lock/unlock thunks are separate functions, not a straight-line pair
+
+```
+0x126440  addiu $sp,-0x10 / sd $ra / ld $ra / j 0x118d98 / addiu $sp,+0x10   ; LOCK thunk
+0x126458  addiu $sp,-0x10 / sd $ra / ld $ra / j 0x118db0 / addiu $sp,+0x10   ; UNLOCK thunk
+```
+
+`eeref refs`: `0x126440` has **10** callers, `0x126458` has **15**. The excess is concentrated
+in multi-exit functions (`sub_125470` 1 lock / 4 unlocks; `sub_125898` 2 / 4), which is the
+normal single-entry-multiple-return shape — **not by itself a bug**, same as `sub_11D510`.
+Static analysis cannot settle it further.
+
+### ★★★ Why a data watchpoint can never close this
+
+A `svm_lock` that takes the null-hook branch at `0x13bb38` **writes nothing**. The missing
+increment is invisible to `PS2X_HWWATCH` by construction. 24e's #418 showed the unmatched
+*unlock*; the absent *lock* leaves no trace to watch. **Stop watching `0x45EFC0`.**
+
+### NEXT ARM — again NO BUILD. Trace ORDER, not writes.
+
+`PS2X_ORDER` records dispatch order with no memory reads, so it sees calls that produce no
+store. SVM traffic does not begin until ADX init (24e proved: zero writes to `0x45EFC0`
+before vbl 956), so the 16384-entry log starts filling at init and covers ~18 s — the drift
+is 3–4 s in, comfortably inside.
+
+```
+cd "F:\SDBZ Recomp"; $env:PS2X_IPUTRACE="64"; $env:PS2X_ORDER="13bc10,13bc28,126440,126458,118d98,118db0"; Remove-Item Env:PS2X_HWWATCH_ADDR -EA SilentlyContinue; Remove-Item Env:PS2X_HWWATCH_VAL -EA SilentlyContinue; Remove-Item Env:PS2X_HWWATCH_VBL_LO -EA SilentlyContinue; Remove-Item Env:PS2X_HWWATCH_VBL_HI -EA SilentlyContinue; Remove-Item Env:PS2X_REFSTAT_YIELD -EA SilentlyContinue; .\launch_recomp.ps1 -Determinism 1 -RunSeconds 260 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+(No `-HwWatch` this time, and every `PS2X_HWWATCH_*` var must be cleared or the launcher
+throws at `launch_recomp.ps1:264`.)
+
+**Pre-registered reading — declared before the run:**
+- A `13bc28` (unlock) with **no preceding `13bc10`** (lock) = the lost pair, located exactly.
+- Same at the thunk layer: a `126458` not preceded by `126440`.
+- ⚠️ `PS2X_ORDER` only sees **dispatch-loop** calls; direct C++ `fn_` calls bypass it
+  ([[feedback_registerfunction_bypass]]). 24e's backtraces show `0x13bc10` IS
+  dispatch-reached, but `0x118d98`/`0x126440` are unverified. If some of the six addresses
+  never appear, that is the bypass, **not** absence.
+- Check `[order]` for its cap line before reading any absence as evidence.
+- `[order] armed -- tracing dispatch ORDER of 6 addresses` must appear at startup; "parsed 0
+  addresses" means it did not arm.
+
+## HANDOFF 2026-08-24e (HWWATCH on 0x45EFC0) — ★★★ SVM READING **CONFIRMED**. THE LOST INCREMENT IS AT **vbl=962**, NOT AT THE t=203 DEREGISTRATION.
+
+Run `20260824-165316`, `exeWritten=2026-08-24 16:33:12` (same exe as 24d), 260 s,
+`hwWatch=True`, `PS2X_HWWATCH_ADDR=0x45EFC0`, `PS2X_HWWATCH_VAL=0xFFFFFFFF`
+(0xFFFFFFFF behaves as a **wildcard** — newvals 0,1,2,3,4 were all captured).
+
+### ⚠️ The capture SATURATED. Read the coverage before reading anything else.
+
+- `run_probe.jsonl.hwwatch.txt` holds **exactly 16384 hits = `kHwWatchMaxHits`**.
+- Coverage is **vbl 956 → 1162 only**. Everything after vbl 1162 is UNOBSERVED.
+- ⇒ The t=203 deregistration and the t=237 re-registration are **not in this capture**.
+  Any statement about who wrote the count at those moments is unsupported by this run.
+- `[HWSTAT]` printed **records=0** — the stat line never emitted. Saturation is inferred
+  from the hit count matching the cap exactly, not from a `[cap]` marker.
+  (`analyze_run.py --tag HWSTAT` therefore says "absence IS evidence" — **it is wrong here**;
+  the tag was never written at all. See [[feedback_capped_probes_false_negatives]].)
+
+### CONFIRMED: 0x45EFC0 has exactly two writers, and they are the two SVM primitives
+
+Every one of the 16384 store sites is one of:
+
+| store site | guest | role |
+|---|---|---|
+| `noop_sub_bb20_0x13bb20 + 0xc7b` | `0x13bb6c` | `svm_lock` increment |
+| `noop_sub_bb80_0x13bb80 + 0xa6d` | `0x13bbb0` | `svm_unlock` decrement |
+
+**No third party touches the nest count.** HANDOFF 24d's SVM identification is confirmed
+by direct observation, not inference.
+
+### The drift begins at vbl=962 — during ADX/boot init, long before the movie
+
+```
+#416  vbl=962  ->  1   LOCK    0x13bc10 <- 0x138a58 <- 0x139ce8 <- sub_125470+0x1b27
+#417  vbl=962  ->  0   UNLOCK  0x13bc28 <- 0x138a70 <- 0x139ce8 <- sub_125470+0x1b27   (balanced pair)
+#418  vbl=962  -> -1   UNLOCK  0x13bc28 <- 0x118db0 <- 0x126458 <- sub_125470+0x473a   <<< NO MATCHING LOCK
+#419  vbl=962  ->  0   LOCK    0x13bc10 <- 0x118d98 <- sub_11C940+0x18
+```
+
+From #418 onward the counter oscillates `0 / -1` for the rest of the capture and never
+recovers inside it. Value census over all 16384 hits: `0`=4901, `-1`=3792, `2`=3255,
+`3`=2441, `1`=1959, `4`=36. It reaches +4, so nesting is real and deep.
+
+### The lost write is an INCREMENT, and the guest code is statically balanced
+
+`0x118d98` = ADX lock wrapper, `0x118db0` = ADX unlock wrapper (thin `j` into
+`0x13bc10`/`0x13bc28`). `eeref refs` on both returns **matched pairs in every caller** —
+`sub_114C98`, `sub_11C150`, `sub_11C400` (x2), `sub_11C660`, `sub_11C940`, `sub_11D728`,
+`sub_11D8B8`, `sub_1218F8` (x2), `sub_121D68`, `sub_124118`, `sub_1275F8`, `noop_sub_6ce0`,
+`noop_sub_7140`, `noop_sub_76b0`, `sub_128FA0`… Only `sub_11D510` shows 1 lock / 2 unlocks,
+and that is two exit paths from one critical section.
+
+⇒ **The guest source is balanced. The imbalance is produced at runtime.**
+
+#418's unlock arrives via `0x126458`; its lock counterpart is `0x126440` (`noop_wrapper_c`,
+`j 0x118d98`). That lock is absent from the write stream — so it **executed but did not
+increment**, i.e. it took the `beq $v1,$zero,0x13bb70` null-hook branch at `0x13bb38`.
+**HYPOTHESIS (not yet verified):** `[0x54EBE0]` was null when the lock ran and non-null when
+the unlock ran — the lock-hook registration landed between them.
+
+### REFUTED this session
+
+- **"The registrars take the SVM lock themselves."** No. `0x13c4c8` and `0x13c4e0` are each
+  five instructions, two plain `sw`s and a `jr`. No locking.
+- Also clarified: the pair is **not** (lock hook, unlock hook). `0x13c4c8` writes
+  `[0x54EBE0]`=fn + `[0x54EBE4]`=arg; `0x13c4e0` writes `[0x54EBE8]`=fn + `[0x54EBEC]`=arg.
+  Two registrars, one per hook, each taking fn+arg.
+
+### Reproduction + one new fact
+
+`[pump] records=256, no [cap]`. Same shape as 24d, shifted ~58 s later by HWWATCH's cost:
+`t=179` h2 registers with `n=0` → `t=182` `n=-1` → `t=203` h2 **deregistered** →
+`t=237` re-registered (34 s gap, matching 24d's 33 s) → `t=240` `n=-2`.
+
+**NEW: `t=256` (final sample) `n=0x0`.** The count climbed from -2 back to 0 in the last
+second — two increments with no decrements. Not explained; the run ended there, so we do
+not know whether it held. If it holds, `svm_lock` would return 1 on the next call and the
+movie body's `bne $s0,$s2` gate at `0x155268` would pass.
+
+### NEXT ARM — again NO BUILD. Move the watch to the hook itself.
+
+`0x54EBE0` is written only by the registrars — a handful of times, so **no saturation risk**,
+and the full 260 s is covered instead of 3 s of it.
+
+```
+cd "F:\SDBZ Recomp"; $env:PS2X_IPUTRACE="64"; $env:PS2X_HWWATCH_ADDR="0x54EBE0"; $env:PS2X_HWWATCH_VAL="0xFFFFFFFF"; Remove-Item Env:PS2X_HWWATCH_VBL_LO -EA SilentlyContinue; Remove-Item Env:PS2X_HWWATCH_VBL_HI -EA SilentlyContinue; Remove-Item Env:PS2X_HWWATCH_CLIENT -EA SilentlyContinue; Remove-Item Env:PS2X_REFSTAT_YIELD -EA SilentlyContinue; .\launch_recomp.ps1 -HwWatch -Determinism 1 -RunSeconds 260 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+⚠️ `-HwWatch` is MANDATORY — `launch_recomp.ps1:264` throws if any `PS2X_HWWATCH_*` var is
+set without it, precisely to stop a silent false negative.
+
+**Pre-registered reading** (declared before the run):
+
+- **Every write to `0x54EBE0` gets a backtrace.** Expect ≥4 (register at ~t=179, clear at
+  ~t=203, register at ~t=237), each naming its caller — which finally identifies who tears
+  ADX down mid-run, the thing static xrefs cannot answer (`sub_11FE90` and `sub_120080` are
+  both UNREACHABLE in the static image).
+- **hits=0 and skipped=0** ⇒ nothing writes the hook and the `[pump]` h2 transitions came
+  from somewhere else — the whole 24d/24e model is wrong.
+- Check the hit count against **16384** before treating any absence as evidence.
+
+---
+
+## HANDOFF 2026-08-24d (`[pump]` h2/n RESULT) — ★★★ IDENTIFIED: THE GATE IS CRI **SVM LOCK NESTING**, AND THE NEST COUNT IS **NEGATIVE**.
+
+Run `20260824-163809`, exe written 16:33:12 (fresh, 5 min before launch).
+`[pump] records=197, no [cap]`. `PS2X_IPUTRACE=64`, det=1, quantum=20000,
+`PS2X_REFSTAT_YIELD` correctly absent.
+
+### The string that named the subsystem
+
+`0x4bc7c0` = `"2103102:SVM:svm_unlock:lock type miss match.(type org=%d, type now=%d)"`
+
+So, verified by decode + string, not inference:
+
+| addr | role |
+|---|---|
+| `0x13bb20` | `svm_lock` core — calls hook `[0x54EBE0]`, then `[0x45EFC0]++`, **returns the NEW count** |
+| `0x13bb80` | `svm_unlock` core — gated on hook `[0x54EBE8]`, does `[0x45EFC0]--` |
+| `0x45EFC0` | SVM lock **nest count** |
+| `0x45EFC4` | SVM lock **type** (the `type org` in the error string); written only when count was 0 |
+| `0x13bd30` | getter for the lock type |
+| 6+6 thin wrappers | one per lock type; `0x13bc10` passes type `1` |
+
+`0x155264 daddu $s0,$v0` / `0x155268 bne $s0,$s2` (s2=1) ⇒ **the movie body demands
+`svm_lock` return exactly 1**, i.e. it must be the OUTERMOST lock holder.
+
+### The measurement (1 Hz transitions — this is why sampling mattered)
+
+```
+t=1     en=0  h2=0x0       n=0
+t=121   en=1  h2=0x11e598  n=0        <- registered; a lock here returns 1. CORRECT.
+t=124   en=1  h2=0x11e598  n=0xffffffff   (-1)
+t=130   en=1  h2=0x11e598  n=0x1
+t=131   en=1  h2=0x11e598  n=0xffffffff   (-1)
+t=143   en=1  h2=0x0       n=0xffffffff   <- HOOK DEREGISTERED
+t=176   en=1  h2=0x11e598  n=0xffffffff   <- re-registered 33 s later
+t=178   en=1  h2=0x11e598  n=0xfffffffe   (-2)
+```
+
+`h2a` (`[0x45EFC4]`) = **0x0 at all 197 samples** — the "count was 0" branch never
+left a visible mark.
+
+⚠️ A single end-of-run read would have shown `h2=0x11e598` and called it healthy.
+The register→deregister→register cycle is only visible because the probe samples
+at 1 Hz. See [[feedback_probe_the_final_value]].
+
+### Why the count goes negative
+
+`svm_lock` increments **only if** `[0x54EBE0]` is registered. `svm_unlock`
+decrements **only if** `[0x54EBE8]` is registered. Calls that straddle a
+register/deregister boundary are unbalanced, and **nothing ever resets
+`[0x45EFC0]`** — so the drift is permanent. Once negative, `svm_lock` returns
+0 or -1, never 1, and the movie body bails to `0x155308` on every attempt.
+
+Registration map (all four confirmed by disassembling the call sites):
+
+| caller | a0 → lock hook | a0 → unlock hook | role |
+|---|---|---|---|
+| `ADX_Init+0x50` (`0x11f2b8`) | `0x11e598` | `0x11e620` | REGISTER |
+| `sub_11FE90+0x44` (`0x11fed4`) | `0x11e598` | `0x11e620` | REGISTER |
+| `sub_11F448+0x64` (`0x11f4ac`) | **0** | **0** | DEREGISTER |
+| `sub_120080+0x74` (`0x1200f4`) | **0** | **0** | DEREGISTER |
+
+### Two corrections to HANDOFF 2026-08-24c
+
+1. `sub_13C740` clears **both** hooks (`memset(0x54EBE0,0,8)` AND `0x54EBE8`), so
+   it is NOT the asymmetric wipe I hypothesized. More decisively, `eeref` reports
+   it **UNREACHABLE — nothing links to it**. It is dead code and cannot be what
+   cleared `h2` at t=143. The clear came from a real ADX deregistration.
+2. The "memset ordering hazard" pre-registered reading is therefore retired. The
+   observed `h2 → 0 → h2` churn is an **ADX shutdown/re-init cycle**, not an init
+   race.
+
+### Still unmeasured (the next question)
+
+`[0x54EBE8]` was never sampled — the unlock hook's timeline is unknown, so the
+exact straddle window is inferred, not measured. And no probe names **who** calls
+`sub_11F448` at t=143.
+
+`sub_11FE90` and `sub_120080` are both UNREACHABLE statically ⇒ reached only via
+function pointer, so static xref cannot close this. It needs a runtime writer trace.
+
+### NO BUILD NEEDED for the next arm
+
+`PS2X_HWWATCH_ADDR` takes a **guest EE address**, and the frame-trace wrapper
+([game_overrides.cpp:3387](ps2xRuntime/src/lib/game_overrides.cpp:3387)) arms DR0
+unconditionally whenever it is set — `PS2X_FRAMETRACE=1` is already in the run env.
+So a DR0 write-watch on `0x45EFC0` is a **pure run**, no rebuild.
+
+Pre-registered reading:
+- `HWSTAT hits>0` → `.hwwatch.txt` backtraces name every writer of the nest count,
+  in store order. That directly identifies the unbalanced caller.
+- `hits=0, skipped>0` → the value filter is wrong; re-run (should not happen with
+  `VAL=0xFFFFFFFF`).
+- `hits=0 AND skipped=0` → nothing writes it; the whole SVM read above is wrong.
+- Cap is `kHwWatchMaxHits = 16384` — check HWSTAT for saturation before treating
+  any absence as evidence ([[feedback_capped_probes_false_negatives]]).
+
+⚠️ Use `-RunSeconds 260`, not 200. HWWATCH costs ~20% wall-clock; the t=176
+re-registration sits close enough to the old 200 s edge to be lost
+([[feedback_run_window_false_negative]]).
+
+### Unchanged from previous runs
+`[ipu:cmd] records=12, no [cap]` — byte-identical to arms A–D. Still **zero decode
+commands** (codes seen: 0, 5=SETIQ, 6=SETVQ, 9=SETTH). Consistent: the movie body
+bails before ever issuing a decode.
+`[cblist]` L6 = 9→11 in 197 s while L0 reaches 443. `[thsync]` still alternates
+WORKER-INSIDE-WORK / WORKER-NOT-RUNNING.
+
+---
+
+## HANDOFF 2026-08-24c (`[pump]` RESULT) — ★★★ THE FALLBACK HYPOTHESIS WAS WRONG. THE REAL GATE IS A SECOND HOOK AT `0x54EBE0`, REGISTERED BY THE ADX LAYER.
+
+Run `20260824-161358`, exe written 16:12:14 (fresh). `[pump] records=202, no [cap]`.
+
+### Verified
+
+- `en=0` for t=1..126, then **`en=1` from t=127 to the end**. Master enable opens.
+- `skip=0` at every one of the 202 samples. The skip gate never fires.
+- `nostream=0` at nearly every sample. The stream loop is NOT the thing being skipped.
+- Only `s[0]` is ever non-zero, and its value is `1` — not a pointer. `s[1..7]` always 0.
+- **`hook(0x54EBF8)=0x0` at all 202 samples.**
+- `[ipu:cmd] records=12, no [cap]` — byte-identical to arms A-D. Still ZERO decode commands.
+
+### ⚠️ CORRECTION — my pre-registered reading #3 was wrong
+
+I pre-registered "`en=1, skip=0, hook=0x0` -> the fallback hypothesis is confirmed;
+`0x13c880`'s handler was never registered, and *that* registration is the stage."
+
+**`hook=0x0` is the DESIGNED state, not a missing registration.** Static proof:
+
+- The only writer of `0x54EBF8` other than a `sw $zero` clear at `0x13c7dc` is
+  `0x13c8fc`, inside the register-once function `0x13c8e8`.
+- `eeref refs 0x13c8e8` -> **exactly one caller**, `0x13c920`, inside `0x13c910`.
+- `0x13c910` passes **`a0 = 0`**.
+- `eeref refs 0x13c910` -> **UNREACHABLE in the static image; nothing links to it.**
+
+No path in this ELF can make `0x54EBF8` non-zero. `0x13c880` ALWAYS takes its
+`0x13bc10` fallback. That fallback is the normal handler, not a degraded one.
+
+### The real gate (decoded field by field)
+
+`0x13bc10` discards its argument (`addiu $a0,$zero,0x1`) and tail-jumps `0x13bb20`:
+
+```
+0x13bb20:  v0 = 0x54EBE0
+           if ([v0] == 0) goto 0x13bb70;      // v0 left holding 0x54EBE0
+           jalr [v0]   (a0 = [v0+4])
+           if ([0x45EFC0] == 0) [0x45EFC4] = arg;
+           v0 = [0x45EFC0] + 1;  [0x45EFC0] = v0;
+0x13bb70:  jr $ra                             // $v0 NEVER assigned on this path
+```
+
+- **null** -> returns `0x54EBE0`, the address itself.
+- **bound** -> first call returns exactly **1**.
+
+And `0x155264 daddu $s0,$v0,$zero` / `0x155268 bne $s0,$s2` with `s2=1` means the
+movie body bails to `0x155308` on anything but `1`. Confirmed by disassembly, not inferred.
+
+### Why this closes the loop on the ten-session ADX drill
+
+Registrar is `0x13c4c8` (`sw $a0,0($v0); sw $a1,4($v0)` -> `0x54EBE0`/`0x54EBE4`).
+`eeref refs 0x13c4c8`, call=4:
+
+| caller | function |
+|---|---|
+| `0x11f2b8` | **`ADX_Init+0x50`** |
+| `0x11f4ac` | `sub_11F448+0x64` |
+| `0x11fed4` | **`sub_11FE90+0x44`** |
+| `0x1200f4` | `sub_120080+0x74` |
+
+`sub_11FE90` is the function last session proved DID run. The ADX layer the drill
+kept circling is exactly what registers the handler this gate needs.
+
+**Ordering hazard, not yet measured:** `0x13c750` does `memset(0x54EBE0, 0, 8)`
+(via `0x18e408`). If that init runs AFTER the ADX registration, it wipes it.
+
+### `[pump]` extended — pre-registered reading (written BEFORE the run)
+
+New fields `h2=[0x54EBE0]`, `h2a=[0x54EBE4]`, `n=[0x45EFC0]` at
+`ps2xRuntime/src/lib/ps2_runtime.cpp:5153`.
+
+- `h2=0x0` at **every** sample -> the registration never happens. Stage = why
+  `ADX_Init`/`sub_11FE90` don't reach `0x13c4c8`.
+- `h2` non-zero **then returns to 0** -> the `0x13c750` memset wipes a live
+  registration. Stage = init ordering. This is the case a single end-of-run read
+  would have missed entirely.
+- `h2` non-zero and stable, `n=0` -> registered but `0x13bb20` is never called;
+  the fault is upstream of `0x1548a0`.
+- `h2` non-zero, `n` climbing, still no IPU decode -> the gate passes and the
+  fault is inside the stream loop at `0x155320`.
+
+### Still open
+
+- `iChangeThreadPriority` (`Thread.cpp:1138`) still calls `force_reschedule()`, contrary to ps2tek 2Ah.
+- `0x4418F8` value mismatch; `dispFbp`/`ctx0.fbp` divergence.
+
+---
+
+## HANDOFF 2026-08-24b (`[cblist]` RESULT) — **★★★ THE MOVIE PUMP IS ONE FUNCTION (`0x154fa8`), IT IS DISPATCHED 9 TIMES IN 200 s, AND THE WHOLE CHAIN IS NOW DECODED.**
+
+Run `20260824-155704`, arm-A settings + `PS2X_IPUTRACE=64`, `PS2X_REFSTAT_YIELD` unset.
+`[cblist] records=198, no [cap]`.
+
+### Verified (not inferred)
+
+1. **`[thsync] tick` IS the list-6 dispatch counter.** They match sample for sample:
+   t=124 → 1/1, t=127 → 3/3, t=140 → 4/4, t=142 → 5/5, t=147 → 6/6.
+   The `[thsync]` verdict string "stuck in 0x13c6e8 / the movie pump" was a guess in a
+   string; it is now grounded — list 6 really is the movie worker's list.
+
+2. **List 6 holds exactly ONE callback: `fn=0x154fa8, arg=0x0`.** Slots 1–5 null.
+   That is *not* a missing registration — every list is sparse (L2 fill=2, L4 fill=1,
+   L5 fill=2). The pre-registered "a null slot means an unregistered callback" reading
+   does **not** apply.
+
+3. **The movie is started TWICE, with a full teardown between.**
+   - t=124 registration → lists live → L6 tick creeps 1→5
+   - **t=147 teardown**: all `fn` slots cleared, ticks for L0–L5 zeroed (L6/L7 ticks survive)
+   - **t=147–183: 36 seconds where every list is empty and nothing ticks at all**
+   - t=184 re-registration, identical shape, L6 tick 7→9 then frozen
+   This exactly explains `[ipu:cmd] records=12` = two identical 6-command blocks.
+
+4. **List 6 is dispatched only while `req=1`.** L0/L2/L4/L5 tick at ~22–29/s (frame rate);
+   L6 ticked **9 times in 198 s**. `busy=1` at consecutive 1 Hz samples ⇒ the callback
+   dwells ≥1 s per call.
+
+5. **IPU unchanged from arms A–D**: BCLR/SETIQ/SETIQ/SETVQ/SETTH/BCLR ×2, zero decode.
+
+### The decoded pump chain — every address a fixed lui+addiu absolute
+
+```
+0x14e4d0: return 0x45F678                       <- movie global base
+0x154ff0: return [base+0x10]  = [0x45F688]
+0x1556f8: return [base+0x188C]= [0x460F04]
+
+0x154fa8  (THE registered callback)
+    if ([0x45F688] == 1) return 0;              // SKIP flag
+    return f_155210();
+
+0x155210  (the body)
+    if ([0x45F674] != 1) return 0;              // master enable (base-4)
+    if (f_1548a0(base+0x58) != 1) return 0;     // object state
+    f_155148();
+    if (f_1556f8() == 1) skip the stream loop;  // [0x460F04]
+    for (i=7; i>=0; --i) f_155320(0x45F6E4 + i*0x304);   // 8 streams, stride 0x304
+
+0x1548a0 -> tail-jumps 0x13c880:
+    v0 = [0x54EBF8];                            // RUNTIME-REGISTERED fn ptr
+    if (v0) return v0(a0); else return f_13bc10(a0);
+```
+
+⚠️ `eeref refs 0x45f674` returns only ONE imm site (`0x155058`). It does **not** see the
+`lui $v0,0x46 / lw $s2,-2444($v0)` reads at `0x15522c` and `0x15571c` — eeref pairs `lui`
+with `addiu`, not with `lw` offsets. **Treat its writer set for this address as incomplete**
+([[project_eeref_static_xref]]).
+
+### HYPOTHESIS — not yet verified
+
+The t=190 `[watchdog]` trace reads `... 0x12f1e8 -> 0x13c880 -> 0x13bc10 ...`, which is the
+**null-pointer fallback branch** of `0x13c880`. If `[0x54EBF8]` is genuinely 0, the object-state
+gate in `0x155210` is answered by a fallback rather than the real handler. `hook=` in the new
+probe confirms or kills this. Do not act on it before the run.
+
+### `[pump]` probe added — `ps2_runtime.cpp:5071`, UNBUILT
+
+1 Hz, unconditional, appended to the `[cblist]` block. Prints
+`en= skip= nostream= hook= obj= s:<8 stream head words>`.
+
+**Pre-registered reading** (declared before the run):
+- `en != 1` → the body never runs; find the writer of `0x45F674` — that is the stage.
+- `en=1, skip=1` → the callback self-skips every dispatch; `0x45F688` is the gate.
+- `en=1, skip=0, hook=0x0` → the fallback hypothesis is confirmed; `0x13c880`'s handler
+  was never registered, and *that* registration is the stage.
+- `en=1, skip=0, hook!=0, nostream=1` → the stream loop is skipped; `0x460F04` is the gate.
+- all gates open, streams non-zero, still no IPU decode → the fault is inside `0x155320`.
+
+### Corrections to the previous handoff
+
+- "no run has ever read those six pointers" — now read. There is one pointer, and it is
+  present. The pump is **registered**; it is **under-dispatched** (9×/200 s) and it **dwells**.
+- The 8-second `[thsync]` freeze is not one event: it is a start → 23 s of shallow ticking →
+  teardown → **36 s of total silence** → restart. The silence window is the larger anomaly.
+
+### Still open
+
+`0x4418F8` value mismatch; `dispFbp` vs `ctx0.fbp` divergence. Perf lane parked.
+`iChangeThreadPriority` (`Thread.cpp:1138`) still calls `force_reschedule()` against ps2tek 2Ah.
+
+---
+
 # PS2_PROJECT_STATE — SDBZ Recomp
+
+## HANDOFF 2026-08-24 (arms A–D RESULT) — **★★★ THE IPU IS CONFIGURED AND NEVER FED A DECODE. `PS2X_REFSTAT_YIELD` is a hard REGRESSION — leave it OFF. The quantum is NOT the frame-rate cap.**
+
+Four arms, one exe (`exeWritten=2026-08-24 13:13:26`, identical bytes in all four
+`[runmeta]` lines — no stale-binary trap). All 200 s, det=1, `PS2X_IPUTRACE=64`.
+
+| arm | log | `REFSTAT_YIELD` | `quantum` | .SFD open | adx st1@ / maxst | movie maxstat |
+|---|---|---|---|---|---|---|
+| **A** control | `20260824-132448` | unset | 20000 | ✅ | 123 s / 3 | 1 |
+| **B** quantum | `20260824-132046` | unset | 2000 | ✅ | **70 s** / 3 | 1 |
+| **C** yield | `20260824-132857` | 1 | 20000 | ❌ | 120 s / **1** | — |
+| **D** both | `run_log.txt` | 1 | 2000 | ❌ | 87 s / **1** | — |
+
+### ★★★ Result 1 — `PS2X_REFSTAT_YIELD` breaks the game. Verdict: REJECTED.
+
+- C and D **never open the `.SFD`**: `dvci=0 mvopen=0 cdsrch=0 sfdhd=0`, adx never
+  passes status 1 (A/B reach 3).
+- `[thsync]` in C: **`nTh=2`** for the whole run vs **`nTh=6`** in A. Four threads are
+  never created. `tick` frozen at 10; `req` never rises — the handshake the edit was
+  written to unblock **never happens at all**, because the game dies upstream of it.
+- ⇒ forcing a reschedule out of syscall 0x30 diverts early init. ps2tek was right:
+  `ReferThreadStatus` does not reschedule on real hardware.
+- **Action: keep the gate, keep it default-OFF.** The binary with the gate unset is
+  byte-identical in behaviour to the old one (arm A reproduces the 08-24 11:07 run
+  exactly). No rebuild needed to neutralise it. Do not promote it.
+
+### ★★★ Result 2 — my Finding-1 premise was HALF RIGHT. `vbl/s` has a second source.
+
+The previous handoff said `vbl/s = progress/quantum, a hard-coded constant`. That was
+derived from samples that all read `vblSrc=q/0/0` — I never looked at a sample where
+the other source fired. Across a full run it does:
+
+```
+arm A t=181:  vbl/s=35  vblSrc=0/35/0   <-- 35 from the guest-IDLE path, 0 from quantum
+arm B t=101:  vbl/s=31  vblSrc=2/29/0
+```
+
+⇒ **the machine already delivers ~35 vbl/s whenever the guest genuinely idles.** It
+delivers 5–8 the rest of the time because the guest is *spinning*, and spin only earns
+vblanks through the quantum divider. **The cap is not the constant — it is that the
+guest almost never reaches the idle path.** Retuning the quantum cannot fix that, and
+the measurement proves it:
+
+| | arm A (q=20000) | arm B (q=2000) |
+|---|---|---|
+| progress @ ~198 s | 20,096,047 | 3,518,197 |
+| `vbl/s` typical | 4–8 | 7–13 |
+| `busy%` typical | 83–107 | 88–102 |
+
+10× smaller quantum bought **~1.75×** more vblanks, not 10×, because guest progress
+collapsed 5.7× in step. Progress is dominated by *spin*, so it is not a work metric.
+
+**Exit test `vbl/s ≥ 40 sustained`: FAILED (7–13).**
+
+**But B's wall-clock gain is real and free:** adx status 1 at **t=70 s vs t=123 s**,
+status 3 at t=71 vs t=126 — 1.75× sooner to the interesting part, same milestones, no
+rebuild. Worth using for diagnostic runs. It is a knob, not a fix; it unblocked nothing.
+
+### ★★★ Result 3 — THE HEADLINE. The IPU is initialised and never asked to decode.
+
+`PS2X_IPUTRACE=64` armed the probe for the first time. **`records=12, no [cap]` — that
+is the complete count for 198 s, identical in all four arms:**
+
+```
+#1 code=0  BCLR     #7  code=0  BCLR
+#2 code=5  SETIQ    #8  code=5  SETIQ
+#3 code=5  SETIQ (opt=0x8000000, second table)   #9  same
+#4 code=6  SETVQ    #10 code=6  SETVQ
+#5 code=9  SETTH    #11 code=9  SETTH
+#6 code=0  BCLR     #12 code=0  BCLR
+```
+
+Codes verified against `ps2_ipu_core.cpp:1178-1226` (0=BCLR 1=IDEC 2=BDEC 3=VDEC
+4=FDEC 5=SETIQ 6=SETVQ 7=CSC 8=PACK 9=SETTH). **Zero IDEC/BDEC/VDEC/FDEC/CSC/PACK.**
+
+⇒ The guest loads the quantiser, VQ and threshold tables — twice, bracketed by BCLR —
+and then never issues a decode. `avail=0` after SETTH: the bitstream FIFO is empty.
+**The IPU path is wired, reached, and correctly configured. Only the per-frame decode
+trigger is missing.** This retires the old `[ipu:cmd] records=0` false negative and
+replaces it with a much narrower target.
+
+### ★★★ Result 4 — `0x13c6e8` is NOT "the movie pump". It is a callback-list thunk.
+
+`[thsync]`'s verdict string says *"stuck in 0x13c6e8; blocker moved into the movie
+pump"*. That label was the probe author's guess, baked into a string. Decoded from the
+ELF (`mips_r5900_disassembler.py`):
+
+```
+0x13c6d0  addiu $a0,$zero,5 ; j 0x13c4f8     three 24-byte thunks,
+0x13c6e8  addiu $a0,$zero,6 ; j 0x13c4f8     selector in $a0
+0x13c700  addiu $a0,$zero,7 ; j 0x13c4f8
+```
+
+`0x13c4f8` is a generic **"run callback list N"** dispatcher (funcmap:
+`sub_13C658_tail0013C4F8`, 0xc4 bytes — note the `_tail` naming, a hole-recovery
+fragment):
+
+```
+v0 = ((a0<<3)+a0)<<3 = a0*72        s0 = 0x54E960 + a0*72   list base
+s1 = 0x45EFE8 + a0*4  busy flag     s2 = 5, loop 6x         SIX entries, 12 bytes each
+per entry: if (fn) { [s1]=1; v0 = fn(arg); [s1]=0; s3 |= v0; }
+then [0x45EFC8 + a0*4]++   (per-list tick);  return s3
+```
+
+⇒ `inWork=1` means the worker is inside **one of the six callbacks in list 6**, which
+are registered at runtime. **No run has ever read those six pointers.** A null slot
+there is exactly what "IPU configured, never fed a decode" would look like.
+
+### Result 5 — `intrEsc` is NOT the bottleneck. The `di` gate is largely innocent.
+
+First run ever to print it. A=40, B=21, C=0, D=0 escapes over ~198 s; `intrStray=0`
+everywhere (the single-bit EIE model is not under-protecting). 40 escapes ×4096 samples
+is ~0.8% of arm A's back-edges. The pre-committed rule said "non-zero ⇒ fix
+`yield_point` step 2b" — **that rule was mis-calibrated**; non-zero is not the same as
+significant. Recording the miscalibration rather than following it mechanically.
+
+Note C/D read 0 *because* the extra yields pre-empt the escape, and C/D are the broken
+arms — so 0 here is a symptom of the regression, not a win.
+
+### Edit made this cycle (UNBUILT)
+
+`ps2_runtime.cpp` — new **`[cblist]`** 1 Hz probe after the `[thsync]` block. Dumps, for
+lists 0–7: `tick/fill` (+`*` if busy), then list 6's six `fn`/`arg` pairs in full.
+Pure diagnostic, no gate, no header touched.
+
+**Next run: arm A settings (defaults) + `PS2X_IPUTRACE=64`.** `PS2X_REFSTAT_YIELD` must
+stay unset.
+
+### Pre-registered reading of `[cblist]`
+
+- **a slot in L6 is `fn=0x0`** → the pump has an unregistered callback. Find its
+  registrar (`eeref refs` on `0x54EB10 + e*12`) — that is the stage.
+- **all six non-null, L6 tick climbing** → the pump runs; one callback is the one that
+  should issue BDEC/VDEC. Disassemble each `fn`, cross-check against the IPU writers.
+- **L6 tick frozen while `inWork=1`** → a callback genuinely never returns; that `fn`
+  is the hang.
+- **L6 fill=0 but tick climbing** → dispatching into nothing; registration never ran.
+
+### Still open, unchanged
+
+- `iChangeThreadPriority` (`Thread.cpp:1138`) still reschedules, contrary to ps2tek 2Ah.
+  Deliberately left alone during A–D. **Now safe to fix** — and Result 1 makes it more
+  suspicious, not less.
+- `0x4418F8` value mismatch (read 0, expected 0xF from an observed `sw a1,0x8(v0)`).
+- `dispFbp=0x0` vs `ctx0.fbp=0x70` in arm A; arm B shows them agreeing at `0x70`.
+- Perf lane — parked by user decision.
+
+---
+
+## HANDOFF 2026-08-24 (reassess) — **★★★ THE MOVIE WAS NEVER THE CONSTRAINT. `vbl/s`=5–7 is a hard-coded pacing constant (`quantum=20000`), not a stall and not a perf wall. Ten sessions of ADX/ADXM drilling were aimed three layers below the actual bottleneck. Two edits made, UNBUILT.**
+
+**Method:** re-measured the top-level premise instead of drilling further. Everything below comes from the **existing** `20260824-101518` run — **zero new runs, zero builds.**
+
+### ★★★ Finding 1 — the ~7 fps is a tuning constant
+
+- The run's own startup line: `[determinism] vblank paced by guest progress, quantum=20000 ticks`
+- Guest progress = **139,944 ticks/s** (`[watchdog]` t=194→195: 19,815,948 → 19,955,892)
+- **139,944 ÷ 20,000 = 7.0** — matches observed `vbl/s` 5–7 exactly
+- `vblSrc=q/0/0` on every sample ⇒ **100%** of vblanks come from the quantum path
+- Source `Kernel/Syscalls/Interrupt.cpp:618`, default `20000`, own comment: *"There is no principled value here"*
+- `launch_recomp.ps1:156` hard-codes 20000 but **honours a pre-set env var**
+
+⚠️ **This is a regression, and the direction is counter-intuitive.** At the Stage 5.6 close (2026-07-28) the same RelWithDebInfo config ran `vbl/s = 47–49` with progress ≈ **14,837/s**. Guest throughput has since improved **9.4×** while the displayed frame rate **fell 7×** — because quantum-paced vblank was added *during* Stage 5.17, calibrated against the old slower guest, and never re-tuned. Do not read "9× more guest work" as "faster"; it is mostly spin.
+
+### ★★ Finding 2 — an 8-second whole-machine freeze, mechanism in OUR code
+
+`[thsync]` t=186→194, one handshake, eight seconds:
+
+```
+t=186  req 0→1   tick=9    WORKER-NOT-RUNNING
+t=187  inWork=1  tick=10
+t=188  inWork=1  tick=11
+t=189  inWork=0  tick=11   WORKER-NOT-RUNNING   <- 3 dead seconds
+t=190  inWork=0  tick=11   WORKER-NOT-RUNNING
+t=191  inWork=0  tick=11   WORKER-NOT-RUNNING
+t=192  inWork=1  tick=12
+t=194  req 1->0
+```
+
+Same seconds in `[watchdog]`: `vbl/s=1 gif/s=0 dma/s=0 pc=0x11e6f0`, trace = `0x11ed28 → 0x174ba0 → 0x11ed90 → 0x174ba0` ×32. `0x174ba0` = syscall 0x30 `ReferThreadStatus`.
+
+Read from source, not inferred:
+- `maybe_yield()` (`ps2_scheduler.cpp:1194`) selects a **strictly higher**-priority ready head (`<`)
+- `yield_point()` step 3 (`ps2_scheduler.cpp:1420`) calls exactly that ⇒ **no equal-priority rotation exists anywhere**
+- `force_reschedule()` (`<=`, correct EE 29h semantics, `ps2_scheduler.cpp:1221`) is called **only** from `ChangeThreadPriority` (`Thread.cpp:1131`) — once, *before* the loop
+- `ReferThreadStatus` (`Thread.cpp:796`), the only syscall *inside* the loop, had **no yield at all**
+
+⇒ once the equal-priority worker blocks and becomes Ready again, the spinner can never hand back the slot. `force_reschedule()`'s own comment already names `sub_11E690` and this exact scenario.
+
+### ⚠️ Finding 3 — `[ipu:cmd] records=0` is a FALSE NEGATIVE
+
+Gated on `PS2X_IPUTRACE` (`Kernel/Ipu/ps2_ipu_core.cpp:101`, `:1427`), never set on any run. **Nobody has ever measured whether the validated IPU decoder receives a single decode command in-game.** Do not cite the zero.
+
+### Finding 4 — the screen is fully painted
+
+`[present] has=1 w=512 h=448 nonblack=229376` = 512×448, **every pixel**. Not a black screen. Also `dispFbp=0x0` while `ctx0.fbp=0x70` — draw and display targets differ. Noted, **not** investigated.
+
+### Finding 5 — a dead diagnostic (now wired up)
+
+`ps2x_guest_intr_disable_escapes()` + 3 siblings existed (`ps2_scheduler.cpp:252`) but **nothing printed them**. `yield_point` step 2b (`:1406`) refuses to yield while the guest holds `di`, for up to 4096 samples ≈ **512K back-edges per escape** — a plausible second cause of the 3-second dead stretches, until now unmeasurable.
+
+### Q6 / Q7 answered with evidence
+
+- **Q6 (existing tooling):** `git log --all --diff-filter=D -- build_scripts/*` returns only `elf_disasm.py`, which lives on as `mips_r5900_disassembler.py`. **Nothing to recover.** Everything above was answered by tools that already existed.
+- **Q7 (upstream):** head moved to `14b1e5cb` *"Start the main thread with COP0 Status.IE set (#214)"*. **We already have it** (`ps2_runtime.cpp:1057`, `ps2_scheduler.cpp:799`). `EeScheduler.cpp` (#184, 2,106 ln) still collides — `Kernel/*.cpp` is `GLOB_RECURSE`. Not now.
+- **Q8 (clean rebuild):** **NO.** No codegen change, no header under `include/` touched.
+
+### Edits made — UNBUILT
+
+1. **`Kernel/Syscalls/Thread.cpp`** — split `ReferThreadStatus` into `referThreadStatusImpl()` (no scheduler action, lock scoped) + a gated `ps2sched::force_reschedule()` **outside** `info->m`. `iReferThreadStatus` calls the impl directly, so the gate can never leak into interrupt context (ps2tek 31h). Gate `refstatYieldEnabled()` reads `PS2X_REFSTAT_YIELD`, **default OFF** ⇒ the binary is behaviourally identical to today unless enabled.
+2. **`ps2_runtime.cpp`** — watchdog line now carries `intrEsc= intrSec= intrStray=`, placed before `trace=` so truncation cannot clip them. Pure diagnostic.
+
+**Deliberately NOT done:** `iChangeThreadPriority` (`Thread.cpp:1138`) still inherits `ChangeThreadPriority`'s `force_reschedule()`, which ps2tek 2Ah says it must not. Real defect, **left alone on purpose** — an ungated scheduling change would contaminate arms A–D below. Fix it after this experiment.
+
+### The run matrix — ONE build, FOUR arms, same exe
+
+`det=1` throughout (mandatory). 200 s each. `PS2X_IPUTRACE=64` on **all four**.
+Launcher `:158` only sets its own keys, so pre-set vars pass through, and `:518` dumps every `PS2*` var into each log — **each arm self-documents**.
+⚠️ Env vars persist across invocations in one shell — clear them between arms or the arms contaminate.
+
+| arm | `PS2X_REFSTAT_YIELD` | `PS2X_DET_VBLANK_QUANTUM` | isolates |
+|---|---|---|---|
+| A | unset | 20000 | new binary ≡ old run (control) |
+| B | unset | 2000 | pacing alone |
+| C | 1 | 20000 | fairness alone |
+| D | 1 | 2000 | interaction |
+
+### Exit tests — PRE-REGISTERED, declared before the runs
+
+| signal | now | pass |
+|---|---|---|
+| `vbl/s` (arm B) | 5–7 | ≥ 40 sustained |
+| `[thsync] tick` (arm C) | 12 in 198 s | > 100 |
+| `req` 1→0 latency (arm C) | 8 s | < 1 s |
+| `vbl/s` during handshake (arm C) | 1 | no collapse |
+| `[ipu:cmd]` (any arm) | never measured | any BDEC/VDEC ⇒ decoder is fed |
+| `[movie] maxstat` | 1, ~8 s | holds a full logo duration |
+| `intrEsc` | unmeasured | 0 ⇒ the `di` gate is innocent |
+
+### Decision rules — PRE-COMMITTED
+
+- **B passes + movie renders** ⇒ Stage 5.17 closes; the ADX/ADXM branch was chasing a pacing artifact.
+- **B passes + movie blank + `[ipu:cmd]` shows BDEC/VDEC** ⇒ decoder fed, output not reaching GS. Next lane is the frame-upload path (`0x16B318` → `mwPlyGetCurFrm 0x14D2C0` → `MovieUpdate 0x113920`), **not** the IPU.
+- **B passes + `[ipu:cmd]` still zero** ⇒ guest never issues a decode. Back to the CRI layer — but now at 60 fps, so SofDec's timing assumptions finally hold.
+- **C passes, B doesn't** ⇒ the scheduler was the constraint, not pacing. Promote the yield out of its gate.
+- **Neither** ⇒ `intrEsc` is the tiebreaker. Non-zero ⇒ the `di` gate eats the yields and the fix belongs in `yield_point` step 2b, not the syscall.
+
+**Parked by user decision:** the perf lane. `[hostprof]` shows the main guest thread at 92% of one core — ~20% software GS rasterizer, ~21% MMIO/memory plumbing (`readIORegister` 8.2%, `read32` 5.2%, `translateAddress` 3.0%, an Fnv1a hash 1.8%, `isScratchpad` 1.9%). Real numbers, but the frame rate was never a throughput wall. Revisit only if the quantum sweep proves us genuinely CPU-bound.
+
+---
+
+## HANDOFF 2026-08-24 (real-HW memory check) — **REVERSED: `sub_11FE90` DID run on real PCSX2. The execution breakpoint was a false negative, not proof of unreachability. Investigation branch closed — this is not the movie-stall cause.**
+
+**What happened:** user set a PCSX2 execution breakpoint at `0x11fe90` and played through the movie; it never hit. Per [[reference_pcsx2_debugger_quirks]] (`"z_un"-named functions never trip breakpoints` entry, 2026-06-22), execution-breakpoint absence is a known unreliable signal on this build — checked memory state directly instead, per that memory's documented workaround.
+
+**Static read of `sub_11FE90` (via PCSX2 native disassembler, live):**
+```
+0x0011fe90  lui  s2, 0x0044
+0x0011feb4  lw   v1, 0x18E4(s2)      ; guard flag @ 0x004418E4
+0x0011febc  bnezl v1, ->0x00120058  ; already-initialized? skip re-init
+...
+0x0011ff1c  sw   t2(0x18), 0x14(v0) ; v0 = 0x004418F0 (table base)
+0x0011ff20  sw   v1(0x01), 0x00(v0)
+0x0011ff24  sw   a0(0x08), 0x04(v0)
+0x0011ff28  sw   a1(0x0F), 0x08(v0)
+0x0011ff2c  sw   a2(0x10), 0x0C(v0)
+```
+(disasm window capped at 40 instrs — a3/t0/t1 stores past +0x10 not directly viewed, extrapolated only)
+
+**Live memory read at `0x004418E0` (u32_array, 64B), game paused mid-run:**
+```
+0x4418E0: 0x004b86f0
+0x4418E4: 0x00000001   <- guard flag = 1 (SET, not 0)
+0x4418E8: 0x00000000
+0x4418EC: 0x00000000
+0x4418F0: 0x00000001   <- table[0x00] = 1  (matches v1 store exactly)
+0x4418F4: 0x00000008   <- table[0x04] = 8  (matches a0 store exactly)
+0x4418F8: 0x00000000   <- expected 0xF (a1); mismatch — see caveat below
+0x4418FC: 0x00000010   <- table[0x0C] = 0x10 (matches a2 store exactly)
+0x441900: 0x00000012
+0x441904: 0x00000018   <- table[0x14] = 0x18 (matches t2 store exactly)
+0x441908: 0x00000019
+0x44190C: 0x00000000   <- extrapolated slot; mismatch — see caveat below
+```
+4 of the 5 offsets **directly confirmed in the disassembled store instructions** (`0x00`→1, `0x04`→8, `0x0C`→0x10, `0x14`→0x18) match their live memory values exactly, at the exact byte offsets those instructions target.
+
+⚠️ **Corrected 2026-08-24:** the two mismatches are NOT the same kind of thing, and an earlier version of this entry wrongly lumped them together.
+- `0x44190C` reads 0 against an **extrapolated** expectation past the 40-instruction disasm window — no observed instruction, so no inconsistency, just missing coverage.
+- `0x4418F8` reads **0 where `sw a1(0x0F), 0x8(v0)` at `0x11ff28` was directly observed** in the disassembly. That is a **genuine mismatch against observed code**, not a coverage gap. Not investigated. Candidates, none tested: a later overwrite with 0, a second write path, or `v0` not holding `0x004418F0` at that particular store — note `v0` is loaded **twice** (`addiu v0, 0x18E0` at `0x11feac`, then `addiu v0, s0, 0x18F0` at `0x11fefc`).
+
+Neither changes this entry's conclusion — the guard flag is latched and 4 offsets match exactly — but do not cite the match as clean.
+
+**Conclusion:** `sub_11FE90` has executed and its guard flag is latched. This reverses the prior HANDOFF's "possibly unreachable" framing built on `eeref`'s `call=0 ptr=0 imm=0 gp=0` result — that static xref gap is real (nothing in the ELF text/data references this address by any method `eeref` traces — likely reached via a computed/jump-table dispatch [[project_eeref_static_xref]]) but does NOT mean the function never runs. Combined with the PCSX2 execution-breakpoint false-negative, **both signals available (static xref, dynamic breakpoint) were misleading in the same direction; only a direct memory read cut through it.**
+
+**Consequence:** `sub_11F160` (ADXM UsrIdleThread spawn), whose only caller is `sub_11FE90+0x17c`, is also presumptively reached — the guard-flag/table evidence shows `sub_11FE90` runs its full body (past the guard check) at least once, and the `jal` to `sub_11F160` sits inside that same unconditional path. **Not yet independently confirmed** — would need the same memory-read technique against whatever `sub_11F160` itself writes (e.g. a thread ID or TCB slot) to close this fully. This ADXM-thread-never-spawns theory as the Stage 5.17 stall root cause is now **weakened, not strengthened** — the subsystem this branch chases appears to initialize correctly on real hardware.
+
+**Next step:** either (a) confirm `sub_11F160` similarly via a live memory read of its output (thread handle/TCB), closing this branch entirely, or (b) abandon this ADXM-init theory for the movie-stall root cause and look elsewhere, since the evidence so far says this subsystem path is NOT the stall's cause.
+
+---
+
+**Command run (user):**
+```powershell
+python "F:\SDBZ Recomp\build_scripts\eeref.py" refs 0x11f160
+python "F:\SDBZ Recomp\build_scripts\eeref.py" refs 0x11fe90
+```
+
+**Result 1 — `sub_11F160` (ADXM UsrIdleThread spawn) HAS a caller, static grep just missed it:**
+```
+target 0x11f160  sub_11F160  slot=yes
+CALL 0x12000c  jal  in sub_11FE90+0x17c
+total: call=1 ptr=0 imm=0 gp=0
+```
+So the chain from the prior HANDOFF entry is real: `sub_11FE90` → (jal at +0x17c) → `sub_11F160`. `sub_11F160` never firing in the `PS2X_ORDER` trace is a *consequence* of `sub_11FE90` never firing, not an independent bug. This also confirms the earlier "zero-hit decompile-grep ≠ unreachable" caveat was correct to apply — `eeref`'s MIPS-level xref pass found what the text grep missed.
+
+**Result 2 — `sub_11FE90` (ADXM priority-table init) has NO references of any kind:**
+```
+target 0x11fe90  sub_11FE90  slot=yes
+total: call=0 ptr=0 imm=0 gp=0
+UNREACHABLE in the static image -- nothing links to this address.
+```
+This is stronger than the `sub_11F160` case — `eeref` checks direct calls, pointer stores, immediate loads, AND `$gp`-relative access, and found zero hits across all four categories. ⚠️ Per [[project_eeref_static_xref]], `eeref`'s own bugs present as confident "nothing found" — a computed/jump-table dispatch could still reach this address without `eeref` seeing it. **Do not conclude "dead code" from this alone.**
+
+**Working hypothesis (unconfirmed):** if `sub_11FE90` really is unreachable, the ADX priority table never gets initialized and the ADXM idle/worker thread (`sub_11F160`) never spawns — which would leave the ADX streaming subsystem running without its worker thread. Whether that's the actual root cause of the Stage 5.17 movie-streaming stall is still unproven.
+
+**Next step, not yet done:** real-hardware A/B check. Set a PCSX2 execution breakpoint at `0x11fe90` during movie playback — if real hardware also never hits it, this is conditionally-skipped by design (not a recomp bug, dead end for this theory). If real hardware DOES hit it, the recomp is missing whatever dispatch mechanism reaches it (jump table, function pointer table, etc. — worth then checking `sub_11FE90`'s neighbors/xrefs-to-region for a jump table pattern).
+
+---
+
+## HANDOFF 2026-08-24 (PS2X_ORDER trace) — **`ADX_Init` fires (x2). `sub_11EAC8`/`sub_11F0C8`/0x11ed78 fire heavily (1422 total dispatches). But `sub_11F160` (ADXM UsrIdleThread spawn) and `sub_11FE90` (ADXM priority-table init) NEVER fire — not capped, absence is real. Next: find who's supposed to call `sub_11F160`.**
+
+**Command run (user):**
+```powershell
+$env:PS2X_ORDER = "11eac8,11ed78,11f0c8,11f268,11fe90,11f160"
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag order
+```
+
+**Raw result** (capacity 16384, `total=1422 logged=1422` — NOT capped, so the absence below is real evidence, not truncation):
+```
+[order] #0 0x11f268
+[order] #1 0x11f0c8
+[order] #2 0x11ed78 x2
+[order] #4 0x11eac8
+[order] #5 0x11ed78 x527
+[order] #532 0x11f268
+[order] #533 0x11f0c8
+[order] #534 0x11ed78 x2
+[order] #536 0x11eac8
+[order] #537 0x11ed78 x885
+```
+
+**Identity check** (`sdbz_func_map_merged.csv`, confirmed by grep — do not re-derive):
+| addr | symbol | fired? |
+|---|---|---|
+| `0x11f268` | `ADX_Init` | ✅ yes, x2 (once near start, again at #532 — looks like two separate init attempts) |
+| `0x11f0c8` | `sub_11F0C8` | ✅ yes, x2 |
+| `0x11ed78` | `noop_wrapper_l_2` | ✅ yes, MASSIVELY (527 then 885 calls back-to-back). ⚠️ Per the existing "misleading func-map names" trap (documented earlier in this file re: Stage 5.11/movie-open chain — `noop_wrapper___` symbols in this exact CRI subsystem are confirmed LIVE stream functions, not noops) — treat this as a real hot function, not literally a no-op, until decompiled and checked. |
+| `0x11eac8` | `sub_11EAC8` | ✅ yes, x2 |
+| `0x11f160` | `sub_11F160` | ❌ **never** |
+| `0x11fe90` | `sub_11FE90` | ❌ **never** |
+
+**What `sub_11F160`/`sub_11FE90` actually do (read from `ida_scripts/decompiles_SLUS_214_42.txt`, hypothesis-labeled — NOT yet confirmed against runtime):**
+- `sub_11F160` (`ida_scripts/decompiles_SLUS_214_42.txt:23412`) — logs `"ADXM: UsrIdleThread Stack pointer = 0x%08x, size = %d"`, then calls `syscall_stub_r` (thread-create-shaped syscall) → `ADX_unk_unk` → `array_state_dispatch_c`. Reads as **the function that spawns the ADX streaming subsystem's idle/worker thread.**
+- `sub_11FE90` (`ida_scripts/decompiles_SLUS_214_42.txt:23951`) — gated on `if (!dword_4418E4)`; its "use defaults" branch hardcodes `dword_4418F0=1, dword_4418F4=8, dword_4418F8=15, dword_4418FC=16, dword_441900=18, dword_441908=25, dword_44190C=26`. **These are the exact same priority values (1/8/16/18/25) already seen live in run 89's `[chgpri]` boost bursts** — meaning either (a) this init function DOES run through a code path this trace didn't capture, or (b) those values are baked into the static `.data` image directly and this function's job was already done at ELF-load time, or (c) something else writes the same constants. Not yet distinguished — **hypothesis, not fact.**
+- Static grep for callers of `sub_11F160(` in the decompile dump: **zero hits.** Per this file's own established pattern in this subsystem (`noop_wrapper___` thunks, indirect/computed calls), a zero-hit static grep does NOT mean unreachable — it means the caller is likely a thunk/indirect call IDA didn't resolve. Do not conclude "dead code" from this alone.
+
+**Next step, not yet done:** find `sub_11F160`'s real caller. Two options: (1) `eeref.py refs 0x11f160` / `up` for a MIPS-level xref pass that (per this file's own notes) sometimes catches what IDA's decompile-dump grep misses, or (2) a hardware data/execution breakpoint on `0x11f160` itself in PCSX2 to catch it live on real hardware and see if IT ever fires there (A/B signal — if PCSX2 also never hits it during movie playback, it may be conditionally skipped by design, not a recomp bug).
+
+---
+
+## HANDOFF 2026-08-24 (web research) — **General PS2 movie pitfall (thread-priority/ring-buffer stalls) matches our OLD "boost-a-worker" theory — which run 89 already disproved. Doesn't change the plan. `PS2X_ORDER` trace is still the next actionable step.**
+
+**What was searched:** CRI SofDec/IPU pipeline architecture, PCSX2 FMV-stall bug reports, and — most useful — a real open-source PS2 homebrew player ([Simple Media System](https://github.com/TheMrIron2/Simple-Media-System)) whose changelog documents actual ring-buffer stalls on real hardware caused by thread-priority misconfiguration, because PS2 EE threading is non-preemptive/cooperative at a given priority level (same-priority threads only swap on explicit yield/reschedule, not a timer).
+
+**Why this doesn't change anything:** that failure mode — a worker boosted to the caller's own priority never actually getting scheduled because nothing forces a reschedule — is EXACTLY the theory already tested in this codebase (`ps2sched::force_reschedule()`, `ps2xRuntime/src/lib/ps2_scheduler.cpp:1221`, wired into `ChangeThreadPriority` at `Thread.cpp:1131`, with `<=` instead of `maybe_yield()`'s strict `<`). Run 89 (see entry below) already showed the boost bursts DO fire (40 `OTHER` calls, 3 discrete bursts, priorities 8→16→18→25) and `[thsync] tick` **still** stuck at 12 regardless. So this specific PS2 pitfall is a real thing in general, but it's a dead end for OUR stall specifically — already falsified empirically, not just in theory.
+
+**Confirms the architecture context for later reasoning:** SofDec's video path is IOP CD-read → EE memory buffer → IPU (bitstream decode + IDCT + colorspace conversion only) → EE MMI does motion compensation in software (NOT IPU hardware) → GS via GIF. Audio (CRI ADX/ADPCM) is a separate stream, synced via its own buffer/semaphore handoff — consistent with the `sub_11EAC8`(worker)/`sub_11ED78`(acker)/`0x441924`(shared flag) shape already found by static trace. `[sfdc] nz=0` (all 12 words zero, entire 198s of run 89) reads as "the producer side of this pipeline never puts real data in the buffer" — consistent with, not contradicted by, the standing hypothesis that the worker-thread cluster itself may never fire at runtime (still unconfirmed — `PS2X_ORDER` trace below is what settles it).
+
+**No new action taken** — this was research only, no files touched besides this entry. Next step is still the one queued in the "bypass check" entry directly below: run `$env:PS2X_ORDER = "11eac8,11ed78,11f0c8,11f268,11fe90,11f160"` before the next `launch_recomp.ps1`, to see whether the ADX worker/acker cluster dispatches at all.
+
+---
+
+## HANDOFF 2026-08-24 (bypass check) — **NO BYPASS. Every `jal` in generated runner code (checked `sub_113F40`→`ADX_Init` and `ADX_Init`→`sub_11F0C8`) routes through `runtime->dispatchGuestBranch()` → `lookupFunction()`, the SAME table `registerFunction()` writes into. The whole ADX/worker-thread chain is override-eligible AND already traceable for free via `PS2X_ORDER` env var — no new code needed.**
+
+**What was checked:** read `ps2xRuntime/src/runner/sub_00113F40_0x113f40.cpp` and `ADX_Init_0x11f268.cpp` directly (naming convention: `<name>_0x<addr>.cpp`, flat in `src/runner/`, confirmed via `ps2xRuntime/CMakeLists.txt:485` glob and `fn_forward_decls.h` for the name mapping). Every single `jal` instruction in both files — including `ADX_Init`'s call into `sub_11F0C8` (0x11f3a4) and `sub_113F40`'s call into `ADX_Init` (0x113fc8) — emits `if (!runtime->dispatchGuestBranch(rdram, ctx, target, src, fallthrough, GuestBranchKind::DirectCall, "JAL")) return;`. No exception, no direct C++ call.
+
+**Why that matters:** read `PS2Runtime::dispatchGuestBranch` (`ps2xRuntime/src/lib/ps2_runtime.cpp:1953`) — for any call kind it does `RecompiledFunction targetFn = lookupFunction(targetPc); targetFn(...)`. `lookupFunction` (line 1620) and `registerFunction`/`replaceFunction` (line 1590) both read/write `g_ps2RecompiledFunctionTable[slot]` — the identical table. So `[[feedback_registerfunction_bypass]]`'s "direct C++ `fn_` calls bypass it" caveat does **not** apply to guest-code `jal`→`jal` chains; it's a real risk only for **hand-written C++ in `game_overrides.cpp`** calling an `fn_XXXX` body directly as a plain function call instead of through `dispatchGuestBranch`. The generated runner code never takes that shortcut.
+
+**Consequence for Stage 5.17:** `sub_11EAC8`, `sub_11EC00`, `sub_11ED78` (acker), `sub_11F0C8`/`sub_11F160` (spawners), `ADX_Init`, `sub_11FE90` are ALL reachable through the override table. Two ways forward, no new C++:
+1. **Free, zero-risk:** the codebase already has a generic ordered-dispatch tracer gated on env var `PS2X_ORDER` (`ps2_runtime.cpp:3053`, armed at startup, comma-separated bare hex, e.g. `PS2X_ORDER=11eac8,11ed78,11f0c8,11f268,11fe90,11f160`). This reports the **order** these addresses actually dispatch in at runtime — settles "does this cluster fire at all, and in what order" with one run, no build needed (assuming the exe already has this feature — confirm it's wired into the launch script/`-Watch` flag before assuming; not yet checked this segment).
+2. If richer per-call data is needed later (args, `0x441924`/`0x4419D8` state at call time): a `registerFunction` passthrough wrapper (capture original via `runtime.lookupFunction(addr)`, log, call through) is now confirmed safe to add for any of these addresses.
+
+**Confirmed:** `launch_recomp.ps1` doesn't name `PS2X_ORDER` explicitly, but it follows the script's general pattern (seen for `PS2X_HWWATCH`, `PS2X_DIAG`, etc.) of honoring any `$env:` var already set in the parent shell before launch — it never clears the environment. So `$env:PS2X_ORDER = "11eac8,11ed78,11f0c8,11f268,11fe90,11f160"` set in the calling PowerShell session before running `launch_recomp.ps1` should reach the exe and arm the tracer, no script edit needed. Not run this segment (user runs launches, not me).
+
+---
+
+## HANDOFF 2026-08-24 (static trace) — **`sub_11EAC8` fully traced: it's a spawned WORKER THREAD, not a helper function, part of the CRI ADX audio-init chain. Real acker is `sub_11ED78`, gated on shared flag `0x441924`. Not yet confirmed live at runtime — `registerFunction` probing is blocked by the direct-call bypass.**
+
+**Verified from static disasm (`mips_r5900_disassembler.py --func`) + `eeref.py refs`:**
+- `sub_11EAC8` (0x11eac8–0x11ebfc) is **not called** anywhere (`eeref refs` → 0 CALL sites). Its address is only materialized as data in `sub_11F0C8+0x2c` (`slot=yes`).
+- `sub_11F0C8` loads that address into `$a1` and calls, in order: `jal 0x174aa0` (CreateThread-style SDK call, entry=`sub_11EAC8`), `jal 0x175de0` (StartThread), `jal 0x174b30` (the same syscall-0x29 `ChangeThreadPriority` thunk from run 89's `[chgpri]` probe, priority pulled from `0x4419C8`), `jal 0x11edf8`. **`sub_11EAC8` is a dedicated PS2 thread body**, spawned+started+priority-set by `sub_11F0C8`. This is a strong candidate source for at least some of run 89's 40 `OTHER` `[chgpri]` calls (creator thread setting a freshly-spawned worker's priority).
+- `sub_11EAC8`'s thread loop: while gate word `0x4419D8`==0, calls worker fn `0x13c6e8`, then checks flag `0x441924`. If `==1`: calls `sub_11ED78` and clears the flag to 0. Exits (sets `0x4419E0=1`, tail-calls `0x174ae0`, likely a semaphore/event signal) once `0x4419D8`!=0.
+- `sub_11EC00` (0x11ec00–0x11ecd4) is a **structural twin**: spawned the same way by `sub_11F160` (called from `sub_11FE90+0x17c`), own gate `0x4419E8`, own counter/busy-flag, but polls the **same shared flag `0x441924`** and calls the **same acker `sub_11ED78`**. Two worker threads, one shared completion flag, one acker.
+- `eeref refs 0x11f0c8` → real callers: `ADX_Init+0x13c`, `mem_fill_j_0+0x4c`, `sub_120220+0x4c`. This ties the whole cluster to **CRI ADX audio init** — matches the earlier `eeref refs 0x4418f0` hit on `ADX_Init+0x94/+0xd0`. Stage 5.17's stall may be an audio-streaming-thread stall, not (only) a SofDec video one.
+- `eeref refs 0x11fe90` (the other spawner, `sub_11FE90`) → **0 refs, reported UNREACHABLE**. Per `[[feedback_validate_tables_against_an_oracle]]`/eeref's known blind spots, this is flagged as **inconclusive, not dead code** — `sub_11FE90` itself calls both `sub_11F0C8` and `sub_11F160` and is a real 0x1ec-byte function, so something reaches it that the static tool can't see (likely another IMM/vtable slot pattern not covered).
+- One further hop up: `ADX_Init` (real entry `0x11f268`, func-map size `0x190`) has 3 static callers (`sub_113F40+0x88`, `mem_fill_j_0+0x4c`, `sub_120220+0x4c`); `sub_113F40` itself is called from `sub_113D30+0x8`. Chain not yet walked up to a landmark already confirmed live (GameMain/CAppInit) — stopped here for this pass, static reachability alone doesn't prove "runs in this session."
+
+**Blocker for a direct probe:** `eeref refs 0x11f0c8`/`0x11f268` show these are all reached via plain `jal` (direct calls), not `jalr`/dispatch-table dispatch. Per `[[feedback_registerfunction_bypass]]`, `runtime.registerFunction()` overrides only intercept calls that go through `dispatchGuestBranch` — direct `jal`-compiled calls between recompiled functions bypass the override table silently. Grepped `game_overrides.cpp` for the `dispatchGuestBranch` convention (lines ~783, 917, 996, 1408, 4507, 4618, 5605, 5916) confirming this is a known, actively-managed distinction in this codebase, not a guess. **Before writing a logging override on `ADX_Init`, `sub_11F0C8`, or `sub_11ED78`, must first confirm (by reading the one specific generated `.cpp` file for whichever caller) whether that particular call site actually routes through `dispatchGuestBranch` — otherwise the override silently never fires and produces a false "never called" reading.**
+
+**Recommended next step:** identify the runner `.cpp` file for `sub_113F40` (or `mem_fill_j_0`/`sub_120220`) and check whether its call into `ADX_Init` is a direct C++ call or a `dispatchGuestBranch`. If direct, the cheaper path is a host-side approach that doesn't depend on override interception at all — e.g. a hardware data breakpoint on `0x441924`/`0x4419D8` (`[[feedback_hardware_data_breakpoint]]`, ~19s/96s cost) or a hand-added log line inside `ChangeThreadPriority` keyed on `newPrio` values matching `0x4419C8`'s content, since that syscall path is already proven to fire and is not subject to the bypass.
+
+---
+
+## HANDOFF 2026-08-24 (run 89) — **`[chgpri]` now fires (28,877×) on a verified fresh binary. 99.83% is `SELF`; a real 40-call `OTHER` burst pattern exists but does NOT move `[thsync] tick` off 12. Boost-a-worker theory is dead as the unblock mechanism — look at the acker (`sub_11EAC8`) / `[sfdc]` producer next.**
+
+Run 88 (03:23) was the stale-binary false negative already flagged below — do not
+read it. This run rebuilt `RelWithDebInfo` first (`exeWritten=10:10:41` vs
+`Thread.cpp` mtime 03:14:58 — checked before trusting anything) and re-ran the
+identical 200s det=1 command. Full log decoded and grepped, not skimmed.
+
+**Verified, from the log:**
+- `[chgpri:enter]` = 28,877, `[chgpri]` = 28,877 — the probe fires copiously.
+  Run 87's "zero calls" conclusion stands as correct *for that run's binary*,
+  but is superseded now that a valid build shows the syscall firing constantly.
+- `SELF` (tid==callerTid) = 28,829 (99.83%). `OTHER` = 40 (0.17%), 100%
+  `callerTid=1` (main thread) targeting tid 3/4/5/6 and 7/8/9/10.
+- The 40 `OTHER` calls are NOT scattered — they cluster into 3 discrete
+  bursts (line numbers 3852–4128, 23926–25405, 62246–63013), landing at
+  watchdog t≈116–119s, t≈129–171s, and t≈184–192s respectively. Each burst
+  boosts one batch of 4 worker threads (either {3,4,5,6} or {7,8,9,10}) up
+  through priorities 8→16→18→25 in order, then later resets that same batch
+  back to priority 1. This is a real, reproducible round-robin/ping-pong
+  worker-dispatch pattern — not noise.
+- Despite these 3 boost bursts happening, `[thsync] tick` reads **12** at
+  t=196/197/198s — the exact same stuck value run 87 reported for its
+  (differently-probed) run. The boosts demonstrably do not advance the
+  worker's tick counter. `[sfdc]` stays `nz=0` (all 12 words zero) and
+  `[mvgate]` stays `nLive=0 live=-1 GEOMETRY-SUSPECT` for the entire 198s,
+  unaffected by the bursts. `pc` still parks at `0x422660` (the GameMain
+  spin, see below) between bursts.
+- Arithmetic re-check on `sub_11E690`'s `$a1` load (`lui $v0,0x44; lw $a1,
+  6384($v0)`): 6384 = 0x18F0, so the address is `0x440000+0x18F0 =
+  0x4418F0` exactly — matching `[thsync]`'s existing `boost=` field address.
+  Run 87's note below claims this is "off by 0x10" (`0x4418E0`); recomputing
+  independently from the same disasm output does not reproduce that — **this
+  looks like an arithmetic slip in run 87's session, flagged but not yet
+  fixed pending a second confirmation.**
+
+**Not yet investigated (side finding, unverified):** the GameMain watchdog
+`pc=0x422660` spin (`ELF/SLUS_214.42` @ 0x422660) polls a *dynamically
+allocated* cell — `lw $v0,-524($v0)` off a `lui $v0,0x64` base, i.e. reads
+`*0x63fe04` — against the address of a `$gp`-relative global, `0x500854`
+(`addiu $v1,$gp,0xffffd7e4`). `eeref refs 0x63fe04` returns UNREACHABLE
+(it's a heap cell, not a static symbol, so the static xref tool can't help
+here). `0x500854` itself has GP-relative writers in `GameState_Init`,
+`GameState_ReadInput`, `async_task_tick`, `async_task_complete`, and several
+`pool_entry_push_b_0_clone_*`/vtable-dispatch helpers — consistent with a
+generic object-pool/vtable-registration slot, not confirmed as this specific
+stall's cause. **This is a hypothesis, not a finding — has not been probed
+at runtime.** Per the decision tree below, the next concrete step is still
+to trace `sub_11EAC8` (the acker for `[0x441924]`) directly to see whether
+it's even reached on a separate host fiber, since that's what the existing
+plan already called for and this run's data doesn't change that.
+
+---
+
+## HANDOFF 2026-08-24 (run 87) — **The run-86 "boosts the worker" reading is WRONG. `[chgpri]` fired zero times in a 198s run whose `[thsync]` tick still reached 11. Two new probes added.**
+
+⚠️ **Run "88" (03:23) was a STALE-BINARY false negative — do not read anything into it.**
+`Thread.cpp` was edited 03:14, `ps2EntryRunner.exe` was last built 02:30 (44 min *before*
+the edit). `[chgpri:enter]`=0 and `[chgpri]`=0 in that log just means the old narrow probe
+never fired, same as run 87 — zero new information. **Must run `build.ps1` before the next
+`launch_recomp.ps1`** — check `Thread.cpp` mtime < exe mtime before trusting any future
+`[chgpri]` read.
+
+Run 86's `PS2_PROJECT_STATE.md` entry (below) proposed that `sub_11E690`
+boosts a *different* worker thread to its own priority via `ChangeThreadPriority`,
+and that `maybe_yield()`'s strict `<` (vs `force_reschedule()`'s `<=`) was why
+the boost never actually preempted the spinner. That theory is now falsified
+by direct measurement, not just re-reading:
+
+- Rebuilt with the `[chgpri]` probe (`target != callerTid` only) and ran the
+  same 200s command. Result: **`[chgpri]` count = 0** for the entire run, while
+  `[thsync]`'s `tick` counter still climbed to 11 (`[ipu:cmd]` stayed at 12,
+  unchanged from run 86) and the last `[thsync]` line still read
+  `VERDICT=WORKER-NOT-RUNNING`. Full tag census: `grep -c` per tag over the
+  238s→198s log, see command below.
+- That means `ChangeThreadPriority` (syscall 0x29) is **never called with a
+  target other than the caller itself** — the run-86 "boosts a worker thread"
+  reading was an unverified inference from IDA's pseudocode variable naming
+  (`ChangeThreadPriority(tid, [0x4418F0])` in the old comment), never checked
+  against raw MIPS.
+- Went back to static (per `[[feedback_static_before_probe]]` — should have
+  done this before writing `[chgpri]` in run 86, not after): IDA was
+  disconnected this session, so used `build_scripts/mips_r5900_disassembler.py`
+  directly against `ELF/SLUS_214.42`, no MCP needed.
+  - `sub_11E690` (`noop_sub_e690`) disassembled at 0x11e690: calls
+    `jal 0x174b30` **twice**, once before the spin loop (0x11e6e0) and once
+    after it exits (0x11e744). `0x174b30` disassembles to
+    `addiu $v1,$zero,0x29 ; syscall ; jr $ra` — confirmed, this really is
+    syscall 0x29 (`ChangeThreadPriority`), not a naming artifact.
+  - Argument setup: `$a0` is untouched since function entry (still the
+    caller-supplied `tid` param), `$a1` is reloaded right before the call via
+    `lw $a1, 6384($v0)` with `$v0=0x440000` → **`*0x4418E0`**, not `*0x4418F0`.
+    The existing `[thsync]` probe's `boost` field reads `0x4418F0` — **off by
+    0x10**, so that field has never shown the real value handed to the
+    syscall. Not fixed yet; low priority next to the bigger question below.
+  - The spin loop itself (`0x11e6f0`..`0x11e710`, up to 200,000,000 iterations)
+    contains **no syscall at all** — only two conditional-wakeup helpers
+    (`array_state_dispatch_b`/`0x11ed28`, `thread_resume_if_suspended`/`0x11ed90`,
+    both gated on the target's `status` field) and a poll of `[0x441924]`.
+    On real EE this works because a second, genuinely concurrent thread
+    clears the flag; our cooperative scheduler has nothing to switch to
+    unless one of those two helpers, or the boost call surrounding the loop,
+    triggers a reschedule.
+- Given `[chgpri]`=0 but the boost call demonstrably executes twice per
+  invocation of `sub_11E690` (per the disasm), the only ways to reconcile
+  that with zero logged targets are: (a) every call is a **self**-boost
+  (`tid == callerTid`, i.e. the thread raises its own priority, not a
+  worker's — a legitimate and different real-code pattern than assumed), or
+  (b) the call bails inside `ChangeThreadPriority()` before reaching the
+  probe line (`resolveSelfOrThread()` miss, or a `DORMANT`/illegal-priority
+  early return). **Both widened this session, not yet tested:**
+  1. `[chgpri]` in `Thread.cpp` no longer filters on `tid != callerTid` — now
+     logs every call, tagged `SELF` or `OTHER`.
+  2. New `[chgpri:enter]` logs at function entry (before `resolveSelfOrThread`)
+     and at each early-return path (`resolveSelfOrThread` miss, `DORMANT`,
+     `ILLEGAL_PRIORITY`), so "never called" and "called then bailed" are now
+     distinguishable without another blind round trip.
+- **Next step:** rebuild, re-run with the same command, then
+  `analyze_run.py --tag chgpri` (or grep, since `analyze_run.py` may not know
+  this tag — see `[[project_diagnostic_tooling]]`) and:
+  - if `[chgpri:enter]` count is 0 → `sub_11E690` itself never executes in
+    this run; the movie-pump thread relationship needs re-tracing upstream
+    from scratch, the run-86/87 reading of this function was moot.
+  - if `[chgpri:enter]` fires but `[chgpri]` (post-lock) stays low/0 → read
+    which bail fired (`resolveSelfOrThread MISS` / `DORMANT` / `ILLEGAL_PRIORITY`).
+  - if `[chgpri]` fires and every line reads `SELF` → the boost-a-worker
+    theory is dead; `force_reschedule()`'s `<=` fix (already in
+    `ps2_scheduler.cpp:1221`, uncommitted) is not the mechanism that unblocks
+    this stall, and the investigation should look at what actually clears
+    `[0x441924]` (i.e., trace `sub_11EAC8`, the acker, directly — is it even
+    running on a separate host fiber, or does everything happen on one?).
+
+Command used to extract tag counts from the UTF-16LE log (works without
+`analyze_run.py`, useful for tags it doesn't know about yet):
+```python
+import io, re
+from collections import Counter
+with io.open('run_log.txt', encoding='utf-16-le', errors='replace') as f:
+    lines = f.readlines()
+tagc = Counter()
+for l in lines:
+    m = re.search(r'\[([a-zA-Z0-9_:]+)\]', l)
+    if m: tagc[m.group(1)] += 1
+```
+
+## HANDOFF 2026-08-24 (run 86, SUPERSEDED — see run 87 above) — **Root cause found: the movie worker IS ticking, but our scheduler starves it to ~1 tick/2s. A fix is already written; needs a rebuild+re-run to test.**
+
+Supersedes the previous "run 85" entry below, which mislabeled the run and — more importantly —
+was written without reading the `[thsync]`/`[mvgate]` data that was **already in the same log**.
+There was no separate "run 85"; `run_log.txt` (238s, ends 08-24 02:39) already contains `[mvslot]`,
+`[movie]`, `[ipu:cmd]`, `[adx:stream]`, `[mvgate]`, **and** `[thsync]` together — the `ps2_runtime.cpp`
+comment trail itself calls this "run 86" (see the `[thsync]` block, ~line 4810). Read the whole probe
+stack before writing a new handoff; don't stop at the first tag that looks conclusive.
+
+### What still holds from the old "run 85" reading
+
+- The movie object **is** created, twice (t=111-125s, t=159-176s), cleanly — `[mvslot]`'s 5 fields
+  all go nonzero together both times, so `module_obj_init_z_42` isn't failing on any branch.
+- `[ipu:cmd]` is still only 12 commands total, all init, zero BDEC/VDEC/FDEC. `[adx:stream]` is
+  silent the whole run.
+- **New correlation this pass:** 12 is not a coincidence. `[thsync]`'s `tick` counter (the movie
+  worker's own tick, `[0x441960]`) also reaches exactly **12** by the end of the second window
+  (t=181s). Every IPU init command lines up with one worker tick — the worker *is* driving the
+  pump, just far too rarely to ever reach a real decode call.
+
+### The actual mechanism — `[thsync]`, `sub_11E690`/`sub_11EAC8`
+
+`sub_11E690` is a synchronous cross-thread handshake: set `[0x441924]=1`, `ChangeThreadPriority`-boost
+the worker to the caller's own priority, then spin on `ReferThreadStatus` until the worker ACKs by
+clearing `[0x441924]`. The worker side (`sub_11EAC8`) sets `[0x441934]=1`, calls the actual movie pump
+(`jal 0x13c6e8`, which reaches `sub_155320`), clears it, then ACKs.
+
+`[thsync]`'s own pre-committed verdict logic caught it directly: `VERDICT=WORKER-INSIDE-WORK` and
+`VERDICT=WORKER-NOT-RUNNING` **alternate roughly every 1s** while `req=1` is held — i.e. one worker
+tick takes multiple seconds of wall/host time to complete, when the guest math inside it should be
+near-instant. Across both ~8-9s "playing" windows the worker gets scheduled only ~5-6 times each,
+then the window closes (SofDec's own ~8s timeout fires) before anything downstream ever reaches a
+real decode.
+
+`Thread.cpp`'s `ChangeThreadPriority` already carries a comment diagnosing exactly this: boosting a
+worker to the **caller's own** priority (both at 1) doesn't cause `maybe_yield()` to give up the
+fiber, because `maybe_yield()` only yields to a **strictly higher**-priority head. `force_reschedule()`
+(the real EE-syscall-29h semantics, `<=` not `<`) is the fix for that half, and **it is already
+present in the working tree** (`ps2xRuntime/src/lib/ps2_scheduler.cpp:1221`, uncommitted, part of
+this same investigative arc). It was not confirmed whether this run's binary was built *with* that
+fix in place or the log predates it — this needs settling before drawing conclusions from the tick
+rate, not assumed either way.
+
+### Loose end this pass closed only partially — `[chgpri]` probe added, not yet run
+
+The `[thsync]` thread table can't safely identify *which* tid is the boosted worker: at
+t=112 (`inWork=1`, mid-tick) **three different tids simultaneously read `st=1` (THS_RUN)**
+(tid 1, 4, 6) — impossible for a single EE core, so `ThreadInfo::status` is not being kept
+in lockstep with real dispatch on every transition and cannot be trusted to pick the target
+out of a crowd. `tid=2` looked like a candidate (`pri=1` matches `boost=1`) but reads
+`st=4(WAIT) wt=2(SEMA) wid=3` **unchanged across the entire window**, t=111 through t=130,
+regardless of `req`/`inWork`/`tick` — it is blocked on something else entirely, not our
+worker.
+
+Added a one-line, unambiguous probe instead of guessing further: `[chgpri]` in
+`ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp` (`ChangeThreadPriority`, ~line 1046) prints
+`target=<tid> newPrio=<n> callerTid=<n> targetStatusBefore=0x.. targetWaitTypeBefore=<n>
+targetWaitIdBefore=<n>` at the exact syscall that names the boost target — no inference from
+a 1Hz snapshot needed. Uncapped (ChangeThreadPriority is a rare syscall, not a per-tick one).
+Not yet built or run.
+
+### Next step — one build + run
+
+1. Rebuild (picks up the `[chgpri]` probe and confirms whether `force_reschedule`'s `<=` fix
+   was already in the binary that produced this log or is new).
+2. Re-run with the same command as before.
+3. `analyze_run.py --tag chgpri` — read the target tid off the `sub_11E690` boost calls
+   during t=111-130 and t=159-181, then re-read `[thsync]`'s thread table for *that specific*
+   tid only (ignore the others — they're a red herring per the THS_RUN-x3 finding above).
+4. Compare `[thsync]` tick-rate and `[ipu:cmd]`/`[adx:stream]` record counts against this run.
+   If `force_reschedule`'s fix was already active and the worker is *still* starved, the
+   remaining gap is elsewhere in the scheduler (maybe the boosted thread isn't actually
+   *Ready* — it could be blocked on something upstream of the priority boost, same shape as
+   the `tid=2` red herring above, just for the real target). If the fix was NOT active in this
+   log, this alone may resolve the movie stall — rerun is the only way to tell.
+
+Also still open and unrelated: `vbl/s` = 0-1 instead of 60.
+
+---
+
+## HANDOFF 2026-08-24 (run 85, SUPERSEDED — see run 86 above) — **The object IS created (twice); it "plays" ~8s with zero frames decoded.**
+
+Corrects run 84: that handoff read `obj=0x0 for all 238 ticks` from a run that predates
+the new `[mvslot]` probe. Re-ran with the probe in place; the picture is different.
+
+**Superseded 2026-08-24, same day:** this entry was written without reading `[thsync]`/`[mvgate]`,
+which were already present in the very same `run_log.txt`. The "next thread" section below
+(chase `mwPlyGetCurFrm`/`MovieUpdate` statically) was overtaken by data that was already sitting
+in the log — the movie-pump call chain was already identified down to `sub_11E690`/`sub_11EAC8`/
+`0x13c6e8` by the code comments before this entry was even written. Kept for the raw `[mvslot]`
+signal table below, which is still accurate; follow the run-86 entry above for what to do next.
+
+### Both creation attempts succeed
+
+`obj` (`*(u32*)0x54BD90`) goes nonzero **twice**: t=111-125s and t=159-176s, both times
+to `0x45f6e4` (pool slot 0). `objSt=1`, `stat` hits `1` ("playing") for ~8s inside each
+window, `objFile=0x4597b0`, `objLen=0xfffff`. Then `crt2` drops, then `obj` drops, and
+the object tears itself down. No third attempt in the remaining 62s of the 238s run.
+
+The `[mvslot]` probe (5 fields inside `module_obj_init_z_42`'s target struct, all
+previously suspected failure points) confirms this: all 5 go nonzero **together** in
+the same two windows — so that function is not failing on any branch, it's succeeding
+cleanly both times. (The old "which of 5 branches fails" framing from the deeper
+`module_obj_init_z_42` trace was answered: none of them fail.)
+
+| Signal | Value | Reading |
+|---|---|---|
+| `dvci` / `mvopen` / `cdsrch` | 2 / 2 / 4 | the `.SFD` opened, twice — matches 2 create/play/teardown cycles |
+| `[movie] wrkAdr` | `0x1806c00`, `wrkSiz=0x332100` | SofDec work area allocated, stable all run |
+| `[movie] obj` | `0x45f6e4` for t=111-125s and t=159-176s, else `0x0` | object created and destroyed twice |
+| `[movie] stat` | `1` for ~8s inside each window | playback state reached, then reverts |
+| `[ipu:cmd]` | 12 total, all init, 0 BDEC/VDEC/FDEC | decoder never fed a bitstream despite "playing" |
+| `[adx:stream]` | `nonzero=0/40` always | audio also never fed |
+
+`obj` sampled at `ps2xRuntime/src/lib/ps2_runtime.cpp:3552`. `[mvslot]` probe added at
+`ps2xRuntime/src/lib/ps2_runtime.cpp:4738` (5 fields off pool slot 0, `0x45f6e4`).
+
+---
+
+## HANDOFF 2026-08-23 (later) — **THE IPU IS IMPLEMENTED AND VALIDATED. Needs a build.**
+
+**Session type:** static scoping, then implementation, then offline validation against
+ffmpeg. **Zero game builds, zero game runs.** The IPU was written and proved correct
+outside the 48-minute build loop entirely.
+
+### State in one line
+
+Stage 5.17's answer was "the IPU is pure register storage". It is now a real MPEG
+decoder: IPU_CMD/CTRL/BP/TOP behave, the input and output FIFOs are real, DMA channels
+3 and 4 walk their own descriptors, and BCLR/BDEC/VDEC/FDEC/SETIQ/SETVQ/SETTH/CSC/PACK
+all execute. Validated by playing three real SDBZ movies through it and diffing every
+frame against ffmpeg: **422 frames, worst absolute pixel difference 2, min PSNR 63.7 dB,
+zero decode errors.** The remaining +/-2 is this float IDCT versus ffmpeg's integer IDCT.
+
+### What to do next — ONE build, then one run
+
+```powershell
+& "F:\SDBZ Recompuild.ps1" RelWithDebInfo
+```
+
+Then the normal runner. Expect the two logo movies to render. If they do not, the IPU is
+no longer the first thing to suspect: it is proved correct against a reference decoder,
+so look at what the guest does with the decoded frame (`0x16B318` -> `mwPlyGetCurFrm`
+`0x14D2C0` -> `0x113920 MovieUpdate`) and at the GS upload path.
+
+### The scope discovery that made this tractable
+
+**Every movie this game ships is MPEG-1, not MPEG-2.** ATARI, OKR, OP, OP1, OP_PAL and
+OP_USA contain **zero** extension start codes (`0x000001B5`) — no sequence_extension, no
+picture_coding_extension. That removes intra_vlc_format, alternate scan, non-linear
+quantiser and the MPEG-2-only Table B.15 from the critical path. B.15 is deliberately
+NOT transcribed; a half-remembered table would decode into plausible garbage, whereas the
+missing-table path raises IPU_CTRL.ECD, which the guest driver already checks at
+`0x424bec` and handles cleanly.
+
+A static scan of **every** IPU_CMD store in the ELF shows the guest only ever issues
+BCLR, BDEC, VDEC, FDEC, SETIQ, SETVQ, SETTH and CSC. No IDEC, no PACK.
+
+### Facts pinned from the disassembly, not assumed
+
+| Fact | Evidence |
+|---|---|
+| BDEC output is **768 bytes** = int16 `Y[16][16]` + `Cb[8][8]` + `Cr[8][8]` | `0x424710` `addiu $a1, $zero, 0x300` feeding the IPU_FROM helper at `0x426048` |
+| VDEC result is in **IPU_CMD[15:0], sign-extended 16-bit** | `0x424440` `andi $v0,$a2,0xffff` then `sll 16 / sra 16` |
+| macroblock-type flags: bit2 = backward, bit3 = forward | `0x424484` `andi $v0, $a0, 0xc` |
+| The guest **refills IPU_TO from inside its wait loop**, with a 501-iteration bail-out | `0x424b98`; `0x424c70` reads IPU_TO QWC, `0x424c7c` calls the refill helper `0x428448` |
+| So reporting BUSY while starved is correct AND safe | same loop — it reacts by feeding data instead of hanging |
+| The guest drives IPU_FROM/IPU_TO **directly via MMIO**, not `sceDmaSend` | stores to `0x1000B0x0` / `0x1000B4x0` throughout `0x163xxx` and `0x42xxxx` |
+| IPU_TO uses **both** normal (`0x101`) and chain (`0x105`) mode | `0x429620` and `0x42784c` |
+| IPU_FROM is normal mode, QWC up to `0xFFC0` — a streaming pull the guest aborts by clearing STR | `0x4293dc` |
+| The guest polls IPU_CMD as a **64-bit** load and tests bit 63 | `0x424bd4` `ld $s1, 0($v0)` + `bgezl` |
+
+### What was written
+
+| File | Role |
+|---|---|
+| `ps2xRuntime/src/lib/Kernel/Ipu/ps2_ipu_core.h` | interface, ~120 lines |
+| `ps2xRuntime/src/lib/Kernel/Ipu/ps2_ipu_core.cpp` | registers, FIFOs, DMA ch3/ch4, command engine, block decode, IDCT, CSC/PACK |
+| `ps2xRuntime/src/lib/Kernel/Ipu/ps2_ipu_tables.cpp` | MPEG VLC tables B.1/B.2-B.4/B.9/B.10/B.12/B.13/B.14, built and prefix-checked at startup |
+| `ps2xRuntime/src/lib/ps2_memory.cpp` | wiring only — MMIO, 64-bit IPU_CMD/IPU_TOP reads, 128-bit FIFO windows, ch3/ch4 claim, D_STAT bits 3/4 |
+| `build_scripts/ipu_validation/` | the offline harness + README |
+
+**No CMakeLists edit was needed** — `src/lib/Kernel/*.cpp` is already a `GLOB_RECURSE
+CONFIGURE_DEPENDS`, so the new directory is picked up automatically. **No header under
+`include/` was touched**, so no runner TU is invalidated.
+
+### The design decision that matters
+
+Input is **pulled one quadword at a time straight out of the ch4 descriptor**, exactly
+like hardware, rather than being gathered up front. That keeps MADR/QWC/TADR truthful
+while a command is mid-flight, so the guest's halt-and-resume bookkeeping keeps working.
+Output is pushed into the ch3 transfer as it is produced, and a ch3 kick that arrives
+before there is any data simply stays pending — which is the normal ordering for Sony's
+FMV libraries and is covered by a test.
+
+### Three real bugs the offline validation caught
+
+Each of these would have cost a build+run cycle to even notice, and two of them do not
+desync the bitstream — they just corrupt a few macroblocks per frame.
+
+1. **CSC fixed-point shift.** The IPU's colour matrix is 6-bit fixed point (76/64 =
+   1.1875), not 7-bit. Shifting by 7 turned a full-white macroblock into mid-grey.
+2. **Table B.10, motion codes.** `+/-11` and `+/-12` are **11-bit** codes. Writing `+/-11`
+   as the 10-bit `0000010000` swallowed `+/-12`'s slots and shifted `+/-13..+/-16` down one
+   rung. Large motion vectors then decoded at the wrong length and desynced the stream a
+   few hundred macroblocks later. The prefix-code self-check did **not** catch this — the
+   wrong table was still a valid prefix code.
+3. **Table B.14, runs 22-26.** That group descends as the code value ascends; I had it
+   ascending, which swaps (22,1)<->(25,1) and (23,1)<->(26,1). Identical code lengths, so
+   no desync — coefficients just land 2-3 positions too far along the scan and the block
+   overruns index 63 and aborts. Caught only by validating **every one of the 111 entries
+   individually against ffmpeg**.
+
+### How it is validated (reproducible, no game build)
+
+`build_scripts/ipu_validation/` — see its README. Three layers:
+
+1. `validate_b14.py` — synthesises a one-macroblock MPEG-1 stream per table entry and
+   asks ffmpeg what each code means. Currently **111/111 match**.
+2. `ipu_player.cpp` — a full MPEG-1 player that does header parsing and motion
+   compensation itself (as the guest does) and drives everything below the slice header
+   through the real IPU registers and DMA. Whole-movie diff against ffmpeg.
+3. `ipu_csc_test.cpp` — CSC through the FIFO and both DMA channels, RGB32 and RGB16,
+   with and without SETTH thresholds. All cases pass.
+
+| Movie | Frames | Min PSNR | Worst abs diff | ECD |
+|---|---|---|---|---|
+| ATARI  | 122 | 71.8 dB | 2 | 0 |
+| OKR    | 150 | 67.0 dB | 2 | 0 |
+| OP_USA | 150 | 63.7 dB | 2 | 0 |
+
+### Known limits, stated plainly
+
+- **IDEC is not implemented** — it raises ECD and logs once. No SDBZ code path issues it.
+- **Table B.15 is not transcribed** — MPEG-2 only, unreachable for this title. Raises ECD.
+- The IDCT is float, so results are within +/-2 of an integer-IDCT reference rather than
+  bit-exact. Within IEEE 1180.
+- **The ADX audio silence (`[adx:stream] nonzero=0/40`) is NOT addressed by any of this.**
+  ADX is CRI's own ADPCM, decoded on the EE into SPU2; it never touches the IPU. Still open.
+
+## ⚠️ SUPERSEDED by the entry above — Stage 5.17 diagnosis, 2026-08-23
+
+**Session type:** one build + one 197 s run (`[sreg]` probe, det=1, no behavior change),
+then a **long static lane, zero builds**. The run reached the `.SFD` open like the previous 37.
+The answer came out of the static lane — **no further runs were spent**.
+
+### State in one line
+
+SofDec video decodes MPEG-2 **through the IPU**. Our IPU (`0x10002000`-`0x10002030`) is
+**pure register storage** — commands stored and never executed, `IPU_CTRL` BUSY permanently
+clear, `IPU_TOP`/`IPU_BP` echoing the last write, and **no IPU_FROM/IPU_TO DMA at all** —
+while the guest ships a full software IPU driver at `0x423xxx`-`0x42Axxx`. So
+`mwPlyGetCurFrm` bails **silently** with `frm = 0` every tick, forever, and every layer above
+it correctly reports success. **Nothing was ever stuck.**
+
+### Run 88 — the four retractions from the `[sreg]` probe
+
+| # | Was believed | Run 88 says |
+|---|---|---|
+| 1 | step 0 blocks on `(sceSifGetReg(13) & 0x201)` | `gate13block=0`, `gate13pass=5183`, **every value `0x0`, every verdict PASS**. IOP `SET_SREG` fired 742× and wrote only regs **12/14/15**, never 13. EE `sceSifSetReg` called **once** (`idx=12 val=0xf0000000`). |
+| 2 | the logo states never reach step 0xd | both ran the **full** machine `0x0→0x1→0xb→0xc→0xd→0xe→0xf`, once each. `0x3E2E80` never ran (`calls=0`). |
+| 3 | `sub_113D30` sets `[0x500728]` | it is `jal 0x113f40; jal 0x114b60(a0=0); memset(0x54BD60, 0, 0xD8)`. The real writer is `0x113FD8`, inside `sub_113F40`. |
+| 4 | `0x500724`/`0x500728` are globals | ⚠️ **this retraction was itself WRONG — see below.** They ARE globals. |
+
+### ✅ The static lane — what it found (2026-08-23, no builds)
+
+**1. `$gp = 0x503070`, and `eeref.py` was blind to an entire class of globals.**
+Decoded from crt0 (`0x1001c0  or $gp,$a0,$zero`). PS2 SDK code reaches the small-data area
+as `imm16($gp)` — an address that never exists as a `lui` constant, so a lui-only index
+returned a confident **"UNREACHABLE"**. The 109,770-EA "independent confirmation" shared the
+same blind spot, so it agreed for the same wrong reason.
+**FIXED in `build_scripts/eeref.py` 08-23** — `find_gp()` + `GP` rows in `refs`, `--gp`
+overrides. Reproduces the hand-built toucher table exactly.
+
+**2. `0x500728` is a MODE SELECTOR, not a gate.** Sole consumer `0x1712D0 RenderDispatch`,
+called twice from `SyncFrame`: flag==1 → movie-driven field sync (`sub_14FF28`+`sub_11FBA0`),
+else GS `CSR` bit 13 FIELD (`sub_1721E0`). ⇒ the 1→0→1→0 toggling is **two movies starting
+and ending**. Nothing anomalous.
+
+**3. ❌ RETRACTED: "the movie object is never constructed."** That came from reading only the
+**tail** of the `[movie]` tag. The whole tag shows two complete sessions:
+
+| logo | window | obj | stat |
+|---|---|---|---|
+| Atari | **t=110–124 s** | `0x45f6e4` | 0 → **1** @112 → 0 @121 |
+| Okrtron | **t=158–175 s** | `0x45f6e4` | 0 → **1** @160 → 0 @172 |
+
+`objFile=0x4597b0`, `objSt=1`, `crt2=0x500730`.
+
+**4. The guest's own TTY is already in the run log** — channel `[Deci2Call:reqsend:tty]`.
+Run 88 contains **10 records total**: `CMemory::Init`, five `Load Module ... OK!`, and
+`MovieCreate: Use Work Size = 0x332100` / `Use Work Adrs = 0x1806c00`, each twice.
+This is a free permanent oracle — the game printfs every CRI error path.
+
+**5. Every layer with an error path reports success.** `sub_113AA0` = `MovieCreate`; its three
+failure strings (`0x4B7310`/`0x4B7340`/`0x4B7370`) never printed ⇒ movie handle created
+(`sw $v0,48($s0)` at `0x113bb0`) and texture created. Success path calls `0x14F140` =
+**`mwPlyStartFname`**, whose two error strings ("handle is invalid", "fname is NULL") also
+never printed ⇒ valid handle, non-NULL filename, playback started.
+Files: **`movie/atari.sfd`** and **`movie/okr.sfd`**, 256×448.
+
+**6. ❌ `objSrc=0` is a dead-code field.** Its only setters `0x14F880` / `0x14F8D0` (and entry
+points `0x14F998` / `0x14F6B0`) have **zero `jal` callers and zero data-word occurrences in
+the whole image**. ⇒ Stage 5.16's outcome **C** ("the bug is above CVFS, in the movie source
+binding") is **void** — it rested on a field this path never writes.
+
+**7. Free symbol recovery.** `0x11xxxx` / `0x14Fxxx` / `0x15xxxx` are **CRI SofDec + ADX**,
+fully named by their own error strings (`mwPly*`, `ADXT_*`, `ADXF_*`). ADXRT 3020,
+ADXF/PS2EE 7.36, ADXT/PS2EE 9.61, ADXPS2 2.63. "SJ" = CRI **Stream Joint**.
+
+### 🔴 Do NOT build the sreg-mirror fix
+
+`ps2_iop_sifSetEeSreg` (`ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp:2215`) writing a host
+`std::unordered_map`, and `g_sifCmdHandlers` being written+erased but never read, are **real
+defects**. They are **irrelevant to this stall** — reg 13 is never written by anyone.
+
+### ★★★ THE ANSWER — found 2026-08-23, static, zero runs
+
+**The pull side is fully wired, reachable, and runs every tick:**
+
+```
+AtariLogo / OkrtronLogo update   0x420FC0 / 0x421830
+  -> 0x113920  MovieUpdate
+    -> 0x14D2C0  mwPlyGetCurFrm(obj, &frm)
+      -> 0x150008  mwPlyGetSfdHn -> obj+60
+      -> 0x167320  SofDec get-current-frame
+        -> 0x16B318(sfd, 6, 0xB, &frm, 0)     THE ACTUAL FRAME FETCH
+      -> 0x14DC98  mwPlyIsNextFrmReady
+```
+
+Named from their own CRI error strings via `eeref refs`. `0x14D160 mwPlyGetFrmSync` and
+`0x14D1B8 mwPlyGetFrm` have **zero callers** — `mwPlyGetCurFrm` is the one that runs.
+
+**Both failure exits are silent** (`sw $zero, 0($s2)` and return; `0x167320` writes `frm = 0`
+up front and skips its callback when it is still 0). No printf on either. `obj+132`
+(frames consumed) and `obj+120` (current frame) therefore never advance.
+
+**The IPU evidence, both sides:**
+
+| register | guest refs | our runtime |
+|---|---|---|
+| `IPU_CMD` `0x10002000` | 33 | stored, never executed — no IDEC/BDEC/VDEC/FDEC/CSC |
+| `IPU_CTRL` `0x10002010` | 50 | reads mask off bit 31 (BUSY) ⇒ guest never spins |
+| `IPU_BP` `0x10002020` | 13 | echoes last write |
+| `IPU_TOP` `0x10002030` | 8 | echoes last write ⇒ bitstream reader sees 0 |
+| `IPU_IN_FIFO` `0x10007010` | 2 | `sceIpuInit` writes IQ/VQ into a FIFO that discards |
+
+Guest IPU driver: `0x423828`, `0x423A68`, `0x423D98`, `0x424360`, `0x4248B8`, `0x424A30`,
+`0x424B98`, `0x4271F8`, `0x4294B8`, `0x429990`, `0x429EB0`, `0x429F98`, `0x42A1C8`.
+Runtime: `ps2xRuntime/src/lib/ps2_memory.cpp:1292` (write), `:2631` (read),
+`ps2xRuntime/src/lib/Kernel/Stubs/IPU.cpp` (all no-ops).
+
+**DMA matches.** Guest drives IPU_FROM `0x1000B000` (ch3) and IPU_TO `0x1000B400` (ch4) from
+`0x429990`, `0x429AD8`, `0x163A98`, `0x163C98`, `0x426048`, `0x427770`, `0x427870`,
+`0x4280E0`, `0x4292F8`, `0x4294B8`. Our `Support.h` dispatches **only VIF1 and GIF**; IPU
+appears in a base list at `Support.h:1240` and a comment at `ps2_memory.cpp:1424`, nowhere
+else. The generic MMIO read clears `STR` on any `(addr & 0xFF) == 0`, so the guest's
+"wait for DMA" poll **exits instantly** and it believes the transfer completed.
+
+On real hardware the IPU cannot fail this way, so CRI wrote **no error path** for it — which
+is exactly why every layer above reported success.
+
+### ⚠️ The audio silence is NOT explained by this
+
+`[adx:stream] nonzero=0/40` is ADX (CRI ADPCM, decoded on the EE into SPU2) and does **not**
+go through the IPU. Do not fold it in. It may share an upstream cause (nothing pushed into
+the SJ Stream Joint pipe) or be entirely separate. **Unmeasured either way.**
+
+### 🔴 DECISION THE USER OWNS — do not start the work without it
+
+The fix is **Fix Tool 2** (runtime `src/lib/`, no headers, no recompiler) but it is a real
+subsystem, not a stub tweak:
+
+1. IPU command engine — IDEC / BDEC / VDEC / FDEC / CSC / SETTH / SETIQ / SETVQ, plus
+   `IPU_BP` bit-pointer and `IPU_TOP` bitstream-peek semantics.
+2. An MPEG-2 macroblock decoder behind it — VLC tables, IQ, IDCT, motion compensation.
+3. `IPU_IN_FIFO` / `IPU_OUT_FIFO` plus DMA ch3/ch4 plumbing in `Support.h`, which today has
+   no IPU case at all.
+4. `IPU_CTRL` BUSY must become real, or guest timing assumptions break the other way.
+
+**Question:** are the two logo movies worth an MPEG-2 decoder now, or do we skip the movies
+and press on to the title screen?
+
+### Still open, unrelated to the CRI gate
+
+- `vbl/s` ≈ 6 instead of 60 — the game runs ~10× slow.
+- `iChangeThreadPriority` (`Kernel/Syscalls/Thread.cpp:1079`) forces a reschedule; ps2tek 2Ah
+  says it must not. Unfixed.
+- Unconditional `THS_RUN` at `Thread.cpp:729/876/932` and `Helpers/Runtime.h:234/261` →
+  three simultaneous THS_RUN threads. Unfixed.
+- Upstream **#214** (2-hunk COP0 IE change) — never bundle with a Stage 5.17 change.
+  Upstream **#210** — HOLD (recompiler, 30 h rebuild).
+- PCSX2 ground-truth lane still needs the user: DebugServer build running + its MCP enabled.
+
+---
+
+## ⚠️ SUPERSEDED 2026-08-22 — **was the single entry point; its Stage 5.17 conclusions failed at run 88**
+
+**Session type:** static-only. **Zero runs. Zero builds.** Nothing here was measured
+on the runtime this session — it was decoded from the ELF and from the run-85 log
+that was already on disk.
+
+### State in one line
+
+Stage 5.17's mechanism is **solved and written down**; the `[thsync]` probe that
+discriminates the remaining four candidates is **shipped in source but never
+compiled**. The project is one build + one run from a verdict.
+
+### Do this first, in this order
+
+1. **Build.** `build.ps1`. Aux targets `iop_harness` / `ps2x_tests` will LNK1120 on
+   `fn_*` symbols — that is normal, by construction. The build is good iff no error
+   names `ps2EntryRunner.vcxproj`.
+2. **Run 86.** Use the corrected Active Runner Command (`-Determinism 1
+   -RunSeconds 200`). ⚠️ The stored command was wrong on **both** of those until
+   today; do not copy an older one out of this file.
+3. **Read `[thsync]`.** Convert first — `run_log.txt` is **UTF-16LE**, plain grep
+   returns zero matches for everything. The probe prints its own `VERDICT=` field.
+   The decision table it maps to was committed **before** the run — see
+   *"Run 86 — `[thsync]` probe SHIPPED"* in the 08-22 entry. Do not re-derive it
+   after seeing the numbers.
+
+### The one thing this session actually proved
+
+`0x13c6e8` — the frame worker's work call — is what invokes `0x155320`, the movie
+pump. **The "movie gate" and the "thread spin" are one mechanism, not two problems.**
+Two weeks of Stage 5.17 were spent on the downstream symptom.
+
+The main thread sits in a naked spin (`sub_11E690`) waiting for a worker ACK. Its
+only syscall is `ReferThreadStatus`, which does not yield. On real EE the priority
+boost preempts the spinner; we have no preemption.
+
+### Do NOT do these — they are closed or void
+
+| lane | status |
+|---|---|
+| `Thread.cpp` "make `WakeupThread`/`ResumeThread` land" | **VOID.** No kick is ever issued — both are absent from the spin trace. Marked ⚠️ VOID in entry (c). |
+| `ee_thread_status_t` layout | cleared. `status` at offset 0x00, `Helpers/State.h:132`. |
+| `ChangeThreadPriority` unimplemented | cleared. Exists, `Thread.cpp:1044`. |
+| Codegen / recompiler | cleared, see (b). |
+| Upstream #170 / #179 / **#184** | **HELD by decision.** #184 replaces this exact subsystem (`EeScheduler.cpp`, 2038 lines) but is welded to the IOP stack — 5–8 day re-port. Strategic destination, not this session's work. |
+
+### Still open, needs the user
+
+- **PCSX2 ground-truth lane.** Not run. Needs PCSX2 (DebugServer build) launched
+  **and** its MCP server enabled — MCP servers are disabled by default and the agent
+  will not enable them. Capture list is in the 08-22 entry. Worth doing *before*
+  interpreting run 86: if `[0x4419D8]` is nonzero on hardware too, the gate is normal
+  and the preemption theory dies without spending a run.
+- **The candidate fix** (`maybe_yield()` in `ReferThreadStatus`) is a **hypothesis
+  only**. Do not build it together with the probe — a combined run cannot tell which
+  change moved the needle.
+
+### Touched this session
+
+| file | change |
+|---|---|
+| `ps2xRuntime/src/lib/ps2_runtime.cpp` | `[thsync]` probe added to the 1 Hz sampler, beside `[mvgate]`, so it shares timestamps with `[watchdog]`. **Unbuilt.** |
+| `PS2_PROJECT_STATE.md` | this handoff; the 08-22 retraction entry; entry (c) marked ⚠️ VOID; Active Runner Command corrected. |
+| `memory/project_stage517_movie_streaming_stall.md` | "READ THIS FIRST" retraction prepended. |
+| `memory/MEMORY.md` | Stage 5.17 index line rewritten to the retraction. |
+
+**No build, no run, no commit, no zip this session.**
+
+### Process note worth keeping
+
+The static pass that produced all of the above took roughly ten minutes and was
+available on day one of Stage 5.17. `feedback_static_before_probe` says to run that
+lane first; it was skipped in favour of the runtime until the user intervened. The
+lane order is **binary → PCSX2 → probe**, and it is not advisory.
+
+## 2026-08-22 — Stage 5.17: ⚠️ RETRACTS (c). No kick was ever issued. The movie code was never the bug.
+
+Zero runs. Everything below is static (ELF disassembly + `eeref`) or a re-read of
+the run-85 log that was **already on disk**. Entry (c) below is superseded.
+
+### Retraction — "the thread kick never lands" was never tested
+
+(c) concluded the game was "alternately resuming and waking a worker thread
+indefinitely" and sent the next lane at `Thread.cpp`. Its own source log refutes it.
+Run 85, t=132–137, the trace field contains:
+
+| addr | syscall | present in the spin? |
+|---|---|---|
+| `0x174ba0` | `ReferThreadStatus` (0x30) | **yes** |
+| `0x174bd0` | `WakeupThread` (0x33) | **no — absent the whole window** |
+| `0x174c30` | `ResumeThread` (0x39) | **no — absent the whole window** |
+
+Both helpers are conditional, decoded from the ELF:
+
+```
+0x11ed28   if (status == 4 || status == 0xc) WakeupThread(tid)
+0x11ed90   if (status == 8 || status == 0xc) ResumeThread(tid)
+```
+
+Neither fires ⇒ the worker's status is **not** WAIT and **not** SUSPEND. So no kick
+was sent, and a fix making `WakeupThread`/`ResumeThread` "land" would have changed
+nothing. **The three `Thread.cpp` questions in (c)'s "Open, not started" are void.**
+
+Also corrected: `pc` is **not** pinned at `0x113c9c`. It moves across the window
+(`0x113c9c` → `0x113cd8` → `0x113cf8` → `0x11f478`). One sample was read as a trend.
+
+### THE MECHANISM — a guest spin-wait our scheduler cannot break
+
+`sub_11E690` — the spinner:
+
+```
+[0x441924] = 1                            ; raise request
+ChangeThreadPriority(tid, [0x4418F0])     ; boost worker ABOVE us
+LOOP 0x11e6f0:
+    0x11ed28(tid) ; 0x11ed90(tid)         ; kick (both no-op, see above)
+    if ([0x441924] == 0) break            ; worker ACKs by clearing
+    if (++n > 199,999,999) -> error 0x4B8720
+```
+
+`sub_11EAC8` — the acknowledger:
+
+```
+if ([0x4419D8] != 0) return               ; gate: skips the ACK entirely
+[0x441960]++ ; [0x441934] = 1
+jal 0x13c6e8                              ; THE WORK — this is what calls 0x155320
+[0x441934] = 0
+if ([0x441924] == 1) { [0x441924] = 0 }   ; the ACK
+```
+
+**`0x13c6e8` drives the movie pump.** So the "movie gate" and the "thread spin" are
+one mechanism, not two problems: the main thread is blocked waiting on the frame
+worker, and the worker is not completing a tick. Stage 5.17 has been looking at the
+downstream symptom for two weeks.
+
+### Why the spin cannot break here
+
+- The loop's **only** syscall is `ReferThreadStatus`, which does **not** yield.
+- `ChangeThreadPriority` — the one call that does `maybe_yield()` — is **outside** the loop.
+- On real EE the boosted worker **preempts** the spinner. We have no preemption.
+- `ps2_scheduler.cpp:1340 yield_point()` step 3 is `maybe_yield()`, which only
+  switches to a higher-priority **READY** fiber. **A Blocked worker is invisible to it.**
+
+Corroborated in the same log: during the stall `res/s` falls to **1–3** while
+`progress` climbs **~40× faster**. `yield_point` is sampled ~21,000×/s and actually
+yields ~1–3×/s.
+
+### Ruled out for free — do not re-check these
+
+- **`ee_thread_status_t` layout** — `status` is at offset 0x00 (`Helpers/State.h:132`).
+  The guest's `lw $v1, 0($sp)` reads the right word. Not a struct bug.
+- **`ChangeThreadPriority` unimplemented** — exists, calls `update_priority` +
+  `maybe_yield` (`Thread.cpp:1044`). The boost is not silently dropped.
+
+### Q7 finding — upstream already replaced this subsystem
+
+`f4309cd1` *"refactor: from guest threads to EE scheduler (#184)"* adds
+`runtime/ee_scheduler.h` (447 lines) + `Kernel/EeScheduler.cpp` (2,038 lines). It is
+welded to the held #170/#179 `ps2xIOP/` stack, so it carries the same 5–8 day re-port
+of our ARKD bridge. **Decision taken: #170/#179/#184 stay HELD**; probe + surgical fix
+first. If the fix turns structural, taking all three becomes the cheaper path.
+
+### Run 86 — `[thsync]` probe SHIPPED, awaiting build
+
+`ps2_runtime.cpp`, in the 1 Hz sampler beside `[mvgate]` so it shares timestamps with
+`[watchdog]` (the cross-read that cracked this). Prints unconditionally, no gate.
+Reuses `getThreadDebugSnapshot()` — the data source already existed; only the emit was
+missing (its sole caller sits in the `RecompDbg` block, dead under `-NoDebugger`).
+
+Fields: `req` `inWork` `gate` `tick` `dTick` `boost` `idle` `tokW` + full thread table
+(`tid:status,waitType,waitId,priority,pc`).
+
+**Decision table is pre-committed and evaluated inline as `VERDICT=`**, so a later
+reading cannot be fitted to whatever came back:
+
+| verdict | conclusion | next action |
+|---|---|---|
+| `WORKER-GATED` | `[0x4419D8] != 0`, acker early-outs before the ACK | fix the gate's producer — **not** the scheduler |
+| `WORKER-INSIDE-WORK` | stuck inside `0x13c6e8` | blocker moved into the movie pump |
+| `WORKER-NOT-RUNNING` | request up, worker never ticked | read the thread table: Blocked vs Ready |
+| worker Ready, pri ≤ spinner, `res/s` 1–3 | pure preemption failure | make `ReferThreadStatus` a yield point |
+| status RUN/READY but fiber Blocked | bookkeeping desync | reconcile `info->status` with fiber state |
+
+**Do not build the probe and a fix together** — a combined run cannot say which change moved the needle.
+
+### Run command for 86 — two changes from the stored Active Runner Command
+
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+- **`-Determinism 1`**, not 0 — the stored command contradicts
+  [[feedback_determinism_gates_guest_progress]] for Stage 5.15+.
+- **`-RunSeconds 200`**, not 90 — the stall episodes are at **t=121–138** and
+  **t=171–192**. A 90 s run ends before both and reads as "never happens"
+  ([[feedback_run_window_false_negative]]).
+
+### The candidate fix — NOT implemented, hypothesis until run 86 returns
+
+A guest polling thread status is by definition waiting on another thread, so
+`ReferThreadStatus` (`Thread.cpp:794`) should call `ps2sched::maybe_yield()` after
+releasing `info->m` — the spinner calls it 2×/iteration, making every iteration a
+preemption point, which is what the hardware priority boost buys and we do not honour.
+Yield **outside** `info->m`, matching `ResumeThread` (`Thread.cpp:773`).
+
+### Learned patterns
+
+1. **A trace that omits a syscall is evidence, not noise.** Two weeks rested on
+   "the kick doesn't land". The log said no kick was sent. The absent addresses were
+   the finding; nobody listed what was *missing* from the trace.
+2. **Lane 1 was skipped for two weeks.** Ten minutes of `eeref` + disassembly
+   produced the mechanism, the acknowledger, and two free eliminations. Every prior
+   session went straight to a probe. [[feedback_static_before_probe]] exists because
+   of runs 74–81 and it was not applied here either.
+3. **Name the caller before naming the bug.** `0x13c6e8` links the movie pump to the
+   thread handshake. Stage 5.17 treated them as separate problems for two weeks
+   because nobody walked one level up the call chain.
+4. **Put the decision table in the probe's own output.** `VERDICT=` strings written
+   before the run cannot be retrofitted to the result — which is exactly how (a),
+   (b) and (c) each got fitted to their own numbers and then retracted.
+
+## ⚠️ SUPERSEDED 2026-08-21 (c) — Stage 5.17: it is a THREAD KICK THAT NEVER LANDS. Gate arithmetic retracted.
+
+Run 85 (`[mvgate]` + canary, `PS2_COVERAGE=1`). The probe refuted the reading it
+was built to test. The canary read **clean** (`rate=0x426fc28f` throughout,
+matching PCSX2 exactly), which killed the "foreign bulk write" branch outright --
+useful, but not what found the bug. The bug was found by cross-reading
+`[watchdog]` at the seconds where `g36` flipped: a line already in the same log,
+written by an older probe, never previously read alongside this one.
+
+### Retraction — `0x1551E0` was misidentified, so the run-84 read-side arithmetic is void
+
+Last entry treated `0x1551E0` as "the fall-through taken when the pause read
+returns != 1", and built the whole gate-5 conviction on its count. It is nothing
+of the sort. Decoded:
+
+```
+0x1551e0  jal 0x14e4d0 ; lw $v1, 80($v0) ; beq $v1,$zero,ret ; lw $a0,84($v0) ; jalr $v1
+0x155178  jal 0x14e4d0 ; lw $v1, 72($v0) ; beq $v1,$zero,ret ; lw $a0,76($v0) ; jalr $v1
+```
+
+Both are **callback invokers** -- fptr at `[0x45F6C8]`/`[0x45F6C0]` with its arg.
+Not gates, not fall-throughs. Every number derived from that premise is dropped.
+
+### The gate ladder is real, but counts cannot pick the gate — by construction
+
+Verified against the ELF, not from memory:
+
+```
+0x155338  lw   $a1, -2444($v0=0x460000)   ; [0x45F674]
+0x155358  bne  $a1, 1     -> ret            GATE 1
+0x155360  bne  $s1, 0     -> assert         GATE 2
+0x155380  lw   $s0, 0($s1)
+0x155384  bne  $s0, $a1   -> ret            GATE 3   (so $s0 == 1)
+0x15538c  jal  0x155520   ; = lw $v0,96($a0)
+0x155394  beql $v0, $s0   -> ret            GATE 4   0x5050000a, rs=$v0 rt=$s0
+0x15539c  jal  0x1555e8   ; = lw $v0,36(0x45F678) = [0x45F69C]
+0x1553a4  beq  $v0, $s0   -> ret            GATE 5
+```
+
+Pump geometry confirmed from `0x155210`: slot base `$s1+0x6c` = **0x45F6E4**,
+stride **0x304 = 772**, **8** slots. The `[mvgate]` probe reads exactly this, so
+its geometry is not in doubt.
+
+`0x155520` and `0x1555E8` each have two callers, and both split assignments fit
+the totals. That ambiguity is **not** resolvable by counting and should not be
+attempted again. What the counts *do* pin, under either split, is that
+`[0x45F69C]` reads **1** at essentially every read -- `0x1551E0` ran 4 times, and
+it sits directly behind the pump's own `!= 1` test.
+
+### Codegen is NOT at fault — checked, so nobody re-checks it
+
+- `get_field_val___0x155520.cpp` executes the delay-slot `lw` **before** taking
+  `jr $ra`. Correct.
+- `beql` at `0x155394` is emitted as `GPR_U64(2) == GPR_U64(16)` with the
+  delay slot inside the taken branch. Correct nullification semantics.
+- ⚠️ **Three** generated bodies exist for this one address:
+  `fn_155320_0x155320.cpp`, `sub_00155320_0x155320.cpp`,
+  `sub_155320_0x155320.cpp`. The live one is `sub_155320_0x155320.cpp` -- it is
+  the only variant that routes calls through `dispatchGuestBranch`, which is what
+  coverage counts, and coverage is non-zero. Worth a separate look; not this bug.
+
+### THE FINDING — `g36=1` is not a movie flag, it is a system-wide stall
+
+`[mvgate]` collapsed to transitions gives two identical episodes:
+
+```
+t=121  en=1 g36=1 nLive=1 live=0     movie A starts
+t=122  en=1 g36=0 nLive=1            "playing"  -- 10 s
+t=132  en=1 g36=1 nLive=1            <-- pause raised
+t=136  en=1 g36=1 nLive=0            slot torn down
+t=138  en=1 g36=0 nLive=0            recovered
+t=171 .. t=192                       movie B, same shape
+```
+
+Cross-referencing `[watchdog]` at those exact seconds is what breaks the case
+open:
+
+| | t=125 (`g36=0`) | t=134 (`g36=1`) |
+|---|---|---|
+| `vbl/s` | 27 | **1** |
+| `res/s` | 106 | **1** |
+| `gif/s` | 27 | **0** |
+| `busy%` | 88 | **100** |
+| `pc` / `ra` | 0x422660 | **0x113c9c, pinned** |
+| `cb` | 0 | **0x154fa8** |
+
+Rendering stops dead. The trace is one repeating pair, forever:
+
+```
+0x11ed90 -> 0x174ba0 -> 0x11ed28 -> 0x174ba0 -> 0x11ed90 -> ...
+```
+
+Decoded, that is a **thread-kick poll loop**:
+
+```
+0x174ba0  $v1=0x30 syscall   ReferThreadStatus
+0x174bd0  $v1=0x33 syscall   WakeupThread
+0x174c30  $v1=0x39 syscall   ResumeThread
+
+0x11ed28(tid):  status == 4 (THS_WAIT)    || 0xc -> WakeupThread(tid)
+0x11ed90(tid):  status == 8 (THS_SUSPEND) || 0xc -> ResumeThread(tid)
+```
+
+The game is alternately resuming and waking a worker thread, reading its status
+back, and finding it unchanged -- indefinitely. The pause flag stays 1 for the
+whole spin because the `setPause(1) ... work ... setPause(0)` pair never reaches
+its clear: the *work* call in the middle is what is waiting on that thread.
+
+So gate 5 is shut as a **symptom**. The pause flag is held up by a thread that
+our scheduler never actually runs, and the movie tick starving is downstream of
+that, not the cause of it.
+
+### Where to look next — scheduler, not movie code
+
+The target thread's status never leaves whatever value it has despite
+`WakeupThread` and `ResumeThread` being issued at full tilt. Candidates, in order:
+
+1. `WakeupThread`/`ResumeThread` in `Kernel/Syscalls/Thread.cpp` update bookkeeping
+   but never make the thread runnable to the scheduler.
+2. `ReferThreadStatus` reports a stale/wrong status word, so the game's
+   `== 4` / `== 8` tests pick the wrong kick every iteration.
+3. The spinning thread never yields, so at `busy%=100 vbl/s=1` the woken thread
+   is runnable but never scheduled.
+
+(3) is strongly suggested by `vbl/s` collapsing 27 -> 1 during the spin: the
+vblank ISR itself is being starved, which is a host-side scheduling symptom, not
+a guest-logic one.
+
+### Method note
+
+Zero new runs were needed to reach this. The gate arithmetic that consumed two
+windows was answered -- and invalidated -- by cross-referencing two samplers that
+were already in the same log. Read `[watchdog]` alongside any new sampler before
+theorising about the sampler's own field.
+
+### Learned patterns from this session
+
+1. **A new sampler's own field is the least reliable thing in its own line.**
+   `[mvgate] g36` was read three ways across two sessions and each reading was
+   defensible. What settled it was `[watchdog]` at the *same timestamps* --
+   already in the same log, already written, never cross-read. Before theorising
+   about a probe's field, print the other samplers at that second.
+2. **A two-caller function cannot be convicted by a coverage count -- ever.**
+   `0x155520` and `0x1555E8` both fit both hypotheses to the digit. Two sessions
+   were spent re-deriving that. If `eeref refs` shows >1 live caller, stop
+   counting and go read the value.
+3. **"Unreachable" from `refs` must be paired with a coverage zero AND a check
+   that the caller isn't invoked directly.** `0x1551E0` looked like a gate
+   fall-through purely because its position fit the story; nobody decoded it.
+   Decode every address before it carries an argument.
+4. **`busy%=100` with `vbl/s` collapsing is a scheduler signature, not a guest
+   one.** A guest logic bug leaves the frame loop running. When the vblank ISR
+   itself starves, look host-side first.
+5. **Duplicate generated bodies are possible.** Three files exist for
+   `0x155320`. The live one is identifiable by `dispatchGuestBranch` (coverage
+   only counts those). Check for duplicates before reading generated code.
+
+### Exit test for run 86
+
+No probe change is required to run this; the next lane is static (Thread.cpp).
+When a run is next taken, the pass condition is:
+
+- `[watchdog]` at the seconds where `[mvgate] g36=1` no longer shows
+  `vbl/s <= 1` / `gif/s = 0` -- i.e. the thread kick lands and the spin ends.
+- Secondary: `0x165250` (the movie tick) rises above **2** in coverage.
+- If the spin persists but `vbl/s` recovers, the kick works and the blocker has
+  moved downstream -- that is progress, record it as such rather than a failure.
+
+### ⚠️ VOID — do not start (cancelled 2026-08-22)
+
+> These three `Thread.cpp` questions rest on a kick that is **never issued**. See the
+> 2026-08-22 entry at the top: `WakeupThread`/`ResumeThread` are absent from the spin
+> trace entirely. Q1 and Q2 are unanswerable because their syscalls never run; only
+> Q3 ("the spinning thread yields") survives, and it is now the leading hypothesis —
+> tracked there, not here.
+
+~~`ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp` -- three questions, in order:
+`WakeupThread`(0x33)/`ResumeThread`(0x39) actually make a thread runnable;
+`ReferThreadStatus`(0x30) returns a live status word; the spinning thread yields.~~
+
+
+## ⚠️ PARTLY RETRACTED 2026-08-21 (a) — Stage 5.17: "THE TICK IS THE BUG"
+
+> **Superseded in part by entry (c) above.** The run-83 retraction and the
+> pump/gate geometry here still stand. The gate-4-vs-gate-5 arithmetic does not.
+
+Run 84 (`PS2X_ORDER` + `PS2_COVERAGE=1`, `PS2_COV_GAMELO=0x100000`). The ordered
+dispatch trace paid for itself on its first use, and it overturned the previous
+entry rather than confirming it.
+
+### Retraction — we were never stuck in state 1
+
+The 2026-08-20 (d) entry concluded that `dec+76` was written to 3 and then
+**reset** before the state machine next ticked, because `0x164F78` ran 3x with
+its guard passing while `0x165458` (state-1 handler) kept reading `dec+76 < 2`.
+
+That is wrong, and the evidence was already in the same log:
+
+```
+[sfdst] t=83s .. t=294s   dec=0x1b12cc0  st=2
+```
+
+`st` is `read32(dec + 72)`. **Ours reads 2 from t=83 s onward — identical to
+PCSX2 on real hardware.** The single tick we get advances the ladder 1 -> 2
+correctly. Nothing is being reset. There is no ordering bug.
+
+The `[order]` trace shows the same thing directly. Per movie, three times over,
+byte for byte:
+
+```
+... 0x14ee80  0x164f78  0x165300  0x165458  0x166a28  0x166ab0  0x1668f0 ...
+```
+
+`0x164F78` (writes `dec+76 = 3`) lands **immediately before** `0x165300`, with no
+writer in between. The bootstrap is correctly ordered. Total log: 38 records, all
+38 kept, no `[cap]`.
+
+### What the trace actually says
+
+`0x165300` was dispatched **exactly 3 times in 300 s** — once per movie, and only
+at start. State 2's handler `0x165488` cannot run on the tick that *produces*
+state 2; it needs the **next** tick. There is no next tick. The preroll gate
+`0x165548` has therefore never been called, and every symptom downstream follows.
+
+This count is exact, not a lower bound: `jal` to an external function is emitted
+as `dispatchGuestBranch(... DirectCall ...)` -> `lookupFunction` -> the hook
+(`control_flow_emitter.cpp:emitExternalJumpDispatch`). Only *intra*-function
+jumps bypass it.
+
+### The pump is alive and hammering — the gate is what starves
+
+Static walk up from `0x165300`, all of it read-only in minutes:
+
+```
+class-5/6 callback registry  (table 0x54E960, 8 classes, runners 0x13C658+0x18*k)
+  -> 0x154FA8 / 0x154F58     registered by 0x14E6B0 via 0x154688 / 0x1546E0
+    -> 0x155210              loops 8 slots
+      -> 0x155320            per-object movie update
+        -> 0x165250          -> jal 0x165300   THE TICK
+```
+
+Coverage on the same run:
+
+| function | calls | |
+|---|---:|---|
+| `0x155210` 8-slot loop | 113,719 | the pump, per frame |
+| `0x155320` per-object update | **909,186** | = 8 x 113,648 |
+| `0x155520` gate-4 getter | 113,711 | gates 1-3 pass every tick |
+| `0x155518` **only** writer of `+96` | 9 | |
+| `0x165250` -> the tick | **3** | |
+| `0x1652A8` | ZERO | dead, see below |
+
+**909,186 calls reach the gate; 3 get through.**
+
+### The five gates, and which two are left
+
+`sub_155320`, entry `0x155320`, decoded:
+
+```
+0x155340  lw   a1, -2444(0x460000)   ; [0x45F674] global "movie system enabled"
+0x155358  bne  a1, 1        -> ret 0      GATE 1
+0x155360  bne  s1, 0        -> ret 0      GATE 2  (obj != NULL)
+0x155380  lw   s0, 0(s1)
+0x155384  bne  s0, 1        -> ret 0      GATE 3  (obj->+0 == 1, "playing")
+0x15538c  jal  0x155520     ; = lw v0,96(a0)
+0x155394  beql v0, 1        -> ret 0      GATE 4  (obj->+96 re-entrancy latch)
+0x15539c  jal  0x1555e8     ; = lw v0,36(0x45F678)
+0x1553a4  beq  v0, 1        -> ret 0      GATE 5  ([0x45F69C] global pause)
+          ... tail 0x1553D8 ... 0x15542C  jal 0x165250
+```
+
+Gates 1-3 pass ~113,711 times per run (that is `0x155520`'s count). So the tick
+is eaten by **gate 4 or gate 5**.
+
+Arithmetic pins the tail exactly. `0x155518` is the sole writer of `+96` and ran
+9 times: 3 from `0x14C598` (which passes `a1=0` — always a clear) plus `2N` from
+the tail block (one set at `0x1553F4`, one clear at `0x155410` or `0x155464`, per
+entry). `2N + 3 = 9` gives **N = 3**, matching `0x165250`'s 3 dispatches exactly.
+The tail was entered 3 times out of 113,711 chances.
+
+### Why static cannot finish this one
+
+Both gates read **balanced** in the image:
+
+- `0x1555A0` is `setPause(obj, val)`: `if (obj) obj->+92 = val; global->+36 = val`
+  — the `bnel` puts the per-object store in the taken-delay-slot, the global store
+  is unconditional.
+- All three call sites are matched pairs: `0x14E92C`/`0x14E940`,
+  `0x154A1C`/`0x154A30`, `0x155648`/`0x15565C` — `set(1) ... work ... set(0)`.
+- `0x1555A0` ran an even **18** times. `0x14C598` only ever clears.
+
+On paper both words end at 0. One of them does not, at runtime.
+
+And counts cannot say which: `0x155520` and `0x1555E8` each have **two** call
+sites, and both attributions fit the totals to the digit
+(`113,711 + 9 = 113,720`). Order cannot separate two callers of one address
+either. This is a read-the-word question.
+
+### New probe `[mvgate]` (in `ps2_runtime.cpp`, 1 Hz sampler)
+
+Geometry is fixed, not inferred — `0x14E4D0` is three instructions
+(`lui v0,0x46; jr ra; addiu v0,v0,-2440`), a constant `0x45F678`, and `0x155210`
+computes the slot array as `+108`, stride 772:
+
+- global enable `[0x45F674]`, global pause `[0x45F69C]`
+- per slot i in 0..7 at `0x45F6E4 + 772*i`: `+0`, `+92`, `+96`, `+100`
+
+`nLive` (count of slots with `+0 == 1`) is the shape gate: gates 1-3 passing
+113,711 times means **exactly one** slot must read 1. `nLive != 1` prints
+`GEOMETRY-SUSPECT` and every other column is to be treated as fiction.
+
+Reading:
+
+| result | verdict |
+|---|---|
+| `g36=1` persistently | gate 5 — global pause stuck; find the `setPause` pair whose middle call never returned |
+| `L.f96=1` persistently | gate 4 — re-entrancy latch never cleared |
+| both 0, `nLive=1` | all five gates pass; the bug is in **our** dispatch of `0x165250` |
+| `nLive != 1` | probe geometry wrong, stop and re-derive |
+
+### Not bugs — measured, do not reopen
+
+- **`dec+76` reset / ordering.** Retracted above. `dec+72=2` matches hardware.
+- **`0x1652A8`** — the 8-slot loop that calls `0x165300` directly — is
+  **UNREACHABLE**: 0 jal, 0 j, 0 data word, confirmed twice (eeref and an
+  independent raw PT_LOAD scan). Coverage ZERO. It is not the missing pump.
+- **The `0x154F58`/`0x154FA8`/`0x1554B8` "unreachable roots"** are not dead: they
+  are **registered callbacks**, materialized `lui+lo` at `0x14E6DC`/`0x14E6F4` and
+  handed to the class registry. Class 2, 5 and 6. This is the runtime-built-table
+  case the static lane cannot see, and it is now documented rather than re-derived.
+
+### Tool fix — `eeref.py` was hiding data references
+
+`refs` only recorded `lui+lo` materializations landing in `CODE_LO..CODE_HI`
+(`0x100000..0x500000`), so **every data address reported "UNREACHABLE in the
+static image"** — confidently and wrongly. `refs 0x54e960` said `imm=0` while the
+class table is materialized **6 times** inside `0x13Cxxx`. Also `daddiu` (op
+0x19) was not folded at all — same class of hole as the `sdl`/`sdr` gap in
+`field`. Both fixed; the plan's four self-tests still pass
+(`0x168320` 0/0/0, `0x16C620` one data word at `0x4bf7ac`, `field 14000` exactly
+one store at `0x167BA8`).
+
+
+## ⚠️ RETRACTED 2026-08-21 (b) — Stage 5.17: "it is GATE 5, and the game is not the one closing it"
+
+> **Superseded by entry (c) above.** The read-side arithmetic here rests on
+> `0x1551E0` being a gate fall-through. It is a **callback invoker**. Gate 5 is
+> shut, but as a *symptom* of a stalled thread kick, not because a non-game
+> writer touches `0x45F69C`. Kept for the PCSX2 reference values only.
+
+Lane 2 finally ran. PCSX2 (real, Pine confirms "Super Dragon Ball Z") was sitting
+at a breakpoint on `0x155320` with `a0 = 0x0045F6E4` — which independently
+confirms the probe geometry we derived statically, base and all. Backtrace:
+`0x11EAC8 -> 0x13C4FC -> 0x155228 -> 0x155320`, exactly the class-registry chain.
+
+Every hand decode was re-checked against PCSX2's native disassembler and all of
+it held, with one refinement worth keeping: gates 4 and 5 compare `v0` against
+**`s0`**, not a literal 1. `s0` is `obj->+0`, which gate 3 has already forced to
+equal `[0x45F674]` = 1, so the meaning is unchanged — but the code does not
+contain the constant, and a future reader will look for it.
+
+Confirmed verbatim from the emulator:
+
+```
+0x14E4D0   lui v0,0x46 ; jr ra ; addiu v0,-0x988      -> constant 0x45F678
+0x1555E8   jal 0x14E4D0 ; lw v0,0x24(v0)              -> reads [0x45F69C]
+0x1555A0   jal 0x14E4D0 ; bnezl s0 ; sw s1,0x5C(s0)
+                        ; sw s1,0x24(v0)              -> writes [0x45F69C]
+```
+
+The `bnezl` guards only the per-object store; the global store is unconditional.
+
+### The read side: `[0x45F69C]` returns 1 for essentially the whole run
+
+The attribution problem from the 08-21 (a) entry is now closed, by two static
+facts rather than another run:
+
+- `wrap_ptr_deref_safe_i @ 0x155538` — the gate-4 getter's *other* caller — is
+  **unreachable in the image and absent from coverage**. So all 113,711 calls to
+  `0x155520` come from gate 4. Gates 1-3 pass 113,711 times, measured, not assumed.
+- `0x1551E0` and `0x155178` have **exactly one caller each**, so their counts are
+  clean readings of the loop tail.
+
+`0x1555E8` (the gate-5 getter) ran 113,720 times, split between the loop tail at
+`0x1552EC` and gate 5 at `0x15539C`. We cannot see the split — but we do not need
+to, because `0x1551E0` is the fall-through taken when that read returns **not 1**,
+and it ran **6 times**. Both extremes land in the same place:
+
+| split | consequence |
+|---|---|
+| tail-heavy (gate 4 blocks) | 113,709 of 113,715 tail reads returned 1 |
+| gate-heavy (gate 4 passes) | gate 5 blocked 113,708 times, i.e. returned 1 |
+
+**Either way the pause word reads 1.** Gate 5 is shut.
+
+### The write side flatly contradicts it — and that is the finding
+
+`0x1555A0` is the **only** writer of `0x45F69C` in the image; `eeref refs
+0x45f69c` finds no direct-addressed store either. It ran 18 times, and its three
+call sites account for all 18 exactly:
+
+| pair | container | container ran | calls |
+|---|---|---:|---:|
+| `0x14E92C` / `0x14E940` | `sub_14E8B0` | 2 | 4 |
+| `0x154A1C` / `0x154A30` | `sub_1549C0` | **0** | 0 |
+| `0x155648` / `0x15565C` | `0x155630` | 7 | 14 |
+| | | | **18** |
+
+All three are straight-line `set(1) ... work ... set(0)` pairs (verified natively).
+Every set has its matching clear. **The game cannot be leaving its own pause flag
+at 1.** So something that is not the game is writing that word.
+
+### `[mvgate]` extended — the canary costs nothing
+
+PCSX2 at the main menu holds these exact values, and they are the reference:
+
+```
+[0x45F674] = 1            [0x45F678] = 0
+[0x45F67C] = 0x426FC28F   (59.94f, the frame rate)
+[0x45F680] = 1            [0x45F69C] = 0
+```
+
+`0x426FC28F` is a specific float six words from the flag, so the probe now samples
+it as a clobber canary and prints `REGION-CLOBBERED` when it differs:
+
+| result | verdict |
+|---|---|
+| `rate` wrong | foreign bulk write — arm a data breakpoint on `0x45F69C` next |
+| `rate` right, `g36=1` | a single targeted store; distrust `0x1555A0`'s own count |
+| `g36=0` throughout | the read-side arithmetic above is wrong, gate 4 is back on |
+
+Note `[0x45F674] = 1` on hardware **at the main menu** with every slot zeroed —
+the movie system is enabled globally all the time, so gate 1 tells us nothing
+about whether a movie is playing. `[0x5E6B3C]` (GameMode) was 0 = MainMenu, which
+is why all eight slots read zero and why hardware could not be asked directly what
+a *healthy playing* slot looks like this session.
+
+### Method note
+
+This entry cost zero runs. The gate-4-vs-gate-5 question was supposed to need the
+`[mvgate]` build; it was answered instead by one unreachability check, two
+caller-count checks and a native disassembly. Lane 1 and Lane 2 did the work the
+plan said they would.
+
+## 2026-08-20 (d) — Stage 5.17: THE MOVIE STATE LADDER, and where ours stalls
+
+Run 83 (`PS2_COV_GAMELO=0x100000`) plus a PCSX2 A/B session. This is the first
+time the movie stall has a named mechanism rather than a suspect.
+
+### The ladder
+
+`sub_165300` is a jump-table state machine on **`dec+72`**, table at `0x4BF510`:
+
+| state | handler | ours |
+|---|---|---|
+| 1 | `jal 0x165458` | **3x** |
+| 2 | `jal 0x165488` -> `jal 0x165548` (preroll gate) | never |
+| 3 | `jal 0x165820` | never |
+| 4 | `jal 0x1658C0` `state_byte_transition_s_2` | never |
+
+State-1 handler `0x165458`, decoded field by field:
+
+```
+v1 = dec+76 ; a1 = dec+72 (=1)
+if (v1 <  2)  return 1      # stay        <- WE ARE HERE
+if (v1 <  5)  return 2      # advance
+if (v1 == 6)  return 2      # advance
+```
+
+So **`dec+76` must be 2,3,4 or 6** to leave state 1. `0x16AAA0` = 6 = exactly
+2 per `0x165300` entry (it is called at +0x3c and +0xd8), which pins the entry
+count at exactly 3 and makes "3 entries, all state 1" arithmetic, not inference.
+
+### PCSX2 ground truth
+
+`$s1` at `0x165398` = **`0x01B12CC0`** — the state machine runs on `dec` itself,
+the same object and the same address as ours. Hardware at that moment:
+
+```
+dec+64 = 0x4000   dec+68 = 0   dec+72 = 2 (state)   dec+76 = 3
+```
+
+### Every writer of `dec+76`, enumerated
+
+| site | value | gate |
+|---|---|---|
+| `0x164F78` `wrap_sif_is_bound_e` | **3** | `0x15B560`: `dec != 0 && dec+72 != 0` |
+| `0x166998` | 4 | requires `dec+72 == 3` |
+| `0x1661B4` `sub_166190` | 6 | state-4 path only |
+| `0x1665DC` `sub_1663D0` | 1 (`$s3`) | also writes `dec+72 = 1` |
+| `0x166AF4` `sub_166AB0` | 1 | also writes `dec+72 = 1` |
+| `0x16645C`, `0x166A58`, `0x166900` | 0 | resets |
+
+`0x1687B8` returns `lw $v0, 72($s0)` — **it returns the state**, which is why
+every producer above state 1 is gated on the state having already advanced.
+`sub_16AD18` is NOT a `+76` writer: it is a stride-68 loop zeroing `slot[i]+8`
+(eeref's fold arithmetic coincided at +76). Ruled out.
+
+### The contradiction that defines the next run
+
+`0x164F78` — the **sole** writer of `dec+76 = 3` — ran **3 times** for us, and
+its error path `0x15B340` is **ZERO**, so the guard passed and the store
+executed. Yet `sub_165300` read `dec+76 < 2` on all three of its own ticks.
+
+⇒ The value is being written and **reset before the state machine next ticks**,
+or the two are interleaved wrongly. Counts cannot separate those. A 1 Hz
+sampler cannot either — a value written and overwritten between samples is
+invisible, the same false-negative shape this project has paid for before.
+
+### New instrument: `PS2X_ORDER` (ordered dispatch trace)
+
+`ps2_runtime.cpp` — hooks `pushDispatchPc`, env-driven address list, run-length
+compressed dump at shutdown, explicit `[cap]` line on saturation. **No memory
+reads**: order alone answers this. Cost when unarmed is one relaxed bool load.
+Next ordering question costs a run, not a build.
+
+### Not the bug (measured, do not reopen)
+
+- Everything on the movie-open path runs **exactly 3x** = **once per movie**,
+  3 movies in the run. That is correct, not a starved pump.
+- `0x154C70`'s ZERO is an attribution artifact — it is a folded interior block
+  of `0x154AE0` (cov 3) reached by an internal `j`, not a dispatch target.
+- The `dec+14000` line is closed: hardware leaves those four words at
+  constructor values while the movie plays correctly.
+- The first PCSX2 watchpoint hit was `memset` at `0x18E404`: `a0=0x01806C00`,
+  walked + remaining = `0x30E180 + 0x23F80` = `0x332100` = `wS`. One memset of
+  the whole work area; `slot6` merely lives inside it.
+
+
+## ★★★★★ 2026-08-20 (c) — **PCSX2 A/B: the `+14000` fields are IDENTICAL on hardware. The divergence is `slot6+0`/`slot6+4`.**
+
+First PCSX2 ground truth of Stage 5.17. Same object address on both sides
+(`dec = 0x01B12CC0`), confirmed live against a running SLUS-21442.
+
+| | PCSX2 | our runtime |
+|---|---|---|
+| `dec+14000..14012` | `0, 0, -3, 1` | `0, 0, -3, 1` — **same** |
+| slot list | `4bf220,4bf258,4bf2a0,4befe8,0,0,4bf780,4bf040,4bf748` | **same** |
+| slot6 vtable | `0x4bf780` | `0x4bf780` |
+| **slot6+0 / slot6+4** (`f7984`/`f7988`, `d8392`/`d8396`) | **`1` / `1`** during decode | **`0` / `0`** |
+
+★★★ **The `+14000` line is closed.** Real hardware leaves those four words at
+their constructor values *while the movie plays correctly*. Runs 74–82 were
+measuring normal behaviour. `sub_168320` is dead on the PS2 too.
+
+**Object model confirmed against hardware:** slot stride **68**, vtable at
+**+12**, slot base `dec+7984`, object size `0x4000` (`dec+64`).
+
+**The live chain, from a PCSX2 backtrace (not inference):**
+
+```
+0x3E0E60 loadscreen_tick -> 0x3E10D0 -> 0x3E0E60
+  -> 0x421830 state_byte_transition_l_3      (vt40 of state vtable 0x4faf70)
+    -> 0x113C60 -> 0x14F518 -> 0x14F428
+      -> 0x1669D0 -> 0x166A28 -> 0x166B10 -> 0x1663D0 -> ctor
+```
+
+Entry is method **+0x40** of the *current* state vtable (`0x420FC0` for state
+`0x4faeb0`, `0x421830` for `0x4faf70`) — not +0x38 as first guessed. The live
+path uses `0x14F518`/`0x14F428`/`0x1669D0`, not the `0x166850` branch.
+
+**The gate that decides the write** (`mem_fill_z_9`):
+
+```
+0x166c48  lw    $s2, 14000($s0)      # s2 <- dec+14000
+...
+0x166e48  beq   $s2, $zero, 0x166e94 # skip if zero
+0x166e54  jal   0x167b68             # dec+14000 = s2
+```
+
+Self-referential — it can never bootstrap. Consistent with hardware leaving it 0.
+
+**Our runtime reaches the whole upper chain** (run 82 COVGAME, `run_probe.jsonl`):
+`0x3E0E60` ×5401, `0x3E10D0` ×5401, `0x421830` ×438, `0x420FC0` ×259,
+`0x3E2FF0` ×625. So `vt40` **is** being called hundreds of times.
+
+➡️ **Next:** the break is below `0x200000`, where COVGAME does not dump.
+`PS2_COV_GAMELO=0x100000` fixes that — **env only, no rebuild** — and gives
+per-address counts for `0x113C60`, `0x14F518`, `0x14F428`, `0x1669D0`,
+`0x166A28`, `0x166B10`, `0x1663D0`. Read a **zero** with care: coverage counts
+table-dispatched calls only.
+
+⚠️ COVGAME/COVTOP go to `run_probe.jsonl`, **not** `run_log.txt`. Grepping the
+console log for them returns nothing and looks like "coverage did not run".
+
+
+## ★★★★★ 2026-08-20 (b) — **METHOD CHANGE. `sub_168320` is unreachable; runs 74–81 were spent on dead code.** New static tool `build_scripts/eeref.py`.
+
+**The retraction.** Runs 74–81 narrowed the movie data-supply path to
+`sub_168320 @ 0x168320` — the only writer of `dec+14004/14008/14012` and the
+only issuer of the method-13 broadcast. Run 81 proved it never executed. It
+*cannot* execute. Scanned read-only over all 4.2 MB of PT_LOAD in
+`ELF/SLUS_214.42`:
+
+| check | `0x168320` | control `0x168938` | control `0x16C620` |
+|---|---|---|---|
+| `jal`/`j` targeting it | **0** | 28 | 0 |
+| 32-bit word equal to the address | **0** | 0 | 1 — at `0x4bf7ac` |
+| `lui`+`addiu`/`ori` materialization | **0** | 0 | 0 |
+
+`0x4bf7ac` is the slot-6 vtable we had been reading all along, so the scan
+demonstrably finds real references. `0x168320` has none of any kind, yet
+`slot=yes` — it has a recompiled body. It is CRI library code linked in and
+never called. **Do not reopen it.**
+
+**Why it went unnoticed for eight run cycles:** the method. One probe field per
+build+run, and the decompile text was treated as an xref database — it also
+claimed `0x167B68` had zero callers, which is false (`jal` at `0x166E54`).
+
+**The real chain**, from the writer upward. Exactly **one instruction in the
+game** writes `dec+14000`: `sw` at `0x167BA8` in `sub_167B68`.
+
+```
+vtable[+8] index 2   0x420E70 (@0x4faee8)  /  0x3E2E80 (@0x4f9aa8)
+  -> 0x113AA0 obj_set_fields___30_0   |  0x113C60 wrap_wrap_obj_set_flags_clone_01
+    -> 0x14C8C8 -> 0x14C0D0 wrap_wrap_get_data_ptr
+      -> 0x166850 -> 0x166A28 -> 0x166B10 mem_fill_z_9 -> 0x167B68 -> sw +14000
+```
+
+`0x113AA0`/`0x113C60` sit beside `ra_save_alloc_d @ 0x113920` (MovieUpdate).
+The two roots are index **2** of two sibling vtables sharing one interface
+layout (base at `0x4faee0` / `0x4f9aa0`, `loadscreen_*` block immediately
+above them).
+
+**Every node on that chain has a dispatch slot** — checked statically, no run.
+There is no Stage 5.11 hole on this path.
+
+**New tool: `build_scripts/eeref.py`.** Static cross-reference engine over the
+EE image — `refs` / `up` / `down` / `field` / `vtable`. Answers “who calls X”,
+“who writes offset N”, “does X have a dispatch slot” in seconds instead of a
+build+run. Two limits are in its docstring and both are real: it sees the
+static image only (a table built at runtime is invisible), and `field` had to
+learn `sdl`/`sdr` before it could see the 64-bit store at `+14004` — a
+too-small opcode table reports “nothing writes this field”, which is the exact
+false negative the tool exists to prevent.
+
+**Priority order from here:** static (seconds) → PCSX2 ground truth (minutes)
+→ our own runtime probe (hours). A probe is now the last resort.
+
+
+## ★★★★★ 2026-08-20 (a) — **STAGE 5.16 CLOSED, run 69. The completion handshake was never broken — we were poisoning it ourselves.** New blocker (5.17) opened on the streaming stall.
+
+Run 69 (`RelWithDebInfo`, 300 s, `det=1`) validated the `ps2_iop.cpp` S-command
+decode-table fix. All four pre-declared exit tests passed:
+
+| test | run 68 | run 69 |
+|---|---|---|
+| `[srd] fn=187898 sceCdGetError ret=` | `0x1` | **`0x0`** |
+| `SRD: Drive Error` lines | 248 | **0** |
+| SRD status byte (`12ee20 postStat`) | parked at `0x2` | **`0x3` = DONE** |
+| `130b80 dvcidone cvfsStat` | `0x1` | **`0x3`** |
+
+**Root cause.** The cdvdman S-command handler memset the recv buffer and stamped
+`word[0] = 1` as a blanket "benign success" marker. The libcdvd EE wrappers
+(`sub_187898`, `sub_187930`, `sub_1879E8`, `sub_187AA0`, `sub_187B98`) all share
+the tail `v1 = MEMORY[0x20464440]; return v1;` — they return recv `word[0]`
+**verbatim as the command's value**. So `sceCdGetError` answered `0x1`, and SRD
+correctly concluded the drive had faulted. The GS, SRD and movie layers were
+never at fault; neither was the read path, which had been moving real bytes
+since run 63.
+
+Fix: per-fno decode table — fno 4 → `SCECdErNO` (0), fno 12 → `SCECdStatSpin`
+(`0x02`), fno 1 → genuine success flag (1), unknown → 1 **plus a loud
+`UNDECODED` census line**. The census is keyed on *distinct fno*, not a flat
+count cap, so it cannot go quiet the way a capped probe does
+([[feedback_capped_probes_false_negatives]]).
+
+**Measurement note worth keeping.** `run_log.txt` is **UTF-16LE with a BOM**.
+Plain `grep` against it returns **zero matches for everything** — a total false
+negative that looks exactly like "the probe never fired". Decode first:
+`iconv -f UTF-16LE -t UTF-8 run_log.txt > /tmp/r69.txt`. Preferred path remains
+`analyze_run.py`, which handles the encoding itself.
+
+**Build note.** Cancelling a `cmake --build` mid-flight destroys MSBuild's CL
+tlog resume state and forces a full unity recompile
+([[project_msbuild_unity_parallelism]]). The `iop_harness` / `ps2x_tests`
+`LNK2019`/`LNK1120` errors that scroll past at the end of `ALL_BUILD` are
+**normal by construction** ([[project_aux_target_link_failures]]) — they mean
+the build *finished*, not that it hung. Let it print and exit.
+
+➡️ Next blocker is **Stage 5.17** — see the sub-phase tracker.
+
+## ★★★★★ 2026-08-19 (j) — REAL PCSX2 cross-check says `0x126388`/`0x1263b8` may be the WRONG target entirely; real candidate found: `CAppCRISofdec_*` (0x3f9bd0 family). **Verification interrupted — PCSX2 crashed, needs relaunch.**
+
+Session used real PCSX2 (DebugServer, live SLUS-21442) as ground truth, independent
+of the recomp runtime's own `[adxpump]` probe (entry (i)). User set the 7 known
+addresses (`0x126388`, `0x1263b8` + others) as manual execution breakpoints.
+Findings, all measured on real hardware:
+
+1. **Both addresses are correctly identified and well-formed** — live
+   `pcsx2_disassemble` confirms `0x126388` is a thunk (`jal 0x126488` then
+   `jal 0x1263b8`) and `0x1263b8` is the real gated pump body (`lw v0,0x50(s0)`,
+   `beqzl`/`bnezl` on the pending sentinel). Not an address error.
+2. **Zero execution hits across ~1.9B cycles**, including one full observed
+   intro/movie loop. Breakpoint mechanism itself is proven working (two
+   unrelated genuine hits landed correctly: a boot/reset pause, and a false
+   positive caused by an IOP thread PC — `0011CCF0` — numerically coinciding
+   with an EE address; EE and IOP are separate address spaces, the IOP hit
+   means nothing here).
+3. **`pcsx2_find_pattern` for the raw LE pointer bytes of both addresses
+   (`88 63 12 00`, `B8 63 12 00`) across all of EE RAM (`0x00100000`–
+   `0x02000000`) returned zero matches.** Nothing in live memory references
+   either address as a stored pointer — this argues against even an indirect
+   function-pointer-table dispatch, not just a missing direct `jal`.
+
+**⇒ On real hardware, at least within this observation window, `0x126388`/
+`0x1263b8` were never reached and are not referenced anywhere in RAM.** This
+doesn't retract entry (i)'s recomp-side measurement (the pump is still
+correctly wired and still gets 0 calls there too) — but it reframes the
+question: this may not be dead-in-recomp-only code, it may be dead code /
+the wrong target *in general* for this playthrough.
+
+**New lead found via funcmap grep (static, not yet dynamically verified):**
+`build_scripts/funcmap/sdbz_func_map_merged.csv` has a `CAppCRISofdec_*`
+family — this is CRI **Sofdec** (the actual movie/video codec engine class,
+distinct from the ADXF audio-only interface the pump chain was assumed to
+belong to):
+
+| Symbol | Address |
+|---|---|
+| `CAppCRISofdec_Begin` | `0x003f9bd0` |
+| `CAppCRISofdec_Tick` | `0x003f9c10` |
+| `CAppCRISofdec_End` | `0x003f9d50` |
+| `CAppCRISofdec_Update` | `0x003f9d80` |
+| `CAppCRISofdec_Tick_clone_01` | `0x003fc250` |
+| `CAppCRISofdec_Tick_clone_02` | `0x00420780` |
+| `CAppCRISofdec_Tick_clone_03` | `0x004212b0` |
+
+**Notably, `CAppCRISofdec_Tick_clone_02` was already named in stage 5.5.1's
+notes** (this file, run 2026-07-27) as one of the landmark symbols seen in
+the watchdog PC trace band around the healthy per-frame loop (`0x421f10`,
+alongside `CAppCopyRight_0x4206c0`) — i.e. this function's *neighborhood* was
+already known to be near live per-frame code, independent of this session's
+work. That was read as an orientation landmark at the time, not investigated
+as a call target.
+
+**Session ended mid-verification: attempted to set fresh breakpoints on the
+`CAppCRISofdec_*` family via PCSX2 MCP directly (`pcsx2_clear_all_breakpoints`
+succeeded, first `pcsx2_set_breakpoint` on `0x3f9bd0` succeeded) — then the
+DebugServer connection dropped mid-batch (`ECONNRESET`), and a reconnect
+attempt got `ECONNREFUSED` on both DebugServer (21512) and Pine (28011).
+User confirmed PCSX2 itself crashed/closed, not just the plugin.**
+
+**Next step (needs PCSX2 relaunched with DebugServer):** set execution
+breakpoints on all 7 `CAppCRISofdec_*` addresses above, run through the intro/
+movie sequence, and see which (if any) actually fire. If `CAppCRISofdec_Tick`
+or one of its clones fires while `0x126388`/`0x1263b8` still don't, that
+confirms Sofdec — not the ADXF pump chain — is the real movie-audio/video
+driver for this build, and Stage 5.16 should retarget around it instead.
+
+### ★★★★★ CONFIRMED (same session, PCSX2 relaunched, one-breakpoint-at-a-time this time — see below): Sofdec IS the live movie driver. Stage 5.16 as originally framed (`0x126388`/`0x1263b8`) should be RETARGETED, not pursued further.
+
+Note on method: batching all 7 `pcsx2_set_breakpoint` calls in one tool
+round-trip crashed PCSX2's DebugServer **twice in a row** (`ECONNRESET` then
+`ECONNREFUSED` on both ports, user confirmed the PCSX2 process itself died
+both times). Setting breakpoints **one at a time** worked cleanly on the
+third attempt, all 7 armed with no crash. **Do not batch `pcsx2_set_breakpoint`
+calls against this DebugServer build — one call per round-trip only.**
+
+With all 7 armed and the game run from a fresh boot:
+
+1. **First hit, cycle 59,765,856** (very early — well inside the boot-movie
+   window): `CAppCRISofdec_Tick_clone_01` (`0x003fc250`), called from
+   `loadscreen_reset` (`0x003e1280`, funcmap name).
+2. **Second hit, cycle 1,393,119,062**: `CAppCRISofdec_Tick_clone_03`
+   (`0x004212b0`), called from `loadscreen_tick` (`0x003e0e60`, funcmap name).
+3. **Continued twice more from the clone_03 hit** — it re-hit at cycle
+   1,398,251,378 (Δ≈5,132,316) then cycle 1,403,130,179 (Δ≈4,878,801). Both
+   deltas match the NTSC EE frame period (~4,919,595 cycles/frame @ 60 Hz)
+   within measurement noise. **This is a genuine per-frame tick, confirmed
+   by two consecutive consistent deltas — not a one-off or coincidental hit.**
+
+**Conclusion:** `loadscreen_reset`/`loadscreen_tick` own a `CAppCRISofdec`
+movie-decoder instance and pump its `Tick` method once per frame during
+movie/loadscreen playback. This is the real, live, per-frame movie-driving
+call chain on real hardware. Meanwhile `0x126388`/`0x1263b8` (the ADXF pump)
+had zero hits and zero RAM pointer references across the *entire* session,
+both before and after this test (see the entry above). **The two chains are
+not the same code path, and only one of them is actually alive.**
+
+**Recommendation — do not act on this without the user's sign-off, it
+reframes the stage:** Stage 5.16's blocker definition ("the ADXF pump at
+`0x126388`/`0x1263b8` never fires") should be retired as the wrong target.
+The real open question becomes: **does the recomp runtime's own
+`CAppCRISofdec_*` chain (same 7 addresses, in `runner/`) get called with the
+same `loadscreen_reset`→`loadscreen_tick` per-frame cadence as real PCSX2
+does here?** That is the actual apples-to-apples test for whether the recomp
+movie path is broken — not `[adxpump]`'s 0-calls reading, which was
+measuring a chain that apparently isn't the load-bearing one even on real
+hardware.
+
+### ✅ ACTED ON — `[sofdec]` probe written into `game_overrides.cpp`. **UNBUILT, needs run 65.**
+
+Static checks done first, so the run does not have to answer them:
+
+- **All nine bodies exist** in `ps2xRuntime/src/runner/` (`CAppCRISofdec_{Begin,Tick,
+  End,Update}_0x3f9*.cpp`, `_Tick_clone_0{1,2,3}_0x{3fc250,420780,4212b0}.cpp`,
+  `loadscreen_{tick,reset}_0x3e{0e60,1280}.cpp`). So this is **not** a Stage
+  5.13 dispatch hole.
+- **`loadscreen_tick` has no `jal 0x4212b0`.** Its recompiled body contains
+  four *indirect* dispatches (`0x3e0f34`, `0x3e0fd8`, `0x3e101c`, `0x3e1060`)
+  and two direct ones to unrelated targets. PCSX2's backtrace named
+  `entry=0x3e0e60` as clone_03's caller, so the call is a **JALR through a
+  function pointer** — i.e. through a vtable/fnptr the instance must own.
+- **Every branch in that body goes through `dispatchGuestBranch`** (checked in
+  the generated source, not assumed), so `replaceFunction` wrappers *do* see
+  them — [[feedback_registerfunction_bypass]] does not apply here.
+- `fn_forward_decls.h` is **not** perturbed: build.ps1's scan only matches
+  `void fn_<hex>_0x<hex>(uint8_t *rdram`, and the new code adds no such name.
+  No 30 h rebuild.
+
+The probe wraps all nine addresses and reports `tag=<calls>/<installed>` from a
+**detached 5 s reporter thread**, not from a guest callback — an all-zero
+result is the most informative outcome here, so it must not depend on guest
+code running to be printed. `PS2X_SOFDEC=0` disables. Per-site emit cap is 24
+with an explicit `[cap]` line ([[feedback_capped_probes_false_negatives]]).
+
+**Decision table for run 65 — reads straight off `[sofdec:stat]`:**
+
+| Reading | Meaning | Next move |
+|---|---|---|
+| `loadscreen_tick.3e0e60=0` | blocker is upstream of the movie code entirely | Sofdec is a red herring; go back up the caller chain |
+| `loadscreen_tick>0`, all `Tick*=0` | caller reached, **JALR target wrong** — the instance's function pointer was never populated | dump the fnptr the JALR reads; find its writer |
+| any `Tick*>0` | recomp *does* drive Sofdec per-frame | divergence is *inside* a tick, not in whether one happens — compare against the PCSX2 cadence above |
+| any `.../0` | that address is not in the dense table | invalidates that row before the run, not after |
+
+---
+
+### ✅ RUN 65 READ (2026-08-19, 306 s, det=1, RelWithDebInfo) — the probe fired; the answer is a **state machine that never leaves its idle arm**
+
+`[sofdec:stat]` final totals (`<calls>/<installed>` — every site installed, so no row is invalid):
+
+| site | calls | note |
+|---|---|---|
+| `loadscreen_tick.3e0e60` | **1870** | ~34 per 5 s = **6.8 Hz**. Real hardware ticks this at **60 Hz** |
+| `loadscreen_reset.3e1280` | 3 | a0 = 0x6330d0, 0x632da0, 0x632cf0 — **three distinct instances** |
+| `Tick_c3.4212b0` | **4** | ra0=0x3e0fe0 ⇒ the JALR at 0x3e0fd8, i.e. the `state==2` arm |
+| `Tick_c1.3fc250` | 1 | ra0=0x3e12a8, called from `loadscreen_reset` |
+| `Begin.3f9bd0` `Tick.3f9c10` `End.3f9d50` `Update.3f9d80` `Tick_c2.420780` | **0** | installed, never entered |
+
+**None of the four decision-table rows is a clean match — the disassembly explains why the table was
+mis-framed.** `0x3e0e60` disassembles to a dispatch on `byte[$s0+9]`:
+
+```
+0x3e0e6c  lbu  $v0, -3514($gp)   ; GLOBAL enable byte
+0x3e0e70  beqz $v0, 0x3e0fb8     ; <-- if 0 the entire tick is a no-op
+0x3e0e88  state = byte[$s0+9]
+0x3e0ec8  state==2 -> 0x3e0fd0 -> lw $t9,0($s0); lw $t9,0x38($t9); jalr   (= Tick_c3)
+0x3e0ed8  state==3 -> 0x3e1014 -> jalr vtable[+0x44]
+0x3e0ee8  state==4 -> 0x3e1058 -> jalr
+0x3e0ef8  state!=5 -> 0x3e0f84  (exit path)
+```
+
+So `Tick_c3=4` does **not** mean the call site is broken — it means the object was in `state==2` on
+only 4 of 1870 ticks. The other 1866 took an arm we never instrumented, or died at the `$gp-3514`
+gate before reading the state at all. **Probing callees was the wrong measurement**; the state byte
+and the resolved `$t9` are the right one. (Same failure mode as
+`[[feedback_probe_gate_on_shape_not_address]]` — a probe aimed at guessed destinations reports
+confidently about the wrong thing.)
+
+**Two independent facts recovered in the same run:**
+
+1. `[cdsearch]` shows the movie file **is** found: `name="\MOVIE\OKR.SFD;1" outLbn=0x1575ed
+   outSize=0x250000 ret=0x1`. The data path is not the blocker.
+2. `[movie]` is frozen for all 298 samples at `stat=1 objSt=1 objFile=0x4597b0 **objSrc=0x0**`.
+   The Sofdec object never gets a source bound.
+3. Exactly one `[guest-branch:missing-target]`: `JALR source=0x115334 target=0x0 a1=0x459770`.
+   Disassembly:
+   ```
+   0x115320  lw   $v0, 192($a0)      ; obj->field_0xC0, non-null (branch not taken)
+   0x11532c  lui  $v0, 0x44
+   0x115330  lw   $v1, -14008($v0)   ; global fnptr @ 0x43c948
+   0x115334  jalr $v1                ; <-- NULL
+   ```
+   A **global callback slot at 0x43c948 was never written.** `[adxgate] records=0` in the same run,
+   consistent with the PCSX2 finding that the ADXF pump is dead on this path.
+
+### ✅ RUN 66 READ — the state machine is EXPLAINED, and it is a symptom
+
+`[lstick:stat]` records=60, `[sofdec:stat]` records=61, **no `[cap]` for either tag** ⇒ absence is
+evidence. Final values:
+
+| field | value | meaning |
+|---|---|---|
+| `gateAddr` / `gate` | `0x5022b6` / **`0x1`** | derived from live `$gp`; the global enable byte is **OPEN**. The tick is not a no-op. |
+| state histogram | **`4:1972`**, `2:19`, `1:5`, `other:0` | the object is parked in **state 4**, 98.8% of ticks |
+| `f8` (byte[obj+8]) | `0x0` | `& 2` ⇒ 0, gate **passes** |
+| `w12` (word[obj+12]) | `0x0` | `& 0x80000000` ⇒ 0, gate **passes** |
+| `nullcb.115318` | `0/1` | installed correctly (it IS a function start), **0 calls this run** |
+
+State-4 body at `0x3e1058` advances `byte[obj+9] = 5` only if ALL THREE hold:
+
+```
+0x3e1058  lw   $t9, 0($s0) ; lw $t9, 64($t9)   ; vtable[+0x40]
+0x3e1060  jalr $t9   (a0 = obj)
+0x3e1068  beq  $v0, $zero, 0x3e0ef0             ; <-- ret 0  => stay in state 4
+0x3e1070  lbu/andi byte[+8] & 2   -> bail       ; MEASURED 0, passes
+0x3e1080  lw/and  word[+12] & 0x80000000 -> bail; MEASURED 0, passes
+0x3e1090  sb   $v0(=5), 9($s0)                  ; advance
+```
+
+Two of the three gates are measured open. **By elimination, `vtable[+0x40](obj)` returns 0, 1972
+times in a row.** No new run was needed to resolve it: the vtables live in initialized data, so
+slot `+0x40` was read statically out of the ELF.
+
+| vtable seen | `+0x38` (st2) | **`+0x40` (st4)** | `+0x44` (st5) |
+|---|---|---|---|
+| `0x4fa400` | `0x3fbf70` | `0x3fc0c0` | `0x3e0c20` |
+| `0x4f99a0` | `0x3e1610` | `0x3e19a0` | `0x3e1c00` |
+| `0x4faeb0` | `0x420e70` | `0x420fc0` | `0x421130` |
+| `0x4faf10` | `0x4212b0` | `0x421420` | `0x421540` |
+| `0x4faf70` | `0x4216e0` | **`0x421830`** | `0x4219a0` |
+
+⚠️ **`Tick_c3=4` in run 65 was a red herring.** `Tick_c3` is `vtable[+0x38]` of ONE object
+(`0x4faf10`). The vtable rotates across at least five loadscreen objects, so probing a fixed callee
+address measures object identity, not liveness. Same failure mode as
+`feedback_probe_gate_on_shape_not_address`.
+
+⚠️ **`0x421830` is a load-screen animation/timer sub-machine** (dispatches on `word[obj+48]`,
+does float delta-time accumulation against `0x40e0` = 7.0f). It returning 0 means *"the load screen
+is still waiting"* — which is **correct behaviour**, not a bug. The loadscreen state machine is a
+**symptom**. Do not sink further runs into it.
+
+### ⭐ THE ACTUAL ANOMALY — a global that nothing writes
+
+Unchanged and confirmed across runs 65 and 66:
+
+- `[cdsearch]` — `\MOVIE\OKR.SFD;1` found, `outLbn=0x1575ed outSize=0x250000 ret=0x1`. Data path OK.
+- `[movie]` — **298/298 samples identical**: `objSt=1 objFile=0x4597b0 **objSrc=0x0** objLen=0xfffff`.
+  The file handle binds; **the source never does.**
+- `[guest-branch:missing-target]` — **exactly 1 record, uncapped**:
+  `JALR source=0x115334 target=0x0 a0=0x175064 a1=0x459770 v0=0x440000 v1=0x0`.
+  Note `a1=0x459770` is `0x40` below `objFile=0x4597b0` — same structure family.
+
+Static facts established this session about the slot `0x115330` loads (`0x440000 - 14008 = 0x43C948`):
+
+1. It is **inside the loaded file image** (PT_LOAD vaddr `0x100000`, filesz `0x400680`), not past the
+   end ⇒ **not a loader/BSS gap**. Its initial value in the ELF is a genuine `0x00000000`.
+2. A full 4 MB instruction scan for immediate `0xC948` finds **exactly ONE** instruction:
+   `0x115330  lw $v1, -14008($v0)`. **Zero stores.** The IDA decompile dump agrees — one textual hit,
+   the read itself.
+3. It sits in a **203-word contiguous zero run** (`0x43C63C .. 0x43C967`) ⇒ a runtime-populated table,
+   written through a **computed base**, which is why no immediate-offset store exists.
+
+➡️ **Working hypothesis:** `0x43C948` is a callback slot in a registration table that is never
+populated, so the one-shot notify at `0x115334` no-ops, so `objSrc` is never bound, so the movie never
+starts, so the load screen waits forever in state 4. Every link except the first is measured.
+
+➡️ **The adjudicator is PCSX2, and it is one breakpoint.** Break at `0x115330`, read `$v1`.
+- `$v1 != 0` on hardware ⇒ a real recomp gap; find the registrar and port it.
+- `$v1 == 0` on hardware too ⇒ the null JALR is normal game behaviour and this whole thread is
+  cleared; the blocker is upstream in whoever sets `objSrc`.
+
+This is cheap and decisive. **Do not spend another 300 s run on the loadscreen state machine.**
+
+### ⭐ STAGE 5.16 REFRAMED — THE MOVIE **OPENS**; IT STALLS IN THE CVFS READ-COMPLETION POLL (2026-08-19)
+
+Found by **static analysis of `ida_scripts/decompiles_SLUS_214_42.txt` + re-reading the EXISTING
+`run_log.txt`**. Zero builds, zero runs. No new instrumentation was needed.
+
+#### ⚠️ RETRACTION — the previous framing was wrong
+
+"`objSrc` never binds / the file is found but the movie object never gets its source" is
+**false**. The live log (`run_log.txt`, 2026-08-19 16:50, a run that reached the `.SFD` open)
+shows both movies opening *successfully*:
+
+```
+[moviegate] fn=124dc8 seq=0 base=0x44bf18 ra=0x155a54 name="movie/atari.sfd"
+[moviegate] fn=124e38 seq=0 ... post.arm45=0x1 post.fptr50=0x1b173a8 post.hnd08=0x0
+[moviegate] fn=130ef0 seq=0 ... ret=0x44f278 h24=0xb4000   cache=HIT name="movie/atari.sfd"
+[moviegate] fn=12cc20 seq=0 ... ret=0x54c060                        name="movie/atari.sfd"
+[moviegate] fn=125898 when=post seq=5 ... b02=0x1 latch49=0x1 hnd08=0x54c060 fptr50=0x1b173a8
+   ... later, seq=1029/1031: b46/b48 set, then ALL ZERO -> atari.sfd CLOSED normally
+[moviegate] fn=124dc8 seq=1 ... name="movie/okr.sfd"   -> identical successful open, hnd08=0x54c060
+```
+
+`fptr50` **is** populated (`0x1b173a8`), `hnd08` **is** populated (`0x54c060`). The old
+`objSrc=0x0` reading came from records sampled *before* the arm, not from a failure.
+
+#### The decoded CRI chain (all names from the IDA dump)
+
+| Addr | Real identity |
+|---|---|
+| `0x124E38` | `ADXT_StartFname`-equivalent — sets `[obj+0x50]=fname`, `[obj+0x54]=arg`, **`[obj+0x45]=1`** |
+| `0x125898` | ADXT stream state machine — on `[+0x45]==1 && [+0x08]==0` calls the open |
+| `0x12CC20` | **`CVFS_Open`** (error strings `cvfsopen1..6`) — returns the handle `0x54c060` |
+| `0x130EF0` | **`DVCI_Open`** — `[dvci+1]=1` on cache hit |
+| `0x125470` | the **per-frame read pump** that `0x125898` calls every tick |
+| `0x12D0B8` | **`CVFS_ReqRd`** -> device vtable **`+0x20`** |
+| `0x12D240` | **`CVFS_GetStat`** -> device vtable **`+0x2C`**; returns **3** if handle/slot null |
+| `0x131190` | **`DVCI_ReqRd`** |
+| `0x131420` | **`DVCI_GetStat`** — literally `return *(char*)(dvci+2)` |
+| `0x131338` | **`DVCI_StopTr`** — spins <=655360 iters, then prints `"DVCI: DvciStopTr..."` |
+| `0x1322F0` | **`DVCI_SetReadMode(m0, m1, m2, syncFlag)`** — writes `byte_44F400/401/402`, **`dword_44F404`** |
+
+#### Where it actually stalls
+
+`sub_125470` (the pump) is:
+
+```c
+v5 = CVFS_GetStat(*(int*)(a1 + 8));      // -> DVCI_GetStat -> [dvci+2]
+if (*(BYTE*)(a1 + 2) == 1) {             // [a1+2] == "a read is IN FLIGHT"
+    if (v5 != 1) {                       // not complete
+        if (v5 == 3) { ...error... }     // NOT taken - state never became 4
+        goto LABEL_23;                   // <-- WE SIT HERE FOREVER
+    }
+    ... consume buffer, advance ...
+}
+```
+
+`[adx:stream]` confirms it, frozen and unchanging from **t~47 s to t=298 s** (250+ seconds):
+
+```
+i=1 raw=0x1010201 act=1 st=2 pau=1 fd=0x54c060 cmd=0x0 bsy=1 f80=0x1b173a8
+```
+
+WARNING: **the probe field named `pau` is mislabelled.** `[obj+2]` is not "paused" — it is
+**"read request outstanding"**. Rename it; the current name has been actively misleading.
+
+#### Prime suspect: `dword_44F404`
+
+`DVCI_ReqRd` (`0x131190`) branches on it:
+
+```c
+if (DVCI_ReqRd issued OK) {
+    if (dword_44F404 == 1) { ...wait, close, ... *(BYTE*)(dvci+2) = 1; }   // SYNC  -> DONE
+    else                   {                     *(BYTE*)(dvci+2) = 2;     // ASYNC -> READING
+                             return *(int*)(dvci+16); }
+}
+```
+
+**Nothing anywhere in the ELF sets `[dvci+2]` from 2 back to 1.** Only `DVCI_ReqRd`'s *sync*
+arm does. So if `dword_44F404 != 1`, `DVCI_GetStat` returns 2 forever and the pump can never
+advance — exactly the observed freeze.
+
+NEXT MEASUREMENT (cheap, two independent ways):
+1. **Hardware:** read `0x0044F400` (16 B) on PCSX2 while a movie plays. `dword_44F404` is at
+   `0x0044F404`. If hardware has 1 and we have 0, the stage is closed.
+2. **Recomp:** wrap `0x1322F0` and log `a1..a4`, and dump `[0x44F404]` in the `[adx:stream]`
+   record. Also add `[dvci+2]` (reached via `[cvfs_handle+4]`) to that record — today we sample
+   the ADXT object but never the DVCI object the pump is actually polling.
+
+#### Negative results worth keeping (they eliminate whole classes)
+
+- **No dispatch holes on the chain.** `check_trace_addrs.py` over all 15 addresses
+  (`0x1322F0 0x131190 0x131338 0x131420 0x131458 0x131068 0x130EF0 0x12D0B8 0x12D240 0x12D050
+  0x12CC20 0x125470 0x125898 0x124E38 0x115318`) -> **15 START, 0 holes.** Every body exists and
+  every dispatch slot is populated. This is a *state* bug, not a missing-code bug.
+- **Guest `printf` IS visible in the log** as `[Deci2Call:kputs]`. Exactly one CRI string ever
+  fired: `DVCI: File cache was not hit. "\MOVIE\ATARI.SFD;1"`. **No** `cvfsopen*`, **no**
+  `cvfsgetstat*`, **no** `E00929*`, **no** `E0211050`, **no** `DvciStopTr` timeout. The stall is
+  silent — CVFS is not erroring, it is patiently waiting. => absence of those strings is now a
+  usable signal, not an unknown.
+- **`0x115318` is a consequence, not a cause.** With `[obj+2]==1` and `[+0x45]==0`,
+  `sub_125898`'s *first* branch does exactly one thing per tick: call `sub_125470`. Hardware
+  never reaches `0x115318` during boot because on hardware the read *completes* and the stream
+  takes the other path. The null JALR is downstream of the stall
+  (see the `0x43C948` refutation block below).
+
+#### Method note
+
+Found by **Step 0 of the approved plan** (`~/.claude/plans/frolicking-shimmying-sun.md`):
+static IDA work + re-reading logs we already had, before spending any build. It cost no runs.
+The generic env-driven tracer (Step 2) is still worth building, but it was **not** needed to get
+here — the prior sessions' loop of "guess an address -> hand-write a wrapper -> rebuild" had
+already collected the evidence; nobody had read it against the decompiled CRI source.
+
+---
+
+### ❌ RETIRED — STAGE 5.16 "SLEEPING CRI SERVER THREAD" (2026-08-19, refuted same day)
+
+> **DO NOT REOPEN.** Run 67's coverage census measured `0x130c48` at **727 calls**. The DVCI server tick runs, `0x11e9d8` (the CRI thread body) is entered and loops internally, and 354 reads went out with 354 RPC completions back. **Nothing on this path is asleep.** The chain below is kept only because its *static* call-graph and field offsets are still correct and were re-used by the run-67 analysis — the **conclusion** is dead. See the run-67 block below for what replaced it.
+
+<details><summary>Refuted reasoning (kept for the call graph only)</summary>
+
+#### (former header) STAGE 5.16 — HARDWARE ADJUDICATED: THE COMPLETION IS DRIVEN BY A SLEEPING CRI SERVER THREAD
+
+Measured live on PCSX2 (DebugServer), game at the movie-init point. Supersedes the
+`dword_44F404` hypothesis in the block above.
+
+#### ❌ RETRACTED — `dword_44F404` is **0 on hardware too**
+
+Watchpoint `0x0044F400` (write) fired with `PC=0x00132304`, i.e. inside `DVCI_SetReadMode
+@ 0x1322F0`, one instruction past `sw a3, -0xBFC(v1)`.
+
+| evidence | value |
+|---|---|
+| `a0 a1 a2 a3` | `0 0 0 0` |
+| `mem[0x0044F404]` | `00 00 00 00` |
+| `ra` | `0x00126594` |
+
+Caller `0x12658C`: `jal 0x1322F0` with `a3 = *(s1+4)`, `s1 = 0x0054BE40`.
+`mem[0x54BE40] = {0x004b73a0, 0, 0, 0, 0}` ⇒ `a3 = 0`.
+
+⇒ **Hardware runs the ASYNC arm.** `DVCI_ReqRd` sets `[dvci+2] = 2` (READING) on hardware
+exactly as it does for us. The sync/async fork is NOT the divergence. The earlier claim
+"nothing sets `[dvci+2]` back to 1" was wrong — see below.
+
+#### ⭐ FOUND — the async completion path
+
+```
+sub_130B80 @ 0x130B80   per-object completion check
+  reads [obj+28] (pending request handle); switch on its status:
+    case 3  -> [obj+2] = 1   <-- DONE. advances [obj+20], [obj+12]
+    case 0  -> [obj+2] = 0
+    case 9  -> [obj+2] = 3   (error)
+  then frees the request, [obj+28] = 0
+
+sub_130C48 @ 0x130C48   DVCI server tick
+  gated on dword_44E710; iterates 40 objects (dword_44E780, stride 72),
+  calls sub_130B80 for each with [obj+0] == 1
+```
+
+#### ⭐⭐ THE DRIVER — a thread that `SleepThread()`s
+
+PCSX2 breakpoint on `0x130C48`, backtrace:
+
+```
+#0 0x00130C48   DVCI server tick
+#1 0x0012D1E0   CVFS ExecServer  (walks dword_54C1A0[32], indirect-calls each device server)
+#2 0x0011D708   thin wrapper
+#3 0x0013C4F8   (entered via tail `j` from 0x13C6B8, a0=4)
+#4 0x0011E9D8   CRI server thread body       sp = 0x004451B0  <-- NOT the main stack (0x01FFExxx)
+```
+
+`sub_11E9D8` is a thread loop:
+
+```c
+while (!qword_4419C8) {
+    ...  MEMORY[0x120000E0] = word_441A04;   // GS BGCOLOR debug bar
+    noop_wrapper___367();                    // -> 0x13C6B8 -> 0x13C4F8 -> ... -> 0x130C48
+    ...
+    wrap_syscall_stub_z();                   // -> 0x00174BC0: li v1,0x32; syscall  = SleepThread
+}
+```
+
+`0x00174BC0` = **syscall 0x32 = `SleepThread`**. PCSX2 EE thread list at the movie point:
+
+```
+TID 1: PC=0x00174bc8 status=2  waitType=0   (READY -- just woken)
+TID 4: PC=0x00174bc8 status=4  waitType=1   (WAIT, SLEEP)
+TID 6: PC=0x00174bc8 status=12 waitType=1   (WAIT|SUSPEND, SLEEP)
+```
+
+Three threads parked one instruction past the `SleepThread` syscall. Something calls
+`WakeupThread` (syscall 0x33 @ `0x00174BD0`) on them every frame.
+
+#### ➡️ THE HYPOTHESIS THIS REPLACES IT WITH
+
+> If the CRI server thread is never woken in the recomp, `0x130C48` never runs, `[dvci+2]`
+> stays 2 forever, `CVFS_GetStat` returns 2 forever, and `sub_125470` polls forever.
+> **That is precisely the observed freeze** — patient waiting, zero error strings.
+
+This is a **thread/scheduler** bug, not a CRI-logic bug. It is consistent with every
+negative result: no CRI error string ever printed, `[adx:stream]` frozen identical for
+250+ s, and the det=1 dependence.
+
+#### ✅ NEGATIVE RESULT — the chain is fully present in the recomp
+
+`check_trace_addrs.py 0x11E9D8 0x13C4FC 0x11D708 0x12D1E0 0x130C48 0x130B80 0x131190 0x131420 0x11D728`
+-> 8 START, 1 FOLDED, 39 overrides registered.
+
+The one FOLDED (`0x13C4FC` inside `sub_13C658_tail0013C4F8 @ 0x13C4F8-0x13C5BC`) is a
+**false alarm**: `0x13C6B8` tail-jumps to `0x13C4F8`, which is the true entry (`sll v0,a0,3`
+consumes `a0` immediately). PCSX2's stack walker guessed `0x13C4FC` because that is where
+the `addiu sp,-0x40` prologue sits. **No dispatch hole.**
+
+#### ➡️ NEXT MEASUREMENT — one run, NO BUILD
+
+`PS2_COVERAGE=1` is env-armed and already compiled in. The full per-address `COVGAME` dump
+is gated on `addr >= kGameBandStart` (default `0x00200000`) — **the entire CRI chain is
+below that**, so the band floor must be lowered:
+
+```
+PS2X_DIAG=1  PS2_COVERAGE=1  PS2_COV_GAMELO=100000   (strtoul base 16)
+launch_recomp.ps1 -Exe <RelWithDebInfo> -RunSeconds 90       # det=1, do NOT pass -Determinism 0
+```
+
+Then `analyze_run.py --coverage --band game` and look for `0x130c48`, `0x12d1e0`, `0x11e9d8`.
+
+- `0x130c48` count **0** ⇒ hypothesis confirmed; the fix is in thread wakeup, not CRI.
+- `0x130c48` count **> 0** ⇒ the server does run, and the divergence is inside
+  `sub_130B80`'s status switch (`get_field_val_z_109` never returning 3).
+
+⚠️ Coverage counts **table-dispatched calls only**; zero proves "never dispatched", not
+"never executed". All nine chain addresses are registered (above), so a zero here is strong
+but should be confirmed by a second det=1 run before hardware time is spent.
+
+</details>
+
+### ⭐⭐⭐ RUN 67 (COVERAGE, 300 s) — **SLEEPING-CRI-THREAD HYPOTHESIS REFUTED.** THE WHOLE CHAIN RUNS (2026-08-19)
+
+`PS2_COVERAGE=1 PS2_COV_GAMELO=100000`, det=1, 300 s. Run reached the movie stage:
+`[cdsearch]` found **ATARI.SFD** and **OKR.SFD**, `[movie] wrkAdr=0x1806c00 stat=1` from t=121 s
+to t=294 s. 2478 distinct game addresses dispatched. Measurement is valid.
+
+**Pre-declared decision rule fired the "> 0" arm.** `0x130c48` = **727**.
+
+| addr | role | calls |
+|---|---|---|
+| `0x125898` | movie state machine | 1440 |
+| `0x130c48` | **DVCI server tick** | **727** |
+| `0x12f1e8` | SRD server tick (outer) | 727 |
+| `0x125470` | CVFS_GetStat poller | 709 |
+| `0x130b80` | DVCI async completion | 708 |
+| `0x12ee20` | **SRD state handler** (issues read, completes it) | 707 |
+| `0x12e950` | `get_field_val_z_109` = `*(char*)(h+2)` CVFS status read | 707 |
+| `0x131190` | DVCI_ReqRd | 354 |
+| `0x1875e8` | **`sceCdRead`** | 354 |
+| `0x186310` | **SIF-RPC end_function** for the read | 354 |
+| `0x186100` | end_function tail — clears `dword_463274` | 354 |
+| `0x12ecc0` | **SRD error check** (`sceCdGetError` wrapper) | 354 |
+| `0x187898` | `sceCdGetError` | 354 |
+| `0x11e9d8` | CRI server thread body | 2 |
+
+⇒ The CRI server thread **is** being woken. Reads **are** being issued *and* completed
+(354 in, 354 RPC callbacks out). **Nothing is asleep.** The 2026-08-19 hardware-adjudication
+hypothesis ("`sub_11E9D8` never woken ⇒ `0x130c48` never ticks") is **dead** — retire it.
+
+**Zero-coverage nodes on the path** (all classify `START`, real bodies, so zero is meaningful):
+
+| addr | what | why zero is (probably) fine |
+|---|---|---|
+| `0x12f008` | SRD *streaming-mode* handler | gated on the SRD mode byte `byte_44D231 == 2`; mode is 1 |
+| `0x12d1e0` | CVFS ExecServer | second CVFS server, not on this path |
+| `0x186270` | `sceCdInitEeCB` | ⇒ `dword_463254 = 0` ⇒ no CD callback thread |
+| `0x1861a0` | CD callback thread body | never created (follows from `0x186270`) |
+
+⚠️ I chased `0x1861a0`/`dword_463274` as "sceCdSync stuck BUSY" and **it does not hold**:
+with `dword_463254 == 0`, `0x186100` takes the `else` arm and clears `dword_463274` itself.
+`sceCdSync(1)` therefore returns **0 = DONE**. Recorded so nobody re-walks it.
+
+#### ➡️ NEW FRONTIER — the SRD completes into **ERROR**, not DONE
+
+Static chain, all confirmed against `ida_scripts/decompiles_SLUS_214_42.txt`:
+
+```
+sub_12EE20 (SRD tick, 707)
+  status==1 -> sceCdRead (354) -> status = 2
+  status==2 -> v9 = sceCdSync(1);  r = sub_12ECC0(a1);   // 354
+              if (!v9) *(a1+2) = (r == 1) ? 9 : 3;       // 9 = ERROR, 3 = DONE
+sub_12ECC0 (354) -> v3 = sceCdGetError() (0x187898, 354)
+              v3 == 0 or -1 -> return 0   (ok)
+              v3 == 32              -> return 0   (NOTREADY, retry)
+              else -> printf "SRD: Drive Error (sceCdGetError = 0x%x)" ; return 1
+```
+
+CVFS status 9 -> `sub_130B80` **case 9** -> DVCI `[obj+2] = 3` -> the movie layer retries ->
+**the same LBN is read again, forever.** That matches the standing symptom exactly, and it
+matches the 1:1:1 ratio of `sceCdRead` : `end_function` : `sceCdGetError` = 354.
+
+The rival reading is `r == 0` -> status 3 (DONE) and the failure is further up (`objSrc` never
+bound). Both survive the current data. **`sceCdGetError`'s return value is the one number that
+separates them** and it is not yet measured.
+
+**Next measurement (one probe, one build):** log `dword_44D2B4` (SRD's saved
+`sceCdGetError` result) and the `*(a1+2)` value written at the end of `sub_12EE20`.
+Decision: value **9** ⇒ error-retry loop, fix is in `sceCdGetError`/cdvdfsv completion status.
+Value **3** ⇒ reads succeed and the bug is above CVFS, in the movie source binding
+(`[movie] objSrc=0x0`).
+
+---
+
+### ➡️ ACTED ON — `[srd]` COMPLETION PROBE WRITTEN INTO `game_overrides.cpp`. **UNBUILT, needs run 68.**
+
+`ps2xRuntime/src/lib/game_overrides.cpp`, new block `applySdbzSrdProbe` (registered as
+"SDBZ SRD completion probe"). No headers, no `runner/`, no recompiler. Master switch
+`PS2X_SRD` — **defaults ON**, `PS2X_SRD=0` disables. Tag is `[srd]`.
+
+**Five wrappers, all measured as dispatched in run 67** (so a `0` in the install line is a
+broken probe, not a quiet guest):
+
+| addr | what | run-67 count |
+|---|---|---|
+| `0x12EE20` | SRD state handler — **the adjudicator** | 707 |
+| `0x12ECC0` | SRD error check — returns the ERROR/DONE verdict | 354 |
+| `0x187898` | `sceCdGetError` — **the decisive number, never yet measured** | 354 |
+| `0x186BB0` | `sceCdSync` — separates "never completes" from "completes wrong" | 1424 |
+| `0x130B80` | DVCI async completion — what the movie layer actually sees | 708 |
+
+#### The decision rule — pre-declared, three arms
+
+`sub_12EE20` ends with `sync = sceCdSync(1); chk = sub_12ECC0(obj); if (!sync) obj[2] = chk ? 9 : 3;`
+Read the `[srd] stat` line's `syncRet=` / `chkRet=` / `exitStat=` histograms:
+
+| observation | verdict | where the fix lives |
+|---|---|---|
+| `syncRet` has nonzero entries, `exitStat` stuck at `2` | **A** — the read never completes | `sceCdSync` / `dword_463274` |
+| `syncRet=0:*`, `chkRet=1:*`, `exitStat=9:*` | **B** — error-retry loop | `sceCdGetError` / cdvdfsv completion status |
+| `syncRet=0:*`, `chkRet=0:*`, `exitStat=3:*` | **C** — reads succeed | **above CVFS**, in the movie source binding (`[movie] objSrc=0x0`) |
+
+⚠️ **The B/C trap.** `sub_12ECC0`'s entire body is gated on `dword_44D27C`. If that flag
+is `0`, the check returns `0` *without ever calling `sceCdGetError`* — which is
+indistinguishable from arm C unless the gate is read. The probe logs it as `gate44d27c=`
+on every `12ecc0` line. **Do not call arm C without checking that field**
+([[feedback_probe_gate_on_shape_not_address]]).
+
+Rival-reading field: `raw44d230=` dumps the raw 8 bytes at the SRD object base on every
+`12ee20` detail line. IDA reads `+1` as the handler selector and `+2` as the status; a
+one-byte error in that reading would otherwise silently reframe every other field
+([[feedback_degenerate_result_convicts_the_probe]]).
+
+Caps: `kSrdMaxDetail = 96` detail lines **per site**, each emitting an explicit `[cap]`
+line. The histograms are uncapped and a `[srd] stat why=shutdown` line is emitted via
+`atexit` regardless, so absence in the detail stream is never mistaken for absence of the
+event ([[feedback_capped_probes_false_negatives]]).
+
+#### ⚠️ Run-68 window — 300 s MINIMUM
+
+The movie system does not initialize until **t≈121 s**. Run 66 was voided by a 90 s window.
+Anything under ~150 s cannot observe this probe at all
+([[feedback_run_window_false_negative]]).
+
+#### Run-68 exit test
+
+1. `[srd] wrappers ... 12ee20=1 12ecc0=1 187898=1 186bb0=1 130b80=1 enabled=1` — else the
+   probe is broken and nothing below is evidence.
+2. `[srd] stat why=shutdown` present, with `12ee20` in the hundreds. If it reads `0`, the
+   run ended before t=121 s — **void, re-run longer**, do not interpret.
+3. Read `syncRet` / `chkRet` / `exitStat` against the three-arm table above.
+
+#### Run-68 command (det=1 is mandatory — [[feedback_determinism_gates_guest_progress]])
+
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -RunSeconds 300 -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+Then:
+
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag srd
+```
+
+### ⚠️ RUN 66 (COVERAGE) — **VOID: RUN WINDOW ENDED 31 s TOO EARLY** (2026-08-19)
+
+`PS2X_DIAG=1 PS2_COVERAGE=1 PS2_COV_GAMELO=100000`, **`-RunSeconds 90`** — my error.
+
+**What the census said:** 1485 distinct game-band addresses, 859665 dispatched calls,
+9 coverage dumps. Band floor took effect (addresses down to `0x00110000` present).
+**Zero** dispatches anywhere in `0x00120000`–`0x0013FFFF` — the entire CRI/CVFS/DVCI stack.
+
+**Why that proves nothing.** The run never reached the movie stage at all:
+
+| tag | run 66 (90 s) | run 65 `20260819-165027` (298 s) |
+|---|---|---|
+| `[cdsearch]` | **records=0** | 4 pairs, `ATARI.SFD` then `OKR.SFD` |
+| `[movie] wrkAdr` | `0x0` for all 89 records | `0x1806c00` **first at t=121 s** |
+| `[adx:stream]` | `nonzero=0/40` | streams live |
+
+**The movie system does not initialise until t≈121 s.** A 90 s window ends 31 s before the
+first event on the path under test. This is exactly `[[feedback_run_window_false_negative]]`
+firing again — the zero-coverage result is indistinguishable from "never happens" and must
+not be read as evidence for or against the sleeping-server-thread hypothesis.
+
+✅ **Salvage:** the mechanism is proven working. `PS2_COV_GAMELO=100000` correctly lowers the
+`COVGAME` band floor (default `0x00200000` would have hidden the whole CRI range), and
+coverage needs no build. Re-run only needs a longer window.
+
+➡️ **REDO with `-RunSeconds 300`.** Decision rule unchanged:
+- `0x130c48` count **0** ⇒ sleeping-CRI-server-thread hypothesis confirmed; fix is in wakeup.
+- `0x130c48` count **> 0** ⇒ server runs; divergence is inside `sub_130B80`'s status switch.
+
+### ✅ PCSX2 HARDWARE ADJUDICATION — `0x43C948` HYPOTHESIS **REFUTED** (2026-08-19)
+
+The working hypothesis was: global `0x43C948` is a callback slot that hardware populates and we
+don't, so the one-shot notify at `0x115334` no-ops, `objSrc` never binds, the movie never starts.
+
+Measured on real PCSX2 (SLUS-21442), breakpoint armed across a full reset + boot through the
+Atari logo:
+
+| Check | Hardware result |
+|---|---|
+| Code at `0x115318`–`0x115344` | **Byte-identical to the ELF** — no overlay, no runtime patching |
+| `0x43C948` + its 203-word zero run | **All `0x00000000`**, before reset, after reset, and after the logo plays |
+| Write watchpoint on `0x43C948` | Fired **once**, inside the BIOS zero-fill loop at `0x8000e3c8` (`sq v0,(s0)`, `v0=0`) — an ELF-load/BSS artifact, **not** a registrar |
+| Full 4 MB scan for stores to `0x43C948` | **Zero stores**; exactly one `lw` (the one at `0x115330`) |
+| Exec BP at `0x115334` (the null JALR) | **NEVER FIRED** — including through the Atari logo |
+| Control BP at `0x17ED60` | Fired **instantly** ⇒ the trap mechanism is proven working |
+| Game health while armed | vsync spin on `INTC_STAT` bit 2 (VBLANK_START) at `0x175220`; PC later at `0x00081fc0` ⇒ running normally |
+
+⭐ **Conclusion.** `0x43C948` is zero on hardware too, and hardware **never reaches `0x115318`
+during boot at all**. So the recomp's single `[guest-branch:missing-target]`
+(`JALR source=0x115334 target=0x0`) is **the recomp taking a path hardware does not take** — it is
+not a missing registrar we failed to port. Nothing to implement here.
+
+⚠️ **Do not re-open this.** The exec-BP silence is evidence, not a broken trap: the `0x17ED60`
+control fired immediately in the same session
+([[feedback_capped_probes_false_negatives]] discipline applied — the absence was proven meaningful
+before being used).
+
+➡️ **Blocker moves upstream.** The question is no longer "who writes `0x43C948`" but
+**"who is supposed to set `objSrc`"** — `[movie]` is 298/298 identical with
+`objSt=1 objFile=0x4597b0 objSrc=0x0 objLen=0xfffff`, while `[cdsearch]` already resolves
+`\MOVIE\OKR.SFD;1` (`outLbn=0x1575ed outSize=0x250000 ret=0x1`). The file is found; the movie
+object never gets its source bound.
+
+⚠️ **Secondary finding — why the recomp even lands in `0x115318`.** Hardware doesn't execute it
+during boot, so *something earlier* diverges. That divergence, not the null call, is the next
+thing to trace.
+
+**PCSX2 side-facts worth keeping:**
+- The PCSX2 **cycle counter wraps at 2^32** (observed 3952631813 → 2327157694 → 566052198). It is
+  **not** usable as an elapsed-guest-time measure.
+- `temporary: true` breakpoints do **not** auto-delete — remove them explicitly or they linger.
+- A cleared watchpoint can stay live inside PCSX2's core even after `list_breakpoints` stops
+  showing it, making `continue` a silent no-op. `clear_all_breakpoints` then re-arm one BP.
+- `0x459770` and `0x4597b0` are two adjacent 0x40-byte structs each ending in a **self-pointer** at
+  `+0x3C` — heap/memory-pool descriptors, not movie objects.
+- `0x5e6b3c` (GameMode) reads `0x00` on hardware, but that is **indistinguishable from
+  uninitialized RAM** — do not use it alone as a boot-success indicator.
+
+### ➡️ ACTED ON — `[lstick]` probe added to the same block in `game_overrides.cpp`. **UNBUILT, needs run 66.**
+
+Extends `sofdecWrapper` with a `sofdecCapture()` that, on every `loadscreen_tick` entry, records:
+
+- `gateAddr` / `gate` — the `$gp-3514` byte, **derived from the live `$gp`** so a bad `$gp` shows up
+  as a bad `gateAddr` rather than a confident wrong byte
+- `st=<state>:<count>,…` — a **histogram** of `byte[a0+9]` over all 1870+ ticks
+- `f8` `b18` `b19` `w12` — the other branch inputs (`byte+8 & 2`, the two `0x33` compares, the
+  `0x80000000` bit in `word+12`)
+- `vt` / `vt38` / `vt44` — the vtable pointer and the two arm targets **as actually resolved**
+- new site `nullcb.115318` → `cbSlotAddr` / `cbSlot` (the 0x43c948 fnptr) and `cbA0C0`
+
+Emitted as its own `[lstick:stat]` tag on the same 5 s reporter thread.
+
+**Run 66 decision table:**
+
+| `[lstick:stat]` reading | Meaning | Next move |
+|---|---|---|
+| `gate=0x0` | one global byte disables the whole movie tick | find its writer; that is the blocker, full stop |
+| `st=` dominated by 0 or 1 | object never promoted past init | the promoter is `state==1 → 2` at 0x3e0e98; check `f8 & 2` and the `w12` bit-31 |
+| `st=` dominated by 3/4/5 | it *is* advancing; arms at 0x3e101c/0x3e1060 are the live ones | probe `vt44` target, not `Tick_c3` |
+| `vt38`/`vt44` = 0 or absurd | vtable never populated | find the ctor that writes `word[obj+0]` |
+| `cbSlot=0x0` | confirms the 0x43c948 global callback is unwritten | find its writer — likely the same init that binds `objSrc` |
+
+⚠️ **`gate` / `f8` / `w12` / `vt*` are LAST-VALUE, not histograms.** They describe the most recent
+tick only. Read them together with `st=`; a single sample cannot tell "always 0" from "0 right now"
+([[feedback_probe_the_final_value]]).
+
+## ★★★★★ 2026-08-18 (i) — Run 64 read: `fn=1263b8`/`126388` (the ADX/movie pump) had **zero calls**, confirming it (not the RPC data path) is Stage 5.16's blocker. Traced its only static caller and added a matching probe pair; **UNBUILT, needs run 65**.
+
+Session `60eb8a71` (interrupted mid-trace by a VS Code Claude extension slowdown,
+see [reference_session_transcript_archive]) read run 64's exit test:
+
+- `sfdhd`/`ncmdnew` items were answered (see entry (h) for the setup).
+- `[adxpump]` (`fn=1263b8`/`126388`) — **records=0, calls=0** — despite the
+  wrapper self-reporting `126388=1 1263b8=1` (i.e. correctly installed and
+  ready to fire). The pump is wired right; it is simply never reached.
+
+Picked back up in this (CCD, not VS Code) session. Statically traced the
+pump's only caller: `sub_11CC28` (`ida_scripts/decompiles_SLUS_214_42.txt:21881`),
+found via its recompiled symbol name `noop_wrapper_unk_r`/`noop_wrapper___22`
+since address-grep for callers of `0x126388` found nothing (it's called
+indirectly, same as several other links already proven to fire in this
+subsystem — see the 124dc8 record in run 64's log). `sub_11CC28`'s own
+callers are likewise invisible to a static grep (0 xrefs by symbol name) —
+consistent with a CRI ADX callback-table dispatch, not a direct JAL.
+
+`sub_11CC28(a1, a2)` gates the pump call on a THIRD field, independent of
+the movie-gate struct (`+0x08`/`+0x50`) already tracked:
+
+```
+if ( (unsigned)*(int*)(a1 + 16) > 0x7FFFF9FFu ) {   // "pending" sentinel
+    noop_wrapper___152(*(int*)(a1 + 4));            // -> 0x126388 -> pump
+    ...
+} else {
+    return *(int*)(a1 + 16);                        // cached, pump skipped
+}
+```
+
+`a1` is a distinct ADX-file object (error strings on this call chain read
+"...ADXF...", i.e. CRI ADX File interface) — `*(a1+16)` is its status word,
+and `*(a1+4)` is the movie-gate base pointer the pump already expects.
+0x7FFFF9FF (2147481599) means the pump only runs while the status reads as
+a small negative number (-1600..-1 signed) — "still pending". Everything
+else (status 0, a positive code, or -1601 and below) skips the pump.
+
+### Probe added — `ps2xRuntime/src/lib/game_overrides.cpp` (UNBUILT)
+
+New wrapper pair `0x0011CBF0` (outer thunk) / `0x0011CC28` (the gate check
+itself), riding the same `PS2X_MOVIEGATE` master switch plus its own
+`PS2X_ADXGATE` opt-out — mirrors the existing `cdSearchEnabled()` pattern.
+Emits `[adxgate] fn=11cc28 ... preStatus=.. pumpBase=.. ret=.. postStatus=..
+gate=PASS|blocked`. Registered inside `applySdbzMovieGate`; status line now
+also reports `11cbf0=` / `11cc28=` installed flags.
+
+### Run-65 exit test
+
+1. **`adxgate` tag, calls=0** → `sub_11CC28` itself is never invoked; the
+   blocker is one level further back than this probe reaches (nothing ever
+   asks for ADX status at all — likely need to trace ITS caller next, which
+   is indirect/vtable-driven per the static dump).
+2. **calls>0, `gate=blocked` on every record** → the status word never lands
+   in the pending range, so the pump is skipped by design every time. Cross
+   check `preStatus` against Stage 5.16's retry-loop finding (entry (h)) —
+   plausible that the stuck `sceCdRead` retry never lets this field reach
+   "pending".
+3. **calls>0, `gate=PASS` present but `pump1263b8.calls` (from the existing
+   moviegate wrapper) stays 0** → `pumpBase` (`a1+4`) is not the address we
+   think it is; re-derive the struct offset.
+4. Run with `python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag adxgate`
+   — generic `--tag`, no analyzer changes needed.
+
+### Run-65 RESULT: branch 1 — `adxgate records=0 shown=0`, no `[cap]`
+
+Both `11cbf0` (outer thunk) AND `11cc28` (the gate itself) fired zero times —
+not just `sub_11CC28`. Confirmed this isn't a `registerFunction`-bypass
+artifact ([[feedback_registerfunction_bypass]]): `sub_11CC28` has zero static
+JAL xrefs in the decompile dump, so there's no direct-call path that could
+skip our table-patched wrapper; every real invocation would have to be a
+JALR through `lookupFunction`, which we hook. Absence is real.
+
+Traced further back. Static analysis is now **fully exhausted** for this
+whole block:
+- Symbol-name search across `decompiles_SLUS_214_42.txt` for `sub_11CC28`/
+  `sub_11CBF0`: zero hits besides their own definitions.
+- Raw ELF literal search (`ELF/SLUS_214.42`, parsed via program headers,
+  vaddr→file-offset mapped and sanity-checked against the known function
+  prologue `27bdfff0`): the 4-byte LE words `28 CC 11 00` and `F0 CB 11 00`
+  appear **nowhere** in the file. No static vtable/jump-table literal exists
+  — the call target (if it ever fires) must be constructed at runtime
+  (e.g. split LUI/ORI immediate), which only live tracing can resolve.
+
+### Probe added (run 66, UNBUILT) — three neighbor wrappers
+
+`0x11C9F8` / `0x11CBB0` / `0x11CCF0` are the physically-adjacent real
+functions in the same code block (`sdbz_func_map_merged.csv` lines 438-450;
+IDA fills the gaps between them with `noop_wrapper___` stubs). None has a
+static xref either. Each logs `seq`/`a0`/`a1`/`ra` under tag `[adxneighbor]`,
+capped at 16 records/fn, gated by the same `adxGateEnabled()` switch
+(`PS2X_ADXGATE=0` disables these too). Registered in `applySdbzMovieGate`;
+status line now also reports `11c9f8=`/`11cbb0=`/`11ccf0=` installed flags.
+
+### Run-66 exit test
+
+1. **All three `calls=0`** → this whole code block is unreached in the 90s
+   window; the ADX status-check chain is dead further upstream than static
+   analysis can see at all. Escalate to live tracing (PCSX2/recomp debugger
+   with the game running) — static tooling has nothing left to offer here.
+2. **Any one fires** → read its `ra` field directly off the first record:
+   that address is the real caller, the next probe wraps whatever
+   function contains it.
+3. Run with `python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag adxneighbor`.
+
+**Run-66 RESULT: branch 1.** `adxneighbor records=0 shown=0`, no `[cap]` — all
+three sibling probes (`11c9f8`/`11cbb0`/`11ccf0`) also never fired. The whole
+0x11C9F8-0x11CCF0 block is unreached in the 90s window, not just the one gate
+function. Static analysis is now fully exhausted for this code path (no
+symbol xref, no ELF literal, no live neighbor hit).
+
+**Before escalating to live tracing — one cheap variable was never
+controlled.** Every run this session (63/64/65/66) used `-Determinism 0`.
+[feedback_determinism_gates_guest_progress] documents det=1 as *required*
+for reliable guest progress at Stage 5.15+ (5/5 runs progress at det=1, 0/4
+at det=0) — measured on this exact game, this exact stage range. It is live
+and was never re-checked before handing off runs 63-66. The `calls=0`
+readings across three independent probes could mean "this code path is
+truly dead" OR "the guest never got far enough under det=0 to reach it."
+These are indistinguishable from the log alone.
+
+### Run-67 exit test (det=1 re-run, same adxneighbor probe, before any live-tracing spend)
+
+1. **Still all `calls=0`** → determinism is cleared as a variable; the block
+   really is unreached by this call path. Escalate to live tracing next
+   (PCSX2/recomp debugger, breakpoint on the block's address range or its
+   probable caller).
+2. **Any one fires under det=1** → the det=0 runs were false negatives all
+   along (matches the established pattern from Stage 5.15). Read `ra` off
+   the first record, same as branch 2 above.
+3. Run: `& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 90 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"`
+   then `python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag adxneighbor`.
+
+**Run-67 RESULT: branch 1 — still `adxneighbor records=0 shown=0` under
+det=1.** Determinism is cleared as a variable; this is not a "guest never
+got far enough" artifact.
+
+**Static analysis closed out completely** (ruling out the remaining
+theoretical gap before declaring it exhausted): the ELF has exactly 2
+PT_LOAD segments — the first (`offset=0x80 vaddr=0x100000 filesz=0x400680`,
+already fully scanned) and a second that is empty (`filesz=0 memsz=0`), so
+nothing was missed. Re-ran the raw-literal search across all 5 target
+addresses (not just the original 2) — zero matches, all five. Additionally
+searched the whole code segment for the `lui`+`ori`/`addiu` split-immediate
+idiom (the standard way to materialize an absolute address into a register
+before an indirect call) for hi16 ∈ {0x11,0x12} paired with any of the 5
+target low16 halves within a 40-instruction window — 26 `lui` candidates,
+**zero** completing pairs.
+
+Conclusion: none of these 5 addresses exist as a literal ANYWHERE in the
+ELF (code or data), constructed or otherwise, and none is ever called live
+under two independent determinism settings. This is no longer a
+static-tooling-blind-spot question — it needs a real dynamic trace. Static
+analysis has nothing further to offer this thread.
+
+### Next: live trace via PCSX2 MCP (user pointed out PCSX2 has an MCP to connect to)
+
+Real PCSX2 (not `ps2EntryRunner`) is the right target for this specific
+question — "does the real game, under accurate PS2 hardware emulation,
+ever execute this address at all" is exactly what a dynamic breakpoint can
+answer regardless of how indirectly the target is computed, which is
+precisely what static analysis is blind to. Per
+[[feedback_mcp_servers_disabled_by_default]] the `pcsx2` MCP server is off
+by default and must be enabled only after PCSX2 itself (with DebugServer
+enabled, SDBZ loaded) is already running — asked user for setup status
+before attempting to connect. Per [[feedback_verify_pcsx2_target]], confirm
+which target (real PCSX2 vs ps2EntryRunner) any address readings come from
+before trusting them.
+
+---
+
+## ★★★★★ 2026-08-17 (h) — **`sceCdRead` IS SERVED (run 63): `ncmdrd=24`, `readOk=1`, `rpcmiss` 27→3.** But the guest **retries the identical read forever**, so Stage 5.16 is NOT closed. The blocker moved from "no data path" to "the completion handshake is not accepted."
+
+### 1. What run 63 proved
+
+The `kIopSidCdvdNcmd` handler works. Every `fno=1` was served:
+
+```
+[iop:ncmd] fno=1 handled=1 lbn=1406084 sectors=360 buf=0x01868A40 secSize=2048 readOk=1 send=0x00463340/24 recv=0x00000000/0
+[iop:ncmd] fno=14 handled=1 ... recv=0x004632C0/4
+```
+
+`lbn=1406084` / `sectors=360` (= `0xB4000` bytes) is byte-exact against our own
+`[cdsearch] sendLbn=0x157484 sendSize=0xb4000` for `\MOVIE\ATARI.SFD;1`. The
+`0x80000595` misses vanished from the census (`rpcmiss` 27 → 3; only `0x80000592`
+and `0x80000006` remain).
+
+### 2. What run 63 did NOT fix — and the number that says so
+
+| col | run 62 | run 63 |
+|---|---|---|
+| ncmd / ncmdrd | 0 / 0 | **48 / 24** |
+| rpcmiss | 27 | **3** |
+| maxst | 2 | **2 (unchanged)** |
+| `fn=126388` / `fn=1263b8` | 0 / 0 | **0 / 0 (unchanged)** |
+
+`[adx:stream]` slot `i=1` still ends `st=2 pau=1 bsy=1 cmd=0`, and both ADX pump
+wrappers are still at **zero calls**. Data arriving did not start the decoder.
+
+### 3. ⚠️ The decisive detail: it is a RETRY LOOP, not a stream
+
+All 48 N-commands fell between **t=126 s and t=132 s** — a 6-second burst — and
+every single `fno=1` asked for **the same `lbn=1406084 sectors=360`**: the entire
+720 KB file, re-read into the same buffer, ~4×/s. A stream would advance the LBN.
+
+⚠️ And then the flat 48-record cap fired, blinding the probe for the remaining
+**106 s**. So "the LBN never changed" was *unprovable* exactly where it mattered —
+a textbook instance of [[feedback_capped_probes_false_negatives]]. Fixed in §4.
+
+### 4. Probes added for run 64 (both in `ps2_iop.cpp`, no header touched)
+
+1. **`dstHead`** — the first 8 bytes actually written into the guest buffer.
+   `readOk=1` only means the reader returned true; a `.SFD` is an MPEG program
+   stream, so a healthy head is `00 00 01 BA` ⇒ printed low half `BA010000`.
+   New `sfdhd` column in `analyze_run.py` counts exactly that.
+2. **`desc`/`descW0` (send+0x10) and `res`/`resWord` (send+0x14)** — `sub_1875E8`
+   zeroes `dword_464400` and cache-writebacks it immediately before the call,
+   i.e. it is a word it expects *somebody* to fill in. We never write it. Prime
+   suspect for the retry; now measured instead of assumed.
+3. **Cap replaced by a change-census** — always print while
+   `(fno,lbn,sectors)` is NEW, then only a 1/2/4/8… heartbeat on repeats,
+   with **per-fno slots** (the guest interleaves `14,1,14,1`, so a single slot
+   would call every record new and suppress nothing). A retry loop now collapses
+   to a few lines; a change of target can never be hidden.
+
+### 5. Run-64 exit test
+
+1. `sfdhd > 0` — if **0** with `readOk=1`, `ps2_iop_cdReadSectors` is returning
+   true while writing nothing, and the bug is in the ISO reader, not the guest.
+2. `ncmdnew` — if it stays at 2 (one read target + one status), the guest never
+   advances and the completion handshake is the blocker.
+3. `resWord` — if it reads `0x00000000` on every retry, writing a completion
+   code there is the next fix to try.
+4. `fn=1263b8` — the real pass/fail; still the gate on the ADX pump.
+
+### 6. Parked, unchanged
+
+The single `[hole] target=0x0 source=0x115334` is a retail null (`0x43C948` is
+zero in the ELF and never stored to). Not a func-map hole. `holes=1` is a true
+count — no `[cap] tag=hole`.
+
+---
+
+## ★★★★★ 2026-08-17 (g) — **`0x186310` CONFIRMED FIXED. The game now opens TWO movies.** Run 62 names the next blocker with no ambiguity left: **cdvdfsv's N-command RPC (sid `0x80000595`) is unserved, so `sceCdRead` never moves a byte.**
+
+Run 62 (`run_log.txt`, 4,774,106 B, 237 s, `PS2X_DETERMINISM=1`). Every item of the run-62
+exit test from entry (f) §6 was answered.
+
+### 1. The `0x186310` fix works, and the decompile confirms the reading was right
+
+`[rpcend] fn=186310` fired **24 times** (its own cap) — `packet=0x464340 ra=0x1785d4`.
+Independent confirmation came from `sub_1875E8` in the IDA dump, which is the EE-side
+`sceCdRead` and passes `0x186310` **by name** as its `end_function`:
+
+```
+sceSifCallRpc(client=dword_464410, fno=1, mode=1 /*async*/,
+              send=&dword_463340, ssz=24, recv=0, rsz=0,
+              end_function=obj_set_fields___07 /* == 0x186310 */,
+              end_arg=dword_464340)
+```
+
+`cache_writeback_range(dword_464340, 144)` in that same function matches the override's
+`0x10 + 0x40 + 0x40 == 0x90 == 144` copy-descriptor layout exactly. The layout was
+**measured, not assumed**, and it holds.
+
+Every `[rpcend]` reported `n1=0 n2=0 copied1=0 copied2=0`. That is not a failure: for this
+call the guest registers no copy-back entries, so the end_function's only job is the tail
+call to `sub_186100` with `a0=0x4632a0`. Which it does.
+
+### 2. Forward progress that run 61 could not reach
+
+| Signal | run 61 | run 62 |
+|---|---|---|
+| `mvopen` | 1 | **2** |
+| `cdsrch` | 2 | **4** |
+| second movie | — | **`movie/okr.sfd`**, lbn `0x1575ed`, size `0x250000` |
+| `[movie]` work area | zeros | `wrkAdr=0x1806c00 wrkSiz=0x332100 obj=0x45f6e4 crt2=0x500730 objSt=1` |
+
+The game opened `ATARI.SFD` (handle `0x54c060`, `latch49=1`), ran it out, **released it**
+(`seq=1031 latch49=0 hnd08=0`), then opened `OKR.SFD` and latched that. It is walking its
+own movie sequence now instead of stalling on the first entry.
+
+### 3. THE BLOCKER — `sid=0x80000595` (cdvdfsv N-command) is unserved
+
+```
+[sif:rpc-miss:new-sid] first unserved call to sid=0x80000595 at total=239
+[sif:rpc-miss] sid=0x80000595 func=0x1 send=0x463340 ssz=0x18 recv=0x0 rsz=0x0
+               s[0]=0x157484 s[1]=0x168 s[2]=0x1868a40 s[3]=0x0
+[sif:rpc-miss] sid=0x80000595 func=0xe send=0x0 ssz=0x0 recv=0x4632c0 rsz=0x4   (x12, capped)
+```
+
+Decoded against `sub_1875E8`'s own stores:
+
+- `s[0] = 0x157484 = 1406084` — **the exact LBN our own SearchFile handed back** for
+  `\MOVIE\ATARI.SFD;1`.
+- `s[1] = 0x168 = 360` sectors × 2048 = **737,280 bytes = the exact size we reported.**
+- `s[2] = 0x1868a40` — the EE destination buffer.
+- `s[3] = 0` — mode; `mode[2]==0` ⇒ 2048-byte stride (1 ⇒ 2328, 2 ⇒ 2340, from the guest's
+  own arithmetic).
+
+**The guest is asking us to read back the file we just told it about, and nothing answers.**
+`rsz=0` means there is no reply buffer — completion runs purely through `end_function`
+`0x186310`, which is why `[rpcend]` fired 24 times over an empty buffer. The completion
+path was already right; there was no DATA behind it.
+
+`func=0xe` is the status poll, from `sub_186B18`:
+`sceSifCallRpc(client, 14, 0 /*sync*/, 0,0, recv=dword_4632C0, 4)` then
+`return MEMORY[0x204632C0]`. Callers gate on `!= 6`, and `sub_1875E8` refuses to issue the
+read at all when it reads 6. Unserved, that word keeps whatever was already there.
+
+⚠️ **`arkdSup` does NOT apply here.** The suppression window in `SIF.cpp:638` is
+`boundSid >= 0x500 && <= 0x503`. `0x80000595` is outside it, so `arkdSup=228` is just a
+running global counter riding the line — these misses are **genuinely unserved**. Do not
+re-read that field as "ARKD handled it".
+
+### 4. The fix (written, UNBUILT) — `ps2_iop.cpp`
+
+New `kIopSidCdvdNcmd = 0x80000595` handler, placed immediately after the SearchFile block:
+
+- **fno 1 (`sceCdRead`)** — decodes `lbn/sectors/buf/mode` from the 24-byte send struct and
+  calls `ps2_iop_cdReadSectors` (declared `extern`; defined in `CD.cpp`, the one TU that
+  owns the live CD table). **Real ISO bytes** — same reader that backs every other CD path,
+  and the same resolver that produced the LBN, so search and read cannot disagree.
+- **fno 14 (status)** — writes `0x02` (SPIN / ready). Deliberately **not** `6`, the one
+  value the guest treats as "do not read".
+- **Any other fno falls THROUGH to the rpc-miss census.** Claiming the packet
+  unconditionally would make the next blocker invisible the way this one was.
+
+`[[feedback_no_iop_faking]]` does not apply, for the reason already on the SearchFile
+handler: cdvdfsv lives in the **IOP BIOS image, not on the disc**, so there is no IRX to run
+in the R3000.
+
+### 5. The remaining dispatch hole is NOT a func-map hole
+
+The new `[hole]` census reported exactly **one** distinct target all run, and `0x186310` was
+not it:
+
+```
+[hole] n=0 target=0x0 source=0x115334 ra=0x11533c op=JALR kind=IndirectCall codeRegion=no
+```
+
+`sub_115318` is `if (*(a1+192)) return dword_43C948(*(a1+192));`. `0x43C948` is **zero in
+the ELF image and never stored to anywhere in the main ELF** (verified two ways: an
+`imm==-14008` opcode scan and a full lui/addiu/ori value-tracking scan — both returned 0
+hits). So the null pointer is the *retail* state, and the anomaly is that `*(a1+192)` is
+non-zero on our side. **Parked** — the run made progress straight through it. Do not chase
+it as a missing body; it is not one.
+
+### 6. Run-63 exit test
+
+1. `[iop:ncmd] fno=1 handled=1 ... readOk=1` present, with `lbn=1406084 sectors=360`.
+2. `ncmdrd` column > 0 in `analyze_run.py --runs`.
+3. `[adx:stream]` slot `i=1` leaves `st=2 pau=1 bsy=1` — **this is the actual pass/fail.**
+4. `fn=126388` / `fn=1263b8` leave 0. Both were 0 in runs 61 **and** 62; if they are still 0
+   while `readOk=1`, the data arrived and the pump is gated on something else again.
+5. Read the **whole** `[hole]` set, not the first line.
+
+### 7. Other unserved services seen in run 62 (not yet blocking)
+
+- `sid=0x80000592 func=0x0 send/4 recv=0x464440/0x10` — cdvdfsv INIT, one call at `total=1`.
+- `sid=0x80000006 func=0x0 ssz=0x200 rsz=0x8`, send words spell **`"cdrom0:\"`** — FILEIO
+  open. Two calls. Likely the `DVCI: File cache was not hit` fallback path.
+
+### 8. Run-63 command
+
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" `
+  -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe" `
+  -RunSeconds 240
+```
+
+`ps2_iop.cpp` + `analyze_run.py` changed. No `-Determinism 0`.
+
+---
+
+## ★★★★★ 2026-08-17 (f) — **STAGE 5.15 CLOSED. `MOVIE/ATARI.SFD` IS OPEN.** Run 61 proved the `sceCdSearchFile` fix end to end, and named the next blocker: a func-map hole at `0x186310`.
+
+Run 61 (`run_log.txt`, 6,727,776 B, launched 17:44:19, 240 s, `PS2X_DETERMINISM=1`,
+`PS2X_MOVIEGATE` cleared). The chain that has been open since 08-15 completed.
+
+### 1. The whole `.SFD` chain now succeeds — every link measured, none inferred
+
+| link | run-61 record | verdict |
+|---|---|---|
+| IOP serves the RPC | `[iop:cdsearch] name="\MOVIE\ATARI.SFD;1" found=1 lbn=1406084 size=737280` | ✅ |
+| EE `sceCdSearchFile` returns | `[cdsearch] fn=1866a0 ret=0x1 recv840=0x1 outLbn=0x157484 outSize=0xb4000` | ✅ |
+| irq thunk passes it up | `[cdsearch] fn=130ad8 ret=0x1` | ✅ |
+| the open returns a handle | `[moviegate] fn=130ef0 ret=0x44f278 h24=0xb4000 h04=0xb4000 cache=HIT` | ✅ **first ever non-null** |
+| the player takes it | `[moviegate] fn=12cc20 ret=0x54c060` | ✅ |
+| the handle is latched | `[moviegate] fn=125898 post seq=5 latch49=0x1 hnd08=0x54c060 b02=0x1` | ✅ |
+| the stream slot arms | `[adx:stream] i=1 act=1 st=2 pau=1 fd=0x54c060 bsy=1 f80=0x1b173a8` | ✅ |
+
+`0x157484` = 1406084 and `0xb4000` = 737280 — the lbn and size travel intact from
+the ISO through the RPC into the guest's handle. The four-step exit test written
+into entry (e) §6 passes on steps 1–3.
+
+**`sceCdSearchFile` (sid `0x80000597`) served from `ps2_iop.cpp` is CORRECT and STAYS.**
+
+### 2. Step 4 fails, and the reason is a dispatch hole — not the movie code
+
+The stream slot then sits at `st=2 pau=1 bsy=1 cmd=0`, **unchanged from t=129 s to
+t=238 s**. Both pump wrappers (`fn=126388`, `fn=1263b8`) show **0 calls**. The
+one-shot record names the cause:
+
+```
+[guest-branch:missing-target] kind=IndirectCall op=JALR
+  source=0x1785cc target=0x186310 pc=0x186310 ra=0x1785d4 v1=0x8000000a
+```
+
+- `sub_178560` is the EE **SIF-RPC completion dispatcher**. `v1=0x8000000a` is
+  `RPC_CALL_END`; it takes the client-data pointer from `packet[7]` and JALRs
+  `client[7]` — the caller's **`end_function`** — with `client[8]` as its argument.
+- libcdvd registers `0x186310` there.
+- `0x186310` is a **func-map GAP**: `sub_186270` ends at `0x18630c`, the next mapped
+  row is `sub_1863C8`. 0xb8 bytes with no dispatch slot. Stage 5.13 class exactly.
+
+So every async libcdvd request completed on the IOP side and **never signalled the
+EE**. `bsy=1` forever is the correct behaviour of a correct guest waiting on a
+callback that has no body.
+
+### 3. Implemented for run 62
+
+**`sdbzCdvdRpcEnd186310`** in `game_overrides.cpp`, registered at `0x0018630C` and
+`0x00186310`. Disassembled from the ELF, not read off the decompile: two byte-wise
+copy-outs from an inline payload in the RPC packet (count `+0x00` → dst `+0x08`,
+payload `+0x10`; count `+0x04` → dst `+0x0c`, payload `+0x50`), each store issued to
+both the uncached mirror and the cached alias, each count **reloaded every
+iteration** as the original does. Ends in a **tail call** (`j`, not `jal`) to
+`sub_186100` with `$a0 = 0x004632A0`, reached via `dispatchGuestBranch` because
+`sub_186100` is mapped and recompiled — it is not reimplemented.
+
+Full disassembly is quoted in the comment block above the function.
+
+### 4. ⚠️ Probe defect fixed: `missing-target` could only ever name ONE hole per run
+
+`PS2Runtime::reportMissingFunction` gates its dump on `m_missingFunctionReported`, a
+**single global bool for the whole process** (`ps2_runtime.cpp:1645`). Once any hole
+fires, every later hole is silent. Run 61's "only one missing target" therefore
+meant *"the probe already fired"*, not *"there is one hole"* — and anything
+downstream of `0x186310` was invisible by construction.
+
+Added a **per-distinct-target census** in the same function: one short `[hole] n=`
+line per new target, capped at 64 with a self-announcing `[cap] tag=hole`. The heavy
+GPR/stack/trace dump stays one-shot. `analyze_run.py` gains a **`holes`** column;
+read that, not `missing-target`.
+
+### 5. New probe: `[rpcend] fn=186310`
+
+A hole fix that changes nothing is indistinguishable from a hole fix that never ran.
+The new body logs its first 24 completions (`packet`, `n1/dst1`, `n2/dst2`,
+`copied1/copied2`) and announces its own cap. New `analyze_run.py` column: **`rpcend`**.
+
+### 6. Exit test for run 62
+
+1. `[rpcend] fn=186310 seq=0 …` present ⇒ the callback body runs at all.
+2. `[hole] n=…` lines — **read the whole set now**, this is the first run that can
+   show more than one. Any new target on the CD/movie path is the next item.
+3. `[adx:stream]` slot i=1 leaves `bsy=1 cmd=0` — i.e. `cmd` or `pau` changes, or
+   `maxst` moves past 2.
+4. `[moviegate] fn=1263b8` / `fn=126388` call counts leave **0**. Those are the ADX
+   pump; if they stay 0 while `[rpcend]` fires, the blocker is upstream of the pump
+   and *not* the RPC completion.
+
+If (1) is absent, the registration did not take — check the `[moviegate] wrappers`
+banner exists and the exe timestamp postdates the edit before reading anything else.
+
+### 7. Run-61 error scan — nothing else actionable
+
+`dispatch-miss` 0 · guest `E0xxxxxx` 0. Five `[sif:rpc-miss]` records, unserved sids
+`0x80000592` (cdvdfsv N-cmd, one call at init), `0x80000006` (FILEIO) and
+`0x80000595` (`arkdSup=228` — ARKD_DVD supersedes it, benign). None is on the movie
+path; still deferred. `[cap] tag=iop:import saturated at 6` — the default; raise
+`PS2X_IOP_IMPORT_MAX` to a **number**, never `0` (entry (e) §4).
+
+### 8. Run command for run 62
+
+Build first, then:
+
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" `
+  -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe" `
+  -RunSeconds 240
+```
+
+Do **not** pass `-Determinism 0`, and make sure `PS2X_MOVIEGATE` is not set in the
+shell. 240 s because the `.SFD` open lands at t≈129 s at det=1.
+
+---
+
+## ★★★★★ 2026-08-17 (e) — `sceCdSearchFile` (sid `0x80000597`) IDENTIFIED and SERVED. Run 60 could not test it: ⚠️ **`PS2X_DETERMINISM=0` costs the movie path entirely.**
+
+Two independent results. The first is the Stage 5.15 answer; the second is a
+measurement-discipline finding that **invalidates the previous entry's perf advice.**
+
+### 1. `sub_1866A0` is the EE `sceCdSearchFile`, and its RPC was never served
+
+Decompilation (`ida_scripts/decompiles_SLUS_214_42.txt`) and the 08-17 16:4x logs
+agree field for field — this is not an inference:
+
+| `sub_1866A0` decompiled | logged (`164414`, `165605`) |
+|---|---|
+| `sceSifBindRpc(&client_568880, 0x80000597)` | `[SIF:BIND] client=0x568880 sid=0x80000597` |
+| `sceSifCallRpc(…, 0, send 0x568700, 300, recv 0x568840, 4)` | `func=0x0 send=0x568700 ssz=0x12c recv=0x568840 rsz=0x4` |
+
+`0x12c` = 300 = the exact `cache_writeback_range` length in the decompilation.
+The call is logged as **`[sif:rpc-miss]`** — unserved.
+
+The function **returns `MEMORY[0x20568840]`, the recv word verbatim.** So an unserved
+RPC leaves recv untouched ⇒ returns 0 ⇒ `0x130AD8` returns 0 ⇒ `0x130EF0` takes its
+`E0092911 sceCdSearchFile` branch ⇒ returns 0 ⇒ the movie never opens. Silent
+throughout, because **every printf on that path is gated on `dword_463250`** (libcdvd
+verbosity), which is 0 — that is why 20+ runs showed nothing.
+
+Same failure class as Stage 5.12 (memory card) and 5.14 (SJX):
+**silence must be written, not omitted.**
+
+### 2. Fix implemented — `ps2_iop.cpp` `handleRPC` now serves `0x80000597`
+
+Parses the filename at `send+0x24`, resolves it through the existing ISO-backed
+`ps2_iop_cdSearchFile` (`Kernel/Stubs/CD.cpp:25`), writes the `sceCdlFILE` result back
+into the **send** block (lsn/size/name — recv is only 4 bytes and carries the boolean).
+`MOVIE/ATARI.SFD` confirmed present on the CD root, 737,280 bytes.
+
+Not a `feedback_no_iop_faking` violation: **cdvdfsv ships in the IOP BIOS, not on disc**,
+so there is no IRX to run in the interpreter — the same justification already recorded
+for the IOP heap service at `ps2_iop.cpp:348`.
+
+Probes added, all in `game_overrides.cpp`: `0x130AD8` (irq-disable thunk) and `0x1866A0`
+→ `[cdsearch]`; `[iop:cdsearch]` on the service side (**not** gated on `PS2X_MOVIEGATE`).
+The `jal` at `0x130B04` was verified to route through `dispatchGuestBranch`, so
+`replaceFunction` really intercepts.
+
+### 3. ⚠️ Run 60 (08-17 17:31, det=0) DID NOT TEST ANY OF THAT
+
+`[moviegate] … 130ad8=1 1866a0=1 enabled=0 cdsearch=0` — `PS2X_MOVIEGATE=0` was still
+set in the shell from the A/B. But the run also never reached the code at all:
+`DVCI:` = 0, sid `0x80000597` = 0 occurrences, `[sif:rpc-miss] total` = 4 (vs **239**).
+
+The cause is **`PS2X_DETERMINISM`**, and the archive is unanimous:
+
+| det | non-fragment runs | reached `DVCI:` |
+|---|---|---|
+| `1` | 4 (`163801 164107 164414 165605`) | **4 / 4** |
+| `0` | 4 (`033619 033926 034232` + run 60) | **0 / 4** |
+
+`165605` was det=1 **with `PS2X_MOVIEGATE=0`** and still reached DVCI ⇒ the moviegate
+wrappers are not the variable. Determinism is.
+
+⇒ **RETRACTION of (d)-era advice.** Entry (d) and the 08-17 handover told the user to
+run `-Determinism 0` to cure the "slow motion". That is true of wall clock (`vbl/s`
+avg 14.9 vs 5.5) and **false of guest progress** — det=0 reaches `maxstream=1`, det=1
+reaches `4`. The wall-clock rate was measuring the vblank ISR, not the game.
+**Stage 5.15 work must run at `PS2X_DETERMINISM=1`.** Slow is the price.
+
+### 4. ⚠️ `0` is NOT "unlimited" for every cap — entry (d) row 1 is wrong for one of them
+
+| Env var | `0` means | Code |
+|---|---|---|
+| `PS2X_SJX_ACK_MAX` | unlimited (`kAckMax != 0u` guard) | `Kernel/Stubs/SIF.cpp:1725` |
+| `PS2X_IOP_IMPORT_MAX` | **log nothing** (no zero case) | `ps2_iop_irx_loader.cpp:638` |
+
+Run 60 was launched with `PS2X_IOP_IMPORT_MAX=0` and duly printed
+`[cap] tag=iop:import saturated at 0` — the import census was blank by construction.
+Use a large number, not `0`, for that one.
+
+### 5. Run-60 error scan — nothing new
+
+`dispatch-miss` 0 · `missing-target` 0 · no `E0xxxxxx` guest errors.
+127 `[iop:unhandled]`, top: `intrman fid=17/18` (11 each), `libsd fid=5` (10),
+`loadcore fid=5` (10 — [documented as correct](ps2xRuntime/src/lib/ps2_iop_irx_loader.cpp#L615),
+`RegisterLibraryEntries` returns 0 on success).
+Saturated: `ARKD:CALL@64`, `ARKD:run@32`, `sceSifSetDma:DTX@64`, `iop:import@0`.
+
+Still-unserved sids besides `0x80000597`: `0x80000592` (cdvdfsv N-cmd) and `0x80000006`
+(FILEIO, sends `"cdrom0:\"`). Neither is on the movie path; deferred.
+
+### 6. Exit test for run 61 — the narrowest one Stage 5.15 has ever had
+
+Run at **det=1**, `PS2X_MOVIEGATE` unset:
+
+1. `[iop:cdsearch] name="\MOVIE\ATARI.SFD;1" found=1` — the service was reached and hit.
+2. `[cdsearch] fn=1866a0 … ret=0x1 recv840=0x1` — the EE saw the answer.
+3. `[cdsearch] fn=130ef0 … ret=` **non-zero** — the DVCI open succeeded.
+4. `pump1263b8.calls` finally leaves 0.
+
+Any step failing names the next question exactly. If (1) is absent while `DVCI:` is
+present, the sid guess is wrong; if (1) shows `found=0`, it is a path/leaf-matching bug
+in `registerCdFile`, not an RPC bug.
+
+### 7. Housekeeping done this session
+
+- `analyze_run.py` `RUN_MARKERS` rewritten. The old `sfd` column used
+  `DVCI|\.SFD|SFD;1` and scored **2 for a single printf**; replaced by `dvci` plus
+  event columns `597 / mvreq / mvopen / cdsrch`. `maxst` was always correct.
+- `_run_logs` now skips the live log when an archived copy has its exact size —
+  `launch_recomp.ps1` *copies* to archive, so the newest run was listed twice.
+- Fragment runs (<1 MB) flagged `*`; their zeros mean "died before boot", not "absent".
+- 9 evidence-free pre-instrumentation runs parked in `Logs/archive/old/` with a README.
+  The three **det=0 perf baselines were deliberately left in place** — see §3.
+
+---
+
+## ★★★★★ 2026-08-17 (d) — `[moviegate]` RAN. The latch hypothesis is **DEAD**. The movie state object is never armed at all.
+
+Probe built and run (batch of 3, 120 s). Banner: `wrappers 125898=1 12cc20=1 130ef0=1
+enabled=1`. No `[cap]` for the tag ⇒ **absence is evidence**.
+
+### The measurement
+
+```
+[moviegate] fn=125898 when=pre seq=0 base=0x44beb8 ... b02=0 b46=0 b47=0 b48=0 latch49=0 hnd08=0 fptr50=0 arg54=0
+[moviegate] fn=125898 when=pre seq=1 base=0x44bf18 ... (identical, all zero)
+   ... seq=2..5, alternating the two bases, byte-for-byte identical
+[moviegate:stat] state.calls=2560  state.emit=6  open12cc20.calls=0  dvci130ef0.calls=0
+```
+
+`state.emit` stays at **6** while `state.calls` climbs past **2560**. The record is
+change-gated, so that is not a sampling artifact: across ~2560 calls **not one watched
+field ever moved**. Two objects, `0x44beb8` and `0x44bf18` (= base + `0x60`, i.e. ADX
+stream-table entries 0 and 1 — same table `[adx:stream]` sweeps).
+
+### What it closes
+
+1. **`latch49=0` and `hnd08=0` on every call ⇒ the one-shot-latch / stale-handle
+   hypothesis is DEAD.** Neither skip-gate is ever dirty. The 3-in-21 intermittency was
+   never a latch.
+2. **`open12cc20.calls=0`, `dvci130ef0.calls=0`** ⇒ decision-table row 1: the block is a
+   gate inside `sub_125898`, upstream of the open.
+3. **`fptr50=0` forever** ⇒ the decisive byte. `0x124E38` writes the filename pointer into
+   `[+0x50]` **and** the arm byte in the same pass. A permanently-null `[+0x50]` means
+   **`0x124E38` never runs**. Whether the gate byte is `+0x45` (static analysis) or `+0x48`
+   (live disasm) is now moot — nothing arms the object either way.
+
+⇒ **The state machine ticks ~2560 times against a permanently blank object.** Divergence
+is upstream of `sub_125898`, not inside it.
+
+### Next question (narrow, answerable)
+
+**Who calls `0x124E38` (and `0x1263B8`), and why doesn't it fire?** Wrap both, log caller
+`$ra` + args. Cheap: same file, same rebuild.
+
+### Also folded into this build (unbuilt as of this entry)
+
+The four hardcoded probe caps are now env-overridable, `0` = unlimited:
+
+| Tag | Was | Env var | File |
+|---|---|---|---|
+| `sjx:ack` | 32 (saturates every run) | `PS2X_SJX_ACK_MAX` | `Kernel/Stubs/SIF.cpp` |
+| `sif:rpc-miss` | 24 / sid | `PS2X_RPC_MISS_MAX` | `Kernel/Stubs/SIF.cpp` |
+| `adx:stream` | 600 (= 10 min @ 1 Hz) | `PS2X_ADX_STREAM_MAX` | `ps2_runtime.cpp` |
+| `movie` | 600 (= 10 min @ 1 Hz) | `PS2X_MOVIE_MAX` | `ps2_runtime.cpp` |
+
+Every `[cap]` line now prints its own limit and names its env var. `ps2_runtime.cpp` got an
+`envDec` sibling to `envHex` — counts are base-0, not hex, so `PS2X_MOVIE_MAX=1000` means
+1000 and not `0x1000`.
+
+---
+
+## ★★★★☆ 2026-08-17 (c) — PCSX2 live trace names the real caller chain; the "silent cache-hit" hypothesis is **RETRACTED**; `[moviegate]` probe written (⚠️ **NOT COMPILED**)
+
+Session close state: **code written, nothing built, nothing run.** The next action is a
+build, and it is the user's.
+
+### 1. The chain, from a live PCSX2 breakpoint (hardware ground truth)
+
+```
+sub_125898   movie state machine        $s0 = $a0 = state object
+   -- jal  0x12cc20  @ 0x125958        DirectCall,  dispatch-routed
+sub_12CC20   CRI open wrapper
+   -- jalr $v0       @ 0x12ccd8        IndirectCall, dispatch-routed
+sub_130EF0   DVCI file open
+```
+
+⚠️ **Correction to every earlier note:** the last hop is a **`jalr $v0`**, not a `jal`.
+That is *why* no static caller for `0x130EF0` was ever found — the target is a runtime
+function pointer. Stop searching the ELF for one.
+
+### 2. ⚠️ RETRACTION — the "our runs take a quiet cache-HIT branch" hypothesis is DEAD
+
+Hardware enters `0x130ef0` exactly **twice** per boot — `movie/atari.sfd` then
+`movie/okr.sfd`, ~7.6 s apart — and **both take the cache-MISS path**
+(`$a1 == *(h+0x24) == 0` at `0x130f78`). So `DVCI: File cache was not hit` is the
+**normal** path, not an anomaly.
+
+Combined with **ATARI = 0 in all 21 archived runs, including the 3 golden ones**: our
+runtime never opens the Atari logo movie at all. The divergence therefore begins strictly
+**upstream of the DVCI layer**, and probing `0x130ef0` alone can never see it.
+
+### 3. The gate — `sub_125898`'s guard chain, disassembled live
+
+```
+0x125924  bne   $a0, 1     -> 0x125ac8      state must be 1
+0x125930  bnez  0x49($s0)  -> 0x125994      ONE-SHOT LATCH
+0x125938  sb    $a0, 0x49($s0)              latch set to 1
+0x125948  bnezl 0x08($s0)  -> 0x125994      HANDLE ALREADY SET
+0x125950  lw    $a0, 0x50($s0)              filename pointer
+0x125958  jal   0x12cc20                    THE OPEN
+0x125964  sw    $v0, 0x08($s0)              store handle
+```
+
+Plus **three prologue gates found in the generated body**, previously unrecorded:
+`+0x02` must be 0 (`0x1258b4`), `+0x48` must be 1 (`0x1258c4`), `+0x47` is read at
+`0x1258cc`.
+
+`+0x49` is a one-shot: once nonzero the open never runs again for the rest of the run.
+`+0x08` is a second permanent skip. **Either one left dirty produces exactly the observed
+3-in-21 behaviour.** That is the hypothesis the probe exists to measure — not to confirm.
+
+### 4. `[moviegate]` — written into `game_overrides.cpp`, **UNBUILT**
+
+Three wrappers registered via `applySdbzMovieGate`
+(`PS2_REGISTER_GAME_OVERRIDE("SDBZ movie-open gate probe", …)`):
+
+| Address | Emits |
+|---|---|
+| `0x125898` | `base`, `b02 b46 b47 b48`, **`latch49`**, **`hnd08`**, `fptr50`, `arg54` |
+| `0x12cc20` | `a0/a1/a2`, `ra`, `ret`, filename string |
+| `0x130ef0` | same + `s1`, `h24`, `h04`, `cache=HIT/miss` |
+
+Read with `python build_scripts/analyze_run.py --tag moviegate`.
+
+**Decision table it produces:**
+
+| Observation | Conclusion |
+|---|---|
+| `125898` fires, `12CC20` does not | a `+0x49` / `+0x08` / prologue gate is the blocker — the record names **which byte** was wrong |
+| neither fires | the state machine never runs; the fault is further back still |
+| `12CC20` fires, `130EF0` does not | the fault is inside `0x12cc20`'s own argument checks |
+
+Design choices, each closing a known failure mode of this project:
+- **Verified all three inbound call edges emit `dispatchGuestBranch()` before writing a
+  line** (`0x126410→0x125898`, `0x125958→0x12cc20`, the `0x12ccd8` JALR). A recompiled
+  site that calls `fn_*` directly in C++ bypasses `replaceFunction` entirely — that is
+  what silently hollowed out `[pktord]` in run 36.
+- **`std::cerr` + `[tag]` text, NOT `ps2x_probe_kv()`.** The KV sink writes only to
+  `run_probe.jsonl`, which `analyze_run.py --tag` does not read.
+- **Change-gated** on `0x125898` (~5k calls/run), with **pre- AND post-body snapshots** —
+  the latch flips *inside* the body, so a pre-only snapshot would miss it.
+- **Per-object-base keying** (8 slots) so a second movie object cannot masquerade as a
+  transition of the first.
+- **Always-printed install banner** + explicit `[cap]` lines, so "0 records" can never be
+  confused with "wrapper never installed" or "probe saturated".
+- **On by default**; `PS2X_MOVIEGATE=0` disables. The event is 3-in-21 — a run lost to a
+  forgotten env var costs a whole cycle.
+
+### 5. Next action — the user's, in order
+
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 120 -Repeat 3 -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag moviegate
+```
+
+`-Repeat 3` is mandatory, not optional: at 3-in-21 a single run reads as a false negative.
+First thing to check in the log is the install banner
+`[moviegate] wrappers 125898=1 12cc20=1 130ef0=1` — a `0` invalidates the measurement
+*before* the run instead of after.
+
+### 6. Still open / deliberately out of scope
+
+- **Phase 3 of the tooling plan is NOT done.** Four hardcoded caps still cannot be raised
+  without a source edit: `sjx:ack` 32 (`Kernel/Stubs/SIF.cpp:1715`), `sif:rpc-miss` 24/sid
+  (`SIF.cpp:665-667`), `adx:stream` 600 (`ps2_runtime.cpp:3260`), `movie` 600
+  (`ps2_runtime.cpp:3341`). Pattern to copy: `kCallMax` `SIF.cpp:756-771`, `kDtxMax`
+  `SIF.cpp:1791-1805`. **`sjx:ack` is the one that actually saturates every run** — its
+  silence past 32 remains worthless as evidence. All `.cpp`, so it folds into any
+  incremental rebuild.
+- `sub_125898`'s state-object base on hardware was never pinned (`0x0054C060` is
+  `sub_12CC20`'s frame, not it). Largely obsoleted — the probe reads `$a0` directly.
+
+### 7. Learned patterns from this session
+
+- `X = "no static caller found for a function"` → `Y = the call site is a jalr through a
+  runtime function pointer` → `Z = grep the generated body for dispatchGuestBranch with
+  GuestBranchKind::IndirectCall, don't keep searching the ELF for a jal`.
+- `X = a probe reports nothing` → `Y = the wrapper may never have been installed, or the
+  call may bypass the dispatch loop` → `Z = verify the call edge emits
+  dispatchGuestBranch() BEFORE writing the probe, and always print an install banner`.
+- `X = an anomalous-looking log line ("cache was not hit")` → `Y = it may be the normal
+  hardware path` → `Z = breakpoint the real console before building a hypothesis on it —
+  this one cost the whole cache-hit theory`.
+
+---
+
+## ★★★★★ 2026-08-17 (b) — `0x80000597` IS NOT THE BLOCKER. The EE side is **bit-identical** in runs that open the `.SFD` and runs that don't. The divergence is entirely **downstream of SJX `fno=0x408`, on the IOP side**, and it is **intermittent (3/21 runs)**.
+
+Answered offline, from logs already on disk. **Zero new runs.**
+
+### 1. The comparison was always possible — the archive already existed
+
+`launch_recomp.ps1` has been archiving to `logs/archive/` (`-KeepLogs 20` per stream) all
+along. **Run 57 was still on disk** as `run_log.20260816-115006.txt`, with a second run that
+also reached the open at `...-120214.txt`. Three run cycles were spent trying to *reproduce*
+a run that was sitting in the archive the whole time.
+
+### 2. The EE-side setup is identical, call for call
+
+Ordered event stream around the 2nd `MovieCreate`, golden (11:50) vs run 60 — every SJX
+`fno`, every argument, every returned handle, every heap address **matches exactly**:
+
+```
+BIND sid=0x90000200 → fno=0x2 → 0x403 → 0x40c → AllocIopHeap(99904)=0x8900
+→ 6× (fno=0x422 → fno=0x400) → AllocIopHeap(2256) → fno=0x2 → AllocIopHeap(6208)=0x21840
+→ fno=0x40a → MovieCreate(Size) → MovieCreate(Adrs) → fno=0x408{2,0,0x5340,0x53C0} → 0x5640
+```
+
+Then, and only then, they differ:
+
+| | golden 11:50 | run 60 |
+|---|---|---|
+| after `fno=0x408 -> 0x5640` | `DVCI: File cache was not hit "\MOVIE\OKR.SFD;1"` → `[SIF:BIND] sid=0x80000597` | **nothing** |
+| `[adx:stream]` maxst | 1 @t=68 → **4 @t=96** | 1 @t=79, **never advances** |
+
+`[iop:sjx]` is **uncapped in both**, so this absence is real. The SJX census is also identical:
+`0x2=4 0x3=4 0x400=12 0x401=12 0x403=2 0x408=2(nz) 0x409=2 0x40a=2 0x40c=2 0x40d=2 0x422=12 0x423=12`.
+
+⇒ The EE issues the open command correctly in *both* cases. Whether the IOP's DVCI layer then
+performs the file lookup is what varies. **This is an IOP scheduling/race problem, not an
+unserved-RPC problem.** `0x80000597` only ever appears *after* DVCI — it is a **symptom of
+getting far enough**, never the cause of not getting there.
+
+### 3. It is intermittent — which is why single runs kept "disproving" it
+
+`analyze_run.py --runs` across all 21 archived runs: **3 reached the open**
+(`20260812-061029`, `20260816-115006`, `20260816-120214`). Within the instrumented batch it is
+**2 of 7**. Three consecutive misses is entirely consistent with chance.
+
+⇒ **RETRACTED:** the lean toward the `SIF.cpp` census edit having caused the divergence. The
+08-16 morning went ✗ ✓ ✓ ✗ *across* that rebuild, and 08-12 went ✗ ✓ ✗ on one build.
+
+### 4. Not the cause (ruled out this session)
+
+- **Movie object lifecycle** — run 60 creates/destroys it twice with the *same* addresses
+  (`obj=0x45f6e4 crt2=0x500730 objFile=0x4597b0`) as golden, just ~11 s later.
+- **A timeout** — golden advances st 1→4 about 29 s after st=1; run 60 had 98 s of headroom
+  and never moved.
+- **`[guest-branch:missing-target]`** in the golden log is `target=0x0` (a **null function
+  pointer**, not a missing body) at t≈109 s, i.e. *after* the failed open. Downstream.
+
+### 5. Next
+
+The question is now "why does the IOP DVCI lookup usually not run after SJX `0x408`", not
+"who serves `0x80000597`". Instrument the IOP side of `fno=0x408`, and use `-Repeat` to get a
+sample rather than a single run.
+
+---
+
+## ★★★★☆ 2026-08-17 (b2) — Diagnostic tooling: the encoding bug that has been poisoning results
+
+**`Tee-Object` differs between shells in TWO ways, and both bite.**
+
+1. **Default encoding is host-dependent** — Windows PowerShell 5.1 writes UTF-16, pwsh 7
+   writes UTF-8. That is why every log in this project is UTF-16: **the user launches runs
+   from 5.1.** Every reader in `build_scripts/` assumes UTF-16.
+2. **`-Encoding` exists only in pwsh 6+.** 5.1 has no such parameter and *hard-errors* on it.
+
+⚠️ Adding `-Encoding Unicode` unconditionally **killed three runs** on 08-17 — the pipeline
+errored before the exe started, so the game never ran. Verifying the parameter existed in
+pwsh 7 said nothing about the shell that actually runs the launcher.
+
+Fixed by passing `-Encoding` **only where supported**, via a splat:
+
+```powershell
+$TeeArgs = @{ FilePath = $Log; Append = $true }
+if ((Get-Command Tee-Object).Parameters.ContainsKey('Encoding')) { $TeeArgs['Encoding'] = 'Unicode' }
+```
+
+5.1 uses its Unicode default; pwsh 7 gets the explicit override. Both write UTF-16, matching
+the `Out-File -Encoding Unicode` header. **Verified under 5.1 itself** (`powershell.exe
+-NoProfile`), not under pwsh 7 — test PowerShell changes in the shell that will run them.
+
+**Two guards added because of that incident:**
+
+- **Empty runs are no longer archived.** The prune is by *count*, so the three failed
+  launches evicted three real runs from `logs/archive/`. A log holding only `[runmeta]` is
+  now left to be overwritten.
+- **The validity gate now fails on no guest output.** It previously printed *"run passes the
+  validity gate"* for all three dead runs, because it only looked for known failure strings
+  and a log with nothing in it contains none of them.
+
+**Shipped this session (no rebuild — Python + PowerShell only):**
+
+| Change | File | Why |
+|---|---|---|
+| `--runs` | `build_scripts/analyze_run.py` | Per-run inventory of how far the movie path got. Makes intermittency visible; reading one run at a time is what made a 2-in-7 event look like "never". |
+| `--compare A B` | `build_scripts/analyze_run.py` | Cross-run tag diff **with cap status on both sides** — an asymmetric cap is a false diff. |
+| `-Repeat N` | `launch_recomp.ps1` | N runs back-to-back + inventory. Requires `-RunSeconds > 0`. |
+| Provenance header | `launch_recomp.ps1` | `[runmeta]` lines: exe path + mtime + size, elf, and the full resolved `PS2X_*` env block. Logs previously could not be attributed to a build. |
+| Golden-run pinning | `launch_recomp.ps1` | A log containing `DVCI` is **never pruned**. Fail-safe: keeps the file if it cannot be scanned. Run 57 survived only by luck. |
+
+⚠️ **Do not use `[^\n]*X[^\n]*` regexes on `run_log.txt`.** Records run to tens of KB with no
+newline, so those patterns backtrack catastrophically and hang (cost one killed 120 s process
+this session). Use index-based extraction or anchored tag splits, as `cmd_tag` does.
+
+⚠️ **`analyze_run.py --tag` already existed and does this correctly** — encoding-agnostic,
+splits on the tag not newlines, prints the cap verdict. Hand-rolled `Select-String` greps were
+used instead for a whole session, producing two oversized dumps and two near-miss conclusions.
+**Reach for `--tag` first.**
+
+**Deferred (needs a rebuild):** four probe caps are still hardcoded and cannot be raised from
+the environment — `sjx:ack`(32) and `sif:rpc-miss`(24/sid) in `SIF.cpp:1715/667`,
+`adx:stream`(600) and `movie`(600) in `ps2_runtime.cpp:3260/3341`. `sjx:ack` is the one that
+actually saturates today. Follow the existing `kCallMax`/`kDtxMax` env pattern.
+
+---
+
+## ★★★★★ 2026-08-17 (a) — RUN 58 WAS ALREADY ON DISK AND UNREAD. The `[sif:rpc-miss]` probe **was** built and **did** fire — but it was blind over the entire movie window. `0x80000597` is **still unanswered as a question**.
+
+Session opened on `run_log.txt` (4.62 MB, 12:16 on 08-16), which is **newer than the exe**
+(`ps2EntryRunner.exe` 12:13) which is in turn **newer than the probe edit** (`SIF.cpp` 12:08).
+(e) §5's "EDIT MADE, NOT BUILT, UNVALIDATED" was already stale when it was written at 12:15.
+
+### 1. The probe works. 97 records, 179 total misses.
+
+`bridgeHandled == false` means `ps2_iop::handleRPC` returned false. Semantics confirmed by
+reading the emit site (`SIF.cpp:608`), not assumed.
+
+### 2. ⚠️ It answered nothing, for two independent reasons
+
+**(a) The cap saturated BEFORE the window of interest.**
+
+| log line | event |
+|---|---|
+| 2433 | `[cap] tag=sif:rpc-miss saturated at 96` |
+| 2825 | `MovieCreate: Use Work Adrs = 0x1806c00` |
+
+The flat 96-line cap was exhausted ~400 lines *before* the movie even started. Every unserved
+call in the window this probe exists to observe was invisible. **`0x80000597` never appearing
+in run 58 is not evidence of anything** — textbook [capped-probe false negative].
+
+**(b) Most of what ate the cap was a FALSE POSITIVE.**
+
+The census was dominated by ARKD sids `0x500`/`0x501`/`0x502`/`0x503` (`func=0x101` send words
+decode to real asset paths: `font/5-2-4-2.`, `ply/exthit.h`, `dis/toon.pix`, `eff/e00/e00…`).
+`handleRPC` does not serve those — but **`ps2_iop_runArkdService` does**, in a separate block
+at `SIF.cpp:780`. So `!bridgeHandled` was never a sound test for "unserved". The probe was
+counting served traffic and starving itself with it.
+
+### 3. Run 58 also never reached the movie attempt at all
+
+No `DVCI: File cache was not hit` line anywhere. `[adx:stream]` shows two entries appear at
+t=67 s and **stay at `st=1`** — `maxst` never leaves 1, vs run 57's `st=4` error latch at t=97.
+Ends stuck: t=120 `busy%=16 res/s=3 vbl/s=2 stuckSecs=9 pc=0x422660 ra=0x422660`
+`lastCall=0x172998`, versus run 57's healthy `res/s=130 vbl/s=35` at the same point.
+
+⇒ Run-to-run divergence at the movie gate. Run 57 reaching `st=4` at t=97 s is the *late* edge
+of a 120 s window. Any future run must be **≥180 s** or it cannot distinguish "didn't happen"
+from "hadn't happened yet".
+
+### 4. Fix applied — `SIF.cpp` census rewritten (`.cpp` only, no headers, no `src/runner/`)
+
+- ARKD sids `0x500..0x503` **excluded** from the census (served downstream), counted into a
+  running `arkdSup=` that rides every line so the exclusion is never silent.
+- Cap is now **per-sid (24)**, not global — a chatty known service can no longer starve a novel one.
+- **First sighting of any sid logs unconditionally**, past any cap:
+  `[sif:rpc-miss:new-sid] first unserved call to sid=0x…`. This is the line that answers the
+  `0x80000597` question, and it is now structurally impossible to starve.
+- `[cap]` line is now per-sid and names which sid went blind.
+- Added `#include <mutex>` (`.cpp`-local; `<map>` was already present).
+
+**NOT BUILT. NOT RUN.** ⚠️ Verify the exe mtime beats `SIF.cpp`'s before reading the next log.
+
+### 5. Next action
+
+1. `& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo`  *(user runs)*
+2. Run **180 s**, not 120.
+3. Read in this order: `[sif:rpc-miss:new-sid]` → any `sid=0x80000597` record and its `s[0..3]`
+   → `[adx:stream] maxst` (did it reach 4 this run at all?).
+   - `0x80000597` appears ⇒ implement the cdvd file service.
+   - `maxst` never reaches 4 ⇒ the movie was never attempted this run; the probe is fine,
+     the *run* is the false negative. Re-run before concluding.
+
+---
+
+## ★★★★★ 2026-08-16 (e) — RUN 57: the open IS attempted and **FAILS**. New suspect: cdvd RPC `sid=0x80000597`, which we serve with nothing. ⚠️ SUPERSEDES (d).
+
+Log preserved at `run_log_57.txt` (4.78 MB, 12:02). Exe 11:59 ⇒ new build, new run. Run 57 is
+run 56 with the `[adx:stream]` probe widened (peak-hold `maxst/maxcmd/maxfd`, `f80`/`f84`) and
+**the same 120 s window run to completion** — run 56's window ended ~30 s before the movie.
+
+### 1. ⚠️ RETRACTION — (d)'s headline is wrong
+
+(d) said *"the open is never ATTEMPTED, not attempted-and-failed."* **Run 57 disproves it.**
+
+```
+[adx:stream] t=97s nonzero=2/40 maxst=4 maxcmd=0 maxfd=0x0 base=0x44beb8 stride=0x60
+ | i=0 raw=0x1000101 act=1 st=1 pau=0 fd=0x0 cmd=0x0 bsy=0 f80=0x0       f84=0x0
+ | i=1 raw=0x1000401 act=1 st=4 pau=0 fd=0x0 cmd=0x0 bsy=0 f80=0x1b173a8 f84=0x0
+```
+
+- `st=4` = **the error latch** — the exact branch (d) predicted would prove an attempt.
+- `f80=0x1b173a8` = the filename pointer, and `0x01b173a8` is the SofDec work-area buffer the
+  app-side strcpy chain fills. ⇒ writer `0x124E38` **ran**, so `[+69]=1` **was written**.
+- `maxcmd=0` all run: the 1 Hz peak-hold never caught `cmd=1`. That byte lives < 1 s (the
+  writer spins until it clears). **Not evidence of absence** — the peak-hold is too slow for it.
+
+⇒ The gate byte `[+69]` is **no longer the blocker**. Delete it from the suspect list.
+
+### 2. ⚠️ RETRACTION — (d) §8 / the ADXT-AFS branch is RULED OUT
+
+`MovieCreate` at t=67 s prints `objSrc=0x1 objLen=0xfffff`. That is verbatim what `0x14F860`
+(the plain-filename path) stamps: `[107]=1, [108]=0, [109]=0, [110]=0xFFFFF`. The AFS path
+`0x14F8D0` sets `[107]=1` but fills 108..110 with **real** values.
+
+⇒ **mwPly/SofDec path is armed.** `0x12A280` (`ADXT_StartAfs`) and the whole ADXT chain
+`0x12BC98 → 0x12AF58 → 0x1274E8 → 0x124DC8` are not on our path. The caveat recorded in (d) §8
+— *"do not act on §8 until run 57 says which layer is armed"* — did its job.
+
+### 3. The measured timeline
+
+| t | evidence |
+|---|---|
+| 67 s | `MovieCreate: Use Work Adrs = 0x1806c00` `wrkSiz=0x332100` `obj=0x45f6e4` `crt2=0x500730` `objSrc=0x1 objLen=0xfffff` `objFile=0x4597b0`. Two ADX entries appear, both `raw=0x1000101` st=1 |
+| 97 s | guest TTY: `[Deci2Call:kputs] DVCI: File cache was not hit. "\MOVIE\OKR.SFD;1"` (line 3048) |
+| 97 s | **next line, 3049**: `[SIF:BIND] client=0x568880 sid=0x80000597` |
+| 97 s | same second: ADX i=1 → `st=4`, `f80` set |
+| 111–118 s | `obj=0x0`, `nonzero=0/40` — torn down. The game **gives up and moves on**. |
+
+Note it is **OKR.SFD**, not ATARI.SFD. First time in any run that the game has named a movie
+file. `objFile=0x4597b0` is the same value hardware carries as the ADX entry's live fd.
+
+Liveness healthy throughout — t=97 watchdog: `busy%=86 res/s=130 vbl/s=35 progress=302247
+gif/s=30 dma/s=184 stuckSecs=0 pc=0x421ed8`. No `RUN VALIDITY FAILURE`.
+
+`info=0` / `maxinfo=0` for the **entire** run ⇒ `0x54BE30` never set ⇒ render gate `0x113860`
+(`if (dword_54BE2C && dword_54BE30)`) never passes ⇒ logo skipped. Symptom fully explained
+downstream of the failed open.
+
+### 4. The new suspect — an unserved cdvd file service
+
+| fact | evidence |
+|---|---|
+| `sid=0x80000597` binds **exactly once in the whole run** | `Select-String 80000597` → one hit, line 3049 |
+| …at the exact log second the guest asks for `OKR.SFD` | line 3048 immediately precedes it |
+| we serve **nothing** for it | `handleRPC` (`ps2_iop.cpp`) covers `0x80000593` only of the `0x8000059x` family, and serves it a canned `word[0]=1` |
+| no source anywhere mentions it | `grep -rn "0x80000597\|0x80000592"` over `ps2xRuntime/src` → **zero hits** |
+| the bind still *looks* successful | binds are **echo-completed generically** in `SIF.cpp`; every bind succeeds whether or not a service exists |
+| only ARKD_DVD.IRX is really loaded | `libs=12 stubs=57`; the guest's `Load Module cdrom0:\CRI_ADXI.IRX;1 OK!` and LIBSD/MCMAN/MCSERV lines are **faked loadfile completions** |
+| the failure is silent | **no CRI `E…` string prints anywhere in the log** |
+
+An unanswered RPC leaves the guest's recv buffer untouched. CRI reads that as a failed open.
+Nothing prints. **That is our symptom exactly.**
+
+### 5. ⚠️ What is NOT yet proven, and the probe written to prove it
+
+I have **not** shown that a CALL followed that bind. The generic bridge in `SIF.cpp` recovers
+`boundSid = arkdLookupSid(client)` and calls `handleRPC(...)` but **logs nothing** unless
+`PS2X_MCSERV_TRACE` is set. Absence of a log ≠ absence of a call — the ungated/unlogged path
+is a false-negative source in its own right.
+
+**EDIT MADE, NOT BUILT, UNVALIDATED** — `[sif:rpc-miss]` census in
+`ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp` (~line 592), inside the generic-bridge block, fired
+unconditionally on `!bridgeHandled`:
+
+- prints `sid / func / client / send / ssz / recv / rsz` plus the **first four send words**
+  (for a cdvd file service these carry the command and the path/LBA ⇒ *which* open is unanswered);
+- consecutive identical `(sid,func)` collapse so a retry spin cannot exhaust the cap;
+- a running `total=` rides every line so the collapse can never be misread as low volume;
+- cap 96 with an explicit `[cap] tag=sif:rpc-miss` line.
+
+`.cpp` only. No headers, no `src/runner/`. Includes verified present (`std::cerr`,
+`std::memcpy`, `std::atomic`, `getConstMemPtr(rdram, addr)` all already used in this file).
+
+### 6. `[cap]` lines seen in run 57 — absence past these is NOT evidence
+
+`ARKD:CALL` 64 · `ARKD:run` 32 · `iop:import` 6 per stub (first at libsd fid=5 @`0x04ac1c`) ·
+`sceSifSetDma:DTX` 64 · `sjx:ack` 32.
+
+### 7. Next action
+
+1. `& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo` (user runs).
+2. 120 s run — **let it run the full 120 s**; the window of interest is t=90–110.
+3. Read: any `[sif:rpc-miss] sid=0x80000597 …` record and its `s[0..3]`.
+   - **Fires** ⇒ implement the cdvd file service. Stage 5.15 stops being a CRI mystery.
+   - **Doesn't fire** ⇒ the call is being answered by something, and the failure is inside
+     `cvfsOpen`'s own layer; go back to `sub_12CC20`'s return path.
+
+---
+
+## ★★★★★ 2026-08-16 (d) — ⚠️ SUPERSEDED BY (e). STATIC TRACE: the `.SFD` open is never ATTEMPTED, and the gate is one byte
+
+> ⚠️ **Headline retracted at run 57.** The open IS attempted and fails (state 4); `[+69]` IS
+> written. §8's ADXT/`0x12A280` branch is ruled out. §1–§4 (the gate's location, the two
+> writers, the constructor value, base/stride) remain correct and useful. Read (e) first.
+
+Zero run cost. Read out of `ida_scripts\decompiles_SLUS_214_42.txt` (15.9 MB — always grep or
+slice, never full-read) after run 56 measured `cmd=0x0` on both live ADX entries.
+
+### 1. The gate is a single line in `adxstmf_stat_exec` (`0x125898`)
+
+```c
+v9 = *(char *)(a1 + 69);          // byte [+0x45] -- our "cmd=" field
+if ( v9 != 1 )  goto LABEL_38;    // returns the state, touches nothing
+
+v11 = cvfsOpen(*(int *)(a1 + 80), *(int *)(a1 + 84), 0);   // = sub_12CC20
+*(_DWORD *)(a1 + 8) = v11;        // <- the fd
+if ( !v11 ) { *(_BYTE *)(a1 + 1) = 4; ... "E02110501 adxst..." }
+```
+
+Run 56 measured `cmd=0` for the full 40 s window on both entries.
+⇒ **`cvfsOpen` is never called at all.** `fd=0` is *not* a failed open — failure would have
+latched state **4** and printed `aE02110501Adxst`; we saw state 1 and no print. This narrows
+run 56's §4 conclusion from "the CRI file layer fails" to "the CRI file layer is never asked".
+
+### 2. Only two functions can set that byte, and both then SPIN on it
+
+| addr | preconditions | also writes |
+|---|---|---|
+| `0x124E38` | — (reached via `0x124DC8`; caller `0x124F20` then `while(*(a1+69))`) | `[+80]` = **filename ptr**, `[+84]` size, `[+12]`, `[+20]`, `[+16]` |
+| `0x1263B8` | requires `[+80] != 0` **and** `[+8] == 0` | pumps `state_probe_e(a1)` until it clears |
+
+Because both spin until the byte clears, a 1 Hz sampler *should* catch it latched. It never
+did — so neither writer is running. `0x1263B8` additionally depends on `[+80]`, which only
+`0x124E38` sets, so `0x124E38` is the true upstream step.
+
+### 3. `raw=0x01000101` is the CONSTRUCTOR's value, untouched
+
+`sub_124A00` (the entry constructor) writes `*(_WORD *)(a1 + 1) = 1; ... *(_BYTE *)a1 = 1;
+*(_BYTE *)(a1 + 68) = 0;` — which composes to exactly the `0x01000101` we measure. Our two
+entries are freshly built and **nothing has written to them since construction**.
+
+### 4. Base/stride confirmed a third time, independently
+
+`sub_125B58` (the tick): `v2 = (int)byte_44BEB8; LODWORD(v3) = 39; do { if (*(_BYTE *)v2 == 1)
+state_probe_e(v2); v3 -= 1; v2 += 96; }` — base `0x44BEB8`, stride 96, 40 entries. Matches the
+probe and PCSX2.
+
+### 5. The app layer did NOT fail — and this is a REGRESSION FIX confirmed
+
+`MovieCreate` = `0x113AA0`. It has three failure printfs (`aMoviecreateCre`, `aMoviecreateCre_0`,
+`"MovieCreate: No enough memory 0x%x."`). `run_log_56.txt` contains **only the two success
+lines**, twice (lines 2633/2641 and 2854/2862):
+
+```
+MovieCreate: Use Work Size = 0x332100
+MovieCreate: Use Work Adrs = 0x1806c00
+```
+
+⚠️ Compare run 53, which printed `E0100401: can't create PS2RNA of IOP` +
+`MovieCreate: Create movie handle failed`. **Those prints are gone.** The `0x408` mint fixed
+that, and it stayed fixed. So `dword_54BD90` and `dword_54BE2C` are both nonzero, and
+`sub_14F140` (`mwPlySetFile` → `0x14F860` → strcpy) ran — the exact PCSX2 chain.
+
+⇒ **The filename gets set. The stream read never gets requested.** The missing step lives
+between those two facts.
+
+### 6. The movie-player globals, and which one decides the render
+
+Fixed addresses out of `0x113AA0` / `0x113920` / `0x113860`:
+
+| addr | field | meaning |
+|---|---|---|
+| `0x54BD78` / `0x54BD7C` | work adrs / size | **positive control** — game printed `0x1806c00` / `0x332100` |
+| `0x54BD90` | SofDec object ptr | 0 ⇒ create failed (should be nonzero) |
+| `0x54BE2C` | second create result | 0 ⇒ create failed (should be nonzero) |
+| `0x54BE30` | info flag | set to 1 only once `mwPlyGetMovieInfo` returns a header — i.e. once the `.SFD` was actually read |
+| `0x54BE28` | status byte | poll treats `(status - 1) >= 2` as **finished** |
+
+Render gate at `0x113860` is `if ( dword_54BE2C && dword_54BE30 )`. Since `54BE2C` is
+nonzero, **`0x54BE30` is what makes the logo get skipped**, and it can't be set without the
+stream. That closes the loop back to §1.
+
+⚠️ Naming trap again (same class as 5.11/5.15): the dump calls `0x125898` `state_probe_e`,
+`0x12CC20` `state_probe_unk` (it is `cvfsOpen` — proven by its own `aCvfsopen1Illeg` …
+`aCvfsopen6CanNo` strings), `0x124E38` `tagged_dispatch_c`, `0x14F140`
+`ptr_safe_deref_error_guard_f_0`. All are live CRI/SofDec functions.
+
+### 7. Probe extended to measure exactly that gap — BUILT? NO. UNVALIDATED.
+
+Three `.cpp`-only edits to the 1 Hz watchdog in `ps2xRuntime/src/lib/ps2_runtime.cpp`:
+
+- `[adx:stream]` gains **`maxcmd=` / `maxfd=` peak-holds** (hoisted out of the `detailed < 4`
+  guard so all 40 entries feed them) — a transient latch can no longer hide from a 1 Hz sampler.
+- `[adx:stream]` detail gains **`f80=` / `f84=`** — the discriminator: `f80` nonzero with
+  `cmd=0` means the read *was* requested and cleared; both zero means `0x124E38` never ran.
+- New capped **`[movie]`** line reading the §6 table, with `wrkAdr`/`wrkSiz` as the positive
+  control and a RAM-range-guarded deref of `obj+8` / `obj+444`. Env override `PS2_MOVIE_BASE`.
+
+### 8. Walking UP from `0x124E38` — the chain, and the one call that fails SILENTLY
+
+`0x124E38` ← `0x124DC8` ← **`0x1274E8`** (its only caller, line 33025) ← **`0x12AF58`** ←
+**`0x12BC98`** (the ADXT server tick, switches on the ADXT object's own state byte `[+1]`;
+case 1 → `0x12AF58`).
+
+`0x12AF58`'s two guards:
+
+```c
+if ( *(u8 *)(a1 + 2) < 2 && *(u8 *)(a1 + 172) == 1 )   // <- the arm flag
+{
+    if ( adxstm_GetStat(*(a1 + 8)) == 2 ) return;      // 0x125050 = *(char*)(entry+1)
+    ...
+    sub_1274E8(a1, *(a1+180), *(a1+184), *(a1+188), *(a1+192));  // sets [+69]=1
+    *(u8 *)(a1 + 172) = 0;
+}
+```
+
+`0x125050` is just `return *(char *)(entry + 1)` — the state byte. Ours reads **1**, not 2, so
+that early-out is **not** our problem. ⇒ the failing gate is **`[+172] == 1`**, the arm flag.
+
+`[+172] = 1` is written in exactly two places, both immediately after `[+180]`: line 32603
+(`sub_12A280` @ **`0x12A280`**, = `ADXT_StartAfs`) and line 32641. And `0x12A280` contains the
+**only silent failure in the whole chain**:
+
+```c
+result = adxf_GetPtInfo(a2, a3, *(int *)(a1 + 176), &v11, &v12, &v13);  // 0x11CF30
+if ( !result ) { ...set +180..+192, [+1]=1, [+2]=1, [+172]=1... }
+return result;          // <- nonzero: returns with NO print, NO state change
+```
+
+Every other failure in this subsystem prints (`aE02080811AdxtS`, `aE8101202AdxtSt`,
+`aE02080848AdxtE`, `aE0071301AdxtEn`, `aE211151AdxfGet`, `aE02110501Adxst`). **This one does
+not.** Our symptom is precisely "nothing happens and nothing is printed".
+
+`0x11CF30` → `0x11CFC0` resolves a partition/file id: it indexes `dword_43E140[patid]` and
+requires `*(u8 *)(tbl + 15) == 1` — **the AFS partition must be loaded**. That is a disc-read
+dependency, and it is the leading suspect for the silent bail.
+
+⚠️ Not yet proven that the movie uses this ADXT path rather than the mwPly one — `0x14F860`
+(the SofDec filename setter) writes its own 4-word signature instead. §7's `objSrc`/`objLen`
+distinguishes them. Do not act on §8 until run 57 says which layer is armed.
+
+Next: build, run 57. Read `f80` (did `[+80]` ever get a filename), `info` (`0x54BE30`, the
+render gate), and `objSrc`/`objLen` (did `0x14F860` run).
+
+---
+
+## ★★★★★ 2026-08-16 (c) — RUN 56: the drain deadlock is DEAD, and the ADX gate is `fd=0`, not the ack
+
+Run 56 (`run_log_56.txt`, 120 s, `PS2X_DIAG=1`, RelWithDebInfo exe built 11:30). Two probes
+answered at once. **No `RUN VALIDITY FAILURE`.**
+
+### 1. `ackSjxStreamRingIfMatched` WORKS — Stage 5.15's first sub-blocker is closed
+
+```
+[sjx:ack] dest=0x8040  eeBase=0x45e700 len=0x880 ackAddr=0x45ef7c was=1  now=2  ra=0x130784
+[sjx:ack] dest=0x20f80 eeBase=0x458840 len=0x880 ackAddr=0x4590bc was=1  now=2  ra=0x130784
+...                                                               was=31 now=32
+```
+
+- Two independent rings, both advancing **monotonically 1→32**. The ack address is right.
+- **`0x1305e0` appears ZERO times in the whole log.** Run 55's `sub_1305B0` drain spin is gone.
+- Saturated: `[cap] tag=sjx:ack` at 32. Absence past that point proves nothing.
+
+### 2. The `[adx:stream]` probe is VALIDATED and reproduces PCSX2's number first-party
+
+```
+[adx:stream] t=65s nonzero=2/40 maxst=1 base=0x44beb8 stride=0x60
+  | i=0 raw=0x1000101 act=1 st=1 pau=0 fd=0x0 cmd=0x0 bsy=0
+  | i=1 raw=0x1000101 act=1 st=1 pau=0 fd=0x0 cmd=0x0 bsy=0
+```
+
+`raw=0x01000101` is **exactly** the value PCSX2 reported for our build. Base `0x44beb8` and
+stride `0x60` are confirmed correct — the rival-reading `raw=` field carried the proof. Stage
+5.15's exit test is now measurable from inside our own runtime; it no longer needs PCSX2.
+
+### 3. The game runs a RETRY LOOP, ~40 s per attempt — this is the "skip" mechanism
+
+| tick | event |
+|---|---|
+| ~t=60 | `0x40C` → 6×`0x400` → `0x40A` → `0x408`, acks start flowing |
+| t=65 | ADX entries 0 and 1 appear, `st=1 fd=0` |
+| t=65→104 | **40 s of nothing.** `st`, `fd`, `cmd`, `bsy` never change |
+| t=105 | entries torn down, `nonzero=0/40` |
+| ~t=105 | the entire sequence runs a **second** time, identical |
+
+Its own TTY confirms the movie subsystem is alive:
+`MovieCreate: Use Work Size = 0x332100 / Work Adrs = 0x1806c00` — printed **twice**, once per attempt.
+
+### 4. ⇒ The gate is `[+8] fd = 0`, i.e. the .SFD is NEVER OPENED
+
+`st=1` with `act=1` means the stream object was constructed and is idle. Real hardware has
+`fd = 0x004597b0` at that point. **The stream cannot advance to 3 because there is no file
+behind it.** The blocker moved from the SJX/DTX ack channel to the **CRI file layer**
+(`clfile`-class open), which is a different subsystem.
+
+### 5. The plan's branch-2 suspect (`0x40A`) is RETIRED — read the recv size
+
+Full RPC census this run, with `send/recv` byte counts:
+
+| fno | n | send | recv | verdict |
+|---|---|---|---|---|
+| `0x2` / `0x422` / `0x400` / `0x408` | 4/12/12/2 | 16/12/16/16 | **4** | handle-shape, minted ✅ |
+| `0x3` `0x401` `0x403` `0x409` `0x423` `0x40A` | — | 0–12 | **0** | fire-and-forget, **nothing to answer** |
+| `0x40C` | 2 | 4 (`arg0=0xBB80` = **48000 Hz**) | **12** | data-shape, refused |
+| `0x40D` | 2 | 0 | **8** | data-shape, refused |
+
+⚠️ **`0x40A` has `recv=0`.** It was suspected of "returning `handle=0`" — it returns nothing at
+all, because the EE never reads a reply. It cannot be the gate. Only `0x40C` and `0x40D` are
+data-shape, and both stay refused per the no-IOP-faking rule.
+
+### 6. Liveness at t=119 — healthy, and much deeper than run 52
+
+`busy%=94 res/s=13 vbl/s=14 gif/s=10 dma/s=20 progress=403139 (advancing) pc=0x422660`
+`pc` is inside **`GameMain` (`0x422630`)** with a 25-deep render trace. Not a park.
+
+### 7. Next — do NOT chase the SJX channel further
+
+The question is now *"who opens `movie/atari.sfd` and writes its handle into `[+8]`"*.
+Cheapest path: static read of `sub_125898` (`adxstmf_stat_exec`) in the IDA dumps to find the
+`state = 3` store and the condition guarding it. Only then decide whether a run is needed.
+
+Other caps this run (absence past them is not evidence): `ARKD:CALL` 64, `ARKD:run` 32,
+`iop:import` 6/stub, `sceSifSetDma:DTX` 64.
+
+---
+
+## ★★★★ 2026-08-16 (b) — Runs 53–55 RECOVERED from source comments; Stage 5.15 gets its first probe
+
+⚠️ **Bookkeeping failure worth naming.** Runs 53, 54 and 55 happened on 2026-08-12 and were
+**never written into this file.** Everything they established survived only as comments inside
+`ps2_iop.cpp`, `SIF.cpp`, `Thread.cpp`, `Interrupt.cpp`, `Dispatcher.cpp` and
+`ps2_iop_irx_loader.cpp`. The upstream/GS side-quest then consumed two sessions, and
+`run_log.txt` was overwritten by the 08-16 test-dir run, destroying the only copy of their logs.
+The run-52 park recorded further down this file is **superseded** by what follows.
+
+### What runs 53–55 actually established
+
+**Run 53** — park was `0x408 PS2RNA_Create` returning zero:
+
+```
+MovieCreate: Use Work Size = 0x332100
+E0100401: can't create PS2RNA of IOP
+MovieCreate: Create movie handle failed
+```
+
+`0x408` was missed on the first SJX sweep because its caller prints no "can't creat" string of
+its own — it stores the reply at `+32` of the movie object and only the *outer* MovieCreate
+reports. The decompile settles the shape rather than inferring it: `cmd(8,&args,4,&reply,1)`,
+4 words in / **exactly 1 out**, reply stored as `*(obj+32)`, and a later
+`cmd(9,&{*(obj+32)},1,0,0)` teardown. **A destroy that takes the reply back as its only argument
+can only mean the reply is an object handle**, so `0x408` joined the minted set
+([ps2_iop.cpp:175](ps2xRuntime/src/lib/ps2_iop.cpp#L175)).
+
+⚠️ `0x40C` was re-checked in run 53 and **must stay refused** — its caller stores the reply
+straight into the sample-rate/mode flag it later feeds back into `0x408`, with no error path.
+Zero is a legitimate value there; a minted number would be a silent lie.
+
+**Run 55** — the `sub_1305B0` stream-close deadlock, decoded field by field from `sub_130638`
+(the pump), which is the only writer of the in-flight flag:
+
+```
+0x13066c  lw $v0,20($s0)     ; obj[20] = ring's uncached tail pointer
+0x130674  lw $a0,60($v0)     ; ack = *(obj[20] + 0x3C)
+0x130678  slt $v1,$v1,$a0    ; consumer path iff cursor < ack
+0x1306b8  sb $zero,1($s0)    ; ... and ONLY there is byte1 cleared
+0x130718  sw $v1, 8($s0)     ; producer: cursor = cursor + 1
+0x13071c  sw $v1,60($v0)     ; ack = THE SAME VALUE
+0x130790  sb $v0, 1($s0)     ; byte1 = 1, in flight
+```
+
+⇒ the EE stamps `cursor == ack` on every produce, so the drain gate is false the instant a
+buffer is queued, and **only the IOP-side consumer in `CRI_ADXI.IRX` ever advances `ack`** — an
+IRX this runtime never loads. Measured consequence: **two produces in a 120 s run, one per open
+stream, both left `byte1 = 1` forever**, `sub_1305B0` spinning on the drain at `0x1305e0`.
+
+`obj[20]` is `(eeBase + wkLen - 0x40) | 0x20000000`, so the ack word is the ring's **last word**,
+at `eeBase + wkLen - 4`.
+
+### The fix that is built but never evaluated
+
+`ackSjxStreamRingIfMatched`
+([SIF.cpp:1549](ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp#L1549)) increments that ack word when a
+`sceSifSetDma` matches a ring registered by `DTX_Create` (`ps2x_sjxLookupStreamByIopDest`,
+[ps2_iop.cpp:205](ps2xRuntime/src/lib/ps2_iop.cpp#L205)). It is an **acknowledgement, not a
+payload** — the only thing written is a count of transfers that genuinely were delivered, into a
+slot the IOP owns. No stream data is fabricated, so this is not the [[feedback_no_iop_faking]]
+case.
+
+**mtimes prove it is in the current exe:** `ps2_iop.cpp` 01:32, `SIF.cpp` 01:33,
+`build/ps2xRuntime/RelWithDebInfo/ps2EntryRunner.exe` **Aug 12 01:39**. There is no run log and
+no state-file entry showing it was ever exercised. Run 56 is therefore a **zero-build** experiment.
+
+### Stage 5.15 finally gets instrumentation on its own exit test
+
+Until now the ADX stream table had **never been read from inside our own build** — "state 1,
+fd 0" was borrowed PCSX2 ground truth. Added a 1 Hz sweep to the watchdog block in
+[ps2_runtime.cpp](ps2xRuntime/src/lib/ps2_runtime.cpp), alongside the existing `gstate@` sampler,
+emitting `[adx:stream]`.
+
+Two design choices, each paid for by an earlier loss:
+
+- **Sweeps all 40 entries** (`0x0044beb8`, stride `0x60`) instead of sampling the inferred
+  `0x44bf18`. A wrong base or stride now surfaces as `nonzero=0/40`, which convicts the probe
+  rather than reporting confidently about the wrong bytes ([[feedback_probe_gate_on_shape_not_address]],
+  [[feedback_degenerate_result_convicts_the_probe]]).
+- **Carries `raw=` next to the decoded fields**, so a mis-split of word 0 is visible in the same
+  line. Word 0 packs `[+0]` active, `[+1]` state, `[+2]` pause little-endian — hardware reads
+  `0x01000301` (state 3), we read `0x01000101` (state 1).
+- `maxst=` is a run-wide high-water mark: a 1 Hz sampler cannot see a state that comes and goes
+  between ticks, so a stream that really did reach 3 briefly would otherwise be
+  indistinguishable from one that never left 1.
+- The summary line is emitted **every tick including the all-zero case**, capped at 600 with the
+  standard `[cap]` line, so the probe can never be quietly absent
+  ([[feedback_capped_probes_false_negatives]]).
+
+Base/stride/count are env-overridable (`PS2_ADX_BASE` / `PS2_ADX_STRIDE` / `PS2_ADX_COUNT`),
+matching the `PS2_WATCH_ADDR` precedent — moving the probe costs a run, not a rebuild.
+
+### Exit test for run 56
+
+1. `[sjx:ack]` fires with `was=` reading **1, 2, 3 …** (tracking the produce count — if it does
+   not, the ack address is wrong).
+2. `pc=0x1305e0` is gone.
+3. `[adx:stream]` shows `nonzero>0` (probe is alive) and `maxst` reaching **3**, with a nonzero
+   `fd=` on that entry. That is the Stage 5.15 exit test.
+4. Regression guard: `busy%` / `gif/s` / `dma/s` / `progress` must not collapse against run 52's
+   63 s of continuous rendering. Compare rates only at equal boot depth.
+
+If (1) holds but (3) does not, the drain was not the gate and the next suspect is `0x40A`
+returning `handle=0` into the shared recv buffer `0x54C600` — the 5th instance of *silence must
+be written, not omitted*. Decode its caller before minting: `nrecv` 1 = opaque handle (safe),
+2–4 = data (must stay refused).
+
+## ★★★★★ 2026-08-16 — **UPSTREAM + GS-REFACTOR TRACK CLOSED ✅.** `ps2EntryRunner` links in the test dir and the recompiled EE code executes. First run in which upstream's GS was ever exercised.
+
+User's binding instruction — *"add the GS refactor to the test, make sure all current upstream
+is included / then we can build entry runner"* — is **complete and empirically demonstrated**.
+
+- `git log HEAD..upstream/main` = **0 commits**. Test dir is fully current with `d74a3ce1`.
+- Upstream's GS is **in the build**. Our four GS files are out at
+  [ps2xRuntime/CMakeLists.txt:420-425](ps2xRuntime/CMakeLists.txt#L420-L425):
+  `ps2_gs_gpu.cpp` (6526 l), `ps2_gs_rasterizer.cpp` (3085 l), `ps2_gs_memory.cpp` (1417 l),
+  `ps2_gif_arbiter.cpp` (113 l).
+- `F:\sdbz_recomp_test\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe`
+  = **309,277,696 bytes, Aug 16 05:38**.
+
+### The run — before vs after
+
+| | prior runs | this run |
+|---|---|---|
+| `pc` | `0x100008`, spinning | deep, **varying** call traces |
+| `busy%` | 0 | 97–102 |
+| `gif/s` | 0 | 32–33 |
+| `dma/s` | 0 | 64–67 |
+| `progress` | flat | 791,240 and climbing ~5.5 k/s |
+| `dispatch-miss` | flood | **0** |
+
+`missing-target` 0, `unrecompiled` 0, `[error]` 0, `assert` 0.
+`gstate@0x5e6b3c = 0,0,0,1` with `gchg=1`. 57 distinct tags incl. `[frametrace:*]`,
+`[ARKD:CALL]` 192, `[SifRpcPkt:SIG]` 241, `[iop:import]` 228, `[iop:unhandled]` 116.
+Run auto-stopped at 96.2 s wall on the `-RunSeconds 90` budget — it did **not** crash.
+`[cputime]` = CPU-bound, two hot threads (1984 @ 86.61 s, 4508 @ 41.00 s).
+
+**⇒ `gif/s≈33` sustained is the first-ever proof that upstream's `GS` + `GSCpuBackend` receives
+and consumes real GIF traffic without crashing.** Every earlier run was silent about the GS
+refactor because no guest instruction ever ran.
+
+### ⚠️ Two probe corrections — do not reason past these
+
+1. **`cov=` is NOT the liveness indicator.** This run reads `cov=0/0` while the game is
+   unmistakably executing. I had told the user "`cov=` non-zero — the pass/fail line"; that was
+   wrong. The real liveness set is **`busy%` + `gif/s` + `dma/s` + `progress`**, and the broken
+   runs were identifiable by `busy%=0 gif/s=0 dma/s=0 pc=0x100008`.
+2. **RUN VALIDITY FAILURE banner is present** — 4 probes saturated: `iop:import` @6/stub,
+   `sceSifSetDma:DTX` @64, `ARKD:run` @32, `ARKD:CALL` @64. Per
+   [[feedback_capped_probes_false_negatives]] the **absence** of those four tags later in this log
+   proves nothing. Raise `PS2X_IOP_IMPORT_MAX` / `PS2X_SIFDMA_DTX_MAX` / `PS2X_ARKD_RUN_MAX` /
+   `PS2X_ARKD_CALL_MAX` before any conclusion that depends on them.
+
+The single `Exception` line in the log is benign: PowerShell wrapping a `[loadfile-seed]` line the
+child wrote to **stderr** as a non-terminating `RemoteException`. Not a guest fault.
+
+### Root cause of the `0x100008` dispatch-miss — TWO bugs, both closed
+
+**Bug 1 — the dispatch table was upstream's null placeholder.**
+`src/runner/register_functions.cpp` had been overwritten by upstream's 444-byte stub
+(`Base=0x0`, `End=0x01000000`, table `= {}` — every slot `nullptr`). Restored the real 33 MB file
+(`Base=0x100008`, `End=0x4e6c84`, `SlotCount=1022751`). The relink grew the exe by **+13 MB** —
+that table landing in `.data` was the entire size difference.
+
+**Bug 2 — the backup file kept a `.cpp` extension and re-entered the glob.**
+The backup had been named `register_functions.stub-bak.cpp`, which still matches
+`file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS "src/runner/*.cpp")`. The generator therefore
+emitted `void register_functions.stub-bak(...)` into `fn_forward_decls.h:25290` → 7 errors
+(C2146/C2059/C3927/C3484/C3613/C2182/C2365) failing `ps2_runtime.vcxproj`. Renamed to
+`register_functions.cpp.stub-bak` — **in both `src/runner/` and `output/`**; the `output/` copy was
+mandatory because [build_scripts/build.ps1:108](build_scripts/build.ps1#L108) syncs
+`output/` → `src/runner/` on **newer-wins** and would have re-seeded it (Aug 15 05:27 beats
+`output/register_functions.cpp`'s Jul 23 12:09).
+
+⚠️ Bug 2 also masked a second, quieter failure: had it compiled, it would have duplicated all four
+`g_ps2RecompiledFunctionTable*` symbols, and under
+`target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")` the linker could have **picked the
+all-nullptr definition and linked anyway** — silently reproducing the `0x100008` hang with a clean
+build log.
+
+Reminder: `LNK4075` + 2× `LNK4006` + `LNK4088` are the expected `/FORCE:MULTIPLE` set. No signal.
+
+### Known capability lost to the GS swap
+
+**`[drawpath]` is now write-only.** VIF1 still stamps `ps2diag_gifpath::g_curSite`/`g_curSrc` from
+8 sites, but the reader lived in our `ps2_gs_rasterizer.cpp:2803/2806`, which left the build. Any
+Stage 5.11-style draw-**order** question is unanswerable until that stamp is ported into upstream's
+rasteriser. The site-ID legend survives in `src/lib/ps2_gif_arbiter.cpp` (1–7 = VIF1 unpack /
+VIF1 DIRECT / GIF chain ×3 / GIF write ×2).
+
+### Open decisions — all deferred to the user, none blocking
+
+1. **Keep upstream's GS or revert?** Adopting it costs our CLUT/texture-page cache and ~5,500 lines
+   of SDBZ-specific work; upstream's replacement is an uncached lookup marked `// TODO: clut cache`
+   at `gs_cpu_backend.cpp:284`.
+2. Port the `[drawpath]` stamp into upstream's rasteriser.
+3. Adopt `Kernel/EeScheduler.cpp` or keep our `ps2sched::` layer (they share **zero** symbols —
+   only the call sites are mutually exclusive).
+4. **IOP heap:** our `0x01A00000` revert at
+   `src/lib/Kernel/Stubs/Helpers/Support.h:39-42` is an **UNCOMMITTED working-tree edit** —
+   any `git checkout`/`reset` destroys it. HEAD still carries upstream PR #203's `0x04000000`.
+   Adopting upstream's layout wholesale also means porting `g_sifHeapStorage`.
+5. `ps2xTest` CLUT-cache and `drawStat*` tests no longer compile — fix or delete.
+
+**Not yet measured:** what is actually on screen. `[present] nonblack` was retired as an indicator
+([[project_stage512_memory_card]]), so display state needs the user's eyes.
+**Stage 5.15 (the `.SFD` movie gate) is untouched by this session** and remains the blocker.
+
+## ★★★★★ 2026-08-15 — Stage 5.15 scoped by PCSX2 ground truth + upstream test-dir merge
+
+### The symptom, stated exactly (runs 53–59)
+
+The intended boot logo order is:
+
+1. memory-card check → 2. shenron disclaimer → 3. **Atari logo** → 4. funimation →
+5. **okatron 5000** → 6. bandai Namco → 7. crafts & Meister → 8. softdec/Adx →
+9. all rights reserved → 10. opening movie
+
+We skip exactly **#3 and #5** — and those are exactly the two short SofDec movies on disc
+(`MOVIE/ATARI.SFD` 737 KB, `MOVIE/OKR.SFD` 2.4 MB). Everything that plays is a static image
+out of `GAME.DAT`.
+
+> **`.SFD` ⇒ skipped. Static image ⇒ plays. One root cause.**
+
+### Two settled negatives — PCSX2 ground truth, do not re-derive
+
+**1. The movie-open path has ZERO missing bodies.** Conditional breakpoint on `strcpy`
+(`0x00191780`) gated on the source string (`[a1] == 0x69766f6d`, "movi" LE). Three hits,
+three backtraces, 25 distinct addresses — **all 25 are func-map row starts**. Classified with
+the new [check_trace_addrs.py](build_scripts/check_trace_addrs.py) (START / FOLDED / ABSENT).
+
+⚠️ **PCSX2's backtrace `entry=` field guesses one instruction early.** It reported
+`0x0019177c` and `0x0013c4fc` as function entries; both false. `0x0014f880` / `0x0014f1e0`
+*are* real prologues, but the actual call sites are `jal 0x0014F860` / `jal 0x0014F140` — the
+row starts, which we already have. Always confirm a suspected hole against the real `jal`
+target before counting it.
+
+⇒ The dispatch-hole class (Stage 5.13/5.14, closed at run 52) is **not** what skips the movies.
+Step 8 of the governing plan (63 `missing-slot` holes) stays parked for its own reasons.
+
+**2. The `.SFD` open does NOT go through ARKD.** Breakpoint `0x001c0344` (ARKD open-by-name,
+gated `[0x005a97d4] == 0x69766f6d`) stayed armed across ~1.9 **billion** cycles covering the
+whole intro and **never fired**, while the strcpy net caught the movie path three times. CRI
+opens the stream through its own layer. Do not look for the movie in ARKD `func=0x101` again.
+
+### The real movie-open chain (PCSX2, SLUS-21442, hardware)
+
+CRI side:
+`sub_11E9D8` → `0x13c4f8` → `return_zero_e` → `noop_wrapper___`(`0x11d4e8`) → `sub_11D510` →
+`noop_wrapper___`(`0x125b30`) → `sub_125B58` → **`sub_125898`** (= `adxstmf_stat_exec`) →
+`sub_12CC20` / `noop_sub_d2a8`(`0x12d2a8`) → `sub_130EF0` /
+`move_tick_dispatch_g`(`0x130dd8`) → `str_copy_n_03`(`0x1316b0`) → strcpy.
+
+App side (copies `movie/atari.sfd` into the SofDec work area `0x01b173a8`):
+`GameMain`(`0x422630`) → `GameUpdate`(`0x421ea0`) → `0x327f90` → `0x1bf820` →
+`loadscreen_tick`(`0x3e0e60`) → `0x3e10d0` → `0x420e70` → `0x113aa0` → `0x14f140` →
+`0x14f860` → strcpy. Source string table at `0x004DCD80`.
+
+⚠️ **More misleading func-map names**, same trap as Stage 5.11: `noop_wrapper___`,
+`noop_sub_d2a8` and `irq_handler_push`(`0x12f688`) are all live CRI stream functions — not
+noops, not IRQ code.
+
+### The ADX stream table — the state variable to watch
+
+- Base `0x44BEB8`, 40 entries × `0x60` stride. Entry 1 = **`0x44BF18`**.
+- Fields: `[+0]` active · `[+1]` state (1 = init/idle, 3 = streaming, 4 = error) ·
+  `[+2]` pause · `[+8]` fd · `[+0x45]` command · `[+0x49]` busy. Pump guard at `0x4407d8`.
+- Real hardware: `0x01000301, 0x004597b0, …` — **state 3, live fd**.
+- Ours: `0x01000101` — **state 1, fd 0**. The stream never starts.
+
+### Therefore — the gate is the IOP audio / CRI side
+
+Only `ARKD_DVD.IRX` actually executes. `LIBSD.IRX` and `CRI_ADXI.IRX` are answered "OK!" but
+never loaded ⇒ no SPU2 ⇒ libsd returns 0 ⇒ `CRI_ADXI.IRX` can't run ⇒ SJX/DTX *data* commands
+stay refused ⇒ the ADX entry at `0x44BF18` never leaves state 1 ⇒ the EE never opens the
+`.sfd` ⇒ the logo is skipped. See `project_stage514_sjx_iop_heap` / `project_stage515_movie_sfd_gate`.
+
+**The open decision:** build the `ps2_iop_host` bridge so `ps2xIOP`'s `cri_dtx.cpp` can serve
+sid `0x90000200`, **or** write a from-scratch libsd/SPU2 backend. Not yet chosen.
+
+### Upstream catch-up — inventory written to `.github/UPSTREAM_CATCHUP.md`
+
+Baseline `upstream/main = d74a3ce1` *Feature/gs refactor (#204)*, 2026-08-13; swept 08-15.
+
+- **TAKEN:** `ps2xIOP/` (21 files, 5,989 lines) — zero coupling to `ps2xRuntime`, wired with one
+  `add_subdirectory` at [CMakeLists.txt:98](CMakeLists.txt#L98). **Builds standalone, links to
+  nothing.** It does *not* give us an SDBZ profile (no sid `0x90000200`/`0x80000003`/`0x80000701`
+  in `builtin_profiles.cpp`), and its `libsd.cpp` is an EE-RPC forwarder, **not** the IRX import
+  stubs for fids `[4,5,6,11,17,18,19,20,26,28]` that `CRI_ADXI.IRX` imports.
+- **LEFT OUT:** the `ps2_iop_host` bridge (needs diverged headers), GS refactor #204, EE
+  scheduler #184, VU1 refactor #191, `ps2_runtime.h` (**30-hour tripwire**), `MPEG.cpp`/`Audio.cpp`
+  (a hunk-by-hunk merge, and downstream of the current blocker anyway), platform ports, tests.
+- **Our recompiler is ahead** — `ps2xRecomp/` diff is net-negative toward upstream. #194's MMI2
+  fix is already in our `instructions.h`; #168's fallthrough guard we hold in the `__entryPc` form.
+
+### `F:\sdbz_recomp_test` — full upstream merge DONE
+
+Purpose of that directory (user): *bring the project up to speed with main as a test — show
+what the project could look like; everything current on main gets added.* It is **sacrificial**;
+the main tree at `F:\SDBZ Recomp` was verified untouched throughout.
+
+| step | result |
+|---|---|
+| clean | `build\`, `out\` (2.19 GB), `.vs\` removed → **32.1 GB / 122,908 files** |
+| baseline commit | `9457ccf6` — local working changes preserved before the merge |
+| merge | `git merge upstream/main -X theirs` → **`c6816af6`** |
+| scale | 147 files changed, **30,177 insertions**, 29,977 deletions, **63 files added** |
+| conflicts | **0** — the predicted 84 `add/add` conflicts were all auto-resolved by `-X theirs` |
+| deletions | **0** — no common ancestor, so upstream's removals are invisible to the merge |
+| sanity | `src/runner` and `output` both still **36,153 `.cpp`**; `config.toml` present |
+
+**★ The structural finding.** The merged `ps2xRuntime/CMakeLists.txt` is *upstream's*, and
+`src/lib/*.cpp` is **not** globbed (sources are listed explicitly). So our SDBZ-only files are
+on disk but **out of the build**:
+
+- `ps2_iop_cpu.cpp`, `ps2_iop_irx_loader.cpp`, `ps2_iop_mcman.cpp` — our whole R3000/ARKD path
+- `ps2_scheduler.cpp` — displaced by upstream's `Kernel/EeScheduler.cpp`, which **auto-compiles**
+  via the `GLOB_RECURSE … src/lib/Kernel/*.cpp` at `ps2xRuntime/CMakeLists.txt:470`
+- `ps2_gs_gpu.cpp`, `ps2_gs_rasterizer.cpp` — displaced by `gs_frontend` / `gs_cpu_backend`
+- `game_overrides.cpp` is upstream's **183-line skeleton**; our 4,072 lines of Stage 5.x fixes
+  are out of that copy (intact in the main tree and in `9457ccf6`)
+- `ps2_gif_arbiter.cpp` now exists **twice** — `src/lib/` (ours) and `src/lib/gs/` (upstream's).
+  Duplicate-symbol hazard; one must go before any configure.
+
+⇒ The test dir faithfully answers *"what does upstream main look like"*. It **cannot boot SDBZ**,
+so it cannot yet answer the perf question. Re-grafting our layer is a separate deliberate step,
+and its compile-error surface against upstream's changed `ps2_runtime.h` (67 added / 299 of ours
+removed) is itself the honest measure of the catch-up cost.
+
+⚠️ The copied build tree was 100 % non-reusable (CMakeCache/vcxproj/tlog all bake absolute
+paths at `F:/SDBZ Recomp`) and has been deleted. **A `ps2EntryRunner` build in the test dir is a
+full 30+ hour build** (36,153 runner TUs). ✅ **But `--target ps2_runtime` is minutes** — it
+compiles only the hand-written layer + the Kernel glob (190 objects), and that is where every
+integration error lives. Use it for all catch-up measurements.
+
+### 2026-08-15 (build 2) — GS is DONE compiling; `ps2xIOP` built for the first time
+
+Second `--target ps2_runtime`. **Every GS refactor file compiled clean** — `gs_frontend.cpp`,
+`gs_cpu_backend.cpp`, `ps2_gif_arbiter.cpp`, `ps2_gs_memory.cpp`, plus all of `Kernel/`, the ~120
+`sub_*` bodies and `ps2_fiber.cpp`. The GS swap itself is no longer producing errors.
+
+✅ **`ps2_iop.lib` linked** (`build/ps2xIOP/RelWithDebInfo/ps2_iop.lib`), 11 TUs including
+`cri_dtx.cpp`. That closes the Phase 1 open item "ps2xIOP has never been built" — in the test dir.
+The main tree still has not built it.
+
+**One file still fails: `ps2_iop_host.cpp`** — 5 undefined `ps2_stubs::` symbols
+(`isSifIopHeapAddress`, `isSifIopHeapRange`, `readSifIopHeap`, `writeSifIopHeap`,
+`zeroSifIopHeap`). Diagnosis below; this was NOT a missing-port oversight.
+
+#### ⚠️ The IOP heap divergence — read before touching `kIopHeapBase`
+
+Upstream PR **#203** (`8d7e8a5a`) moved the SIF IOP heap from `0x01A00000` to **`0x04000000`**,
+i.e. *outside* the 32 MB of EE RAM, and gave it a 5 MB side buffer `g_sifHeapStorage`. The five
+functions above are the escape hatch that change required: guest-memory walkers like
+`ps2_iop_host.cpp` would call `getMemPtr()` on such an address and fail, so upstream intercepts
+first and services the access from the side buffer.
+
+**We hold the heap at `0x01A00000`, inside EE RAM — a deliberate local revert of #203.**
+⚠️ Correction: this revert is an **uncommitted working-tree edit** in the test dir, not a commit —
+`git status` shows `Support.h` modified, and HEAD still carries upstream's `0x04000000`. It will be
+lost by any `git checkout`/`reset` of that file. The substantive point (deliberate, load-bearing,
+do not "fix" it back to upstream) is unchanged.
+(`Kernel/Stubs/Helpers/Support.h:39`), and it is load-bearing: SDBZ's mcserv path hands the guest
+heap addresses that guest code dereferences directly (Stage 5.12), so the heap must be EE RAM the
+guest can actually see.
+
+⇒ Under our layout the hatch is not just unnecessary, **porting it verbatim would be a silent
+bug** — every heap write would land in a shadow buffer the guest never reads, and the build would
+go green while the memory card quietly broke. So:
+
+- `isSifIopHeapAddress()` returns **false**, computed as `kIopHeapBase >= PS2_RAM_SIZE` rather
+  than hardcoded, so adopting upstream's base re-arms the hatch instead of leaving it wrong.
+- `isSifIopHeapRange()` is upstream's real implementation (allocation-map only, layout-agnostic).
+- `readSifIopHeap`/`writeSifIopHeap`/`zeroSifIopHeap` return false — unreachable today, and
+  failing sends callers to their correct EE-RAM path. `g_sifHeapStorage` deliberately NOT ported.
+
+Callers are unaffected: with the hatch off they fall through to `getMemPtr()` /
+`ps2ResolveGuestPointer()`, which handle `0x01A00000` correctly because it is ordinary EE RAM.
+
+Low blast radius: **nothing in our tree constructs `PS2IopHostAdapter`** — it is orphaned
+plumbing for the deferred Stage 5.15 IOP-audio work. Its only job right now is to link.
+
+⚠️ Header touched: `Kernel/Stubs/SIF.h` (declarations). Internal runtime header, but it reaches
+runner TUs via `ps2_stubs.h`. **Free in the test dir** (no `ps2EntryRunner` objects there yet);
+this same edit in the main tree would cost the 30+ hour rebuild.
+
+**Open decision, unchanged:** whether to eventually adopt upstream's `0x04000000` layout wholesale.
+Doing so means porting `g_sifHeapStorage`, filling in the three accessors, and re-validating the
+memory-card path. Not on the critical path — do not do it as a drive-by.
+
+### 2026-08-15 (later still) — first GS build: exactly 2 errors, both fixed
+
+The `--target ps2_runtime` build got through everything except two sites. Everything else in the
+swap compiled clean on the first attempt — including `gs_cpu_backend.cpp`, `ps2_runtime.cpp` (so
+the rewired `[gs-activity]` probe is right) and all of `Kernel/`.
+
+1. **`gs_frontend.cpp:330,518` — `'vsyncTick': is not a member of 'GSRegisters'`.** Upstream's
+   `GSRegisters` carries a 20th u64, `std::atomic<uint64_t> vsyncTick`, right after `csr`; our
+   merged `include/runtime/ps2_memory.h` still had the 19-member version. Added it in upstream's
+   exact slot and bumped the `static_assert` 19 → 20. `gsRegPtr()` maps MMIO offsets **by name**,
+   not by index, so inserting a member shifts nothing.
+   - ⚠️ The only *writer* upstream has is `EeScheduler.cpp`, which we deliberately do not build —
+     so the field would have sat at 0 forever, freezing the interlace field
+     (`gs_cpu_backend.cpp:1780` derives it from bit 0) and pinning the debug frame index at 0.
+     Fixed by publishing the tick from **our** vsync hook,
+     `updateGsCsrFieldForVSync()` in `Kernel/Syscalls/Interrupt.cpp` — the same `tickValue` that
+     sets `CSR.FIELD` two lines later, so the two cannot diverge.
+2. **`ps2_iop_host.h:3` — cannot open `ps2x/iop/iop_host.h`.** Not a missing file: it is at
+   `ps2xIOP/include/ps2x/iop/iop_host.h`, and that dir reaches consumers only through `ps2_iop`'s
+   PUBLIC include dir. Upstream's link line is
+   `target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)`; ours omitted
+   `ps2_iop`. Added. The source and the library travel together — keeping one without the other
+   is not an option.
+   - **Side effect, and a wanted one: this compiles `ps2xIOP` for the first time** (10 files),
+     which is Phase 1's open item. No symbol collision with our own IOP modules —
+     upstream's are in `ps2x::iop::detail`, ours in `ps2_iop_dbcman` etc.
+
+Header edit disclosure: `ps2_memory.h` changed. In the **test** dir that is free — no
+`ps2EntryRunner` objects exist there yet. It would cost 30+ h in the main tree.
+
+### 2026-08-15 (later) — GS refactor ADOPTED in the test dir; awaiting its build
+
+User direction: *"add the GS refactor to the test, make sure all current upstream is included, then
+we can build entry runner."* Done in `F:\sdbz_recomp_test` only — main tree untouched.
+
+- `upstream/main` re-fetched: still `d74a3ce1`, **0 commits ahead of HEAD**. Nothing on disk is
+  missing; "include all upstream" is purely a question of what the CMakeLists excludes.
+- **Swapped into the build:** `src/lib/gs/{gs_frontend,gs_cpu_backend,ps2_gs_memory,ps2_gif_arbiter}.cpp`
+- **Swapped out (on disk, unbuilt):** `src/lib/ps2_gs_gpu.cpp` (6526 l), `ps2_gs_rasterizer.cpp`
+  (3085 l), `ps2_gs_memory.cpp` (1417 l), `ps2_gif_arbiter.cpp` (113 l)
+- **Consumer edits (7 include lines, 5 files):** `include/ps2_runtime.h`, `ps2_memory.cpp`,
+  `ps2_runtime.cpp`, `vu/ps2_vu1_lower.cpp`, `Kernel/Stubs/GS.cpp` → `runtime/gs/…` paths
+- **`[gs-activity]` probe rewired**: upstream dropped `drawStatPrims/ImageBytes/LastFbp`; substituted
+  `nativeImageUploadCount` / `nativePackedGIFPacketCount` / `getContextFrame(0).fbp` and **renamed
+  the log fields** (`imgup=`/`gifpkt=`/`fbp0=`) so the line never claims a prim count it lacks
+- **Speculative addition:** `src/lib/ps2_iop_host.cpp` — upstream's `PS2IopHostAdapter`, referenced
+  by nothing in our tree, built only to prove it compiles against **our** `ps2_runtime.h`, since it
+  is the intended host for the Stage 5.15 CRI/DTX audio path. Drop the line if it errors.
+- **Deliberately still excluded:** `Kernel/EeScheduler.cpp`. Zero symbol overlap with our
+  `ps2sched::` layer, so it would link — and be **silent dead code**, since our call sites call
+  `ps2sched::`. Adopting it is a separate swap of the same shape as this one.
+
+⚠️ **Size of what this trades away.** Ours 9,611 lines of GS (gpu+rasterizer) vs the refactor's
+3,627. Upstream *pre*-refactor was 4,063, so ~5,500 lines is SDBZ-specific divergence — including
+the **CLUT + texture-page cache** (upstream's `gs_cpu_backend.cpp:284` reads `// TODO: clut cache`
+and does an uncached VRAM lookup) and the draw-stat probes. `ps2xTest` will not compile against
+this (CLUT-cache tests, `ps2_gs_rasterizer.h`); left alone — deleting those tests is a user call.
+
+**Build order matters:** `--target ps2_runtime` (minutes) must pass *before* `--target
+ps2EntryRunner` (30+ h), or the long build burns on a config we already know is broken.
+
+### ★★★ 2026-08-16 — `ps2EntryRunner.exe` LINKS in the test dir. Both halves of the instruction met.
+
+**`F:\sdbz_recomp_test\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe`, 296,072,704 bytes,
+01:40:41.** First binary this target has ever produced. Upstream is fully included
+(`git log HEAD..upstream/main` = 0) *and* the GS refactor is in the build.
+
+- **The 30+ h estimate was wrong: the full runner compile took 3h08m.** Unity batching (size 8) plus
+  `/MP6` is why. Record it — future planning should use ~3 h, not 30.
+- **Incremental resume is proven.** The first attempt was killed at 3h08m with no exe and no error
+  line; MSBuild prints one or the other, so *neither* means terminated, not failed. The re-run
+  compiled only the TUs that had changed. **A killed runner build is not a lost day as long as the
+  CL tlogs survive** — never delete `build/ps2xRuntime/ps2EntryRunner.dir/`.
+- **The OOM risk did not materialise.** 15.8 GB RAM completed a `/DEBUG` link over ~1.94 GB of
+  objects with `/FORCE:MULTIPLE`. No `LNK1102`, no `LNK1318`. Retire that concern.
+- `ps2_iop.lib` also linked (8.6 MB, 11 TUs) — closes the Phase 1 item "ps2xIOP has never been
+  built", **in the test dir only**. The main tree's `ps2xIOP` remains unbuilt.
+- Warnings `LNK4075` + 2×`LNK4006` + `LNK4088` are the expected `/FORCE:MULTIPLE` set
+  (raylib vs. user32 `CloseWindow`/`ShowCursor`); identical to the 2026-07-29 main-tree build that
+  produced a working exe. **No signal — do not investigate them.**
+
+**Two link errors had to be cleared to get here, and they are the same failure class:**
+
+1. `ps2_debug_panel.cpp`, 21 compile errors — upstream renamed `GSZbufReg::zmsk`→`zmask`,
+   `GSPrimReg::prim`→`type`, dropped the `u64` typedef, and turned TEST/ALPHA/TEX1/CLAMP/FBA from
+   bitfield structs (`.data`) into raw `uint64_t`. Fixed with a local `decodeGsTest()` helper
+   (ATE:0/ATST:1-3/AREF:4-11/AFAIL:12-13/DATE:14/DATM:15/ZTE:16/ZTST:17-18 per ps2tek).
+   ⚠️ **MSVC truncated its own error list** — errors certainly present at lines 636-643 produced no
+   diagnostic on the first pass. A clean-looking error list after a wide API rename is not a
+   complete one.
+2. `LNK2001` ×2 on `ps2diag_gifpath::g_curSite` / `g_curSrc` from `ps2_vif1_interpreter.obj`. Our
+   `src/lib/ps2_gif_arbiter.cpp` **defined** them and went out of the build; upstream's
+   `src/lib/gs/ps2_gif_arbiter.cpp` has no such namespace. Definitions moved into
+   `ps2_vif1_interpreter.cpp:17-22` (the only consumer left in the build), initialisers preserved
+   verbatim (`{0}` / `{0xFFFFFFFFu}`).
+
+> ★★ **The transferable rule.** Swapping a file out of the build silently orphans everything it
+> *defined* for anyone still building. You do not find these by reading — you find them one
+> `LNK2001` at a time. `g_curPath` produced **no** error precisely because its writer and its reader
+> left the build together; that asymmetry is how you tell a complete diagnosis from a partial one.
+
+⚠️ **`[drawpath]` is now WRITE-ONLY.** VIF1 still stamps `g_curSite`/`g_curSrc` from 8 sites, but the
+only reader — `ps2_gs_rasterizer.cpp:2803/2806` — left the build in the same swap. The stores were
+kept, not deleted, so the probe can be revived by porting the stamp into upstream's rasterizer.
+Runs 33/34 depend on those site IDs; the legend survives in the unbuilt
+`src/lib/ps2_gif_arbiter.cpp:27-33`. **Any Stage 5.11-style draw-order question is unanswerable
+until that port happens.**
+
+**Linking is not running.** Nothing in the test dir has been executed. The exe is entirely unvalidated.
+
+### ★★★ 2026-08-15 — Re-graft EXECUTED in `F:\sdbz_recomp_test`; it builds
+
+**Result: `ps2_runtime.lib`, 114.6 MB, 190 objects, RelWithDebInfo, 19:11.** Zero compile errors,
+zero link errors. Our entire hand-written runtime layer compiles unmodified inside upstream
+`d74a3ce1`. **The catch-up cost at the C++ level is zero.**
+
+| step | what was done |
+|------|---------------|
+| restore | **49 files** written from `9457ccf6` via `git show <rev>:<path> > <path>` — never `git checkout` |
+| keep | **22 upstream-new files** left untouched on disk: `src/lib/gs/*`, `include/runtime/gs/*.h`, `ee_scheduler.h`, `EeScheduler.cpp`, `ps2_iop_host.{cpp,h}`, `ps2_iop_transport.h`, android/vita runtimes |
+| blocker (a) | dissolved — restoring **our** `ps2xRuntime/CMakeLists.txt` brings back the explicit `src/lib` list, so upstream's `src/lib/gs/*` is simply never named. No duplicate `ps2_gif_arbiter` |
+| blocker (b) | our `CMakeLists.txt` still `GLOB_RECURSE`s `src/lib/Kernel/*.cpp`, which would have swept in upstream's `EeScheduler.cpp`. Fixed with a `list(REMOVE_ITEM …)` + rationale comment at [ps2xRuntime/CMakeLists.txt:474-481](ps2xRuntime/CMakeLists.txt#L474-L481) |
+| blocker (c) | dissolved with (a) — our source list is complete by construction; all 28 named `src/lib` sources verified present |
+
+**★ The schedulers never collided.** Ours is `namespace ps2sched::` free functions +
+`extern "C" ps2x_*`; upstream's is `class EeScheduler` methods — **zero symbol overlap**. They are
+mutually exclusive only because they are consumed by the *same call sites*
+(`Kernel/Syscalls/{Interrupt,Sync,System,Thread}.cpp`, `ps2_runtime.cpp`). Grafting
+`ps2_scheduler.cpp` without also restoring those call sites would have made it silent dead code —
+a link-clean build that does nothing. Restoring the whole Kernel layer is what makes it live.
+
+**★ Verified content-identical to the main tree, with a positive control.** Hash comparison over
+`ps2xRuntime/{src/lib,include}` → 228 identical, **46 byte-different, 0 missing**. All 46 were
+then `git diff --no-index --quiet`-tested: **0 real content differences** — the 46 are pure
+LF-vs-CRLF (files written by `git show` land LF). Control: the loop confirmed it visited all 46,
+and a single-file check on `game_overrides.cpp` (4,072 lines both sides, 217,399 vs 221,725 bytes)
+returned exit 0. ⚠️ **Never conclude "differs" from a hash or a byte count alone on this repo** —
+line-ending skew makes every `git show`-restored file look changed.
+
+Header divergence from `9457ccf6` is **+2,044 lines across 12 files, 0 deletions** — all of it
+upstream's new `include/runtime/gs/*.h`. Our headers are untouched, so the feared
+"67 added / 299 of ours removed" `ps2_runtime.h` conflict never materialised: we kept our header.
+The main tree's only uncommitted header edit is +3 lines (`probeVu1MemoryOccupancy()` decl), and
+`9457ccf6` already carries it.
+
+**What this does and does not prove.** It proves our layer + upstream's toolchain, `ps2xIOP`, and
+root CMake coexist and compile. It does **not** prove the merged tree boots SDBZ — that needs the
+36,153-TU `ps2EntryRunner` link, which is the 30+ hour build and is still unrun. It also leaves
+upstream's GS refactor *unadopted*: `gs/gs_frontend.cpp` + `gs/gs_cpu_backend.cpp` sit on disk,
+excluded, while our `ps2_gs_gpu.cpp` / `ps2_gs_rasterizer.cpp` build. Adopting the GS refactor is
+a separate, still-open decision.
+
+### ⚠️ New hazard to respect
+
+**Never run `ps2_recomp.exe` with the live `config.toml`.** It writes new `sub_*` files into
+`output/`, which [build.ps1:108](build.ps1#L108) syncs into `src/runner/`, which changes
+`fn_forward_decls.h` — recompiling all ~4,520 TUs. Always regenerate to a **scratch** output dir
+and diff first.
+
+### Next actions
+
+1. Decide the IOP-audio approach: `ps2_iop_host` bridge → `ps2xIOP/cri_dtx.cpp`, vs a
+   from-scratch libsd/SPU2 backend. Everything in Stage 5.15 is downstream of this.
+2. `ps2xIOP` has **never been built** — the command was handed over; no compile claim until
+   output is read.
+3. ✅ **DONE 2026-08-15 — the graft compiles clean. The compile-error surface is EMPTY.**
+4. Housekeeping: `build_scripts/build_pr137test.ps1` and `build_scripts/boot_test.ps1` still
+   reference the now-deleted `F:\SDBZ-Recomp-pr137-test`.
+
+## 2026-08-12 — Agent policy update (no code/build change, GitHub Copilot / Claude Sonnet 5)
+
+**Source of this entry: co-piolet (GitHub Copilot CLI in VS Code).** No build, no run, no
+code change — a user-directed change to how this agent (Copilot) documents its own work
+going forward.
+
+- **This agent now writes only to this file (`PS2_PROJECT_STATE.md`) to record progress.**
+  `.github/copilot-instructions.md` and `.github/COPILOT_PLAYBOOK.md` are read for
+  orientation but are no longer edited by this agent unless the user asks for that file
+  by name — avoids the two-file drift that made `copilot-instructions.md` go stale
+  (last dated 2026-08-04, still describing the closed Stage 5.9 as the live blocker,
+  while this file had already moved through Stages 5.11–5.14 to Stage 5.15/run 52).
+- **This agent has adopted Claude Code's full rule set** from
+  `C:\Users\mwlab\.claude\projects\f--SDBZ-Recomp\memory\MEMORY.md` as binding — the hard
+  rules (no runner/header edits, no destructive git, no self-run builds, no IOP faking,
+  ps2xStudio out of scope) plus the measurement-discipline lessons (verify translations by
+  decoding, gate probes on shape not an assumed address, read the missing-target record
+  not the spin PC, capped probes are false negatives, hardware breakpoint first for
+  "who wrote X" questions, stale-object-file check, `run_log.txt` is UTF-16, etc.) — see
+  `/memories/repo/rules.md` (this agent's own persistent memory) for the full merged list.
+- Net effect: going forward, treat this file as the single running log for BOTH Claude
+  Code and Copilot sessions on this repo; do not expect new Copilot-authored `.md` files
+  elsewhere.
+
+## ★★★★★ 2026-08-09 — **STAGE 5.11 CLOSED ✅. Root cause: an unrecompiled qsort comparator. The memory-card dialog now renders like PCSX2 — confirmed by eye.**
+
+### The bug, in one paragraph
+
+`sub_002FF5C0` (the dialog/scene renderer) calls
+`qsort(base=0x5D6EC0, num=N, size=4, cmp=0x2FF580)` at `0x2ff800`, then walks the sorted
+pointer array calling each object's vtable slot `+0x2C` to append its primitives.
+**Draw order == qsort order.** But `0x2FF580` was *never recompiled*: it is never a `jal`
+target, appearing only as qsort's 4th argument, so the recompiler never emitted a body for
+it. The indirect `JALR` therefore hit `dispatchGuestBranch`'s missing-target path under
+`MissingFunctionPolicy::ContinueToTarget` (`policy=1`), which logs **once**, does not unwind,
+and resumes with `$v0` untouched — leaving `v0=0x1`. Every comparison answered "A > B",
+producing a deterministic garbage permutation. The full-screen background sorted to slot 9
+and painted over the dialog panel every frame.
+
+**Same class of gap as `0x1c0170`.** Any address reached only as a function *pointer* has no
+generated body. Worth a systematic sweep.
+
+### The fix — [game_overrides.cpp](ps2xRuntime/src/lib/game_overrides.cpp)
+
+`sdbzDrawOrderCompare2FF580` + `runtime.registerFunction(0x002FF580u, ...)`. Ascending sort on
+a float key at object offset `+0x18`:
+
+```
+keyA = (*a)->float[0x18];  keyB = (*b)->float[0x18];
+if (!(keyA <= keyB)) return +1;      // !(a<=b), not (a>b): a NaN key falls out as +1,
+if (keyA <  keyB)    return -1;      // matching the ordered MIPS c.le.s / c.lt.s compares
+return 0;
+```
+
+An indirect JALR **does** consult the registry (via `dispatchGuestBranch → lookupFunction`),
+which is why `registerFunction` is the correct lever here — unlike a direct C++ `fn_` call,
+which bypasses it.
+
+### Exit test — both halves PASSED (run 39)
+
+| Check | Before | After |
+|---|---|---|
+| `[guest-branch:missing-target] target=0x2ff580` | present | **0 hits** — and 0 missing targets of *any* kind in the whole log |
+| Background draw index | 9th (after 8 border strips + box) | **`bgat=0`** — first |
+| Box body | 8th | `boxat=1` |
+| Glyphs | 10+ | `glyphat=11` |
+
+The probe fired its own pre-registered pass branch:
+
+```
+[drawpath] boxat=1 boxpath=2 bgat=0 bgpath=2 glyphat=11 glyphpath=2 boxsite=2 bgsite=2 glyphsite=2
+  verdict=BACKGROUND-FIRST-matches-the-dump-so-submission-order-is-CORRECT-and-run34-was-a-gate-artifact
+```
+
+### Three threads that closed as *consequences*, not independent facts
+
+- **VRAM allocation drift** (chased since 08-08). The 256×256 PSMT8 background now uploads to
+  `dbp=0x2a00` — the first slot, matching PCSX2. Allocation follows submission order. It was
+  never a separate bug.
+- **"Degenerate T4 index fetch ⇒ zero coverage ⇒ invisible text"** — DEAD.
+  `[glyphfate] pix=0x80fffffe ... cc=1 abe=1`: glyph pixels write near-white at alpha `0x80`
+  (= 1.0 on PS2), consistent with the white alpha-coverage-ramp CLUT.
+- **`[present] nonblack`** 9,180 → **64–65k** of 229,376, both buffers, `dispFbp` ping-ponging
+  `0x0` ↔ `0x70` correctly.
+
+### Two measurements that must NOT be re-read as open bugs
+
+- **CLUT base** `0x2b00/04/08/0c` live vs `0x2a48` in the dump. **Not a valid cross-run test** —
+  PCSX2 was parked on a different memory-card page. Already established in
+  `project_stage511_gsdump_replay.md`.
+- **`[glyphfate] unsound-seq glyphlast=… boxlast=… total=0`** — the probe declares itself
+  unsound and accumulated zero samples. *A degenerate result convicts the probe.* This line is
+  evidence of nothing.
+
+### ⚠️ Func-map names that hid this path for ~38 run cycles
+
+Four SDK-signature false positives. A future session reading these names would dismiss the
+entire render path as string/memory helpers. **Trust the disassembly, not the name.**
+
+| Address | Verified role | func-map name |
+|---|---|---|
+| `0x002FF5C0` | **Dialog/scene render** — sorts, then authors the command buffer inline | `str_copy_n_e_clone_88` ❌ |
+| `0x002FF580` | **Draw-order comparator** (float key at obj+0x18) | **NO ENTRY, NO RUNNER BODY** |
+| `0x0018FCE8` | qsort | `sub_18FCE8` ✓ neutral |
+| `0x0019B010` | display-list enqueue (append to tail) | `sub_19B010` ✓ neutral |
+| `0x0019B110` | display-list flush/walk | `obj_set_fields___` ❌ |
+| `0x0019B710` | command-stream interpreter (jump table at `0x0019B868`) | `mem_compare_n_0_clone_06` ❌ |
+| `0x0010A940` | GIF packet writer | `fighter_track_advance_clone_01` ❌ |
+| `0x0010A940`… | callers `0x3280C0` / `0x421EA0` / `0x422630` | `GameState_Update` / `GameUpdate` / `GameMain` ✓ |
+
+Other addresses worth keeping: command buffer EE `0x01646400` len `0x324`; queue object
+`0x005E3620` (`next`@+0, `head`@+4, `tail`@+8); object-pointer array `0x5D6EC0`; count `N` at
+`gp-0x1ED4` with `gp = 0x503070`.
+
+### Learned patterns
+
+- **An address that is only ever a function *pointer* gets no recompiled body.** The failure is
+  silent under `ContinueToTarget`: one log line, then `$v0` garbage forever. Two occurrences now
+  (`0x1c0170`, `0x2ff580`).
+- **A single wrong comparator return value is indistinguishable from a rendering bug.** ~38 run
+  cycles went into the GS layer for a defect that was three levels upstream, in guest logic.
+- **Exonerating layers is not wasted work, but it has a stopping rule:** once the GS/DMA/VIF
+  layers were all clear, the question had become a guest-execution question and no GS probe
+  could ever answer it. Switching to PCSX2 as ground truth + reading the recompiled body found
+  it in one cycle.
+
+### ★★★ Stage 5.13 (opened 2026-08-10) — boot-screen spin at `0x132444`; missing body at `0x12F708`
+
+**Stage 5.12 is CLOSED, both items, user-confirmed run 44:** the memory-card screen was passed
+with a controller press. Card detected, text correct and in the right order, X accepted.
+
+The game advanced to the **Atari loading screen** and then spun. Console:
+
+```
+Error: dispatch-miss x1351500000 (still spinning, latest guest PC 0x132444)
+```
+
+**Do not chase `0x132444` — it is the fall-through, not the fault.** The single
+`[guest-branch:missing-target]` record (first-report-only, so it appears exactly once in
+`run_log.txt`) names the real address:
+
+```
+[guest-branch:missing-target] kind=DirectJump op=J source=0x13243c target=0x12f708
+  pc=0x12f708 ra=0x113f50 sp=0x1ffbeb0 codeRegion=yes policy=1
+```
+
+**Mechanism.** `0x132430` is a 5-instruction tail-call thunk ending in `j 0x12f708`.
+`0x12f708` has **no recompiled body** — IDA folded the callee into the thunk and named the pair
+`noop_wrapper___270`, so the func map lists only `noop_wrapper___,0x00132430,0x00132444,0x14`
+and has a **hole** between `0x12f704` and `0x12f760`. So:
+
+1. `dispatchGuestBranch(target=0x12f708, DirectJump)` → `hasFunction` false
+2. `MissingFunctionPolicy::ContinueToTarget` (policy=1) sets `pc=0x12f708` and returns **true**
+3. the generated thunk therefore runs its own last line, `ctx->pc = 0x132444u`
+4. `0x132444` is the nop padding the thunk out to the next function — no table entry, so the
+   dispatch loop misses, the miss does not advance `pc`, and it re-misses **1.35 billion times**
+
+This is the third instance of the boundary-discovery gap class (`0x1c0170`, `0x2ff580`), but the
+**first reached by a direct `j`** rather than a `jal`/`jalr`. New symptom shape: the spin address
+sits one instruction past a func-map *end*, and the missing function is never named by the
+dispatch-miss lines at all.
+
+**What `0x12F708` actually is.** All 21 words decoded field-by-field from `ELF/SLUS_214.42`:
+`SetHostLock(flag)` — stores `(int8_t)a0` to `0x0044D274` and `0x0044D2A4`, and when
+`flag == 1` tail-calls the varargs print helper at `0x177988` with `a0 = 0x004BA358` =
+`"SRD: Enable HostLock\r\n"`. The `sd`/`ld $ra` pair and the −16/+16 on `$sp` are net-neutral.
+
+**Fix (applied, build pending):** hand-translated `sdbzSetHostLock12F708` in
+[game_overrides.cpp](ps2xRuntime/src/lib/game_overrides.cpp) + `registerFunction(0x0012F708u, …)`.
+Registration is what makes it reachable — a direct `j` goes through `dispatchGuestBranch`, which
+consults the registry (unlike a direct C++ `fn_` call).
+
+**Exit test for run 45:** the `dispatch-miss … 0x132444` flood is gone. Secondary: the log
+should carry `SRD: Enable HostLock` if the flag ever goes to 1. If a *new* spin appears, read the
+`[guest-branch:missing-target]` line first — same class, different hole.
+
+#### RUN 45 (2026-08-11) — ✅ `0x12F708` fix confirmed; instance 4 at `0x13C4F8`
+
+`0x132444` is gone. The spin moved to `0x13c718` — and, exactly as predicted, that is again the
+*fall-through*, one word past the func-map end of the thunk at `0x13c700`. The one-shot record:
+
+```
+[guest-branch:missing-target] kind=DirectJump op=J source=0x13c668 target=0x13c4f8
+  ra=0x11e408 sp=0xfffb0 a1=0xc v0=0x3 codeRegion=yes policy=1
+  trace=0x174f50 -> 0x172e20 -> … -> 0x104b30 -> 0x104f20
+```
+
+Func map jumps `0x13c4f4` → `0x13c5c0`, so `0x13c4f8` has no body. It is the shared tail of
+**eight** sibling thunks at `0x13c658`, `0x13c670`, … `0x13c700`, each of which only loads its own
+index into `$a0` (0 through 7) and jumps there. `0x13c718` is itself another real function
+sitting in the same gap.
+
+`0x13C4F8` is a **callback-list runner**, all 21 words field-decoded:
+
+- `0x0054E960 + idx*72` — six 12-byte `{fn, arg, pad}` records
+- `0x0045EFE8 + idx*4` — "a callback is running" flag, set 1 before each call, 0 after
+- `0x0045EFC8 + idx*4` — per-index invocation counter, bumped on the way out
+- returns the bitwise OR of every callback's return value
+
+Two decode traps: `addiu $s0, $s0, 0xc` sits in the **BEQ's delay slot**, so the record pointer
+advances even for an empty slot; and the loop-back is `bgezl` (branch *likely*), so its
+`lw $v0, 0($s0)` delay slot is skipped on the final not-taken test.
+
+**Fix (applied, build pending):** `sdbzRunCallbackList13C4F8` +
+`registerFunction(0x0013C4F8u, …)`. Registering the shared tail retires all eight thunks and the
+`0x13c718` spin with one override.
+
+#### The gap class is now measured — 144 missing bodies, not a one-off
+
+New tool: [find_dispatch_holes.py](build_scripts/find_dispatch_holes.py). It decodes every
+`j`/`jal` in the ELF, keeps those whose *source* lies inside a known function, and reports targets
+with no `g_ps2RecompiledFunctionTable` slot — the same test `hasFunction()` performs, so it finds
+these holes statically instead of one run cycle at a time.
+
+```
+python build_scripts/find_dispatch_holes.py --class missing-body
+→ 207 holes total (144 missing-body, 63 missing-slot), 249 call sites
+```
+
+`missing-body` = target sits in a func-map gap, nothing was generated (needs an override).
+`missing-slot` = a body covers the address but no entry point is registered.
+
+It correctly re-finds all three already-fixed instances (`0x1c0170`, `0x12f708`, `0x13c4f8`),
+which is the confidence check on the method. **Only direct branches are visible this way** —
+indirect `jalr` targets (the `0x2ff580` class) come from runtime tables and cannot be enumerated
+statically.
+
+⚠️ **Strategic consequence.** Fixing 144 bodies one spin per run is not a viable path. The
+options, for a decision before grinding further:
+
+1. **Regenerate just the missing functions.** ✅ **CHOSEN AND EXECUTED 2026-08-11 — see
+   "Stage 5.14 — tail-chunk recovery" below.** The stated blocker was wrong twice over:
+   `config.toml` *does* exist at the repo root (it names the merged CSV as the recompiler's
+   function list), and the root cause was never a translation gap at all — `export_func_map.py`
+   dropped every IDA tail chunk from the map. This line said the option was closed for six runs.
+2. **An R5900 interpreter fallback** for unregistered PCs, mirroring the existing R3000 IOP
+   interpreter. Fixes all 207 at once *and* the indirect class, permanently — the largest piece of
+   work, and the only option that closes the class rather than the instances.
+3. **Continue hand-translating** only what the boot path actually hits. Cheapest per step, and
+   the four so far were each ~20 instructions, but the run-cycle cost is unbounded.
+
+**Exit test for run 46:** no `dispatch-miss` flood at `0x13c718` or `0x13c4f8`. Expect the next
+stop to be either a new hole from the list above (read `[guest-branch:missing-target]` first) or,
+if the callback list contains unregistered pointers, an `IndirectCall` miss from inside
+`sdbzRunCallbackList13C4F8`.
+
+#### RUN 46 (2026-08-11) — ✅ `0x13C4F8` confirmed, and the frame loop came alive
+
+The `0x13c718` flood is gone, and this fix moved more than the spin. Watchdog deltas, run 45 → 46:
+
+| field | run 45 | run 46 |
+|---|---|---|
+| `busy%` | 0 | **99** |
+| `res/s` | 0 | **60** |
+| `vbl/s` | 0 | **60** |
+| `progress` | 214440 | **1715881** |
+| `gif/s` / `dma/s` | 0 | 0 (still) |
+
+The game is now actually running its frame loop at 60 Hz rather than idling. Nothing is being
+submitted to the GS yet.
+
+**Instance 5 — `0x116CD0`.** Console spun on `0x116d2c`; the one-shot record named the real target:
+
+```
+[guest-branch:missing-target] kind=DirectJump op=J source=0x116d24 target=0x116cd0
+  ra=0x120a64 sp=0x1ffbe90 a0=0x0 v0=0x43cb90 codeRegion=yes policy=1
+```
+
+Func map confirms both halves of the pattern:
+
+```
+noop_wrapper_e,       0x00116c40, 0x00116cac   <- gap 0x116cac..0x116ce0; 0x116cd0 is inside
+get_global_var_2,     0x00116ce0, 0x00116cec   <- the GETTER for the same word
+wrap_wrap_mem_set_h,  0x00116cf0, 0x00116d2c   <- 0x116d2c = one past END = the spin
+```
+
+The whole missing function is three instructions:
+
+```
+0x116cd0  lui $v0, 0x44                ; $v0 = 0x00440000
+0x116cd4  jr  $ra
+0x116cd8  sw  $a0, -13428($v0)         ; DELAY SLOT; 0x440000 - 0x3474 = 0x0043CB8C
+```
+
+It is the **setter** half of a pair — `get_global_var_2` at `0x116ce0` is
+`lui $v1,0x44 / jr $ra / lw $v0,-13428($v1)`, the same word. Two tail-call thunks reach it by
+direct `j`: `0x116cf0` (sets `$a0=0`, restores `$ra`, drops its frame) and `0x120a10` (pure
+pass-through).
+
+**Fix (applied, build pending):** `sdbzSetGlobalVar116CD0` + `registerFunction(0x00116CD0u, …)`.
+
+**★ The census predicted this one in advance.** `find_dispatch_holes.py` had already listed
+`0x00116cd0  missing-body n=2  j  from 0x116d24, 0x120a1c` before the run happened — the tool is
+predictive, not just descriptive.
+
+#### The 144 are not equally hard — 53% are mechanical
+
+Each missing-body hole was decoded forward to its first `jr $ra` and bucketed on length and on
+whether the body contains any control flow:
+
+| bucket | count | share | meaning |
+|---|---|---|---|
+| trivial | **76** | 53% | ≤8 instructions, straight-line leaf — most are 2-instruction accessors |
+| small | 35 | 24% | ≤20 instructions |
+| medium | 22 | 15% | ≤60 |
+| large | 9 | 6% | >60 |
+| bad | 2 | 1% | unmapped or no return found |
+
+This reframes the three options above. A **single batch pass** over the trivial bucket — either 76
+generated overrides, or one scoped straight-line R5900 interpreter registered at all 76 addresses —
+retires half the class at once instead of one hole per run cycle. Decision still open.
+
+#### ★ PCSX2 title-screen trace (2026-08-11) — the remaining gap is FOUR functions
+
+Rather than keep discovering holes one run at a time, we took ground truth from the real game.
+PCSX2 was paused on the title screen and read over MCP. The EE backtrace, nine frames:
+
+```
+#0 0x001751c0   #1 0x001721e0   #2 0x001712d0   #3 0x00104c00   #4 0x00199840
+#5 0x00421ea0   #6 0x00422630   #7 0x0008fefc (pc 0x00100210)   #8 <root>
+```
+
+New tool: [path_holes.py](build_scripts/path_holes.py) walks the direct call graph (`j`/`jal`) to closure from those
+nine roots and reports every reachable target with no dispatch slot.
+
+```
+reachable functions walked: 772
+holes on this path: 5  (4 missing-body, 1 missing-slot)
+```
+
+**Four.** Not 144 — the boot path we are stuck on and the title-screen path share almost
+everything, and one of the four (`0x13c4f8`) was already fixed this run. All are now handled:
+
+| addr | what it is | fix |
+|---|---|---|
+| `0x1748a0` | EE syscall stub, `addiu $v1,2 / syscall / jr $ra` (SetGsCrt). Called from `0x1720d0`+`0x172148`, both inside frame #1 | `sdbzSyscallStub1748A0` |
+| `0x1748c0` | same cell shape, syscall 4, from `0x17f438` | `sdbzSyscallStub1748C0` |
+| `0x1748e0` | same cell shape, syscall 6, from `0x17f410` | `sdbzSyscallStub1748E0` |
+| `0x100218` | two-word trampoline, `j 0x17f418 / nop`, from `0x18c5bc` | `sdbzTrampoline100218` |
+| `0x1bb460` | **missing-slot:** a body covers it (`sub_001BB450`) but no slot; `0x1bb450` is `j 0x1bb460`, so the body's first act is to dispatch to an address it has no slot for | alias via `lookupFunction(0x1bb450)` |
+| `0x180d30` | on the list but a **false positive** — already registered with its generated body | — |
+
+⚠️ **`find_dispatch_holes.py` reads `register_functions.cpp` only**, so anything fixed from
+`game_overrides.cpp` still shows as a hole. Cross-check the overrides before translating.
+
+#### Two measurements that reshape the 144
+
+**1. Check for a generated file before hand-translating.** Testing
+`runner/fn_<ADDR>_0x<addr>.cpp` for all 144 missing-body holes:
+
+```
+generated file EXISTS (just needs registering):    8
+truly absent:                                   136
+```
+
+So mass registration is *not* the escape hatch — but eight were free, and `0x13c4f8` was one of
+them (hand-translated before checking; the override works, so it stays). The six not already
+covered are now registered directly: `0x1137b0`, `0x1c9980`, `0x1c9ab0`, `0x256960`, `0x341920`,
+`0x356cd0`.
+
+**2. The indirect-call class has no *known* holes.** Scanning every ELF data word for a 4-aligned
+pointer into the code range that the func map calls a real function start but that has no slot:
+**zero hits.** Every statically-tabled function pointer we can identify is registered. The
+`0x2ff580` class therefore comes only from pointers into func-map *gaps* — functions IDA never
+discovered — which cannot be separated from data by address alone.
+
+**Exit test for run 47:** no `dispatch-miss` flood at `0x116d2c` or `0x116cd0`. Watch whether
+`gif/s` / `dma/s` come off zero now that the frame loop runs at 60 Hz — `0x1748a0` is SetGsCrt on
+frame #1 of the real title-screen stack, so it is directly implicated in nothing being submitted.
+Per the trace, there should be **no more direct-branch holes** between here and the title screen;
+if run 47 still stops, the cause is a different class (indirect call, or a wrong translation).
+
+#### RUN 47 (2026-08-11) — ✅ dispatch-hole class CLOSED. The white screen is the game giving up.
+
+The trace's prediction held exactly: **zero `dispatch-miss`, zero `[guest-branch:missing-target]`
+in the whole run.** No direct-branch hole remains between the memory card and the title screen.
+
+The white Atari screen is a *different failure and a much better one* — the game is not stuck, it
+reached its own error handler and deliberately parked:
+
+```
+[SIF:BIND] client=0x44e370 sid=0x90000200
+[Deci2Call:kputs] E0100301: SJX_Init can't allocate IOP Heap
+```
+
+```
+0x13b838  jal   0x17cfd8              ; sceSifAllocIopHeap(0x8d0)
+0x13b840  bne   $v0, $zero, 0x13b878  ; nonzero = success
+0x13b844  sw    $v0, 0($s3)           ; [0x45E454] = the IOP address
+0x13b84c  jal   0x120440              ; printf(0x4bc710)
+0x13b86c  beq   $zero, $zero, 0x13b858  <- deliberate infinite loop
+```
+
+That loop is what the watchdog was reporting all along: `pc=0x13b858`, `busy%=99`, `res/s=60`,
+`vbl/s=60`, `progress` climbing ~1.7M/s, `gif/s=0 dma/s=0`, `stuckSecs=335`. The 60 Hz "frame
+loop" in the watchdog trace is only the **vblank interrupt handler** (`0x171320` = `j 0x11fa60`)
+firing into a thread that is spinning on six nops. GS *had* been working — `[gs:image] n=1698
+dbp=0x2a00 psm=0x13` texture uploads are in the log right up to the failure.
+
+**Root cause:** `0x17cfd8` is the real libsif `sceSifAllocIopHeap`, and it does
+`sceSifCallRpc(cd=0x564980 /*sid 0x80000003*/, fno=1, send=0x564A00/4, recv=0x5649C0/4)` then
+returns `[0x5649C0]`. **We had no RPC service for sid `0x80000003`**, so the four-byte receive
+buffer was never written and the game read 0. This is the *third* instance of the shape recorded
+in [[project_stage512_memory_card]]: **the answer lives in the receive buffer, and a handler that
+writes nothing is indistinguishable from a legitimate failure.**
+
+**Fix** (`ps2xRuntime/src/lib/ps2_iop.cpp`, alongside the other kernel RPC services): serve sid
+`0x80000003` — fno 1 ALLOC, fno 2 FREE — from a bump allocator over IOP RAM
+`0x00008000..0x00040000`, 64-byte aligned. That slice deliberately sits **below** everything else
+this runtime puts in IOP RAM (ARKD_DVD image at `0x40000`, its `sceAllocSysMemory` arena at
+`0x60000..0x1d0000`, IOP thread stacks below `0x1efff0`), so it collides with nothing while still
+returning addresses inside the real 2 MB. Not IOP faking — the heap service ships in the IOP BIOS,
+there is no IRX of ours to run, same as the cdvdman S-command path next to it.
+
+**Cross-checked against PCSX2 before writing it.** The next gate, `0x130418`, validates that
+`(iopAddr + 0x40) & ~0x3F` is 32-byte aligned and stores it to `0x45E458`. PCSX2 at the title
+screen holds **`[0x45E458] = 0x00183940`** — a genuine in-IOP-RAM address, 64-byte aligned. Our
+answer has the same shape and clears the same check.
+
+**Exit test for run 48:** `[iop:iopheap] fno=1 arg=0x000008d0 -> 0x00008000` in the log, and no
+`SJX_Init can't allocate IOP Heap`. ⚠️ If `arg=0x00000000` the allocation size never reached us —
+that means the generic RPC bridge failed to recover the 4-byte send payload and fell back to the
+recv buffer, **not** that the heap is exhausted; the log line exists to tell those two apart.
+Expected next gate: sid `0x90000200` (SJX) has no handler either, and `0x13b8b0` has a second
+identical print-and-park at `0x13b8c0` (string `0x4bc740`).
+
+#### RUN 48 (2026-08-11) — ✅ iopheap exit test PASSED. Both predicted next gates hit, together.
+
+```
+[iop:iopheap] fno=1 arg=0x000008D0 -> 0x00008000 send=0x00564A00/4 recv=0x005649C0/4
+[Deci2Call:kputs] DTX_Create: can't create DTX of server
+[Deci2Call:kputs] E0100302: SJX_Init can't create DTX
+   watchdog: pc=0x13b8c0  (the second print-and-park, exactly as predicted)
+```
+
+The exit test passed verbatim — `arg=0x000008D0`, so the RPC bridge recovers a 4-byte send payload
+correctly. `E0100301` is gone. The spin moved forward by one gate, to the *second* infinite loop.
+
+**Both predicted gates turned out to be the same gate.** `SJX_Init`'s next call is
+`DTX_Create(id=0, eewk, iopwk, wklen)` at `0x130418`; it clears all four validators (the aligned
+`0x8040` we produced passes the 32-byte check) and then issues, from `0x130288`, a
+`sceSifCallRpc(cd=0x44E370 /*sid 0x90000200*/, fno=2, send=0x54C500/0x10, recv=0x54C600/4)`.
+**Fourth instance of the receive-buffer shape** — no handler for that sid, recv never written,
+handle reads 0, `DTX_Create` prints `0x4BA620` and returns 0, and `SJX_Init` parks at `0x13b8c0`.
+
+**The server for sid `0x90000200` is inside CRI_ADXI.IRX** (sid constant at file offset `0xd654`
+of the shipped module; scanned all seven disc IRXs, it is the only hit). There is no SJX or DTX
+IRX on the disc.
+
+**PCSX2 ground truth, DTX slot 0 at `0x44DAF0`** (stride 0x44, max 0x10 slots):
+
+| off | real value | meaning |
+|---|---|---|
+| `+0x00` | `0x00010101` | in-use / flags |
+| `+0x04` | **`0x0008BAB0`** | **the DTX handle — an IOP address** |
+| `+0x0c` | `0x0045E700` | eewk (EE work buffer, 64-aligned) |
+| `+0x18` | `0x00183940` | iopwk (= `[0x45E458]`) |
+| `+0x1c` | `0x00000880` | wklen |
+
+Also `[0x45E454] = 0x00183900` — real `sceSifAllocIopHeap(0x8d0)` returned `0x183900`. Ours
+returns `0x8000`. Both are valid IOP addresses and the value is only forwarded, never interpreted.
+
+**★ The DTX handle is opaque to the EE.** `0x8BAB0` is IOP RAM; the EE stores it at `slot+4` and
+echoes it back in later RPCs, and cannot dereference it. That is what makes serving this sid
+locally lossless, and it is why it is *not* the [[feedback_no_iop_faking]] situation — that rule
+came from inventing ARKD_DVD's payload, data the game actually read.
+
+**Decision (user, 2026-08-11):** serve sid `0x90000200` in `ps2_iop.cpp` now; revisit running the
+real CRI_ADXI.IRX once rendering is proven. Cost of the real path, for when we return to it: the
+`sceSifRegisterRpc` capture + dispatch machinery already exists (it is how ARKD's `0x500..0x503`
+work), but the loader is single-module throughout — one `g_arkdCpu`, one base `0x40000`, one arena,
+one service map — and CRI_ADXI needs 44 import stubs across 10 libs, 10 of them `libsd` (SPU2).
+
+**Fix:** handler in `ps2xRuntime/src/lib/ps2_iop.cpp` next to the IOP-heap one.
+`fno 2` mints a handle `0x4000 + id*0x100` (reserved slice of real IOP RAM below the heap arena, so
+it can never alias a `sifIopHeapAlloc` block), refusing `id >= 0x10` rather than minting past the
+window. Everything else answers zero. **All SJX calls share recv buffer `0x54C600`, so the handler
+zeroes the receive buffer on every call** — writing nothing would leave the previous reply in place
+to be read as a fresh answer. Silence has to be written, not omitted.
+
+**Exit test for run 49:** `[iop:sjx] fno=2 args={0x00000000,0x0045E700,0x00008040,0x00000880} ->
+handle=0x00004000`, and neither `E0100302` nor `DTX_Create: can't create` in the log. ⚠️ If the
+args come back all-zero with `send=…/16`, the 0x10-byte send payload did not reach us — a bridge
+problem, not a refusal. Audio stays silent by construction; that is expected, not a regression.
+
+#### RUN 49 (2026-08-11) — ✅ DTX exit test PASSED verbatim. GIF/DMA traffic appears for the first time.
+
+```
+[iop:sjx] fno=2 args={0x00000000,0x0045E700,0x00008040,0x00000880} -> handle=0x00004000
+[watchdog] t=80s gchg=1 gstate@0x5e6b3c=0,0,0,1 busy%=107 res/s=66 vbl/s=65 progress=446358
+           gif/s=10 dma/s=20 stuckSecs=0 pc=0x136b30 ra=0x136b2c lastCall=0x136b30
+           trace=0x13c4f8 -> 0x136b30 -> 0x104b30 -> 0x1bfb80 -> 0x1bfa50 -> 0x171320 -> ...
+```
+
+**Every predicted arg matched, field for field.** `E0100302` and `DTX_Create: can't create` are both
+gone. ★ **`gif/s=10 dma/s=20` — run 48 had `gif/s=0 dma/s=0`.** This is the first run where the
+guest issues GS traffic at this stage, so the DTX gate really was holding back the render path and
+not merely the audio path.
+
+**The park moved up one layer, same shape.** `pc=0x136b30` is another deliberate nop loop; `ra`
+`0x136b2c` is the return of `jal 0x120440` (printf) at `0x136b24`, whose `a0` is `0x4BBE28` =
+`"E0110102: ps2rna_init_psj: can't creat SJUNI_CreaetRmt"`. The gate is `0x136b18`,
+`bne $v0, $zero` on the return of `0x13b278` = `SJUNI_CreateRmt`.
+
+**★ The generic command channel is now the blocker, and its surface is MEASURED, not guessed.**
+`0x130910(cmd, sendArr, nsend, recvArr, nrecv)` copies `nsend` words into `0x54C500`, issues
+`sceSifCallRpc(cd=0x44E370, fno=cmd+0x400, send=0x54C500, recv=0x54C600)`, copies `nrecv` words
+back, returns `[0x54C600]` — **the same shared buffers as fno 2**, so the zero-on-every-call rule
+stays load-bearing. A scan of the whole ELF for `jal 0x130910` finds **22 call sites / 21 distinct
+commands** (`build_scripts` scratch scan; command + `nsend` + `nrecv` recovered from the immediates).
+
+`ps2rna_init_psj` (`0x136980..0x136c64`) is a loop over `[0x455D80]` voices; per iteration it does
+`SJUNI_CreateRmt` → `0x13a228` → a vtable call → `SJX_Create` (`0x13b9d0`), each gated by its own
+`E01101xx` print-and-park. Settled globals: `0x455D80` count, `0x455D84` wk size, `0x455D8C` raw
+`sceSifAllocIopHeap` result (a **second** heap call, at `0x1369ec`), `0x455D90` the 64-aligned wk
+pointer bumped `0x100` per voice, `0x455DE0` the EE object array (stride `0x18`).
+
+**Fix:** mint opaque handles for the four *create* commands only — `0x400` SJX_Create, `0x420`
+SJUNI_Create, `0x421` SJUNI_CreateX, `0x422` SJUNI_CreateRmt — from a bump counter over IOP RAM
+`0x5000..0x8000`, stride `0x40` (above the DTX sub-window which tops out at `0x4F00`, below the heap
+arena at `0x8000`, so neither can alias). **The other 17 commands keep returning zero on purpose:**
+`0x40C`, `0x424`, `0x426` and friends receive two to four words of *data*, not a handle, and a
+plausible-looking invented number there would steer the game silently — strictly worse than the
+refusal it already knows how to print. The `[iop:sjx]` cap is raised to 512 so a single run reveals
+the whole boot-path command sequence instead of costing one build cycle per error code.
+
+**Exit test for run 50:** `[iop:sjx] fno=0x422 … -> handle=0x00005000` appears, `E0110102` does not,
+and the park at `0x136b30` is gone. ⚠️ Read the `[iop:sjx]` census in the log before doing anything
+else: any command logged with `handle=0x00000000` immediately before a new park names the next thing
+to decode. ⚠️ `handle=0x00000000` on a *create* means the `0x5000..0x8000` window was exhausted —
+that is a window-size problem, not a missing service.
+
+#### RUN 50 (2026-08-11) — ✅ SJX creates PASSED; the game left `ps2rna_init_psj`. New park is a DISPATCH HOLE, not an error loop.
+
+```
+[watchdog] t=88s cov=0/0 bssnz=41353 bsschg=7 gchg=1 gstate@0x5e6b3c=0,0,0,1
+  busy%=101 res/s=61 vbl/s=61 progress=3396435 gif/s=0 dma/s=0 stuckSecs=22
+  pc=0x14facc ra=0x14e598 lastCall=0x14facc
+  trace=0x14facc -> 0x14facc -> ... (x32, all identical)
+Error: dispatch-miss x406300000 (still spinning, latest guest PC 0x14facc)
+```
+
+★ **`x406300000` is a COUNT, not an address** — 406.3 million misses. `ps2_runtime.cpp:1526`
+prints a running total every 100000 once the first 8 reports are suppressed. A future reader will
+misparse this as a garbage jump target; it is not one. **This is the dispatch-hole class, back on a
+new code path** — Stage 5.13's class-closure held for the *title-screen* path, which is what the
+PCSX2 backtrace covered; the sound-init path was never in that trace.
+
+**Decode (spin PC is the fall-through, as always):**
+`jal 0x14fab8` @ `0x14e590` ⇒ `ra=0x14e598` — matches the watchdog exactly. `0x14fab8` is a 5-word
+thunk whose only job is `j 0x14fc88`; `0x14fc88` has no body (map runs `0x14fc48..0x14fc88` then
+jumps to `0x14fcb0`, leaving `0x40` bytes unclaimed), so dispatch falls through to the `nop` at
+`0x14facc` and re-dispatches it forever.
+
+**★ Swept the enclosing module instead of fixing the one hole.** `0x14fa58..0x150008` is a small
+flag module over four words at `0x00460F10..0x00460F1C`, and it holds **five** holes, every one a
+2–5 instruction accessor. All five are translated into `game_overrides.cpp`:
+
+| hole (map gap) | real entry | body |
+|---|---|---|
+| `0x14fbfc..0x14fc28` | `0x14fc00` | normalise `$a0` → `[0x460F10] = a0 ? 1 : 0` |
+| `0x14fc34..0x14fc48` | `0x14fc38` | `[0x460F14] = $a0` |
+| `0x14fc88..0x14fcb0` | `0x14fc88` | `[0x460F10]=1`, `[0x460F14/18/1C]=0` ← **the blocker** |
+| `0x14fe84..0x14fe98` | `0x14fe88` | `[0x460F1C] = $a0` |
+| `0x14ff78..0x14ff80` | `0x14ff78` | `jr $ra / nop` — genuine no-op |
+
+⚠️ Each hole's map start is a padding `nop` belonging to the *previous* function, real entry one
+word later. Callers may name either, so **both addresses are registered to the same body**.
+
+**Exit test for run 51:** the `dispatch-miss` flood and the `0x14facc` spin are gone, and `pc`/`ra`
+move somewhere new. ⚠️ If a *new* `dispatch-miss` flood appears, read `ra` first — it names the
+`jal` site, and the thunk at that target names the real hole. The spin `pc` never does.
+⚠️ `gif/s=0 dma/s=0` this run is **not** a rendering regression — run 49 reached `gif/s=10` because
+it parked *later*; run 50 never got as far as the render loop.
+
+#### RUN 51 (2026-08-11) — ✅ flag-block sweep PASSED. Deepest boot yet; new park is a memset hole.
+
+Build chain verified fresh (overrides 03:12 → obj 03:29 → exe 03:29:41 → log 03:30:37).
+
+**Exit test passed verbatim:** the `0x14facc` spin is gone and the run has **zero** `dispatch-miss`
+lines. All five holes in the `0x460F10` flag module were correct.
+
+**Real GS traffic for the first time at this depth** — `gif/s=46 dma/s=59` at t=1s (run 49 peaked at
+`gif/s=10`). MCMAN / MCSERV / LIBSD all loaded OK; `CMemory::Init memsize : 0173fc00`.
+
+Then the EE thread died: t=165s shows `busy%=0 res/s=0 gif/s=0 dma/s=0 stuckSecs=104`, with
+`vbl/s=61` — ⚠️ the vblank handler alone, **not** the game. `pc=0x421ed8` is a dead-thread
+artifact and means nothing.
+
+**The whole run emitted exactly ONE structured record, and it names the fault directly:**
+
+```
+[guest-branch:missing-target] kind=DirectJump op=J
+  source=0x1641a8 target=0x1443e0 ra=0x15df30 a0=0x560730 a1=0x0
+```
+
+Caller decodes cleanly as `memset(0x560730, 0, 0x48)` via a **tail `j` after `ld $ra`**, which is
+why `ra` points past the jump site to the grandparent:
+
+```
+0x164194  lui   $a0, 0x56
+0x16419c  addiu $a0, $a0, 0x730     ; a0 = 0x560730   (matches the record)
+0x1641a0  daddu $a1, $zero, $zero   ; a1 = 0          (matches)
+0x1641a4  addiu $a2, $zero, 0x48
+0x1641a8  j     0x1443e0
+```
+
+**Module sweep — two holes, both translated in one build:**
+
+| Map gap | Real entry | What it is |
+|---|---|---|
+| `0x1443dc..0x1444b0` | `0x1443e0` | **the blocker** — *reverse* byte `memset`: seeks to `dst+n`, fills downward |
+| `0x1440fc..0x1442d0` | `0x144100` | forward byte `memcpy`; 32 B/iteration |
+
+Fix: `sdbzMemFill1443E0` + `sdbzMemCopy144100` in
+[game_overrides.cpp](ps2xRuntime/src/lib/game_overrides.cpp), registered at all four addresses
+(hole start + real entry each). Translated **loop-for-loop, store-for-store** rather than as host
+`memcpy`/`memset` — every routine in the game leans on these two, so a version that gets the bytes
+right but an end-state pointer wrong would corrupt silently.
+
+⚠️ **Only `0x1443e0` is proven reachable.** `0x144100` is module-sweep inference. If run 52
+misbehaves in a *new* way, re-audit the memcpy first.
+
+⚠️ **Misleading func-map names, again (4th time).** The eight `wrap_mem_copy*` thunks at
+`0x144040..0x1440fc` do **not** feed `0x144100` — they `j 0x18e250`.
+
+★ The `n >> 5` block count was *measured*, not assumed: the loop body holds exactly 32 `sb` and
+exactly two `addiu $a0,$a0,0x10`.
+
+**Exit test for run 52:** the `[guest-branch:missing-target]` record for `target=0x1443e0` is gone,
+and the run either pushes past the point where `busy%` collapsed or parks somewhere new.
+
+#### RUN 52 (2026-08-11) — ✅✅ THE DISPATCH-HOLE CLASS IS CLOSED AT RUNTIME
+
+First run with the 135 recovered tail-chunk bodies present. Build chain verified fresh
+(`game_overrides.obj` 19:54:30 → exe 20:00:26 → log 20:05:07), 136 TUs compiled, zero runner TUs,
+`fn_forward_decls.h` mtime unchanged at 7/24.
+
+**Both exit tests passed, and by the strongest possible margin:**
+
+| check | run 51 | run 52 |
+|---|---|---|
+| `[guest-branch:missing-target]` records | 1 (`0x1443e0`) | **0** |
+| `dispatch-miss` lines | 0 | **0** |
+| static `missing-body` holes | 125 | **1** (`0x00257160`, the known data-blob case) |
+| seconds of live guest execution | ~1 | **63** |
+
+★ **This is a different regime, not an increment.** Runs 45–51 each parked within a second or two.
+Run 52 ran **63 seconds of continuous rendering** — `gif/s` 45 → 8 → 15, `dma/s` 14–63,
+`busy%` ~100 throughout, `bsschg` 19–30 per second (the game mutating its own state, not idling).
+The recovered bodies are executing: nothing hand-registered covers that much of the boot path.
+
+**Where it stops now — a NEW class, not another hole.** At t≈63s the game runs a second-phase
+PS2RNA init, all of which *succeeds*:
+
+```
+[SIF:BIND] client=0x44e370 sid=0x90000200
+[Deci2Call:kputs] PS2RNA: sceSifAllocIopHeap(99904) ret=0x00008900
+[iop:sjx] fno=0x422 ... -> handle=0x00005000     (x6, each paired with)
+[iop:sjx] fno=0x400 ... -> handle=0x00005040
+[Deci2Call:kputs] PS2RNA: sceSifAllocIopHeap(6208) ret=0x00021840
+[iop:sjx] fno=0x40A args={0x6,0x00021840,0x00001840,0x0} -> handle=0x0 recv=0x0054C600/0
+```
+
+…then creates **four EE worker threads** and stops dead:
+
+```
+EECREATE tid=0x3 entry=0x11e7e0 stack=0x441a10 size=0x800
+EECREATE tid=0x4 entry=0x11e8d0 stack=0x443210 size=0x1000
+EECREATE tid=0x5 entry=0x11e9d8 stack=0x444210 size=0x1000
+EECREATE tid=0x6 entry=0x11eac8 stack=0x445210 size=0x2000
+```
+
+**`EE threads created: 5, started: 0`.** From t=64s on: `busy%=0 res/s=0 gif/s=0 dma/s=0`, with
+`vbl/s` running away to **832** — the host IRQ thread free-running because no guest thread is
+consuming vblanks. `pc=0x421ed8` is the dead-thread artifact and means nothing (it reads the same
+during the *healthy* 63 seconds).
+
+★ **`started: 0` is real evidence, not a missing probe.** The `EESTART` emit site exists
+([Thread.cpp:511](ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp#L511)) and every *silent* early
+return above it was ruled out: all four entries are in `register_functions.cpp` so the
+`hasFunction` bail cannot fire, and `launch_recomp.ps1:409` captures stderr via `2>&1 | Tee-Object`,
+so the absence of `[StartThread] … is not registered` and `create_fiber failed` is meaningful.
+**Syscall 0x22 was never issued.** The game stopped *between* `CreateThread` ×4 and `StartThread`.
+
+**Last guest call before the stall is `0x13c4f8`** — `sdbzRunCallbackList13C4F8`, the hand-written
+Stage 5.13 override. The frozen call ring ends
+`… 0x11e3b0 → 0x11e560 → 0x11f240 → 0x13c658 → 0x13c4f8`, i.e. the game's own thread-manager module
+(`0x11exxx`, which owns all four thread entry points) calling into the callback-list runner. Since
+that override dispatches arbitrary function pointers, and the run logged **zero** `IndirectCall`
+misses, every callback resolved — one of them entered and did not come back.
+
+**Exit test for run 53 (Stage 5.15):** find why syscall 0x22 is never reached. Two candidates, in
+order of cost:
+
+1. The `0x40A` SJX command returns `handle=0` with `recv=…/0` — nothing written. Per the settled
+   Stage 5.14 rule (*shared recv buffer ⇒ silence must be written, not omitted*), a caller polling
+   that buffer sees whatever the previous command left. This is the 5th instance of that shape.
+2. A callback invoked from `sdbzRunCallbackList13C4F8` blocks. Instrument its loop to log each
+   `callback` address and whether it returned, rather than guessing which one.
+
+⚠️ Do **not** read `gif/s=0` at t≥64s as a rendering regression. It is downstream of the stall, and
+run 51's `gif/s=46` was measured at a boot depth this run passed in its first second.
+
+### ★ Stage 5.12 (opened 2026-08-09, ✅ CLOSED 2026-08-10 run 44) — memory card + controller
+
+The dialog text is legible and matches PCSX2. The game is asking for input and storage:
+
+```
+Checking the memory card (PS2) in MEMORY CARD slot 1. …
+No memory card (PS2) inserted in MEMORY CARD slot 1 or MEMORY CARD slot 2.
+A memory card (PS2) with at least 110KB of free space is required to
+create a Super Dragon Ball Z save data.
+… X button to continue.
+```
+
+Two work items, both **unstarted**:
+
+1. **Memory card not detected.** Existing surface:
+   [Kernel/Stubs/MemoryCard.cpp](ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp),
+   [Kernel/Stubs/MemoryCard_Internal.h](ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard_Internal.h),
+   [ps2_iop_mcman.cpp](ps2xRuntime/src/lib/ps2_iop_mcman.cpp). Needs triage: is McServ/mcman
+   answering "no card", or is the RPC never reaching it? SDBZ needs ≥110 KB free.
+2. **No way to press X.** — ✅ **BUILT + MECHANICALLY VERIFIED 2026-08-10 (run 40).** Input now
+   reaches the guest. But **X still does not dismiss the dialog** — see the run-40 result block
+   below. The pad was necessary, not sufficient; suspicion has moved to item 1.
+
+Item 1 has not been investigated — the file list above is an inventory, not a diagnosis.
+
+#### ★★★ Stage 5.12.2b — RUN 43 (2026-08-10): GetDir verified; pad ROOT CAUSE found (build pending)
+
+Built 09:28, ran 09:35. **GetDir fix confirmed:**
+
+```
+[iop:mcserv] GetDir port=0 slot=0 path='BASLUS-21442SDBZ' maxent=32 table=0x005EB000 -> entries=0
+[iop:mcserv] GetDir port=1 slot=0 path='BASLUS-21442SDBZ' maxent=32 table=0x005EB000 -> entries=0
+```
+
+The path decodes to the real SDBZ save-directory name, `maxent`/`table` come off the correct
+offsets, and `entries=0` is the truthful answer for a formatted card with no save. rpc histogram
+`164× 0x1, 4× 0xD, 2× 0xFE`. `strA` still reads `"Super Dragon Bal"` — no regression.
+
+User reports the memory-card text is now correct **and in the right order**, but still cannot get
+past the screen with any input.
+
+##### Root cause of "no input" — decoded, not guessed
+
+The game's pad manager is `sub_109900` @ EE `0x109900`. Its shape:
+
+```c
+switch ( scePadGetState(port, 0) ) {           // 0x188548
+  case 1: case 5: return 1;                    // busy, wait
+  case 2: case 6: /* state machine */ break;
+  default: v9[2] = 0; return 0;                // reset
+}
+// state v9[2] == 0 (no case matches, falls past the switch):
+v13 = scePadInfoMode(port, slot, MODECURID, 0);   // 0x188970 -> half[101] >> 4
+v9[3] = v13;                                      // cached pad id
+if ( v13 ) { ... v9[2] = 70 (id 7) / 40 (id 4) / 99 ... }
+```
+
+**Blocker 1 (the fatal one).** `scePadInfoMode(MODECURID)` returns `half[101] >> 4`. Our push
+never wrote byte 101, so it returned **0**, `if (v13)` never fired, `v9[2]` stayed 0 forever, and
+the `scePadRead` at `LABEL_40` was **never reached**. Buttons were published into the buffer and
+never read. This is why run 40's mechanical checks all passed while nothing happened on screen —
+they proved the buffer was correct, not that anyone read it.
+
+**Blocker 2 (behind it).** The read site is
+`if ( scePadRead(port, slot, &buf) && !buf[0] )`. Byte 0 is the SIO2 frame validity byte and must
+be **0**; `readState()` was publishing `0x01`.
+
+**Fix (`ps2_pad.cpp`, build pending):**
+
+| Offset | Was | Now | Why |
+|--------|-----|-----|-----|
+| status `+0` | `0x01` | `0x00` | frame validity; `!buf[0]` gate |
+| half `+100` | unwritten | `1` | == `+114` ⇒ `scePadInfoMode` reports 0 for MODECUREXID/MODECUROFFS/MODETABLE — honest for a pad with no mode table, and keeps `v9[3]` at 7 |
+| half `+101` | unwritten | `0x73` | pad id byte; `>>4 == 7` ⇒ DualShock2, matches `status[1]` |
+
+`status[1]` stays `0x73` (analog, 6 bytes, **no** pressure). `0x79` would be wrong here: it makes
+the game run a second loop that overwrites its own "button held" bytes with our zeroed pressures.
+
+With id 7 the state machine goes 70 → 71 → 72 → 99; states 70/71/72 negotiate DS2 mode over padman
+RPCs we do not answer, and **every failure path funnels to state 99**, which is the steady read
+state. So no padman RPC work is needed for input to function.
+
+**Exit test for run 44:** X dismisses the memory-card screen. Mechanical fallback if it does not:
+the `[pad]` records are unchanged in meaning, so a new failure is downstream of `scePadRead` —
+check `cachedId == (buf[1] >> 4)` by probing `v9[3]`.
+
+#### ★★★ Stage 5.12.1 — RUN 42 (2026-08-10): GetInfo fix VERIFIED, memory-card gate is OPEN
+
+Built 09:05, ran 09:12. **Exit test passed on both halves.**
+
+- `[iop:mcserv] GetInfo port=0 slot=0 block=0x00569140 -> type=2 free=8192 format=1 result=0`
+  — the block address is the one the guest itself supplied at `send+0x1C`, so the
+  192-byte-block reading is confirmed against the game, not assumed.
+- **The dialog text is gone.** `[fontgate] strA=0x89e400` read `"No memory card ("`
+  in run 41; it now reads `"Super Dragon Bal"`. The panel is no longer the failure dialog.
+- GetInfo call count went 4 → **82** (the game polls the card once it believes one exists).
+- **`rpc=0xD` (GetDir) appears for the first time, ×2** — the game only browses the card
+  after accepting it. That transition is the real proof the gate opened.
+- `[present] nonblack` still cycles 64188/65140. Not a contradiction: those are
+  whole-frame pixel counts, and a text swap inside one panel moves far fewer than
+  ~950 pixels. **Retire that field as the dialog-change indicator** — `strA` is the
+  direct measurement and it moved. See `feedback_probe_gate_on_shape_not_address`.
+
+#### Stage 5.12.1b — GetDir has the SAME trap, fixed in the same file (build pending)
+
+`sceMcGetDir @ EE 0x18A078` packs its 1044-byte struct as
+`+0x00 port`, `+0x04 slot`, `+0x08 mode`, `+0x0C maxent`,
+**`+0x10 EE address of the caller's 64-B-per-entry table`**, `+0x14 name (1023)`,
+recv **4**. The `cache_writeback_range(table, maxent << 6)` right before the call is
+what pins the 64-byte stride.
+
+Our handler read the path at `+0x08`, `maxent` at `+0x08 + kMcMaxPathLen`, never read the
+table pointer, memcpy'd entries into the **4-byte recv buffer** (so `copyBytes` floored to
+0), and never wrote the result code at all. Net effect: GetDir always answered "0 entries".
+That is a *plausible* answer for an empty card, so it did not block the gate — but it is
+wrong, and it would break save enumeration. Now fixed: correct offsets, entries written to
+the EE table, result code written to recv, plus an `[iop:mcserv] GetDir …` trace line.
+
+**Exit test for run 43:** `[iop:mcserv] GetDir port=0 slot=0 path='…' maxent=N
+table=0x……` with a non-negative `entries=` count, and no regression in `strA`.
+
+#### ★★★ Stage 5.12.1 — RUN 41 (2026-08-10): mcserv GetInfo ROOT CAUSE FOUND + FIXED (superseded by RUN 42 above)
+
+`PS2X_MCSERV_TRACE=1` on the **existing** exe (no rebuild) gave the decisive measurement.
+The RPC sequence is short and complete:
+
+```
+[iop:mcserv-route] sid=0x80000400 rpc=0xFE send=0x00568CC0/48 recv=0x0056A200/12   (Init, once)
+[iop:mcserv-route] sid=0x80000400 rpc=0x1  send=0x00568CC0/48 recv=0x0056A200/4    (GetInfo, x4)
+```
+
+**The RPC does arrive and we do handle it.** Both prior hypotheses are dead: it is not
+"the request never reaches mcserv", and it is not "the reply never completes" (the end
+callback path at `RPC.cpp:2630` does invoke `endFunc`). The bug is the **reply layout**.
+
+**Ground truth — the game's own libmc, read from `decompiles_SLUS_214_42.txt`:**
+
+- `sceMcGetInfo @ EE 0x189E88` fills the shared 48-byte command struct at `0x568CC0` as
+  `+0x04 port`, `+0x08 slot`, `+0x0C wantFormat`, `+0x10 wantFree`, `+0x14 wantType`,
+  `+0x1C = EE address of a 192-byte result block`. It then calls RPC **1**, mode **1**
+  (NOWAIT), recv **4 bytes**, endFunc `0x189E30`, endParam = that same block.
+- `endFunc @ 0x189E30` ORs `0x20000000` onto the block and copies
+  **`+0x00`→type, `+0x04`→free, `+0x90`→format** into the caller's out-pointers.
+- `sceMcSync @ 0x189D68` returns `*0x56A200` (the 4-byte result) as the call's return value.
+
+**So the card info never travels in the recv buffer.** Our handler had three faults:
+
+1. `if (recvSize >= 12u)` — recvSize is **4**, so the branch never fired and we wrote
+   **nothing at all**, not even the result code. `sceMcSync` returned the stale Init reply.
+2. We never wrote the 192-byte result block, so type/free/format stayed whatever was there.
+3. Port/slot were read at `+0x00`/`+0x04`; GetInfo puts them at `+0x04`/`+0x08`. The struct
+   is shared across all commands, so `+0x00` held leftovers from a previous command.
+
+**Fix applied** in `ps2_iop_mcman.cpp` `case kRpcGetInfo:` — read port/slot/block from the
+real offsets, write the result code when `recvSize >= 4`, and write type/free/format into
+the result block at `+0x00`/`+0x04`/`+0x90`. Legacy inline triple kept only for the case
+where no block pointer is supplied. New trace line `[iop:mcserv] GetInfo …` (trace-gated).
+
+**Exit test for run 42:** `[iop:mcserv] GetInfo port=0 slot=0 block=0x……` with
+`type=2 free=8192 format=1 result=0`, and the dialog changes (`[present] nonblack` leaves
+its 64188/65140 two-value cycle).
+
+**Font side — checked, no blocker.** The glyph cache is generic, not per-dialog: `o5C=0x200`
+(512 slots) with `o2C=0x1d6` (470 free ⇒ 42 in use), `roles3` glyph draws climbing past 84k,
+one FFON sheet at `0x659400` (24×24 PSMT4) serving everything. The string buffer at
+`0x89E400` is already being rewritten in-run ("No memory card (" → "N    "), so the text
+path re-renders on demand. Nothing to pre-load; the next dialog's text simply is not
+requested until the card check passes.
+
+#### Stage 5.12.2 — RUN 40 RESULT (2026-08-10): the pad path works; the dialog gate does not open
+
+Built 08:38, run 08:40. **Every mechanical check in the exit test passed:**
+
+| Check | Result |
+|---|---|
+| `[pad] first push port=0 slot=0 buf=0x502e80 half=1 ctr=1 btns=0xffff` | ✅ (port 1 also opened, `buf=0x502f80`) |
+| X/Space held ⇒ `btns=0xbfff` (active-low `PAD_CROSS=0x4000`) | ✅ 30+ transitions, halves alternating, `ctr` advancing 597→779+ |
+| `[pad] cap: change log capped at 64` | ✅ cap line present, so the change record is *saturated*, not exhaustive |
+| `[iop:PADMAN]` still 4 records | ✅ modversion / init / portopen ×2 |
+| **X dismisses the memory-card dialog** | ❌ **NO** — user confirms no input bypasses the check |
+
+The screen never moved: `[present] nonblack` flat at **65140** across the whole run, and the last
+`[drawpath]` still reports the same panel (`boxat=1 bgat=0 glyphat=11`).
+
+**Conclusion: the pad fix is correct and is retained. It was necessary but not sufficient.** The
+gate is item 1 (memory card), which is almost certainly re-arming the dialog every frame regardless
+of input.
+
+⚠️ **Retracted mid-session:** an earlier read of run 40 concluded "no memory-card RPC ever reaches
+mcserv after Init." **That is not established.** Only `kRpcInit` (0xFE) has an *unconditional*
+log; `kRpcGetInfo` (0x01) and every other handled command are served **silently**, and both
+`[iop:mcserv] unhandled` and `[iop:mcserv-route]` are gated behind `PS2X_MCSERV_TRACE`. The single
+`[iop:mcserv] Init` record is therefore consistent with *either* "nothing else arrived" *or*
+"everything else arrived and was answered." Classic
+[[feedback_capped_probes_false_negatives]] — absence behind a gate is not a measurement.
+
+**What IS established for item 1 (static, no run needed):**
+
+- The game loads the real modules off the disc: `[iop:LOADFILE] path="cdrom0:\MCMAN.IRX;1"` and
+  `"cdrom0:\MCSERV.IRX;1"` (also SIO2MAN, LIBSD, CRI_ADXI, ARKD_DVD, PADMAN). Only ARKD is
+  actually executed; MCMAN/MCSERV are HLE'd.
+- Our SID matches: `IOP_SID_MCSERV = 0x80000400`, `IOP_SID_MCSERV_LEGACY = 0x80000080`
+  ([ps2_iop.h:15](ps2xRuntime/include/runtime/ps2_iop.h#L15)).
+- **If GetInfo reaches us we answer "healthy card":** `McPortState::formatted` defaults to `true`
+  ([MemoryCard_Internal.h:71](ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard_Internal.h#L71)), so
+  `kRpcGetInfo` replies `cardType=2 (PS2)`, `freeBlocks=0x2000`, `format=1`, `result=0` — far above
+  the 110 KB the game demands. So a *reaching-and-answered* GetInfo cannot by itself explain the
+  dialog; the failure would have to be in reply/completion delivery.
+- The `sceMc*` stubs in [Kernel/Stubs/MemoryCard.cpp](ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp)
+  are fully implemented **but are the same dead-code shape as `Kernel/Stubs/Pad.cpp`** if SDBZ
+  statically links its own libmc — which the MCSERV.IRX load strongly suggests it does. Not yet
+  confirmed.
+
+**Leading hypothesis (INFERRED, not measured — do not treat as fact):** structurally identical to
+the pad bug. Real libmc is asynchronous — `sceMcGetInfo` returns immediately and the game polls
+`sceMcSync` for completion. If our RPC reply never signals the guest's completion path, `sceMcSync`
+never reports done and the game falls back to "no card." Note `dispatchIopRpc` already carries a
+`signalNowaitCompletion` out-param, so the machinery partly exists.
+
+**NEXT STEP — zero-rebuild measurement.** `[iop:mcserv-route]` at
+[ps2_iop.cpp:69](ps2xRuntime/src/lib/ps2_iop.cpp#L69) logs sid + rpcNum for **every** mcserv RPC
+(cap 96) and is gated only on `PS2X_MCSERV_TRACE`. Re-run the *existing* exe with that env var set
+and read the RPC sequence. Only after that is it worth writing code.
+
+#### Stage 5.12.2 — pad input: root cause and the fix (written 2026-08-10, BUILT — see run 40 above)
+
+**Root cause: there was no input path to the guest at all.** Keyboard-vs-USB was never the
+variable.
+
+- [ps2_pad.cpp](ps2xRuntime/src/lib/ps2_pad.cpp) has a complete raylib keyboard + gamepad map,
+  but it is wired to [Kernel/Stubs/Pad.cpp:302](ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp#L302).
+  **SDBZ statically links its own libpad**, so it never calls our SDK stubs — that backend was
+  dead code for this game.
+- The guest's real path is guest libpad → SIF RPC → IOP `padman`. Our HLE in
+  [ps2_iop.cpp](ps2xRuntime/src/lib/ps2_iop.cpp) (sid `0x80000100`, rpcNum 1) answers
+  `0x12` modversion → `0x0400`, `0x10` init → 1, `0x1` portopen → 1. `run_log.txt` proves the
+  handshake completed: **4 records against a cap of 16**, so the absence of more is a real
+  measurement, not a truncation.
+- **Real padman pushes the per-frame pad state IOP→EE asynchronously on vsync**
+  (SIF CMD `0x80000019`). We never did. So the game's 256-byte pad buffer kept its
+  portopen-time init forever: `+96` length 0, `+112` state 5 (EXECCMD), `+113` reqState 2 (BUSY),
+  buttons `0xFF` ⇒ `scePadRead` returned 0 and every button read as released.
+
+**Dead end worth recording:** `0x187F68` is *not* a per-frame poll. Its only confirmed caller is
+`scePadSetActDirect @ 0x188B60` (vibration). There is therefore **no reliable per-frame EE→IOP DMA
+to hook** — the trigger had to be host-side. `registerFunction` is also unusable here: the game
+reaches `scePadRead` by `jal`, which the recompiler emits as a direct C++ `fn_` call that bypasses
+the dispatch registry ([[feedback_registerfunction_bypass]]).
+
+**libpad address table.** Every dump label is a misleading SDK-signature false positive — third
+occurrence of that failure mode after Stage 5.11's render path:
+
+| Address | Real role | `decompiles_SLUS_214_42.txt` label |
+|---|---|---|
+| `0x187ED8` | cmd `0x0F` sender | `fn_cond_call_00187ed8` |
+| `0x187F68` | request/actuator DMA sender | `mem_compare_unk` |
+| `0x188080` | `scePadPortOpen` | `module_obj_init_z_73` |
+| `0x188320` | internal half-picker + 128B copy | `mem_fill_z_24` |
+| `0x1884D0` | **`scePadRead`** | `mem_compare_unk_e` |
+| `0x188548` | **`scePadGetState`** | `mem_compare_unk_f` |
+| `0x1885F8` | `scePadSetReqState` | `fn_obj_exec_001885f8` |
+| `0x1886B0` | `scePadGetReqState` | `mem_compare_unk_g` |
+| `0x188B60` | `scePadSetActDirect` | `mem_compare_unk_j` |
+
+**Guest memory layout (decoded from the guest's own libpad, not guessed).** Pad table at EE
+`0x568990`, stride **112 B/port**, **28 B/slot**; entry = `0x568990 + port*112 + slot*28`:
+
+| Off | Meaning |
+|---|---|
+| `+0` | pointer to the game's 64-byte-aligned **256-byte** pad data buffer |
+| `+4` | 32-byte EE→IOP request buffer (`0x568A80 + port*128 + slot*32`) |
+| `+8` | IOP-side buffer address returned by portopen |
+| `+12` | pending DMA id |
+| `+16` | **open flag** (`== 1`) |
+
+The 256-byte buffer is **two 128-byte halves**. `0x188320` selects with
+`*(int*)(buf+88) < (__int64)*(int*)(buf+216)` — **strictly-less, so equal counters select half 0.**
+Within a half:
+
+| Off | Meaning |
+|---|---|
+| `+0..+31` | 32-byte pad status — exactly the format `PSPadBackend::readState` already emits |
+| `+88` | frame counter (signed `int`; picks the newer half) |
+| `+96` | data length (32); also `scePadRead`'s return value |
+| `+112` | state — **6 = PAD_STATE_STABLE** |
+| `+113` | reqState — **0 = COMPLETE, 2 = BUSY** |
+| `+114` | actuator ok flag (`scePadSetActDirect` needs `== 1`) |
+
+⚠️ **`scePadGetState` special-cases `state==6 && reqState==2` and returns 5 (EXECCMD).** Writing
+`+112 = 6` alone is NOT enough — `+113` must be cleared to 0 as well. This trap was caught by
+reading `0x188548` before building, not by a run cycle.
+
+**The fix — 2 `.cpp` files, 0 headers:**
+
+- [ps2_pad.cpp](ps2xRuntime/src/lib/ps2_pad.cpp) — new
+  `extern "C" void ps2x_pad_push_frame(uint8_t *rdram)`. Emulates one padman vsync push: walks
+  ports 0–1 × slots 0–3, skips any entry whose open flag ≠ 1, validates the buffer pointer
+  (non-zero, 64-byte aligned, `phys + 256 <= 0x02000000`), fills the **stale** half, then bumps
+  that half's `+88` counter to `max(c0,c1)+1` **last**, behind a
+  `std::atomic_thread_fence(release)` — the guest EE runs on a different host thread, so the flip
+  must be atomic from its point of view. Counter wraps at `0x40000000` (signed compare).
+  Port 0/slot 0 gets real host input; any *other* opened port gets a **valid but idle** pad rather
+  than being left in portopen's BUSY state, so a guest loop waiting for all opened pads to reach
+  STABLE cannot strand.
+- [ps2_runtime.cpp](ps2xRuntime/src/lib/ps2_runtime.cpp) — one call immediately after
+  `EndDrawing()` in `PS2Runtime::run()`, plus the matching `extern "C"` beside the existing
+  `ps2x_host_sampler_*` externs. **That site was chosen because `EndDrawing()` has just run
+  raylib's `PollInputEvents()` on that same thread** — the vblank tick in
+  `Kernel/Syscalls/Interrupt.cpp:642-662` is more faithful to padman's 60 Hz cadence but is a
+  different thread and would race raylib.
+
+**Probe:** tag `[pad]` — first-push records (cap 8) and button-change records (cap 64), each with
+its own `[cap]` line per [[feedback_capped_probes_false_negatives]].
+
+**Exit test (next session — START HERE):**
+
+1. `& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo` (user runs it; errors via
+   `Select-String -Path "F:\SDBZ Recomp\build_log.txt" -Pattern "error"`).
+2. Active Runner Command with `-Determinism 0`.
+3. In `run_log.txt` (**UTF-16**, `Select-String -Encoding unicode`):
+   - `[pad] first push port=0 slot=0 buf=0x… btns=0xFFFF` present ⇒ the table walk found an
+     opened port and the buffer pointer passed validation.
+   - Hold **X** or **Space** ⇒ `[pad] change … btns=0xBFFF` (PS2 buttons are **active-low**;
+     `PAD_CROSS = 0x4000`).
+   - `[iop:PADMAN]` record count still 4.
+4. **End-to-end: pressing X or Space dismisses the memory-card dialog.** That is the real gate;
+   the log lines only localise a failure if it doesn't.
+
+If `first push` never appears, the open flag at `+16` is not 1 — meaning portopen's EE-side
+bookkeeping never ran, which is a *different* bug from this one and should be triaged as such
+rather than by tweaking offsets.
+
+---
+
+## ★★★★★ 2026-08-09 (superseded by the closure above) — **The defect is a GS draw-ORDER inversion: the full-screen background paints over the dialog panel every frame.** Proved twice. Mechanism still being localised — the GIF arbiter has been tried and cleared.
+
+### ⛔ `[giford]` run 31 — ✅ RAN. **The GIF arbiter is EXONERATED. Do not reopen it.**
+
+```
+drains=4096 mixed=0 moved=0 maxbatch=1 p1=0 p2=3922 p3=87
+verdict=NO-MIXED-PATH-BATCH-the-sort-cannot-reorder-anything-so-look-elsewhere
+```
+
+All 7 records identical in shape. `maxbatch=1` — **every drain carries exactly one packet**, so the
+`stable_sort` in `GifArbiter::drain()` is a pass-through and cannot reorder anything, ever. The
+sort has been restored untouched; `PS2X_GIFNOSORT` is gone.
+
+The probe was built to be able to refute itself and did. Two facts worth keeping:
+
+- **`p1 = 0` always.** There is no PATH1/VU1 GIF traffic at all in this scene — everything is
+  PATH2 (VIF1) and PATH3 (GIF channel DMA), roughly 45 : 1 by packet count.
+- Draws reach the GS **one packet at a time, in submission order**. So the inversion is decided
+  strictly upstream of the arbiter.
+
+⚠️ My run-30→31 write-up called the arbiter sort the root cause on code-reading alone. It was
+wrong, and the measurement caught it. The *inversion* below is measured and stands; the
+*mechanism* was inferred and did not.
+
+### Where the mechanism must now be
+
+[ps2_memory.cpp:1847](ps2xRuntime/src/lib/ps2_memory.cpp#L1847) `processPendingTransfers()` drains
+three separate pending lists in a **hard-coded channel order — GIF, then VIF0, then VIF1** — not in
+the order the guest kicked them. Whichever channel carries the background, that fixed order decides
+whether it lands before or after the box group.
+
+The one link never measured is **which path each sprite rides**. Run 32 measures it.
+
+### `[pixlog]` run 30 — ✅ RAN. Verdict `FETCH-IS-DEGENERATE` on every record, but the verdict was aimed at the wrong question.
+
+Run 30 named the run-29 "third party" black sprite by its texture identity. All records, both
+latch points (`pt=0` at 25,308 and `pt=1` at 147,308), both buffers, agreed exactly:
+
+| field | value | decode |
+|---|---|---|
+| `blktfmt` | `0x100413` | psm **0x13 = PSMT8**, tbw **4**, tfx 0 MODULATE, tcc 1, cpsm 0 |
+| `blktbp0` | `0x2A80` / `0x2A60` | two alternating VRAM allocations |
+| `blkcbp` | `0x2A48` / `0x2A44` | ditto |
+| `blktexel` | `0x80000000` | opaque black **as fetched, before blending** |
+| `blkval` | `0x80000000` | stored |
+| `blkalpha` | `0x44` | `(Cs−Cd)·As/128 + Cd`, As = 128 ⇒ source wins outright |
+
+The blender is exonerated again: at `pt=1` the glyph fetches `0x6affffff` and stores `0x6ad3d3d2`
+— (255−0)·106/128 = 211 = `0xd3`. Exact.
+
+⚠️ **The `FETCH-IS-DEGENERATE` verdict is misleading and must not be inherited.** It only asked
+"is the texel black before blending". It is — but a full-screen menu backdrop being black at two
+sample points is perfectly ordinary. The verdict ladder had no branch for *"this draw is fine and
+merely happening at the wrong time"*, which is what the free dump analysis then proved.
+
+### ★★★★ The actual defect — draw ORDER, proved twice from data already on disk (no build, no run)
+
+`dump.jsonl` frame 0 draw order is unambiguous, and identical in all 4 frames:
+
+```
+seq 0x0  clear        prim 0x6 tme=0                      0,0-512,448
+seq 0x1  BACKGROUND   psm 0x13 tbw 4 256x256  tbp0 0x2A00   0,0-512,448
+seq 0x2  box body     psm 0x13 tbw 2 128x128  tbp0 0x2B20  24,302-488,422
+seq 0x3-0xA  8 border strips (same texture)
+seq 0xB+ 128 glyphs   psm 0x14 tbw 4          tbp0 0x2B60
+```
+
+`live.jsonl` frame 250, normalized by −1792,−1824 (XYOFFSET), same sprites by *rect*:
+
+| live seq | rect | = dump seq |
+|---|---|---|
+| 203E | 0,0–512,448 clear | 0x0 |
+| 203F–2046 | 8 border strips | 0x3–0xA |
+| 2047 | 24,302–488,422 **box body** | 0x2 |
+| 2048 | 0,0–512,448 **background** | 0x1 |
+| 2049+ | 147 glyphs | 0xB+ |
+
+**The background moves from position 1 to position 11 — behind the entire dialog box group.**
+
+- **100 / 100** live dialog frames have background AFTER box. **4 / 4** dump frames have it BEFORE.
+  Perfectly deterministic; not a race, not a sampling artifact.
+- Confirmed by a **second, independent instrument**: `[pixlog]` measures the store order at the
+  pixel and sees `clear → box(maroon) → background(opaque black) → glyph(white)`. The debug-history
+  ring and the rasterizer agree.
+- Census matches otherwise: 1 clear / 9 box / 1 background / N glyphs on both sides.
+- `TEST` matches (`0x3000F` on 7.2% of dump draws, 7.3% of live). `alpha` is a single constant on
+  **both** sides (dump `0x0`, live `0x44`) ⇒ **not measured**, not a divergence — see the plan's
+  degenerate-column rule.
+- Tool cleared: `gsdump_draws.py` appends in stream order with `enumerate` for `seq`; no sort.
+
+**This alone explains the symptom.** The maroon dialog panel is painted, then the full-screen
+backdrop paints over it, then the glyphs land on top. VRAM ends every frame with white text on a
+black rectangle — which is exactly what run 29/30 measured.
+
+### ★★★★ Mechanism — `GifArbiter::drain()` retroactively sorts the batch
+
+[ps2_gif_arbiter.cpp:40-52](ps2xRuntime/src/lib/ps2_gif_arbiter.cpp#L40-L52):
+
+```cpp
+void GifArbiter::drain() {
+    std::stable_sort(m_queue.begin(), m_queue.end(), ...pathPriority(a) < pathPriority(b));
+    for (...) m_processFn(...);
+}
+```
+
+`pathPriority(id) = (uint8_t)id`, and `Path1=1, Path2=2, Path3=3` — so **every Path3 packet is
+moved behind every Path1/Path2 packet queued in the same batch**.
+
+The queue accumulates because the two submitters disagree about draining:
+
+| submitter | path | `drainImmediately` |
+|---|---|---|
+| [ps2_memory.cpp:1857,1886,1905](ps2xRuntime/src/lib/ps2_memory.cpp#L1857) GIF-channel chain | **Path3** | **false** → sits in the queue |
+| [ps2_vif1_interpreter.cpp:439,649](ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp#L439) VIF1 | **Path2** | **true** → triggers the drain |
+
+So a Path3 background queued *first* is drained *after* the Path2 box sprites that followed it.
+
+**Why this is wrong on its own terms:** real GIF arbitration is an instantaneous tie-break at a
+transfer boundary — it decides which path acquires the bus *next* when several request it at once.
+It never reorders transfers that have already been handed over. Submission order already encodes
+the real-time interleaving; the sort destroys it.
+
+⚠️ **Still inferred, not measured:** that the background sprite specifically arrives on Path3.
+Run 31 proves or kills that link rather than assuming it.
+
+### ⛔ `[drawpath]` run 32 — ✅ RAN. **Every draw is `path=2`. The DMA channel theory is DEAD too.**
+
+```
+i=0..8   role=1 path=2  8x120, 8x8 x3, 8x120, 8x8, 464x8 x2, 464x120   tbp0=0x2a00
+i=9      role=9 path=2  16x15                                          tbp0=0x2a60   (some frames)
+i=9/10   role=2 path=2  512x448  BACKGROUND                            tbp0=0x2a60/0x2a80
+i=10/11+ role=3 path=2  17x17 glyphs                                   tbp0=0x2b60/0x2b80
+verdict=BOX-FIRST-ON-THE-SAME-PATH-so-the-guest-itself-submits-in-this-order
+```
+
+- **No PATH3 traffic at all** in these frames ⇒ the fixed GIF→VIF0→VIF1 drain order in
+  `processPendingTransfers()` is irrelevant here. ⛔ Do not reopen it.
+- Counters are exact: `roles1` +540, `roles2` +60, `roles3` +8820 per record ⇒ **60 frames per
+  record, 9 box + 1 background + 147 glyphs per frame**. Matches `live.jsonl` exactly.
+- Gates validated by span: `464x120` body, `8x120`/`464x8`/`8x8` borders, `512x448` background,
+  `17x17` glyphs. The roles are measuring what they claim.
+- The `16x15` `role=9` sprite also appears in the 165015 PCSX2 dump — the captures are comparable.
+
+**Order is per-frame `box×9 → background → glyphs`, with no glyph before the background.** If the
+true order were background-first, that subsequence would be impossible. The inversion is real and
+sits upstream of every runtime layer tested so far.
+
+### ⛔ Depth-sort hypothesis — DEAD, refuted for free from the dump (no build, no run)
+
+Extracted per-draw Z straight from the PCSX2 dumps via `gsdump_draws`' own parser
+(scratchpad `dumpz.py`):
+
+| draw | Z |
+|---|---|
+| clear, **background**, box body, all 8 borders | **0** |
+| glyphs | 8388500 |
+
+All the background/box sprites share `Z = 0`, and `ZTST = ALWAYS` on every draw — nothing is
+depth-tested or depth-sorted. Order is pure submission order. ⛔ Do not revisit Z.
+
+### Exact permutation, by rect (not by size — sizes are ambiguous, four 8x8s are interchangeable)
+
+Live frame 250 in dump-index terms: **`[3, 9, 7, 8, 4, 10, 5, 6, 2, 1]`** vs dump `[1..10]`.
+Background goes **first → last**; the 9-slice is regrouped into pairs
+(right+top-right, bottom-left+bottom-right, left+top-left, top+bottom, body+background).
+Close to a reversal but *not* an exact one, so a simple list-walk-backwards is not sufficient
+explanation on its own.
+
+### ★★★ 2026-08-09 — PCSX2 EE-side ground truth: the guest's chain is background-first
+
+Measured live against a running PCSX2 (DebugServer + Pine, SDBZ paused on the memory-card dialog),
+**not** from a GS dump. Method: `find_pattern` for the box body's first `XYZ2` word.
+
+- XYOFFSET is **(1792, 1824)** on PCSX2 — identical to our live run, so the assumption we have been
+  normalising with is confirmed against the real machine.
+- Box body first vertex `x=0x7180 y=0x84E0` → 4 hits, two double-buffered display lists 0x64000 apart.
+- **Each DMA chain link is exactly one sprite**: GIFtag(NLOOP=1,NREG=1,A+D) → `PRIM=0x56`
+  (SPRITE|TME|ABE) → GIFtag(NLOOP=2,NREG=3,REGLIST,{RGBAQ,ST,XYZ2}) → 2 vertices. 6 qwords + 1 tag.
+- **Address order IS chain order** — DMAtag at `0x00771a60` decodes `QWC=6 ID=2(next) ADDR=0x00771ad0`,
+  and every subsequent tag links strictly ascending.
+
+Ordered layout of the dialog frame in EE RAM:
+
+| link addr | sprite |
+|---|---|
+| `0x00771470` | full-screen clear, untextured |
+| `0x007717d0` | **background 512×448** (v0 = `0x7000/0x7200` at +0x40) |
+| `0x00771a00` | **box body 464×120 @ (24,302)** (v0 = `0x7180/0x84E0` at +0x40) |
+| `0x00771a70` … `0x00771bc0` | the 8×120 / 464×8 borders |
+
+⇒ **The guest's own source chain puts the background before the box.** This is now established from
+the guest's input data, independently of the GS dump that showed the same order at the output.
+
+Sprite-link header signature for future searches:
+`01 80 00 00 00 00 00 10 0E 00 00 00 00 00 00 00`; within a link, `XYZ2` v0 is at **+0x40** and
+v1 at **+0x58**. Note the untextured clear does *not* match this pattern (different NREG), so its
+absence from a hit list is expected, not a miss.
+
+⚠️ `read_memory` on `0x10009000` (D1 CHCR/MADR/QWC/TADR) returned all zeros — the MCP does not map
+EE hardware registers. Do not read DMA channel state that way; walk the tags in RAM instead.
+
+### ★★★ 2026-08-09 — run 34 RESULTS — **the defect is on the EE side.** GS/DMA layer closed
+
+`[drawsrc]` ran. 20 records, 20 emits, no `[cap]`. Unanimous:
+
+```
+[drawsrc] bodyat=8 bodysrc=0x7d5b50 bgat=10 bgsrc=0x7d5fb0 pcsx2bg=0x7d57d0 pcsx2body=0x7d5a00
+[drawsrc] verdict=GUEST-CHAIN-IS-INVERTED-...-the-bug-is-on-the-ee-side
+```
+
+| | background link | box body link | order |
+|---|---|---|---|
+| **PCSX2** | `0x7d57d0` | `0x7d5a00` | bg **before** body ✅ |
+| **live** | `0x7d5fb0` | `0x7d5b50` | bg **after** body ❌ |
+
+18 of 20 records are buffer B; 2 read `0x771b50`/`0x771fb0` — buffer A, the `−0x64000` twin.
+Both buffers show the same inversion, so this is a property of **the builder**, not of one buffer.
+
+**What this closes.** Combined with run 33's `BOX-FIRST-SAME-PATH-SAME-SITE`, every layer below the
+guest is now exonerated: GIF arbiter, DMA channel drain order, VIF1 submit-site divergence, and now
+the chain walk itself. Our runtime transports the display list **faithfully**. The recompiled EE
+code hands it a list that is already in the wrong order.
+
+⛔ Do not reopen the GS/DMA/VIF transport path for this defect.
+
+**The remaining question is one level up:** which guest function fills the sprite-link slots, and
+why does it assign the background a later slot than PCSX2 does. Both runs lay links out at a strict
+`0x70` stride and both walk ascending — only the *contents* of each slot differ. Sprites are
+identical in geometry and format and merely permuted (`[3,9,7,8,4,10,5,6,2,1]` vs `[1..10]`), which
+reads far more like a **sort with a bad key/comparator** than like a broken linked list. Unproven —
+name the function first.
+
+**Static grep is a dead end here** (checked): `decompiles_SLUS_214_42.txt` contains no literal
+`0x771xxx`/`0x7d5xxx`/`0x64000` — the buffers are allocated dynamically, so the builder cannot be
+found by searching for its destination address.
+
+### 2026-08-09 — run 35: HWWATCH the misplaced link. **No new probe code, no plumbing**
+
+Per `feedback_hardware_data_breakpoint`, "who wrote X to Y" goes to DR0, not to greps. The
+machinery in `game_overrides.cpp` is already fully env-driven — `PS2X_HWWATCH_ADDR` arms DR0 on a
+fixed guest address from the traced-slot wrapper, which is the one site guaranteed to run in a
+MainMenu-only session. Target `0x7d5fb0`: the slot the background **actually** landed in. Whoever
+stores there is the builder that decided the background goes last.
+
+Two edits to `game_overrides.cpp`, both about not letting the probe lie:
+
+| edit | why |
+|---|---|
+| `kHwWatchMaxHits` 64 → **2048** | it is a **hard cap, not a ring**. The builder rewrites this slot every frame; the dialog is frames ~199–299. At 64 the dump would have contained only boot-time writers and reported them with total confidence. |
+| `HWSTAT` heartbeat gains `seen` + `drop` | `drop = seen − hits` is how much of the run is invisible. Per `feedback_capped_probes_false_negatives`, a saturated probe must convict itself instead of looking like "it never happened". |
+
+**Reading contract.** `hits>0` → `.hwwatch.txt` backtraces name the producer; a single consistent
+writer across the hits is the display-list builder. `hits=0, skipped>0` → stores land but the value
+filter ate them; re-run with `PS2X_HWWATCH_VAL=0xFFFFFFFF` (which run 35 already sets). `hits=0 AND
+skipped=0` → nothing ever writes that address, meaning the resolved source address is wrong and the
+probe is at fault, not the runtime. **`drop>0` invalidates the absence of any writer from the list.**
+
+⚠️ HWWATCH costs ~19s CPU in a 96s run (~20% wall clock). Diagnostic only — do not read timing off
+this run, and leave `PS2X_HWWATCH` unset afterwards.
+
+### ★★★ 2026-08-09 — run 33 RESULTS + `[drawsrc]` run 34 — narrowing to one address comparison
+
+**Run 33 ran. Both probes returned data, 9 emits, no `[cap]`.**
+
+`[drawpath]` returned `BOX-FIRST-SAME-PATH-SAME-SITE` on **every** emit — same PATH2, same submit
+site (2 = the VIF1 DIRECT path) for box, background and glyphs. So neither the GIF arbiter, the
+channel drain order, nor our two VIF1 submit sites can be reordering anything: everything arrives
+by one route.
+
+Also read off run 33, and it corrects a working assumption: the **464×120 box body is `i=8`, the
+LAST of the nine role-1 draws** — the eight borders come first. Earlier notes had the body first.
+
+`[chainord]` returned `CHAIN-WALK-NOT-MONOTONIC`, **and that verdict was wrong** — a probe defect,
+not a finding. The chain walks strictly forward at a 0x70 stride
+(`0x7d5840, 0x7d58b0, … 0x7d5bc0`); the 4–6 "descending" steps are all REF tags jumping to their
+texture payloads (`0xa21800` qwc=4096 = the 64KB background texture, `0xa21400` qwc=64 = its 1KB
+CLUT, `0x8a6440` qwc=2048). A `ref` tag is one qword, so the chain resumes 0x10 later — e.g.
+`0x7d5c30` (qwc=0, a tag) → `0xa21800` (the payload) → `0x7d5c40` (the next link). Counting raw
+address deltas called that backwards. Verdict retired in run 34.
+
+Addresses are the same list PCSX2 showed, in the **buffer-B** copy (`+0x64000`): our
+`0x7d5840…0x7d5bc0` = PCSX2's `0x771840…0x771bc0`.
+
+**What run 33 could not settle.** The 64-entry ring held only the *tail* of a ~5,520-append frame,
+so the background link fell outside the window, and matching the nine role-1 draws onto the nine
+sprite links required assuming the Nth draw came from the Nth link. That is a positional guess of
+exactly the kind [[feedback_probe_gate_on_shape_not_address]] warns about, and the two candidate
+readings disagree about which layer is at fault — so it must not be guessed.
+
+**Run 34 removes the guess.** Every GS draw now carries the EE address it was read from:
+
+| file | change |
+|---|---|
+| `ps2_gif_arbiter.cpp` | new `ps2diag_gifpath::g_curSrc` |
+| `ps2_memory.cpp` | ring 64 → **1024**; new `ps2diag_chainord::resolveSrc(pos)` maps a byte offset in the gathered buffer back to its EE address |
+| `ps2_vif1_interpreter.cpp` | `dsSrcAt(pos)` — exact arithmetic when the buffer is EE RAM, ring lookup when it is a gathered copy; published at both submit sites |
+| `ps2_gs_rasterizer.cpp` | `g_dpSrc[kDpRing]` recorded per draw |
+| `ps2_gs_gpu.cpp` | `src=0x…` on every `[drawpath] i=` line, plus a new `[drawsrc]` summary |
+
+The box body is picked out **by shape** (`464×120`), not by position in the role-1 run.
+
+| `[drawsrc] verdict=` | meaning |
+|---|---|
+| `GUEST-CHAIN-IS-CORRECT-…` (`bgsrc < bodysrc`) | chain order matches PCSX2; something **downstream** reorders → our runtime, our fix |
+| `GUEST-CHAIN-IS-INVERTED-…` (`bgsrc > bodysrc`) | our recompiled **EE code** built a different display list → the bug is on the EE side |
+| `UNRESOLVED-…` | one of the two draws carries no address; the lookup is broken, not the runtime |
+
+Reference values printed on the line: `pcsx2bg=0x7d57d0 pcsx2body=0x7d5a00`.
+
+### ★★★ 2026-08-09 — `[chainord]` run 33 addition — our walk vs theirs
+
+Folded into the same build as run 33. `ps2diag_chainord` (defined in `ps2_memory.cpp`) records the
+`srcAddr` / `qwc` / gathered-offset of every chunk our VIF1 source-chain gather appends
+(`appendData`, ps2_memory.cpp:1501), in a 64-entry ring. `ps2_gs_gpu.cpp` snapshots it **at the
+`[drawpath]` emit site**, so both windows describe the same frame — deliberately not gated on any
+address.
+
+| verdict | meaning |
+|---|---|
+| `CHAIN-WALK-ASCENDING-…` | our gather matches PCSX2; the inversion is introduced **downstream** of the gather (VIF1 interpreter / arbiter / rasterizer) — our bug, ours to fix |
+| `CHAIN-WALK-NOT-MONOTONIC-…` | we visit links out of order, or the recompiled guest built a different chain; compare the `addr=` values to `0x7717d0` and `0x771a00` |
+| `DEGENERATE-EVERY-CHUNK-SAME-ADDRESS-…` | probe is wrong, not the runtime |
+| `NO-CHAIN-CHUNKS-IN-WINDOW-…` | VIF1 was fed by some path other than the chain gather |
+
+This is a **more direct** test than Fork A's submit-site stamping — it compares EE addresses against
+a known-good reference rather than inferring a culprit from which call site fired. Both ship in one
+build; read `[chainord]` first.
+
+### ★★★ 2026-08-09 — `[drawpath]` run 33 (written, not yet run) — the last fork, plus a causality test
+
+**Fork A — who reorders?** Everything is PATH2, but there are *two* `submitGifPacket(Path2, …)`
+call sites in the VIF1 interpreter. `ps2diag_gifpath::g_curSite` now stamps which one carried each
+packet (1 = image/unpack path, 2 = DIRECT, 8 = DIRECTHL). Run 31 proved drain is synchronous with
+submit, so a plain global is current at draw time.
+
+| new verdict | meaning |
+|---|---|
+| `BOX-FIRST-AND-SUBMIT-SITES-DIFFER` | **our VIF1 layer reorders** — a runtime bug, fixable here |
+| `BOX-FIRST-SAME-PATH-SAME-SITE` | **the guest itself submits background-last** — a recompiled-code divergence, and the next step becomes RE of the guest's sprite emitter |
+
+**Fork B — is the order the whole story?** `PS2X_SKIPBG=1` drops the full-screen background sprite
+entirely (one `thread_local` test at the top of `writePixel`, off by default). It is **not a fix** —
+it deliberately leaves the rest of the screen with no backdrop. Its only job: with the background
+gone, the dialog must come back as a **maroon panel with legible white text**. If it does not, a
+second fault exists downstream and the whole order investigation was only half the bug.
+
+### 2026-08-09 — `[drawpath]` run 32 design (superseded by the result above) — stamp every draw with its DMA path
+
+`ps2_gif_arbiter.cpp` publishes `ps2diag_gifpath::g_curPath` around each `m_processFn` dispatch;
+the rasterizer stamps it onto every textured sprite at the existing shape-gate site. No header
+touched — the extern is declared locally in each `.cpp`.
+
+Roles are **texture identity only**, no address and no rect constant, so a sprite that moves or
+resizes is still classified. Span is recorded alongside, so a mis-shaped role convicts the gate
+instead of quietly reporting about the wrong sprite:
+
+| role | gate | expected |
+|---|---|---|
+| 1 | PSMT8, tbw 2 | box body + its 8 border strips |
+| 2 | PSMT8, tbw 4 | full-screen background |
+| 3 | PSMT4, tbw 4 | glyph atlas |
+| 9 | any other textured sprite | — |
+
+Capture window is **one frame**, opened by the glyph→box role transition (shape-derived, so it
+needs no present hook or frame counter) and closed after 16 draws — enough for 9 box + background
++ 6 glyphs.
+
+Output: a census line, 16 `i= role= path= span= tbp0=` lines in submission order, then a verdict.
+
+| verdict | meaning |
+|---|---|
+| `BACKGROUND-FIRST` | this frame is ordered correctly — the inversion is intermittent after all |
+| `BOX-FIRST-AND-PATHS-DIFFER` | **the fixed GIF→VIF0→VIF1 drain order is the cause**; read `boxpath`/`bgpath` |
+| `BOX-FIRST-ON-THE-SAME-PATH` | the DMA layer is innocent — the guest itself submits in this order, which is a much deeper problem |
+| `NO-BACKGROUND-IN-WINDOW` / `NO-BOX-IN-WINDOW` | the role gate is wrong — fix the probe, not the runtime |
+
+### 2026-08-09 — `[giford]` run 31 design (superseded by the result above) — convict or clear the sort
+
+All in [ps2_gif_arbiter.cpp](ps2xRuntime/src/lib/ps2_gif_arbiter.cpp), no header touched.
+Snapshots the batch's path sequence **before** and **after** the sort, so the probe can refute
+itself: a batch that was never mixed, or a sort that never moved anything, clears the hypothesis.
+
+Fields (`[giford]`, two lines per 4096 drains):
+
+- `drains= mixed= moved= maxbatch= p1= p2= p3=` — `mixed` counts batches holding Path3 *and*
+  non-Path3 (the only case the sort can matter); `moved` counts batches the sort actually changed.
+- `lastmixedn= firstp3pre= firstp3post= seqpre= seqpost= nosort=` — the most recent mixed batch's
+  path sequence as digits (e.g. `32222` → `22223`), truncated to 24 chars, bracket-free.
+
+Verdict ladder:
+
+| verdict | meaning |
+|---|---|
+| `NO-MIXED-PATH-BATCH` | sort cannot reorder anything — **hypothesis dead**, look elsewhere |
+| `SORT-IS-A-NOOP` | batches already in priority order — **hypothesis dead** |
+| `SORT-DEMOTES-PATH3` | `firstp3pre < firstp3post` — **convicted**, see `seqpre` vs `seqpost` |
+| `SORT-REORDERS-but-not-by-demoting-path3` | real reorder, different shape — read the sequences |
+
+**`PS2X_GIFNOSORT=1` skips the sort entirely** — the candidate fix, env-gated so ONE build gives
+both the evidence run and the A/B run. With it set the probe still records, and `moved` must drop
+to 0; if it does not, something else reorders too.
+
+## ★★★★ 2026-08-08 — live-vs-dump diff rebuilt on FORMAT+GEOMETRY. The live path draws the dialog correctly; the only divergence is CLUT **allocation**.
+
+### The old diff's headline was an artifact, not a finding
+
+The first `gsdump_diff.py` report said the live path "never emits" 3 of the dump's 4 TEX0/CLUT
+combos and flagged `alpha dump=0x0 live=0x44` as a divergence. **Both claims were tool defects.**
+Four of them, each a textbook instance of a probe-discipline rule already in memory:
+
+| Defect | Effect | Fix |
+|---|---|---|
+| `tbp0`/`cbp` inside the bucket key | any VRAM-allocation difference shatters every bucket → false "live never emits this" | key on **format** `(prim,tme,psm,tbw,tw,th)`; addresses reported *inside* a bucket |
+| `x0/y0/x1/y1` captured, never used | the strongest signal was invisible | XYOFFSET auto-normalized, bbox histograms compared |
+| no frame alignment | 4-frame dump vs 301-frame live compared in aggregate; window chosen by trial-and-error `PS2X_GSHISTORY_FRAMES` tuning | `--align` (default on) scores every live frame's format census against the dump's |
+| no degenerate-column guard | `alpha` is a single constant on **both** sides (dump `0x0` ×556, live `0x44` ×16185) — provably unmeasured, reported as a divergence | constant columns listed under **NOT MEASURED** |
+
+Also: `records[0]` was compared instead of the whole bucket, and `tme=0` draws were keyed on
+**stale TEX0 register contents**, splitting identical untextured draws apart.
+
+`PS2X_GSHISTORY_FRAMES` never needs tuning again — window selection moved from the expensive
+side (a game run) to the cheap side (Python).
+
+### What the rebuilt tool actually reports
+
+`python build_scripts/gsdump_diff.py dump.jsonl live.jsonl` → auto-aligns to live frame 230,
+**4 matched buckets / 0 dump-only / 0 live-only**:
+
+```
+[MATCH] prim=0x6 tme=0x1 psm=0x14 tbw=0x4 256x256      <- PSMT4 glyph atlas
+    draws        dump=128      live=147
+    tbp0         dump=0x2B60   live=0x2B60   same
+    cbp          dump=0x2B08   live=0x2A48   REMAPPED  d=-0xC0
+    bbox sizes   dump=17x17:128  live=17x17:147   identical
+```
+
+| role | dump frame 0 | live frame 249 |
+|---|---|---|
+| glyph atlas 256×256 psm 0x14 tbw 4 | tbp0=**0x2B60** cbp=0x2B08 ×128 | tbp0=**0x2B60** cbp=0x2A48 ×147 |
+| 128×128 psm 0x13 tbw 2 | tbp0=0x2B20 cbp=0x2B04 ×9 | tbp0=0x2A00 cbp=0x2A40 ×9 |
+| 256×256 psm 0x13 tbw 4 | tbp0=0x2A00 cbp=0x2B00 ×1 | tbp0=0x2A60 cbp=0x2A44 ×1 |
+| **dialog box rect** | **464×120 @ (24,302)** | **464×120 @ (24,302)** |
+
+`--find-rect 464 120` locates the dialog on **both** sides at normalized `(24,302)` — dump
+frames 0..3, live frames 199..299. Same formats, same per-role draw counts (9v9, 1v1), same
+17×17 glyph cell, pixel-identical screen rect.
+
+**The live EE path emits the dialog with the right formats, right counts, right geometry. The
+only real divergence is where the CLUTs live in VRAM** — a constant ≈0xC0-block shift, expected
+because the two runs reached the screen by different paths and the game allocates VRAM
+dynamically. ⛔ Cross-run CLUT *address* equality is not a valid test and must not be cited as
+a finding again.
+
+### Upstream check — nothing waiting upstream fixes this
+
+Upstream `main` carries three headers we lack: `ps2_gs_psmt4.h`, `ps2_gs_psmt8.h`,
+`ps2_gs_psmct32.h` — exactly the formats the failing draws use. Extracted and swept against ours:
+
+- All four swizzle tables **byte-identical** to `BlockTableP4`/`ColumnTable4`/`BlockTableP8`/
+  `ColumnTable8` at `ps2xRuntime/src/lib/ps2_gs_memory.cpp:111-194` (32/512/32/256 values each).
+- Address math (`ps2xRuntime/include/runtime/ps2_gs_memory.h:368-437`, the
+  `PageId`/`BlockId`/`ColumnId`/`Address` composition) vs upstream's closed-form
+  `addrPSMT4`/`addrPSMT8`: swept bw 0–8, bp ∈ {0,31,32,33,0x2A00,0x2B20,0x2B60,0x2B80}, x/y to 256.
+  - PSMT4 14976/138528 mismatches, PSMT8 22464/138528 — **exclusively at tbw ∈ {0,1}**.
+  - **0 mismatches at tbw=2 or tbw=4** — the only widths the memory-card draws use.
+- Root cause of the tbw≤1 divergence: our `PageId` computes `(bw*64)/page_extent.x` with **no
+  clamp**, where upstream uses `pagesPerRow = (width>>1) ? (width>>1) : 1`.
+
+**Verdict: a real but latent edge-case bug in our address math, NOT the Stage 5.11 blocker.**
+Our current issue is not already fixed upstream. PR #132 (GS rasterizer rework) stays deferred
+on its own merits.
+
+### `gsdump_diff.py` CLI as it now stands
+
+```
+python build_scripts/gsdump_diff.py dump.jsonl live.jsonl [options]
+  --dump-frame N / --live-frame N   pin a frame instead of auto-aligning
+  --all-frames                      compare whole files (old aggregate behaviour)
+  --xyoffset auto|none|X,Y          default auto: subtract each side's own min x0/y0
+  --find-rect W H                   locate draws by SHAPE on both sides, no address needed
+  --top N                           how many alignment candidates to print
+```
+
+### CLUT *config* is identical too — only the base moved
+
+Pulled straight from the JSONL for the `psm=0x14 tbw=4` atlas bucket:
+
+| field | dump frame 0 | live frame 249 |
+|---|---|---|
+| `cpsm` / `csm` / `csa` / `cld` | `0x0` / `0x0` / `0x0` / `0x2` | `0x0` / `0x0` / `0x0` / `0x2` **identical** |
+| `test` | `0x30003` | `0x30003` **identical** |
+| textured glyph draws (`tme=1`) | 128 | 147 |
+
+So the live atlas draw asks for a CT32 palette, CSM1, csa=0, cld=2 — exactly like the authentic
+dump. Only `cbp` moved. (The lone live `abe=0` draw in that psm/tbw slice is the `tme=0`
+512×448 backdrop carrying **stale TEX0**; `key_of` already collapses it. Not a divergence.)
+
+### ★ NEXT — the one question this leaves open
+
+**Is the LIVE CLUT self-consistent?** Does the palette data at live `cbp=0x2A48` correctly serve
+the atlas at `tbp0=0x2B60`? Intra-run question; needs a C++ probe + rebuild.
+
+Plan written: `C:\Users\mwlab\.claude\plans\stage511-live-clut-self-consistency.md` —
+`[clutlive]` probe, one file (`ps2_gs_gpu.cpp`), no header edit, gated on the atlas *format*
+signature (`tme=1 psm=0x14 tbw=4 256×256`), never on `cbp`.
+
+Its core experiment: emit `cache0_15` (the 16 words `ReadClutCache` will hand the sampler) beside
+`vram0_15` (the same 16 words re-read from VRAM at draw time with the identical CSM1 scatter).
+Same data, two read times — they agree iff the cache is fresh.
+
+⛔ Must not re-litigate the CLUT read chain (closed below). This targets the live run's palette
+at `0x2A48` and its load *timing*, which the read-chain proof does not cover.
+
+### ★★★ Dump-side ground truth extracted (2026-08-08, free — no build). Hypothesis ranking CHANGED.
+
+Ran `gsdump_draws.py --uploads` + a frame-0 event-order trace on
+`snaps/...SLUS-21442_20260808165007.gs.zst`. Two results:
+
+**1. Upload PRECEDES TEX0 — the stale-cache hypothesis is DEMOTED.**
+
+```
+ 18  BITBLTBUF  dbp=0x2B60 dbw=4 dpsm=0x14     <- glyph atlas (T4)
+ 19  BITBLTBUF  dbp=0x2B08 dbw=1 dpsm=0x00     <- its palette (CT32, 8x2 = 16 words)
+ 20  TEX0_1     tbp0=0x2B60 tbw=4 psm=0x14 256x256 cbp=0x2B08 cpsm=0 csm=0 csa=0 cld=2
+ 21  draws      +28 (total 39)     [TEX0 re-written identically at 22/24/26: +36/+32/+32]
+```
+
+The palette is in VRAM before the TEX0 write consumes it. Our eager reload-on-TEX0-write is
+correctly ordered for this pattern.
+
+**2. ★ The glyph palette is an ALPHA COVERAGE RAMP, not colours.** All 16 entries are
+RGB = (255,255,255) **white**; only alpha varies, linearly `0, 8, 17, 25, 34, 42, 51, 59, 68, 76,
+85, 93, 102, 110, 119, 128`. Entry 0 is `0x00000000`, fully transparent. `nonblack = 15/16`.
+
+What this implies:
+
+- The T4 index is an **antialiasing coverage level**, not a colour index. Text is white, composited
+  over the maroon box by alpha blend.
+- Max alpha `0x80 = 128` is **1.0 on PS2** (alpha is 0..128, not 0..255). Treating it as 0..255
+  halves text opacity.
+- **Index 0 is fully transparent** → a degenerate T4 fetch returning 0 everywhere makes the text
+  100% invisible and leaves a flat maroon box. That *is* the red-box symptom.
+- Live `alpha=0x44` decodes to A=Cs, B=Cd, C=As, D=Cd → `(Cs-Cd)*As + Cd`, the **standard, correct**
+  alpha blend. The blend equation is exonerated; what matters is `As` and the index feeding it.
+
+**Revised ranking:** (1) degenerate T4 index fetch → coverage all 0 → invisible text;
+(2) alpha scale 0..128 vs 0..255; (3) stale cache (demoted). `idxhist16` is now the probe's
+**primary** field, and the 16 words above are an exact expected value for `cache0_15`.
+
+### ★★★ `[clutlive]` round 2 RAN (2026-08-08). **The CLUT is fully exonerated.**
+
+131 records. At-write snapshot (not present-time), so this answers "what did *that* draw sample".
+
+```
+atw white=2932  black=0  other=0  sum=2932  hits=2932
+firstblack none (no all-black palette was ever sampled at an atlas TEX0 write)
+cbpcensus slots=2/4  0x2a4cx1444  0x2a48x1488
+atwrite0_15=0x0,0x8ffffff,...,0x80ffffff   <- correct white coverage ramp, every sample
+```
+
+- `white == hits` exactly, `black == other == 0`, on **every** substantive sample. This is the
+  pre-registered branch "palette exonerated; next probe goes in the rasterizer".
+- Two live CLUT bases exist (`0x2A4C`, `0x2A48`) — round 1's single latch was hiding one. Both
+  serve correct ramps, so the second base is not a finding.
+- The present-time all-black `cache0_15` was correctly withheld: it belongs to a **later**
+  texture in the shared 1KB CLUT window, not to an atlas draw.
+- `[cap] tag=clutlive` now appears in the analyzer footer — the round-1 false
+  "no [cap] for this tag" is fixed.
+
+⛔ Do not reopen the CLUT. Atlas index data, palette in VRAM, palette at the draw, alpha test,
+depth test (`test=0x30003` = both ALWAYS on **both** sides), and blend (`alpha=0x44`) are all
+measured-correct.
+
+### ★★★ 2026-08-09 — `[pixlog]` run 29 — ✅ RAN. **The 4-step cycle. Runs 26-28's contradiction dissolves; a new bug appears.**
+
+161 records, `-- no [cap]`. Latched pixel `25,308`, fbp 0 **and** 112, ~30 glyph hits per
+interval, `n ≈ 118 ≈ 4 × 30`. The cycle is **100% regular** in both buffers on every interval:
+
+| step | who | writes | over | prim |
+|---|---|---|---|---|
+| 1 | other | `0x00000000` | `0x80fffffe` | `0x6` |
+| 2 | box | `0x66200e64` maroon | `0x0` | `0x56` |
+| 3 | **other** | **`0x80000000` opaque black** | `0x66200e64` | `0x56` |
+| 4 | glyph | `0x80fffffe` white | `0x80000000` | `0x56` |
+
+`prim` decode (`[0:2]` type, `[4]` TME, `[6]` ABE): `0x6` = SPRITE, TME=0, ABE=0 → the
+**untextured frame clear** (step 1 of the *next* frame — the ring cut the cycle mid-loop).
+`0x56` = SPRITE, TME=1, ABE=1 → textured + blended, shared by **all three** other writers, so
+prim does not discriminate between them.
+
+**Three results:**
+
+1. ✅ **Runs 26/27's "disjoint destinations" were never a contradiction.** Box always follows the
+   clear (`0x00000000`); glyph always follows the black sprite (`0x80000000`). There is no
+   wipe-between-passes. The whole "hunt the wipe" line from run 28 is **closed as a non-issue** —
+   it was a 4-step cycle that no sprite-gated probe could see.
+2. ✅ **The glyph is genuinely the last writer.** White `0x80fffffe` survives to end of frame in
+   **both** buffers. ⚠️ The 7 `THIRD-PARTY-OVERWRITES` verdicts are a **ring-boundary artifact**
+   (window closed on step 1); the 4 `GLYPH-IS-LAST-WRITER` records are the true reading. The
+   verdict was under-specified — it could not tell "overwritten" from "the ring wrapped".
+3. 🆕 **NEW BUG — step 3.** An **opaque black textured sprite paints over the maroon dialog
+   interior**, between box and text. To reach exactly `0x80000000` through blend `0x44`
+   (`(Cs−Cd)·As/128 + Cd`) the source must be `Cs=0, As=128` — fully opaque black. So VRAM ends
+   each frame holding **white text on a BLACK box**, not maroon.
+
+⚠️ Caveat on the sample: latched pixel `25,308` is the **min corner** of the glyph rect
+(`25,306-480,377`) — plausibly a border decoration from the same atlas rather than body text.
+Run 30 adds a second, spatially separated latch to settle it.
+
+### ★★★ 2026-08-09 — `[pixlog]` run 30 (written, not yet run) — name the black sprite
+
+Two additions to the run 29 probe, same tag:
+
+- **Texture identity per ring entry:** `texel` (= `t_lastTexel`, the value **as fetched, before
+  blending**), plus `tbp0`, `cbp`, and a packed `tfmt` (`psm | tbw<<8 | tfx<<16 | tcc<<20 |
+  cpsm<<24`) and `alpha`. `texel` is the field that matters — it splits the two remaining
+  explanations and neither can hide behind the other:
+  - texel **black**, stored black → the **fetch** is degenerate (T4 index or CLUT); blender innocent
+  - texel **coloured**, stored black → fetch fine, the **blend** destroys it
+- **Second latch point.** `pt=1` latches a glyph store ≥120px to the right of `pt=0`, so it is a
+  different glyph by construction. If it never arms it says so loudly rather than repeating
+  `pt=0`'s story.
+
+The step-3 writer is isolated by `tag == other && prim & 0x10` (textured), which excludes the
+untextured clear. `tbp0`/`cbp`/`tfmt` are directly comparable against **`dump.jsonl`**, the PCSX2
+ground truth for this exact screen.
+
+| verdict | reading |
+|---|---|
+| `GUARD-not-latched…` / `GUARD-ring-empty…` | dialog not up, or no second glyph far enough right |
+| `NO-GLYPH-IN-RING…` | latched pixel rarely covered — read a later record |
+| `NO-TEXTURED-THIRD-PARTY…` | the black sprite did not recur at this pixel — it is local, not global |
+| `THIRD-PARTY-IS-NOT-BLACK-HERE` | `blkval` differs from run 29 — the sprite is not uniformly black |
+| `FETCH-IS-DEGENERATE` | **texel black before blending** — texture/CLUT bug; `blktbp0`/`blkcbp` name the draw |
+| `BLEND-DESTROYS-IT` | texel has colour, stores black — blender bug; read `blkalpha` |
+
+### 2026-08-09 — `[pixlog]` run 29 design (superseded by the result above) — one address, every writer, in order
+
+Run 28's `[fbsplit]` re-query closed the phase question and left a contradiction that **no
+sprite-gated probe can resolve**:
+
+```
+glyph: fbp0=159810 fbp112=159810 | box: fbp0=1670400 fbp112=1670400
+gtopfbp=0 btopfbp=0 | glyphord=49574803 boxord=49532385 | dstor=0x80000000 boxpix=0x66200e64
+```
+
+- Both sprites in **both** buffers, matched rates ⇒ **out-of-phase is dead**. Shared memory is
+  now a per-fbp fact, not an aggregate inference.
+- `glyphord > boxord` in **10 of 11** records ⇒ within a buffer, **glyphs store after the box**.
+- `1670400 / 55680 = 30.0` exactly ⇒ 30 clean full box draws per fbp per interval.
+- Yet glyph destination is `0x80000000` and box destination is `0x00000000`, always. Neither
+  sees the other; the box does not even see its own maroon from the previous frame.
+
+Two different reset values in one buffer, between two passes that provably share it. The only
+thing that can do that is a **writer outside both gates** — so run 29 drops the sprite gate.
+
+Design (`[pixlog]`, [ps2_gs_rasterizer.cpp](ps2xRuntime/src/lib/ps2_gs_rasterizer.cpp) globals +
+log site, emit in [ps2_gs_gpu.cpp](ps2xRuntime/src/lib/ps2_gs_gpu.cpp)):
+
+- **Latched coordinate, not a constant.** The first glyph-*white* store of each interval latches
+  its own `x,y,fbp` via CAS. Guarantees the followed address is one the text actually covers —
+  a hard-coded pixel could land in the gap between two glyphs and read as "the glyphs never
+  drew" (`feedback_probe_gate_on_shape_not_address`). Re-latched per interval; printed, so it
+  never has to be trusted.
+- **Ring of 12, not a counter.** The question is *which order, by whom* — the last writer decides
+  the colour. A ring holds the most recent whole frames and **cannot saturate**
+  (`feedback_capped_probes_false_negatives`). `ord == 0` means "slot never filled".
+- Each entry carries `who` (box / glyph / **other**), `val`, `dst`, `prim` — `prim.tme == 0` on a
+  third-party writer identifies it as a clear rather than another sprite.
+
+Verdict ladder:
+
+| verdict | reading |
+|---|---|
+| `GUARD-no-glyph-store-latched…` / `GUARD-ring-empty…` | dialog not up — read a later record |
+| `NO-GLYPH-IN-RING…` | latched pixel rarely covered; ring is box+others only — read a later record |
+| `THIRD-PARTY-OVERWRITES-THE-TEXT` | **the wiper exists**; `otherprim`/`otherval` name it |
+| `BOX-OVERWRITES-THE-TEXT` | the box sprite lands after the glyphs — contradicts the ord data, believe the ring |
+| `GLYPH-IS-LAST-WRITER` | white survives in VRAM ⇒ fault is **downstream** — display/present, not the rasterizer |
+
+### ★★★ 2026-08-09 — `[fbaddr]` run 28 — ✅ RAN. **Same target on all three terms. Address divergence is dead.**
+
+```
+gn=138502 bn=1548396 gpsm=0x0/0x0 bpsm=0x0/0x0 gfbw=0x8/0x8 bfbw=0x8/0x8
+  | verdict=SAME-TARGET-AND-OVERLAPPING-so-memory-is-reset-between-the-passes
+gfbp=0xe00/0x0 bfbp=0xe00/0x0 gmsk=0x1/0x1 bmsk=0x1/0x1
+  grect=25,306-480,377 brect=24,302-487,421 overlap=1
+```
+
+11 stable records, 7 leading `GUARD-` (dialog not up yet — normal, 5th occurrence).
+`-- no [cap] for this tag`.
+
+| term | glyph | box | constant? |
+|---|---|---|---|
+| `psm` | `0x0` PSMCT32 | `0x0` | yes (OR==AND) |
+| `fbw` | `0x8` = 512 px stride | `0x8` | yes |
+| `fbp` | `{0, 0xe00}` | `{0, 0xe00}` | alternates — double buffer, as designed |
+| `fbmsk` | `0x1` | `0x1` | yes |
+
+- `fbp=0xe00` reconciles run 26's "fbp 0 and 112": raw FBP register 112 × 32 = 3584 = `0xe00`
+  blocks. Same two buffers, different unit. 512×448 @32bpp ÷ 64 px/block = 3584 exactly.
+- **Geometry is pixel-correct.** Box rect `24,302–487,421` = **464×120 at (24,302)** —
+  identical to the PCSX2 dump reference. Glyph rect `25,306–480,377` sits **fully inside** it.
+- ⇒ `DIFFERENT-PSM` / `DIFFERENT-FBW` / `DIFFERENT-FBP` / `NO-SPATIAL-OVERLAP` are all dead.
+  Runs 25-27 were **not** mis-aimed. The text is drawn in the right place, right buffer,
+  right format.
+- Side effect worth keeping: `fbmsk != 0` always ⇒ `frmw` is true unconditionally, so every
+  destination reading in runs 26/27 was a genuine VRAM read regardless of blend state.
+
+⚠️ **The verdict is aggregate-limited — it is not yet a per-frame claim.** An interval-wide
+OR/AND cannot distinguish:
+
+1. **shared buffer** — glyph and box both write buffer A in frame N, both B in N+1 (something
+   wipes between the passes); from
+2. **out of phase** — glyph writes A while box writes B *in the same frame*.
+
+Both aggregate to `OR=0xe00 / AND=0x0` on both sprites. Scenario 2 fits the symptom exactly
+(displayed buffer got the box but not the glyphs → flat maroon box). Closing this needs
+per-fbp per-sprite counts, which **run 28's own log already contains** under `[fbsplit]` —
+query it before writing another probe.
+
+Park, do not chase: `fbmsk = 0x1` masks bit 0 of red only. Visually nil, but an odd value
+for a game to set.
+
+### 2026-08-09 — `[fbaddr]` run 28 design (superseded by the result above) — do the two sprites share memory at all?
+
+Run 27's verdict said `CLEARED-BETWEEN`. **The verdict is not the finding.** The finding is the
+pair of reset values:
+
+| sprite | destination OR | meaning |
+|---|---|---|
+| glyph white stores (run 26) | `0x80000000` | opaque black |
+| box stores (run 27) | `0x00000000` | **every bit zero, alpha included** |
+
+One cleared buffer cannot hand one sprite `A=0x80` and the other `A=0x00`. Either the two sprites
+write **different memory**, or a wipe between the passes clears to a third value. Run 28 separates
+those, and it closes a gap that has been open since run 24.
+
+⚠️ **The gap.** The framebuffer address is built from *three* terms
+([ps2_gs_rasterizer.cpp:1502-1504](ps2xRuntime/src/lib/ps2_gs_rasterizer.cpp#L1502-L1504)):
+`fbp = framePageBaseToBlock(ctx.frame.fbp)`, `fbw`, `fpsm`. **Every probe from run 24 onward
+recorded only `ctx.frame.fbp & 0x1FF`.** `fbw` and `fpsm` have never been sampled on either
+sprite, and the `0x1FF` mask discards any high bit `framePageBaseToBlock` would have consumed.
+So "both sprites hit fbp 0 and fbp 112" never meant "both sprites write the same bytes" — it
+constrained one of three terms. Run 28 samples all three, per sprite, at the store site.
+
+Verdict ladder (guards first, every branch actionable):
+
+| verdict | reading |
+|---|---|
+| `VARIES-fbw-or-psm-moved-mid-interval` | a value moved within the interval; no cross-sprite comparison is valid — ignore the rest |
+| `DIFFERENT-PSM` / `DIFFERENT-FBW` / `DIFFERENT-FBP` | **the addresses diverge** — the two sprites never shared memory and the whole occlusion enquiry was mis-aimed. This is the bug. |
+| `NO-SPATIAL-OVERLAP` | the rects never shared a pixel — the premise behind runs 25-27 was wrong |
+| `SAME-TARGET-BUT-FBMSK-DIFFERS` | shared memory, but one sprite's writes are masked |
+| `SAME-TARGET-AND-OVERLAPPING` | shared memory confirmed ⇒ **something resets it between the passes**; hunt the wipe |
+
+Method notes worth keeping: constancy is tested as `OR == AND` (exact, two words). `fbw`/`fpsm`
+are *required* stable; `fbp` is **not** — it alternates with the double buffer, so demanding it
+constant would trip a guard in every record and the probe would report nothing forever. `fbp` is
+instead compared as an OR/AND *pair* between sprites. The XY extents are carried because every
+reading above assumes the rects overlap, and that came from a bbox note rather than the store
+site — hence `NO-SPATIAL-OVERLAP` being a real branch instead of a silent assumption.
+
+### ★★ 2026-08-09 — `[boxover]` run 27 — ✅ RAN. Sum identity held; `bwhite = 0`.
+
+```
+bstores=3340800 bwhite=0 bblack=3340800 bother=0 gtotal=314293 | verdict=CLEARED-BETWEEN...
+bdstor=0x0 bdstwhite=0x0 balpha=0x44 babe=1 bsrca=102 btotal=3340800
+```
+
+- Self-check passed in every record (`3340800 = 0 + 3340800 + 0`; transition record
+  `1715436 = 0 + 1715328 + 108`). Classifier sound, fields readable.
+- `bstores = 55680 × 60` — the box paints the full dialog rect ~60×/interval, matching the glyph
+  side's `gtotal = 5327 × 59`. Equal rates, as run 26 found.
+- **The box never lands on a white pixel** across 3.3 M samples. With run 26's reciprocal, neither
+  sprite ever sees the other.
+- Record 8 (the frame the dialog appears) shows `bdstor=0x802f474a` — real game content, alpha
+  `0x80` — then it drops to exact zero and stays there. `babe=1`, `balpha=0x44`, `bsrca=102`
+  confirm the box *was* blending, so it was never entitled to hide the text opaquely.
+
+⚠️ Do **not** cite `CLEARED-BETWEEN` as a conclusion. It is one of two readings and run 28 decides
+between them; the reset-value mismatch above is the durable result.
+
+### 2026-08-09 — `[boxover]` run 27 design (superseded by the result above) — does the box land ON the text?
+
+Run 26 answered "which buffer" and the answer is **the same buffer, both of them, every frame**.
+The remaining question is order, and run 27 answers it *without an ordering counter* — by
+sampling the destination under the **box**, the exact reciprocal of run 26's `dstor`.
+
+| outcome | reading |
+|---|---|
+| `bwhite > 0`, near `gtotal` | **BOX PAINTS OVER TEXT** — text drawn first onto a cleared buffer, box laid on top. Draw order inverted, or the box should blend and doesn't. |
+| `bwhite == 0`, `bblack == bstores` | **CLEARED BETWEEN** — the box is innocent; a wipe between the text pass and the box pass destroys the glyphs. Different bug, different fix site. |
+
+Pre-registered self-check, read **first**: `bwhite + bblack + bother == bstores`. If that identity
+fails the classifier is broken and no other field on the line is trustworthy.
+
+`babe`/`balpha`/`bsrca` only matter in the first branch — they say whether the box was *entitled*
+to occlude. `ALPHA 0x44` with `abe=1` and source alpha `0x66` (102/128 ≈ 80 %) should leave ~a
+fifth of the text visible, which is **not** what the screen shows; `abe=0` would be a straight
+opaque overwrite and would explain a perfectly flat box.
+
+### ★★★ 2026-08-09 — `[fbsplit]` run 26 — ✅ RAN. **No split, no offscreen. Same buffer, same rate.**
+
+```
+glyph: fbp0=154483 fbp112=159810 | box: fbp0=1614720 fbp112=1670400
+gtopfbp=112 btopfbp=112 disp1=112 disp2=112 | dstor=0x80000000 boxpix=0x66200e64
+```
+
+The counts are exact multiples, which is why this data can be trusted:
+
+- glyph white stores `85232 / 154483 / 159810 / 165137` = **5327 × 16 / 29 / 30 / 31**
+- box stores `1614720 / 1670400 / 1726080` = **55680 × 29 / 30 / 31** (55680 = 464 × 120)
+
+So **5327 white pixels = one complete dialog's worth of text**, drawn the same number of times as
+the box, into **both** framebuffers in near-equal proportion. One box + one full text pass per
+frame. Normal double buffering.
+
+⚠️ **Run 26's `verdict=` field is unsound — do not cite `SPLIT-TARGET` or `OFFSCREEN` from it.**
+It compared a single argmax fbp per sprite, and the buckets are near-ties in every record
+(`154483` vs `159810` is a coin flip). Third probe-field defect in three runs, same family as run
+25's `boxafter`. **Fixed in place**: split is now a property of the *sets* (`overlapFbp`) and
+"shown" of *any* text-bearing fbp (`anyGlyphShown`) — both argmax-free. The interval-granular
+`glyphord`/`boxord` branch was **deleted**; those stamps span ~60 frames and can never resolve
+within-frame order. Do not restore it.
+
+**The field that decided it: `dstor=0x80000000`** — the OR of the destination across every white
+glyph store (314,293 samples/interval), exactly black-opaque. Not one white glyph pixel ever
+landed on maroon, and `boxpix=0x66200e64` (r=100 g=14 b=32) **is** the maroon. The two sprites
+overlap in space (glyph bbox `25,306-491,378` inside box rect `24,302-488,422`) and share buffers
+at the same rate — yet the text never sees the box beneath it.
+
+⇒ **The text is drawn first, onto cleared black, and something covers it afterwards.** Run 27
+distinguishes "the box covers it" from "a clear wipes it".
+
+### 2026-08-09 — `[fbsplit]` run 26 design (superseded by the result above) — which buffer, and in which order
+
+Run 25 (below) removed the last way for the text to be *destroyed*. It is drawn, it is white, it
+is in the right rect, and nothing discards it. Two fields say where to look next:
+
+| field | value | what it forces |
+|---|---|---|
+| `dst=0x0` | destination under a white glyph pixel is **black** | the maroon box has **not** been painted into that pixel when the glyph lands |
+| `fbpmin=0 fbpmax=112` | glyph stores span **two** destination framebuffers | `[dispfb]` already records FRAME.FBP alternating `0x0`/`0x70` while DISPFB stays `0x1070` (= fbp **112**) |
+
+**Leading hypothesis:** the box and the text land in *different* framebuffers in the same frame,
+and only the box's buffer is presented → a flat maroon box, exactly the symptom.
+
+⚠️ **Run 25's `boxafter` is unsound and must not be cited.** It alternated 0/1 with two perfectly
+constant deltas (272089 / 294656), which no real ordering change produces. Cause: both stamps come
+from `g_writeSeq`, which the `[fbdest]` emit `exchange(0)`'s — a reset landing between the box
+store and the glyph store inverts the comparison. `total=0` in the same line is the same defect
+seen directly (`[fbdest]` had already taken the counter). The branch has been **deleted** from
+`[glyphfate]`'s verdict chain; `[fbsplit]` re-measures ordering on its own never-reset counter.
+
+Pre-registered reading, stop at the first line that answers:
+
+| # | field | reading |
+|---|---|---|
+| 1 | `glyph:` / `box:` both empty | GUARD — dialog not up this interval, read a later record |
+| 2 | fbp lists **disjoint** | `SPLIT-TARGET` — split-buffer bug, done |
+| 3 | shared fbp ≠ `disp1`/`disp2` | `OFFSCREEN` — whole dialog drawn where DISPFB never points |
+| 4 | `boxord` > `glyphord` | `BOX-AFTER-TEXT` — real draw-order bug, now on a sound counter |
+| 5 | else | `SAME-BUFFER-TEXT-LAST` — fault moves to the present/copy path |
+| — | `dstor=0` while `boxpix` is maroon | corroborates 2/3: the two sprites never met |
+
+Per-fbp **populations** for both sprites, not min/max — min/max cannot distinguish one stray pixel
+from half of them, and cannot be compared against the box at all.
+
+### ★★★ 2026-08-09 — `[glyphfate]` run 25 — ✅ RAN. **Nothing kills the glyph pixels.**
+
+```
+gfdraws=91728 gfin=26509392 gfscis=0 gfate=0 gfz=0 gfstored=26509392
+ | white=3324048 dark=20589504 srcamax=128 | bbox=25,306-491,378 inrect=1
+ | verdict=TEXT-STORED-WHITE-IN-RECT-check-fbp-vs-presented-buffer
+pix=0x80fffffe dst=0x0 test=0x30003 cc=1 abe=1 | fbpor=112 fbpmin=0 fbpmax=112 | sc=0,0-511,447
+```
+
+- **Zero losses at every exit:** `gfscis`, `gfate`, `gfz` all exactly 0, and `gfstored == gfin`
+  (26,509,392 of 26,509,392). Scissor, alpha test and depth test kill nothing.
+- **The stored word is white:** `pix=0x80fffffe` — A=0x80 (=1.0 on PS2), RGB ≈ 0xFFFFFE.
+  `srcamax=128` confirms full source coverage is reached.
+- **In the right place:** bbox `25,306-491,378` against the dump's dialog rect `(24,302)-(488,422)`.
+- **Scissor is full-screen** (`0,0-511,447`), so no clip is involved.
+- `dark=20589504` (89%) is *expected* — index-0 texels are transparent by design in a coverage ramp.
+- `cc=1` ⇒ the `COLCLAMP == 0` blend-discard bug found in `writePixel` is **not on this path**.
+
+⛔ Do not reopen fate: scissor, alpha test, depth test and the stored pixel value are all closed.
+The fault is in **placement/target/order**, not in any computation.
+
+### 2026-08-09 — `[glyphfate]` run 25 design (superseded by the result above) — fate + ordering, no arithmetic left
+
+Run 24 (below) closed **every arithmetic link** in the text pipeline. Nothing about the texture
+stages is still in doubt. What is left is *where the pixels land* and *what buries them*.
+
+The reasoning that forces this probe:
+
+- Sampler output is verified correct: white RGB, coverage alpha up to `amax=128` (= 1.0).
+- `test=0x30003` decodes to **ATE on / ATST ALWAYS** and **ZTE on / ZTST ALWAYS** — both always-pass.
+- Blend `0x44` = `(Cs−Cd)·As/128 + Cd`; with `Cs` = white this yields **white text over maroon**.
+
+So by every measured value these pixels *should be on screen*. `[glyphfate]` rides the same
+`t_boxDraw` mechanism with a new `t_glyphDraw`, set from the **identical shape predicate run 24
+validated on 115 M samples**, and counts fate at each exit of `writePixel`.
+
+Pre-registered bisect:
+
+| result | conclusion |
+|---|---|
+| `gfdraws == 0` | gate dead — no T4 256×256 tbw4 sprite reached `drawSprite` |
+| `gfin == 0`, `gfdraws > 0` | sprite gated but pixel loop empty — fully clipped rect |
+| `gfscis == gfin` | every glyph pixel scissored; compare `sc=` against `24,302-488,422` |
+| `gfate > 0` or `gfz > 0` | **contradicts `test=0x30003` ALWAYS** — `classifyAlphaTest` mis-decodes |
+| `white == 0`, `srcamax == 128` | stored but dark — blend/pack destroys it; check `cc=` (COLCLAMP) |
+| `inrect == 0` | white text stored at the **wrong screen position** — sprite XY bug |
+| `boxafter == 1` | **box drawn after the text and paints over it** — draw-order bug ← leading |
+| all pass | correct white text in the right rect ⇒ compare `fbpor` vs the presented buffer |
+
+**Bug found in passing, NOT fixed** — `ps2_gs_rasterizer.cpp` `writePixel`, the `COLCLAMP == 0`
+branch computes `br/bg/bb` and then throws them away (`r &= 0xFF` keeps the *unblended* source).
+Should be `r = br & 0xFF`. Not the invisible-text cause (it would make text too bright, not
+absent), and `cc=` in this probe will say whether that path is even taken. Needs approval to fix.
+
+---
+
+### ★★★ 2026-08-09 — `[texfetch]` run 24 — ✅ RAN. **The T4 fetch AND the CLUT lookup are CORRECT.**
+
+Final interval of the run:
+
+```
+[texfetch] tfall=454239936 tft4=115043964 tfsamp=115043964 tfchk=1797562 tfdis=0
+           | u=0..232 v=0..128 | idxmax=15 oor=0 bin0=93409752 histsum=115043964
+           | a0=93409752 amax=128 white=21634212 | verdict=gate-matched-values-below-are-valid
+[texfetch] cfg tbw=4 tw=256 th=256 tbp0=0x2b80 cpsm=0x0 csa=0
+[texfetch] hist16=93409752,0,0,65669,277570,312774,415001,2546874,251844,176697,299234,1623446,319544,0,642473,14703086
+[texfetch] vramtruth=60638,0,0,22,75,83,104,416,68,68,63,365,108,0,158,3368
+```
+
+Every pre-registered branch resolves **in favour of the fetch**:
+
+- **Not degenerate.** `bin0` is 81 % of samples, not 100 %. VRAM truth is 92.5 %; we sample glyph
+  cells rather than the whole page, so slightly less empty is exactly right.
+- **Histogram matches VRAM rank-for-rank.** Both sides order `0 > 15 > 7 > 11 > 14 > {12,6} > 5 >
+  {4,10} > 8 > 9 > 3`, and bins **1, 2 and 13 are zero on both sides**. The sampler is reading the
+  real atlas, not noise.
+- **Masking correct.** `idxmax=15`, `oor=0`.
+- **Different glyphs address different cells.** `u=0..232`, `v=0..128` — kills the "one repeated
+  cell" branch that run 23 could not answer (its `u256`/`v256` were the *last* draw only).
+- **Page cache agrees with VRAM.** `tfdis=0` over `tfchk=1797562` rival `ReadVram` reads — a large
+  sample, so this is a real pass and not a silent probe.
+- **CLUT lookup exact to the digit.** `a0 == bin0` (93 409 752) and `white == tfsamp − bin0`
+  (21 634 212). Every ink texel returns white; every index-0 texel returns alpha 0. `amax=128`.
+
+Side fact: `white == tfsamp − bin0` also says our live CLUT **entry 0 is `(0,0,0,0)`**, where the
+dump's is `(255,255,255,0)`. Harmless — blend `0x44` with `As=0` discards RGB entirely.
+
+⛔ **Do not reopen the T4 fetch, the page cache, or the CLUT lookup.** Suspects #7/#8/#9/#11 in the
+texture path are closed by this run. The `tbp0=0x2b80` here differs from earlier runs' `0x2B60`
+purely because VRAM allocation moves between runs — not a finding.
+
+---
+
+### 2026-08-09 — `[texfetch]` run 24 design (superseded by the result above)
+
+**Everything except one link is now measured.** Proven correct, each against PCSX2 ground truth:
+atlas index data in VRAM; palette in VRAM; palette *at the draw*; alpha test; depth test; blend
+equation `0x44`; geometry/formats/draw counts; and — new from run 23 below — vertex ST/Q, FST
+decode, per-corner UV, sprite size. A static audit added: `applyTexa` is a **pass-through** for T4
+(`default: break;`), `combineTexture` MODULATE is `>>7`, the blender is `((A-B)*C >> 7) + D`.
+⛔ **The "alpha is 0..128 not 0..255" suspect is DEAD** — every stage already uses `>>7`.
+
+**The one unmeasured link:**
+
+```
+gs->ReadTexturePageCache(GS_PSM_T4, tbp0, tbw=4, sampleU, sampleV)   // ps2_gs_rasterizer.cpp
+```
+
+…plus the T4 CLUT lookup right after it. `[clutlive]` **cannot** cover this — its own SCOPE LIMIT
+note says it reads VRAM and the CLUT cache *host-side* and "cannot see what the rasterizer's
+sampler computed."
+
+**Why it was never measured.** `[texfetch]` was gated `if (tex.psm == GS_PSM_T8)` and then
+`if (tbp0 == kTfTbp)` — wrong format, then an address constant. It has never observed a single T4
+fetch. Third instance of `feedback_probe_gate_on_shape_not_address`, same file as `[uvspan]`.
+
+**The change** — gate is now shape-only, `psm==T4 && tbw==4 && texW==256 && texH==256`, with
+guards `tfall` (any paletted sample) → `tft4` (any T4 sample) → `tfsamp` (glyph shape) outside it.
+`kTfTbp` is deleted. New fields:
+
+- **`hist16`** — bins by index **value** 0..15 (was `out>>4`, meaningless for a 4-bit index), so it
+  is directly comparable to the VRAM ground truth, which the probe now **prints alongside it**:
+  `60638,0,0,22,75,83,104,416,68,68,63,365,108,0,158,3368`.
+- **`u=` / `v=`** min..max across *every sample of every glyph*. Run 23's `u256`/`v256` were the
+  **last draw only**, so "do different glyphs address different cells?" is still open. A span of
+  ~24 texels means all ~98k draws read one cell; a wide span means they don't.
+- **`oor` / `idxmax`** — catches `ReadTexturePageCache` failing to mask to a nibble.
+- **`a0` / `amax` / `white`** — the post-CLUT texel *as the sampler returns it*. Separates "index
+  fetch broken" from "CLUT lookup broken". `amax` is PS2 alpha, so **128 == 1.0**.
+- **`tfdis`** — rival `ReadVram` read at 1-in-64, now masked `& 0xF` for T4.
+- `verdict=` string with the two named failure signatures baked in.
+
+**Pre-registered bisect:**
+
+| result | conclusion |
+|---|---|
+| `bin0 == tfsamp` | **PSMT4 nibble fetch is broken** — every texel index 0 = transparent = invisible text |
+| `oor > 0` or `idxmax > 15` | fetch isn't masking to a nibble; index runs off a 16-entry CLUT |
+| `u`/`v` span ≈ 24 texels | every glyph reads the same atlas cell — fault is upstream of the fetch |
+| `u`/`v` span collapses to 1–2 | per-pixel interpolation between (correct) corners is broken |
+| hist healthy but `a0 == tfsamp` | indices fine, **T4 CLUT lookup broken** — check `csa`/`cpsm` |
+| hist healthy, `amax==128`, `white==tfsamp` | fetch *and* lookup correct; loss is in `writePixel` |
+| `tfdis == tfchk` with `badv2 == 0` | convicts **`ReadVram`** (no PSMT4 handler), not the cache |
+
+Full 5-branch reading table lives at the counter definitions in `ps2_gs_rasterizer.cpp`.
+
+### ★★★ 2026-08-08 — `[uvspan]` RE-POINTED at the glyph sprites (run 23) — ✅ RAN, ALL CLEAN
+
+**The dump-side finding that motivates it** (`gsdump_draws.py` on
+`snaps/...20260808165007.gs.zst`, free, no build): every glyph sprite is
+
+```
+prim=0x056 sprite tme=1 abe=1 iip=0  ***fst=0***
+tbp0=0x2B60 tbw=4 psm=T4 256x256 tcc=1 tfx=0 cbp=0x2B08 cpsm=CT32 cld=2
+vtx0 uv=(0,0) st=(0.101961,0.000000) q=1.0 rgba=(0,0,0,0)
+vtx1 uv=(0,0) st=(0.196078,0.094118) q=1.0 rgba=(128,128,128,128)
+```
+
+`fst=0` **and `uv=(0,0)` on both vertices** — the game addresses the atlas *only* through ST/Q and
+never writes UV for these draws. If our vertex assembly loses `s/t/q`, or `prim.fst` decodes as 1,
+every glyph samples texel (0,0) = T4 index 0 = alpha 0 = **fully transparent**. Invisible text
+over a bare maroon box — the exact symptom.
+
+**Why this was never measured.** The existing `[uvspan]` probe was gated on
+`psm == T8 && tbp0 == 0x2A80`. The glyphs are `T4 @ 0x2B60 tbw=4`. The gate matched **zero**
+glyph sprites; `analyze_run.py --tag uvspan` returns `draws=0 fst=4294967295` on every record of
+the last run. Another instance of `feedback_probe_gate_on_shape_not_address`.
+
+**The change** (`ps2_gs_rasterizer.cpp` counters + gate, `ps2_gs_gpu.cpp` externs + emit):
+
+- Gate is now **shape only**, no address: `psm==T4 && tbw==4 && tw==8 && th==8` (tw/th are log2).
+- Rival guards `allspr` (any textured sprite) and `t4any` (any T4 sprite) sit **outside** the gate,
+  so a `draws=0` result is diagnosable instead of silent.
+- `fst0`/`fst1` are **counters**, not a last-observed value — the primary question.
+- `qbad` counts corners with `|q| < 0.015`. Needed because `fabsQ()` substitutes 1.0 below 1e-8,
+  so an exact-zero Q survives the divide and otherwise looks healthy.
+- `du256`/`ds64k` are min..max across all gated draws, so "all glyphs flat" is distinguishable
+  from "one glyph happened to be flat".
+- Emit carries an explicit `verdict=` string so a zero cannot be misread as "renderer is fine".
+
+**Expected on a healthy run:** `fst0==draws`, `fst1==0`, `qbad==0`, `q64k=65536..65536`,
+`ds64k` and `du256` both ≈ **6169** (= 0.094118 × 65536; they must agree numerically because
+`u = s × texW` and texW is 256), `wide==draws`, `flat==0`, `rawu=0..0`.
+
+**RESULT (2026-08-09) — every pre-registered field matched. Nothing here is broken.**
+
+```
+[uvspan] allspr=105016 t4any=97902 draws=97902 | fst0=97902 fst1=0 qbad=0 flat=0 wide=97902
+         | du256=6168..6168 ds64k=6168..6168 | verdict=gate-matched-values-below-are-valid
+[uvspan] last fst=0 | u256=13364..19532 v256=20046..26214 | s64k=13364..19532 t64k=20046..26214
+         | q64k=65536..65536 | rawu=0..0 rawv=0..0 | spanx=17 spany=17
+```
+
+- Guards all nonzero — the gate is on the glyph sprites (97,902 of them).
+- `fst0 == draws`, `fst1 == 0` ⇒ PRIM decode correct. ⛔ **The FST/ST-vs-UV hypothesis is DEAD.**
+- `du256 == ds64k == 6168` vs **6169** predicted (float truncation), min == max over all draws.
+  The independent `u = s × texW` cross-check passes exactly.
+- `qbad=0`, `q64k=65536..65536` ⇒ Q is exactly 1.0, the divide is a no-op, as the dump says.
+- `rawu=0..0 rawv=0..0` matches the dump's `uv=(0,0)`; `spanx=spany=17` matches its 17×17 rect.
+
+⚠️ **One thing this did NOT answer:** the `u256`/`v256`/`s64k`/`t64k` fields are prefixed `last` —
+they are the **final draw's corners**, not accumulators. So "do different glyphs address different
+atlas cells?" remains open, and `[texfetch]` run 24 above now measures it across all samples.
+
+Full reading table (5 numbered branches) lives at the counter definitions in
+`ps2_gs_rasterizer.cpp` — read it, not this summary.
+
+### `[clutlive]` round 1 RAN (2026-08-08). Top hypothesis REFUTED. Palette + atlas both clean.
+
+79 records. Gate silent for the first 7 samples (pre-dialog), then `hits` climbing ~240/sec
+(≈4 atlas TEX0 writes/frame) at `tbp0=0x2b80 tbw=4 cbp=0x2a4c cpsm=0 csm=0 csa=0 cld=2`.
+
+**1. ⛔ The degenerate-T4-fetch hypothesis is DEAD.**
+
+```
+idxnz=4898/65536
+idxhist16=60638,0,0,22,75,83,104,416,68,68,63,365,108,0,158,3368
+```
+
+Index 0 = 60638 (transparent background), index 15 = 3368 (solid glyph interiors), ~1500 spread
+across the antialiasing levels 3–14. Identical in every single sample. **The atlas holds real
+coverage data.** It is not all-zero, so "no text can composite because coverage is 0" is refuted
+at the data layer.
+
+**2. ✅ The live palette in VRAM is byte-exact against the authentic PCSX2 dump.**
+
+```
+vram0_15=0x0,0x8ffffff,0x11ffffff,0x19ffffff,0x22ffffff,0x2affffff,0x33ffffff,0x3bffffff,
+         0x44ffffff,0x4cffffff,0x55ffffff,0x5dffffff,0x66ffffff,0x6effffff,0x77ffffff,0x80ffffff
+```
+
+That is the dump's white alpha ramp exactly. The upload path is correct. `mismatch=0/16` on the
+matching samples also proves `ReadClutCache` and `ReadVram` agree on the CSM1 scatter, and
+`distinct=16/16` on every sample means the probe is not degenerate.
+
+**3. ⚠️ NOT a finding yet — `cache0_15` alternates with an all-black ramp.**
+
+Roughly every other sample returns `0x0,0xa000000,0x13000000,…,0x77000000` — `nonblack=0/16`,
+RGB black, alpha ramp `0,10,19,…,119` (a *different* ramp: 15 steps ending at 119, not 128).
+One late sample held a third palette again.
+
+**This cannot be called stale yet.** The PS2 CLUT buffer is one shared 1KB window and every TEX0
+write with `cld≠0` reloads it. The round-1 consumer samples at **present** time, long after the
+glyph draw, so a black ramp there may be a later texture's palette sitting there legitimately.
+A black ramp is a plausible drop-shadow pass over the same atlas.
+
+**Where that leaves it:** both *inputs* to the glyph draw are now proven correct in memory
+(atlas data ✅, palette in VRAM ✅). The fault is in what the draw actually samples, or downstream
+of it. Black glyphs at ≤50% alpha over a maroon box would be near-invisible — which fits the
+symptom — so "does the atlas draw sample the black ramp?" is now the whole question.
+
+**Round 2 probe written, unbuilt:** snapshot the CLUT cache *inside* the producer, immediately
+after `ReloadClutCache` returns, and classify every snapshot white/black/other over the whole run
+(`atw white= black= other=`), plus `firstblack cbp=`, plus a 4-slot `cbpcensus` (the round-1 latch
+was last-write-wins on one `cbp` and would hide two contending palettes).
+Reading: `black==0 && white==hits` → palette fully exonerated, next probe goes in the rasterizer.
+`black>0` → the glyph draw samples an all-black palette, and that is the bug.
+
+**Tooling defect found and fixed:** `analyze_run.py --tag` detects caps via `\[cap\] tag=(\S+)`
+and by requiring the tag name inside the `[cap]` chunk. Round 1 emitted `[clutlive] [cap] gate
+never matched…` with no `tag=`, so the analyzer printed **"no [cap] for this tag: absence IS
+evidence"** over a run that had capped 7 times. The probe now emits `[cap] tag=clutlive …`.
+A cap line the cap detector cannot see is worse than no cap line at all.
+
+### Learned pattern (this session)
+
+- **A diff tool keyed on run-dependent state manufactures divergences.** Addresses, frame
+  indices, and allocation bases differ between two runs *by construction*; keying on them turns
+  every comparison into "only in A / only in B". Key on what the content determines (format,
+  geometry, counts); report what the run determines (addresses) as a *value inside* the match.
+- **Any field that is constant across a whole side is unmeasured on that side.** Report it as
+  NOT MEASURED, never as a divergence. Generalizes
+  `feedback_degenerate_result_convicts_the_probe` from probes to analysis tooling.
+
+---
+
+## ★★★★ 2026-08-08 — GS dump replay harness confirms the RASTERIZER renders the box correctly
+
+New evidence source: a **real PCSX2 GS dump** of the memory-card dialog screen
+(`...165007.gs.zst`, converted via `gsdump_parse.py --emit-replay`, replayed through our own
+`ps2xTest` `ps2_gsdump_replay_tests.cpp` harness — same rasterizer/blender code as the live
+game, but fed authentic PCSX2-captured GS commands instead of our EE's emitted ones).
+
+**Visual result** (`gsdump/replay_fbp70.bmp` → PNG): two maroon/dark-red PS2 memory-card
+dialog boxes, gold border, legible white pixel-font text — "Checking the memory car[d]...
+MEMORY CARD slot 1. PLE[ASE]..." This is the genuine BIOS memory-card warning screen.
+
+**Counters**, box rect `24,302 464x120`:
+- `[boxtex] idxsamp=890880 idxmin=50 idxmax=50` — same truth index as run 22.
+- `[boxtex] texel=0x6629127e` == `ent50` — correct CLUT entry fetched.
+- `[texred] storedblack=0` — nothing in the red-sampled population ended up stored black.
+- `[gsdump] rect ... redish=30043-32424 / 55680` (~55-58%) on **both** `fbp=0x70` and
+  `fbp=0x0` — vs `redish=266-288` on the old (wrong) battle-frame dump. Box is clearly present
+  and colored in the final framebuffer.
+
+**Interpretation — narrows, does not by itself close, Stage 5.11:**
+Given authentic GS state (real TEX0/CLUT/draw commands from PCSX2), our own
+rasterizer+sampler+blender pipeline reproduces the box correctly, text and all. Run 22's live
+finding (`[texred]`'s gate `tb<0x20` blind to `tb=0x29`, suspects #7/#8/#9/#11 re-opened) was
+about the **live game's own emitted GS state**, not the rasterizer's ability to render a
+correct box given correct input. Combined:
+- The rasterizer/blender code path is now demonstrated correct on ground-truth input.
+- This shifts remaining suspicion toward **what GS state the live EE/game path actually emits**
+  (TEX0/CLUT/draw-command differences between our live run and this authentic dump) rather than
+  the rendering math itself.
+- Suspects #7/#8/#9/#11 (alpha/depth/blend/overdraw) are not yet cleared for the *live* path —
+  only shown non-fatal when fed the dump's real GS commands.
+
+**Not yet done:** confirm the Stage 5.11 box rect geometrically matches one of the two visible
+dialog boxes in this image (two boxes are cut off at the left edge — could be real or just this
+capture's crop); diff this dump's actual TEX0/CLUT GS commands against what the live recomp run
+emits at the equivalent frame, to find where the live path diverges from this authentic one.
+
+**Tooling added 2026-08-08 for that diff (not yet run against a live capture):**
+- `gsdump_draws.py --emit-jsonl PATH` — dump-side ground truth as JSONL, one line per
+  draw, honors existing `--frame/--sprites/--rect` filters. `-` for stdout. Verified
+  against a real snap: 556 draws, box draw at seq 2 matches rect (24,302)-(488,422).
+- Live side: `ps2_gs_gpu.cpp` now drains the existing (previously print-only)
+  `GSDebugHistoryEntry` ring into the same JSONL schema. Opt-in via two env vars,
+  both required: `PS2X_GSHISTORY_DUMP=<path>` + `PS2X_GSHISTORY_FRAMES=<N>`. Flushes
+  once after N vsyncs elapse (own tick-transition counter, not `m_debugFrameIndex`,
+  which resets on every per-transfer ring drain) then goes quiet. No header edit — all
+  in the .cpp's anonymous namespace, hooked via an RAII guard in `processGIFPacket` so
+  it fires on every return path. `N` needs tuning by trial to land on the memory-card
+  screen; not yet determined.
+- `build_scripts/gsdump_diff.py dump.jsonl live.jsonl` — ⚠ **this description is
+  SUPERSEDED.** The `(prim,tme,tbp0,cbp,psm)` key described here was the defect that
+  produced the first (false) live-vs-dump report. See the top section for the rewritten
+  format+geometry tool and its real finding.
+- ⚠ `PS2X_GSHISTORY_FRAMES` **no longer needs tuning** — the rewritten diff auto-aligns
+  frames in Python. Capture broadly (≈300 frames) and slice afterwards.
+
+---
+
+## ★★★ 2026-08-08 run 22 — `[boxtex]` READ. **The sampler is fully exonerated.** Index 50 is fetched correctly and the texel is RED. The loss is downstream, and `[texred]` was blind to the box.
+
+### What `[boxtex]` measured
+
+```
+all=106759 draws=680 cenovf=0
+tex0=0x40054805dd30aa00 tbp0=0x2a00 tbw=2 psm=0x13 tw=128 th=128 tcc=1 tfx=0
+                         cbp=0x2a40 cpsm=0x0 csm=0 csa=0 cld=2
+rect x0=24 y0=302 spanx=464 spany=120          <- exactly the PCSX2 box rect
+idxsamp=151407024 idxmin=50 idxmax=50 idxhist=0,0,0,<all>,0,...
+ent50=0x6629127e ent8=0x3f000000 texel=0x6629127e
+```
+
+Unpacked the way the pixel loop does (`tr=texel&0xFF`, `tg=>>8`, `tb=>>16`, `ta=>>24`):
+
+| | R | G | B | A |
+|---|---|---|---|---|
+| ours `0x6629127e` | 126 | 18 | 41 | 102 |
+| dump `0x8017176F` | 111 | 23 | 23 | 128 |
+
+Both dark red. **The blender receives a red texel.**
+
+### Suspects #16 and #17 are DEAD — and so is the "we fetch index 8" premise
+
+- `idxmin == idxmax == 50`, 100 % in bucket 3 — **exactly** the dump's ground-truth index.
+  **#17 dead**: `ReadTexturePageCache`'s block math is correct.
+- `texel == ent50`, non-black, red. **#16 dead**: a wrong TEX0 cannot yield both the right
+  index and a red entry.
+- ⛔ The old "we fetch index 8 / hist16 100 % bucket 0" reading was the **backdrop**, seen
+  through the dead `tbp==0x2A80` gate. Do not cite it again.
+
+Census `tbp/cbp` differ from the dump (`0x2A00/0x2A40` vs `0x2B20/0x2B04`), but our census
+*does* contain the dump's `0x2A00,cbp=0x2B00`. Different VRAM residence for the same content
+in a different session — the index and the colour are what convict, and both acquit.
+
+### ⚠ The real finding: `[texred]` structurally could not see the box
+
+`ps2_gs_rasterizer.cpp:1059` gates on `tr >= 0x20 && tg < 0x20 && tb < 0x20`. The box texel's
+**`tb = 0x29` fails by nine**, so `t_redPixel` was false for every box pixel.
+
+`killate=0 / killz=0 / storedblack=0` were therefore measured on a sample that **excluded the
+defendant**. Same failure class as the `0x2A80` gate, one layer down.
+
+### Corrected ledger
+
+| # | Suspect | Status |
+|---|---|---|
+| 16 | TEX0 selection / staleness | **dead** (run 22) |
+| 17 | `ReadTexturePageCache` block math | **dead** (run 22) |
+| 7 | alpha test | **RE-OPENED** — acquitted by a probe blind to the box |
+| 8 | depth test | **RE-OPENED** — same |
+| 9 | blender | **RE-OPENED** — same |
+| 11 | overdraw after the box | **RE-OPENED** — same |
+
+Loss is downstream of the sampler: `combineTexture`, or one of `writePixel`'s two
+uninstrumented early returns.
+
+### Run 23 edits — 4 edits, 2 `.cpp`, no header, **UNBUILT**
+
+Rather than a new probe, the existing `[texred]` field set was re-scoped onto the box:
+
+1. `ps2_gs_rasterizer.cpp:~617` — declare `g_trBoxSamp`.
+2. `ps2_gs_rasterizer.cpp:~1059` — `colourRed || t_boxDraw` admits the box by SHAPE (the gate
+   `[boxtex]` proved lands on it); `g_trRedSamp` still counts only colour hits so the two
+   populations stay separable.
+3. `ps2_gs_gpu.cpp:~82` — `extern g_trBoxSamp`.
+4. `ps2_gs_gpu.cpp:~2126` — emit `boxsamp=`, plus the pre-registered reading table below.
+
+### `[texred]` reading table — run 23
+
+| # | Field | Reading |
+|---|---|---|
+| 1 | `boxsamp == 0` | box never reached `writePixel`. Loss is upstream in `drawSprite`'s clip or its caller. **Read no other field** |
+| 2 | `killate` dominant | **#7 convicted** — read `test` (ATE/ATST/AREF) |
+| 2 | `killz` dominant | **#8 convicted** — read `ztst`, bits 17-18 of `test` |
+| 2 | `stored ≈ storedblack` | **#9 convicted** — the blender; compare `alpha` against `dstrgb` |
+| 2 | `stored` large, `storedblack == 0` | red IS in VRAM; **#11** is last standing → next instrument is an overdraw counter on the bbox, not another read-back |
+
+### ★ NEXT ACTION — user's, in this order
+
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag texred
+```
+
+### Learned pattern (run 22)
+
+- **A colour-threshold gate is an address gate wearing a disguise.** `tb < 0x20` was an
+  inferred constant exactly like `tbp == 0x2A80`, and it excluded the target by nine units
+  while reporting four confident zeroes. When a probe reports all-zero fates, verify the
+  target satisfies the probe's own predicate **before** crossing suspects off.
+
+---
+
+## 2026-08-08 (earlier) — CLUT read chain proven correct against a PCSX2 dump *(index-fetch conclusion below is SUPERSEDED by run 22)*
+
+### The decisive measurement — our CLUT readback vs PCSX2 ground truth
+
+A PCSX2 GS dump of the memory-card screen was decoded with `build_scripts/gsdump_draws.py`
+and compared byte-for-byte against our `[shadow]` readback:
+
+```
+CLUT 0x2B00 pos0..7: 00000000 12000000 1A000000 21000000 3F000000 43000000 4A000000 5F000000
+CLUT 0x2B04 pos0..7: 00000000 0A000000 13000000 1A000000 21000000 28000000 30000000 38000000
+our [shadow] read  : 00000000 12000000 1A000000 21000000 3F000000 43000000 4A000000 5F000000
+```
+
+**Byte-identical to CLUT `0x2B00`.** The deswizzle / cache / CSM1 machinery works, verified
+against independent ground truth. ⛔ Do not reopen the CLUT read chain.
+
+### What that leaves — we fetch index 8, the truth is index 50
+
+- `0x80000000` (the black we paint) is exactly **position 8 of CLUT `0x2B04`**.
+- `[texfetch]`'s hist16 put **100 % of samples in bucket 0** (indices 0–15). Truth (index 50)
+  is bucket 3. Two independent corroborations of the same conclusion.
+- Likely cause: **addressing**. Both prior probes were gated on `tbp == 0x2A80` — a base the
+  frame **never contains** — so they measured the 512×448 backdrop, not the box.
+
+### PCSX2 ground truth for this frame (do not re-derive)
+
+Exactly three textured combos exist:
+
+| tbp | psm | cbp | draws |
+|---|---|---|---|
+| `0x2B60` | T4 | `0x2B08` | 852 |
+| `0x2B20` | T8 | `0x2B04` | 36 |
+| `0x2A00` | T8 | `0x2B00` | 4 |
+
+`0x2A80` is **never sent**. The box = draw [2], screen rect `(24.0,301.5)-(488.0,421.5)` =
+**464 × 120**; draws [3][4][5] are its 8 px 9-slice border strips; the backdrop is 512 × 448.
+Expected box values: `tbw=2 psm=0x13 tw=7 th=7 cpsm=0 csm=0 csa=0 cld=2`, `index=50`,
+`clutentry=0x8017176F` (red).
+
+### Code written this session — 6 edits, 2 `.cpp` files, no header touched, **ALL UNBUILT**
+
+`ps2_gs_rasterizer.cpp`
+1. `kTfTbp` `0x2A80u` → **`0x2B20u`** (line ~305). Revives `[texfetch]` + `[uvspan]` onto the
+   real box texture at zero cost.
+2. `[boxtex]` counter block + 6-section reading table + `bxCensus()` (lock-free 12-slot CAS
+   table), in `namespace ps2diag_fbstat`.
+3. Index capture in `samplePoint` — **not** gated on T8, so a box arriving as T4 stays visible.
+4. Capture block in `drawSprite`, **gated on SHAPE** (`spanX 400..500 && spanY 90..150`), not
+   on tbp. Trusting a tbp constant is exactly what wasted runs 20–21.
+5. Texel capture + `t_boxDraw` reset in the sprite pixel loop.
+
+`ps2_gs_gpu.cpp`
+6. `extern` declarations + a five-record `[boxtex]` emit block. No literal `[` in any field
+   (respects `analyze_run.py`'s record-splitting regex). `boxtex` needs no tag registration.
+
+Pre-verified before writing (a compile error costs 48 min): `GSTex0Reg::data` exists
+(`ps2_gs_gpr.h:448-513`); `ReadClutCache(u32 psm, u8 index, u32 csa)` is public
+(`ps2_gs_gpu.cpp:4703`, declared `ps2_gs_gpu.h:344`) and is the **same call the sampler uses**;
+`std::ostringstream` already in scope.
+
+### `[boxtex]` reading table — read IN THIS ORDER
+
+| # | Field | Reading |
+|---|---|---|
+| 1 | `all == 0` | probe describes nothing — read no other field |
+| 1 | `draws == 0` | the rect gate missed. **NOT** a statement about the box → go to (2), still valid |
+| 2 | census matches the 3 combos above | **suspect #16 dies**; fault is below TEX0 → go to (4) |
+| 2 | census has tbp outside that list | **#16 CONVICTED** — bug is GIF register decode / context selection |
+| 2 | right tbp, wrong cbp | CLD/CBP handling picks the wrong palette → `ReloadClutCache`'s `cld==2` path |
+| 2 | `cenovf > 0` | table truncated; absence proves nothing |
+| 3 | decoded TEX0 field wrong | localises to that field |
+| 4 | `idxmax <= 15` (all weight bucket 0) | **#17 CONVICTED** — `ReadTexturePageCache` block math, `ps2_gs_gpu.cpp:4599` `(tbp0 + page_id * 32) & 0x3FFF` |
+| 4 | `idxmin..idxmax` brackets 50, weight in bucket 3 | addressing right → go to (5) |
+| 5 | `ent50 == 0x8017176F` | palette correct **and** correctly addressed |
+| 5 | `ent50 == 0x80000000 && ent8 == 0x80000000` | wrong CLUT, or never reloaded for this draw |
+| 5 | `ent50` some other colour | right base, wrong ordering. ⚠ the dump says **both** candidate orderings give red, so a *black* `ent50` cannot be a swizzle bug |
+| 6 | `ent50` red but `texel` black | loss is in `applyTexa` or `combineTexture` |
+
+**One run separates #16 from #17 with no follow-up build.**
+
+### Suspect ledger — 15 dead, 2 live
+
+| # | Suspect | Status |
+|---|---|---|
+| 1 | `resolveClutIndex` (rasterizer ~318) | dead — call site passes the raw index; it is dead code |
+| 2 | `ReadClutCache` unmasked `csa*64+index*4` | dead — `csa=0` everywhere (dump) |
+| 3 | `ReloadClutCacheCSM2` `cou*16` doubling | dead — `csm=0` everywhere (dump) |
+| 4 | `applyTexa(tex.psm)` | dead — T8 hits the index branch |
+| 5 | CSM1 source/dest shift | fixed; bit-identical at `csa=0` |
+| 6 | whole CLUT read chain | **dead — our read exactly reproduces CLUT `0x2B00`** |
+| 7 | alpha test discarding the box | dead — `killate=0` |
+| 8 | depth test discarding the box | dead — `killz=0` |
+| 9 | blender zeroing the pixel | dead — `storedblack=0` |
+| 10 | presentation / `copyDisplaySource` | dead — same buffer loses red in VRAM |
+| 11 | `clearFramebufferRect` | dead — exactly one full rect/frame |
+| 12 | `ReadPageToLinearBufferP8/P4` | dead — 1.29 M checks, 0 mismatches |
+| 13 | `TexturePageCache::buffer` size | dead — 16 KB, sufficient |
+| 14 | UV/ST generation in `drawSprite` | dead — PCSX2 sends the same 1-texel span |
+| 15 | GIF/VIF vertex assembly | dead — vertices match PCSX2 exactly |
+| **16** | **TEX0 selection / staleness — wrong `tbp`/`cbp` reaching the draw** | **LIVE** |
+| **17** | **`ReadTexturePageCache` block math (`ps2_gs_gpu.cpp:4599`)** | **LIVE** |
+
+### ★ NEXT ACTION — user's, in this order
+
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag boxtex
+```
+
+⚠ `-Exe` is **mandatory** (defaults to the Debug exe). Build is good **iff no error line names
+`ps2EntryRunner.vcxproj`** — `iop_harness` / `ps2x_tests` `LNK1120` on `fn_*` is structural and
+expected every build. If the build fails, read `build_log.txt`; `build.ps1`'s progress bar
+swallows the real `C2039`-style lines.
+
+### Open, unscoped
+
+- `ps2x_tests.exe Observability clut` → 9 tests, **1 fails**:
+  `"clut-cache: CSM1 T4 reload deswizzles physical VRAM layout into linear cache order"`.
+  Known-bad **expectation**, not a runtime bug — the dump comparison above proves the runtime
+  path is right. Offered to correct the test; user has not answered.
+- `launch_recomp.ps1` writes one fixed `-Log` path with **no archiving** — every run destroys
+  the previous log. Mentioned, never scoped in.
+- `PATH_NAMES` in `build_scripts/gsdump_parse.py` lacks `3: "PATH1(new)"` (cosmetic).
+
+### Learned patterns (2026-08-08)
+
+- **An external ground-truth dump ends a suspect ledger faster than any probe.** Six sessions
+  of CLUT probes were settled in one afternoon by decoding a PCSX2 GS dump and diffing bytes.
+  Reach for independent ground truth *before* building the next probe.
+- **Gate diagnostic probes on SHAPE or on geometry, never on an address constant you inferred.**
+  Two full run cycles were spent measuring the backdrop because `tbp=0x2A80` was assumed. A
+  gate whose constant is wrong produces a confident, plausible, entirely wrong reading.
+- **Give every probe a section that survives its own gate failing.** `[boxtex]`'s census is
+  gated only on "is a textured sprite", so `draws == 0` still answers suspect #16. A probe with
+  one gate has one way to tell you nothing.
+- **Verify member/method existence before writing a probe when the build is 48 minutes.**
+  Checking `GSTex0Reg::data` and `ReadClutCache`'s signature cost two Reads and saved a cycle.
+- **A `\`-prefixed comment line in grep output is a display artifact, not a syntax error.**
+  Confirmed by reading the raw files. Cost a false alarm; do not re-chase it.
+
+---
+
+## ★★★ 2026-08-05 — **STAGE 5.9 CLOSED ✅ (asset load works).** New blocker: **Stage 5.10 — GS rasterizes, presented frame is still black.**
+
+### 5.9 root cause — the IOP heap arena was too small, so ARKD's real load buffer never allocated
+
+Chain, in order:
+
+1. `sysmem` fid 7/8 (`QueryMaxFreeMemSize`) had been answering a canned value. Once it
+   answered honestly, `InitLoadBuffers` took its real branch and set
+   `dword_B490 = 983040 (0xF0000)` instead of `0x800`.
+2. One correct init round then needs `0x800 + 0x800 + 0x40000 + 0x18000 + 0xF0000 = 0x149000`
+   — **more than the 1.125 MB arena (`0x60000..0x180000`) held**. `AllocSysMemory` failed twice,
+   `dword_B304` (TOC base) came back NULL, the descrambler's `if (*(BYTE*)dword_B304)` gate
+   left the table all-zero, every lookup returned `size=0 -> SKIP`, and nothing ever loaded.
+3. Fix, both in `ps2_iop_irx_loader.cpp`: enlarge the arena to `0x60000..0x1D0000` (1.44 MB,
+   still 128 KB clear below the deepest guest stack at `kIopStackTop - 0x4000*4 = 0x1EFF00`),
+   **and** recycle the cursor back to `kIopAllocBase` exactly once on the first post-init
+   `AllocSysMemory`, releasing the pre-run scaffolding.
+
+### 5.9 exit test — **PASSED**, every projected number matched
+
+| Evidence | Value |
+|---|---|
+| Heap recycle | `cursor 0x168000 -> 0x060000` — fired **once** |
+| Game's own printf | `LoadBuff Addr:0x000b9000 Size:0x000f0000` — matched the projected `0xB9000` exactly |
+| TOC | `[ARKD:toc] base=0x0a1000 maxFiles=2048 count=1930 (expect 1930) end=0x0b7a10` |
+| First-letter buckets | identical to `build_scripts/arkd_toc.py` ground truth |
+| `AllocSysMemory FAIL` | **absent** (was 2) |
+| `cdread-total` | 1→2→4→8→16→32 reads, 47→555 sectors, 96 KB→1.13 MB, `fails=0` |
+| `size=0 -> SKIP` | **gone** |
+| Real SIF DMAs | `[ARKD:sifdma] iopSrc=0x0b9000 eeDest=0x01670c00 size=0x530e0 -> copied` |
+| Named worker jobs | `font/5-24-2.fon`, `ply/exthit.hit`, `dis/toon.pix`, ~25 `eff/e00/*.ebz`, `shd/shd.{mdl,pix}`, `ply/p00/p00x.pmt`, many `dis/d0*/*.pix` — all `halted=1 B300=30000000` |
+
+### ★ Stage 5.10 (opened 2026-08-05) — pixels are drawn, the presented frame is black
+
+```
+[gs:frame] px=33365775 nonblack=3757356 textured=19832591 maxrgb=255 primmask=0x40
+           imagebytes=107830592 prims=135519
+[present]  has=1 w=512 h=448 nonblack=0 dispFbp=0x0 srcFbp=0x0 ctx0.fbp=0x70 ctx1.fbp=0x70
+           pmode=0x7f27 dispfb1=0x1000
+[blackwho] untex=13533184 texzero=16075177 texcol=232 | last black store:
+           prim=0x6 texpsm=0x14 tbp=0x2b60 cbp=0x2a48 fbmsk=0x1 alpha=0x44 texel=0x0 xy=0x1bf01ff fbp=0x70
+[psmt4]    pre  n=800 eeAddr=0xffffffff dbp=0x2b80 dbw=4 rrw=256 rrh=256 total=65536 sizeBytes=32768 srcNonZero=0
+[psmt4]    post n=800 addr0=0x570000 consumed=32768 copied=0 total=0 readback=0000000000000000
+[gifsrc]   n=1970 path=2 region=copy eeAddr=0xffffffff bytes=32768 nonZero=0
+[vu:frame] vif1calls=59 vif1bytes=7675488 mscal=0 vu1runs=0 xgkicks=0
+```
+
+Deltas vs the 08-04 record: `textured` 0 → 19.8M, `maxrgb` 0 → 255, `nonblack` 0 → 3.76M.
+
+### ⚠️ CORRECTIONS to the 08-04 entry below — do not act on those lines
+
+- **"DISPFB page-flip DEAD" is WRONG as of 08-05.** `dispfb1` now toggles `0x1070` ↔ `0x1000`
+  and `ctx0/ctx1.fbp` swap with it. The flip is **ALIVE**.
+- **The `PS2X_HWWATCH_ADDR=0x89d400` watchpoint is MOOT.** Its premise was that the asset
+  never landed in RAM; assets now load. Do not build it.
+- **`[psmt4] copied=0 total=0` is NOT a bug.** `GS::EndTransfer()` does `m_transferState = {}`,
+  so a *completed* transfer always reports zero counters afterwards. `consumed=32768` with
+  `rrw*rrh = 65536 = 2 * sizeBytes` says the unswizzle loop ran to completion correctly.
+  The readback is zero **because the source bytes were zero** (`srcNonZero=0`) — not because
+  `WritePixelP4` is broken. Measurement artifact; the unswizzle path is exonerated.
+
+### ★★★ Stage 5.10 update — 2026-08-06/07: the font decoder is **never called**
+
+`[fontgate]` (read-only sampler in `game_overrides.cpp`, change-gated, cap 24, `PS2X_FONTGATE=0`
+disables) ran clean — 12 records over 36k samples, **no `[cap]` line**, so absence is evidence.
+Exactly one field diverged from real hardware:
+
+| Field | Ours | PCSX2 (main menu) | |
+|---|---|---|---|
+| `o1C` (+0x1C) | `0x0` | `0x32` | ★ only mismatch |
+| `o3C` / `o44` / `o48` / `o50` | `0x7` / `0x1a1a1818` / `0x9` / `0x51` | identical | ✅ |
+| `tbl0` @ `0x503670` | `0x2b600001`↔`0x2b800001` | `0x2b600001` | ✅ |
+| `tblNz` | 272/768 stable | — | ✅ |
+| gates | `gateA=1 ready0=1` | open | ✅ |
+| FFON | `addr=0x659400 w=24 h=24 fmt=4 count=1` | same | ✅ |
+| `srcNz` / `clutNz` / `payloadNz` | `0/512` / `60/64` / `0/4096` | — | untouched BSS |
+
+**Conclusion:** `sub_00113200` reads `lw v0,0x1C(s5)` at `0x00113284`, sees 0, and early-outs at
+`0x001132D0`. **`sub_00111530` (the glyph decoder) is never invoked.** The zero payload is
+untouched BSS, not a bad decode — the decoder body and the `0x503670` descriptor table are both
+exonerated.
+
+#### The text-layer struct (from `ida_scripts/decompiles_SLUS_214_42.txt`)
+
+28 dwords, stride `0x70`, array base `dword_54BC80`, indexed `&dword_54BC80[28*(id-1)]`,
+valid ids 1..2 (`if (a1 && a1 < 3)`).
+
+| Off | HW | Meaning |
+|---|---|---|
+| +0x04 | `0x800` | char-buffer capacity |
+| +0x08 | `0x22f` | chars used |
+| +0x10 | `0x100` | max lines |
+| **+0x14** | **`0x12`** | **lines queued — the discriminator** |
+| +0x18 | `0x12` | lines to render (loop bound) |
+| +0x1C | `0x32` | glyphs built — a **per-frame counter**, not a flag |
+| +0x28 | `0x32` | secondary glyph count |
+| +0x6C | `1` | gate B (ready) |
+
+Chain: menu code → `sub_00112940` (enqueue/printf API — bumps +0x14, appends to +0x08) →
+`sub_00112750` per frame (`sub_00111DA0`, then `sub_00112030` × +0x18) → `sub_00113200` →
+`sub_00111530`. `sub_00112750` zeroes +0x1C/+0x28 every frame and **bails to `LABEL_12` when
++0x14 == 0**, skipping the whole glyph build. So `+0x1C` alone cannot separate "nothing was ever
+printed" from "printed but the build failed" — it reads 0 in both. **`+0x14` can.**
+
+Full call path: `0x00422630 → 0x00421ea0 → 0x003280c0 → 0x00199fb0 → 0x00112750 → 0x00113200 → 0x00111530`.
+
+#### ✅ ANSWERED 2026-08-07 — **branch B fired. Text IS queued; the glyph build fails.**
+
+Revised `[fontgate]` built + run, 12 records, **no `[cap]`**. Result:
+
+| field | ours (12 samples) | HW | reading |
+|---|---|---|---|
+| `o14` lines queued | **4 → 3 → 2 → 1** | `0x12` | ★ nonzero — enqueue works |
+| `o18` lines to render | 4 → 1 | `0x12` | tracks `o14` |
+| `o1C` glyphs built | **0, always** | `0x32` | ★ the failure |
+| `o28` secondary count | **0, always** | `0x32` | ★ same failure |
+| `srcNz` / `payloadNz` | 0/512, 0/4096 | — | downstream of `o1C` |
+| `clutNz` | **60/64** | — | CLUT IS loaded |
+| `tblNz`, `tbl0` | 272/768, `0x2b600001` | `0x2b600001` | descriptor table IS built |
+| `ffonAddr/WH/Fmt` | `0x659400` / `0x1818` / `4` | same | **FFON asset is resident, correct fmt** |
+
+So the font data is all present and `o14 ≠ 0` — `sub_00112750` does **not** take its
+`LABEL_12` bail. It runs the glyph build and the build produces nothing.
+
+⚠️ **`analyze_run.py` truncated every field after `obj=`** — its record splitter cuts on `[`,
+and the dump was `obj=[...]`. The data was in `run_log.txt` all along. Recovered with a direct
+regex; the probe now emits `obj=<...>` instead. Generalises
+[[feedback_capped_probes_false_negatives]]: **a field absent from the analyzer is not a field
+absent from the log.**
+
+#### ★★ Root-cause candidate — `sub_00111DA0` rejects the font header, leaving a garbage descriptor
+
+Static read of the IDA dump (`mem_fill_m @ 0x111DA0`, `reg_save_stub_z_33 @ 0x112750`):
+
+```c
+// sub_00112750, with +0x14 != 0 (our case)
+*(v9+40)=0; *(v9+28)=0;              // zero +0x28, +0x1C
+if (!*(v9+20)) goto LABEL_12;        // +0x14 == 0 -> bail. NOT taken.
+if (mem_fill_m(v9))                  // sub_00111DA0 = THE GLYPH BUILDER
+    v10 = reg_save_stub_z_36(v9,256,256) != 0;   // = sub_00113200, the blit
+else v10 = 0;
+if (!v10) v6 = 2;                    // <- failure code, no glyphs
+```
+
+`+0x1C` (`a1[7]`) and `+0x28` (`a1[10]`) are incremented **only inside `sub_00111DA0`**, and
+that function opens with:
+
+```c
+v12 = resolve(a1[13]);                            // obj +0x34, a HANDLE
+if (*(u32*)v12 == 0x4E4F4646 /*'FFON'*/           // magic
+ && (u16)*(u32*)(v12+12) == 256                   // hdr+0x0C low16 == 0x100
+ && byte(v12+0x0E)==0 && byte(v12+0x0F)==0)
+    { v47[0..3] = ...; }                          // build font descriptor
+// NO else -- on failure v47[] stays UNINITIALISED STACK
+... reg_save_stub_z_32(v47, v21, &v48)            // per-char glyph lookup
+```
+
+If that header check fails, `v47[]` is uninitialised stack, every per-character lookup misses,
+and neither `+0x1C` nor `+0x28` is ever incremented — **exactly** our signature. The only other
+route to the same signature is an empty line string (`charBuf + *(u32*)(line+24)` is NUL, so the
+inner `while(*v21)` never runs).
+
+★ **Key structural fact discovered:** the small values in the `obj` dump
+(`9, a, b, c, d, e, f, 7, 4`) are **resource handles, not pointers**. `sub_00103E10` →
+`sub_00110260` resolves them:
+
+```
+addr = (h == 0) ? 0 : *(u32*)( *(u32*)( *(u32*)0x005030D0 ) + 16*(h - 1) )
+```
+
+Every earlier attempt to read these fields as addresses was reading nonsense.
+
+#### ❌ RETRACTED 2026-08-07 (run 3) — the run-2 conclusion was wrong; the PROBE was broken
+
+Run 2 concluded "the resource table never points at the font." **That was an artifact of my own
+resolver, not a fact about the game.** `altB` — included in run 3 precisely to test this — came
+back `0x659400`, the FFON.
+
+`fontGateResolve()` took **one deref too many**. The IDA text at `0x103E10` reads
+`vtable_table_lookup(dword_5030D0, h)` with **no cast**, while its neighbours `0x103E20` /
+`0x103E30` both cast `(unsigned int)dword_5030D0`. The cast-free form is IDA printing the
+**address** of the global, so `sub_00110260`'s `*a1` dereferences `0x005030D0` itself. Correct
+formula:
+
+```
+addr = *(u32*)( *(u32*)0x005030D0 + 16*(h-1) )      // one deref, not two
+```
+
+With it, `resolve(obj[13]=4)` = `0x659400`, whose first word is `'FFON'`. Fixed in
+`game_overrides.cpp`.
+
+**Both of these are now dead and must not be re-derived:**
+
+- ~~the resource table is unpopulated~~ — it is fine; `resMgr=0x646400` **is** the array base
+- ~~`sub_00111DA0` rejects the descriptor~~ — it **passes** the header check
+
+> Lesson, now costed twice: `res=<same,same,same,...>` was read as "the game is broken" when it
+> equally meant "my formula is broken." A degenerate probe result is evidence about the probe
+> first. The rival-reading fields (`altB`/`altS`) are what caught it — keep including them.
+
+#### ✅ ANSWERED 2026-08-07 (run 3) — the loop body never runs for a single character
+
+From the decompile of `sub_00111DA0` (`mem_fill_m @ 0x111DA0`):
+
+```c
+v15 = resolve(a1[0]);            // char buffer base
+v14 = resolve(a1[3]);            // line records, stride 28
+v21 = v15 + *(u32*)(v14 + 24);   // this line's text
+while (*v21) { ... a1[10]++ ... }
+```
+
+`a1[10]` (`o28`) is incremented on **both** character paths — the newly-allocated-glyph branch
+and the already-cached branch. It reads `0` in **every** record. So the `while` body never
+executed even once. Only two causes exist:
+
+1. **`*v21 == 0`** — the text pointer lands on a NUL (nothing to draw, or a bad line offset)
+2. **`reg_save_stub_z_32` returns < 0 for every char** — the char→glyph decode fails
+
+~~`o18` (`a1[6]`, line count) does go `4→3→2→1`, so the **outer** loop is entered.~~
+**Struck 08-07 (run 4):** `a1[6]` is written by the *line-queueing* code, not by the builder, so
+its movement says nothing about whether `sub_00111DA0` ran. Both causes stayed live.
+
+#### ✅ ANSWERED 2026-08-07 (run 4) — cause 1 is dead. The text is there.
+
+```
+str=<4e,6f,20,6d,65,6d,6f,72,79,20,63,61,72,64,20,28>   == "No memory card ("
+bufNz=180/256   lineOff=0x0   line0=<19,132,3f800000,12,12,ffffffff,0>
+hdrOK=1  hdr10=0x28  hdrA=0x659400  hdrM=0x4e4f4646
+res=<89e400,89f400,8a2400,8a1400,8a4400,8a3400>          all six handles distinct ✓
+o1C=0  o28=0   still, in every record
+```
+
+`v21 = v15 + *(u32*)(v14+24)` = `0x89e400 + 0` = the `'N'`. **Not a NUL.** The resolver fix is
+also confirmed sound: six handles now give six distinct addresses, and the FFON header passes.
+
+Two possibilities remain, and they are *not* the old pair:
+
+1. **`reg_save_stub_z_32 @ 0x111A00` returns −1 for every char** — its two lookup tables live
+   inside the FFON asset, so a zero-filled asset body produces exactly this.
+2. **`sub_00111DA0` is never called at all** — `o1C`/`o28` staying 0 is equally consistent with
+   the builder not running, now that `o18` no longer argues otherwise.
+
+The decode, for ASCII `c < 0x80` (`v47[1] = hdr+32`, `v47[2] = hdr+160`):
+
+```c
+page = *(u8 *)(v47[1]);                 if (!page) return -1;
+idx  = *(u16 *)(v47[2] + 2*(c - 32 + 96*(page-1)));
+if (!idx) return -1;                    return idx - 1;
+```
+
+#### ✅ ANSWERED 2026-08-07 (run 5 data) — the decode works. Both run-4 causes are dead.
+
+```
+dcCh=0x4e dcPage=0x1 dcSlot=0x2f dcRes=46
+pgNz=40/128  gmNz=252/512  ffonNz=1431/4096
+```
+
+The FFON body **is** loaded and the char→glyph decode resolves `'N'` → slot 46. So
+`reg_save_stub_z_32 @ 0x111A00` does not return −1, and the asset is not a zero body.
+
+**⚠️ Retract as evidence: `o1C=0` / `o28=0` in every record proves nothing.** The caller
+`reg_save_stub_z_33 @ 0x112750` writes `*(a1+28)=0` and `*(a1+40)=0` **on entry** and clears
+`+8/+14/+18/+1C` again at its `LABEL_11` exit. Both counters are zero everywhere *by design*.
+Textbook [[feedback_probe_the_final_value]].
+
+##### ★★ The persistent witness — `obj[11]` has never moved
+
+`obj[11]` (offset `+0x2C`) is the **glyph free-list stack pointer**. `sub_00111DA0` decrements it
+on every allocation (`a1[11] = --v26`), and `sub_00112750` never clears it. It reads **`0x200` in
+all 13 records, n=2000 → 36000**. Zero glyphs have ever been allocated.
+
+##### Why allocation is skipped — the `0x8000` seed
+
+```c
+v23 = glyphMap + 2*glyphIdx;   v24 = *(u16*)v23;
+if (v24 & 0x8000) { ...allocate from free list, build glyph... }
+else if (*(u8*)(cacheMap + 4*v24 + 2) != 2) ++a1[10];      // no-op
+```
+
+`0x8000` is the *"slot empty — go allocate"* marker. A **zero-filled `glyphMap` has the bit
+clear**, so every character falls into the else branch, silently treats slot 0 as a cache hit,
+allocates nothing and builds nothing — which is exactly `payloadNz=0/4096`.
+
+The only writer of `0x8000` we have found is the aging loop at the tail of `sub_00112750`
+(`*(u16*)(v11 + 2*…) = 0x8000`, `v11 = resolve(a1[9])` = `glyphMap`), and it is gated on
+`obj[11] < obj[23]` == `0x200 < 0x200` == **false**. It never runs. If nothing else seeds
+`glyphMap`, the cache can never fill.
+
+#### ✅ ANSWERED 2026-08-07 (run 6 data) — glyphMap is entirely zero, and the seeder is a memset
+
+Run 6, 13 records, n=2000→36000, **every record identical on these fields**:
+
+```
+o2C=0x200  o5C=0x200  o6C=0x1  gmapW=0x0  gmap8k=0/512  gmapNz=0/1024
+```
+
+`glyphMap @0x8a1400` is **all zero across all 1024 bytes** and the free-list SP never moved.
+The `gmap8k == 0` branch is taken: the map was never seeded.
+
+**★★ The seeder is found — and it is a `memset`, not a `0x8000` loop.** My earlier claim that
+"the only `0x8000` writer is the aging loop in `sub_00112750`" was too narrow: it was a literal
+grep for `0x8000`. The real seed is in the **object-create routine** (decompile line 14490 —
+the one whose tail is `*(u32*)(v18+44) = *(u32*)(v18+92)`, i.e. exactly our
+`obj[11] = obj[23] = 0x200`):
+
+```c
+v22 = resolve(*(int*)(v18+36));          // obj[9]  = glyphMap
+v24 = resolve(*(int*)(v18+48));          // obj[12] = freeList
+v23 = resolve(*(int*)(v18+52));          // obj[13] = font
+if (*(u32*)v23 == 'FFON' && hdr check ok) v13 = v23;
+module_obj_init(v22, 255, 2 * *(u32*)(v13 + 24));   // ← memset(glyphMap, 0xFF, len)
+do { *(u16*)v24 = --count; v24 += 2; } while (...); // ← free-list descending fill
+*(u32*)(v18+28) = 0;
+*(u32*)(v18+44) = *(u32*)(v18+92);                  // ← obj[11] = 0x200
+```
+
+`module_obj_init @0x18E408` is a `memset` (`pcpyh`/`pcpyld` + `sq` stores). So `glyphMap` is
+supposed to come out **`0xFFFF`-filled**, and `0xFFFF` carries the `0x8000` "slot empty" bit.
+That is the seed. It did not happen.
+
+⚠️ Note `v13` is an **uninitialized stack variable** unless the FFON header check passes, so the
+memset length `2 * *(u32*)(v13 + 24)` is the prime suspect for being zero.
+
+#### ✅ ANSWERED 2026-08-07 (run 7 data) — branch 3: the init ran, the length was real, the memset vanished
+
+11 records, all identical on the new fields:
+
+```
+hdr18=0x482  fl0=0x1fe01ff  flNz=766/1024  ctNz=0/1024  cmNz=1/2048  gmapNz=0/1024
+```
+
+`flNz=766/1024` is a **byte-perfect** match for the descending free-list fill
+`0x1ff,0x1fe,…,0x000` — 510 nonzero low bytes (all but `0x000` and `0x100`) + 256 nonzero high
+bytes (`0x100`…`0x1ff`) = 766 — and `fl0=0x1fe01ff` is exactly `0x01ff,0x01fe` little-endian.
+
+Three things follow, and they close three open questions at once:
+
+1. **The create routine ran.** The free-list fill is its work, verbatim.
+2. **`fontGateResolve()` is correct.** Handle `0xe` → `0x8a4400` provably holds the game's own
+   data. The resolver is no longer a suspect for *any* handle.
+3. **The memset length was not zero.** `hdr18 = 0x482` ⇒ `2 * 0x482 = 0x904` = 2308 bytes.
+
+So `module_obj_init(glyphMap, 255, 0x904)` — which sits *immediately before* the free-list fill,
+in the same basic block — did not land at `0x8a1400`. The fill worked; the memset did not.
+
+**Ruled out this session, statically:**
+
+- `translatePCPYH` — `_mm_set_epi16(h,h,h,h,l,l,l,l)` from `_mm_extract_epi16(src,0)` /
+  `(src,4)`. Correct.
+- `PS2_PCPYLD` — `_mm_unpacklo_epi64(rt, rs)`, i.e. `rs` upper / `rt` lower. Correct.
+- A globally broken `sq` would take the whole game down, not one buffer.
+
+Also retired: the aging-loop gate `obj[11] < obj[23]` is correct behavior (a full free-list has
+nothing to reclaim), and the `v13`-uninitialized-stack-var worry is dead — `hdr18` is real.
+
+#### ✅✅✅ ROOT CAUSE FOUND 2026-08-07 (run 8) — `translatePCPYH` reads `rs`, must read `rt`
+
+Run 8 returned **`ffAt=0x0 ffLen=0` in all 13 records** — branch 1. The memset stored no `0xFF`
+anywhere in the 128KB arena. That was answerable **statically**, no further run needed:
+
+1. `decompiles_SLUS_214_42.txt:14574` — `module_obj_init(v22, 255, 2 * *(v13+24))`, where
+   `v22 = wrap_vtable_table_lookup_b(*(v18+36))` = `resolve(obj[9])` = glyphMap. The free-list
+   fill at :14583 resolves `v24` through the **same wrapper** and demonstrably works, so the
+   target address was never in doubt.
+2. `decompiles_SLUS_214_42.txt:110279` — `sub_18E408` is a memset that **cannot return without
+   writing**: even when the 16-byte-aligned vector fast path is skipped, the byte tail loop at
+   :110319 (`for (i = a3-1; i != -1; ++v3) *v3 = a2;`) covers every byte. `a3 = 0x904 ≠ 0`.
+   ⇒ the fault is in **our** translation, not the guest.
+3. `ps2xRuntime/src/runner/sub_0018E408_0x18e408.cpp:80-83` —
+   `// 0x18e434: 0x70081ee9  pcpyh $v1, $t0` emits `GPR_VEC(ctx, 0)`. **It broadcasts `$zero`.**
+
+**Decode of `0x70081ee9`:** op=`0x1C` (MMI), **rs=0**, **rt=8 (`$t0`)**, rd=3 (`$v1`),
+sa=`0x1B` (PCPYH), func=`0x29` (MMI3). PCPYH is encoded `rd, rt` with **rs unused (always 0)**.
+`translatePCPYH` formatted `inst.rs`, so every `pcpyh` in the game produced **0**.
+
+**The data fits byte-for-byte.** `0x904` = 2308 = 72×32 + 4. The vector loop *zero*-fills 2304
+bytes; the byte tail (`sb $a1`, correct) writes 4 bytes of `0xFF` at offset `0x900`. Hence
+`gmapNz=0/1024` (the probe window is the first 1024 bytes — all zeroed) and `ffAt=0` (the only
+`0xFF` run is 4 bytes, far below the 256 threshold). This is the seeder for the `0x8000`
+glyph-cache marker, so a zero-filled glyphMap ⇒ every char fakes a slot-0 cache hit ⇒
+`payloadNz=0/4096` ⇒ `[present] nonblack=0`. **The whole Stage 5.10 chain closes on one operand.**
+
+**Blast radius: 4 emission sites, 2 distinct guest functions** (`grep -rl pcpyh` over `runner/`,
+counts only) — `0x18E408` (memset) and `0x18E0D8` (`0x700a46e9` = `pcpyh $t0, $t2`, rs=0,
+rt=10 — same defect). Both are libc mem routines. Each has two coexisting naming generations
+(`fn_*` + `sub_*`/`mem_compare_n_b_*`), which is why 2 functions give 4 files.
+
+**Fix applied:** `ps2xRecomp/src/lib/mmi_translation_helpers.cpp:574` — `inst.rs` → `inst.rt`,
+with a comment recording the encoding. `translatePCPYUD`/`translatePCPYLD` take both `rs` and
+`rt` and were already verified correct; `PS2_PCPYLD` (`ps2_runtime_macros.h:727`) is correct.
+
+**`registerFunction` cannot deliver this fix** — `sub_18E408` is invoked as a direct C++ `fn_`
+call from recompiled code ([[feedback_registerfunction_bypass]]), so an override wrapper would
+never be entered. It must come from **regeneration**.
+
+**Regeneration is cheap here.** `PS2Recompiler::writeToFile` (`ps2_recompiler.cpp:2199`) has a
+content-compare guard: it re-emits ~30,000 TUs but skips writing any file byte-identical to
+what is on disk, so timestamps — and therefore the incremental rebuild — are confined to files
+that genuinely changed. Expect ~2–4 changed TUs, minutes not hours. **This is not a clean.**
+
+#### ✅✅✅ FIX VERIFIED 2026-08-07 (run 9) — every predicted field moved, glyph pipeline is ALIVE
+
+The regen ran, the runtime rebuilt, and **all six pre-registered verification fields hit their
+predicted values.** This is the strongest confirmation the project has produced: the predictions
+were written down *before* the run, and they were exact, not approximate.
+
+| field | run 8 (broken) | predicted | run 9 (observed) |
+|---|---|---|---|
+| `ffAt` | `0x0` | `0x8a1400` | **`0x8a1400`** (n=2000/4000) |
+| `ffLen` | `0` | `2308` | **`2308`** — `2*0x482 = 0x904` exactly |
+| `gmapNz` | `0/1024` | `1024/1024` | **`1024/1024`** |
+| `gmap8k` | `0/512` | `512/512` | **`512/512`** |
+| `payloadNz` | `0/4096` | non-zero | **`621/4096`** |
+| `o2C` (free-list SP) | `0x200` frozen | must decrement | **`0x1d6`** |
+
+**The consequence chain now runs end to end.** `pcpyh` broadcasts `$t0` → `sub_18E408` `0xFF`-fills
+2308 bytes → glyphMap carries the `0x8000` cache-empty marker → cache misses are *real* → glyphs
+allocate. `0x200 - 0x1d6 = 0x2a` = **42 glyphs allocated**, and `o28=0x2a` independently reports the
+same 42. The dependent tables came alive with it: `ctNz` `0/1024`→`41/1024` (charTab), `cmNz`
+`0/2048`→`83/2048` (cacheMap), `srcNz` `0/512`→`58/512` (source pixels), and `gmap8k` correctly
+*decays* `512/512`→`470/512` as 42 slots are consumed. `ffAt` likewise walks forward
+`0x8a1400`→`0x8a14b4` with `ffLen` `2308`→`2128` — the untouched tail of the `0xFF` fill, shrinking
+by exactly the region the allocator claimed. Nothing here is a coincidence of one counter; six
+independent fields agree on the same 42.
+
+**Stage 5.10's root cause is closed.** `translatePCPYH` reading `inst.rs` instead of `inst.rt` was
+the whole blocker, and the fix is confirmed live in the regenerated runners.
+
+#### ✅ `[present] nonblack` ANSWERED — non-zero. Stage 5.10's discriminator PASSED.
+
+The run-9 log was queried; no rebuild, no re-run.
+
+```
+[present] has=1 w=512 h=448 nonblack=0     ...  (first 7 records — early boot)
+[present] has=1 w=512 h=448 nonblack=9180  dispFbp=0x70  pmode=0x7f27
+[present] has=1 w=512 h=448 nonblack=9794  dispFbp=0x0   pmode=0x7f27
+   ... alternating 9180 / 9794 for the remaining 9 records, in lockstep with the page flip
+```
+
+**`nonblack` went `0` → `9180`/`9794`.** The pre-registered branch was binary and it resolved to
+"non-zero ⇒ the frame is drawing". `pmode=0x7f27`, `w=512 h=448`, and `dispFbp` alternating
+`0x70`↔`0x0` in step with `dispfb1/2` `0x1070`↔`0x1000` — the page flip is alive and each buffer
+carries its own stable pixel count. That is a real double-buffered frame, not a stuck one.
+
+**Honest bound on what this proves.** `nonblack` counts non-black pixels in the presented buffer; it
+does not identify *which* pixels. 9180 of 512×448 = **4.0%** coverage, which is the right order of
+magnitude for a line of menu text on a black screen but is not by itself proof the glyphs are the
+source. The chain is now measured end to end at every link — glyph alloc (42), payload
+(`payloadNz=621`), present (`nonblack≈9.2k`) — so the remaining question is cosmetic verification,
+not diagnosis: **look at the window.**
+
+**`[psmt4]` is uninformative here and must not be read as contradiction.** All 20 records are
+`n=0…7, 400, 800` — the probe stopped firing long before glyphs were allocated (that begins around
+`n≈14000`). `copied=0 total=0 readback=0` at `n≤800` describes the pre-glyph era only. Per
+[[feedback_capped_probes_false_negatives]] and the known `EndTransfer()` artifact behind `copied=0`,
+this tag says nothing about the post-fix state. Its one useful field is consistency: `dbp` alternates
+`0x2b80`/`0x2b60`, matching `[fontgate] tbl0=0x2b800001`/`0x2b600001` exactly.
+
+⚠ Do **not** re-derive the glyph chain. It is measured and settled.
+
+#### ✅✅✅ STAGE 5.10 CLOSED 2026-08-07 (run 10) — visual confirmation, TEXT IS ON SCREEN
+
+Ran with `-Determinism 0 -RunSeconds 90 -NoDebugger -Exe …\RelWithDebInfo\ps2EntryRunner.exe`.
+**The memory-card text renders and is legible.** Exit test PASSED. `translatePCPYH`'s `rs`→`rt` fix
+carried the whole chain from `pcpyh` through glyph allocation to visible pixels.
+
+Cumulative fix entry: `translatePCPYH` read `inst.rs`; PCPYH is encoded `rd, rt` with `rs` unused.
+See [[project_stage58_vu1_microcode_missing]] for the full evidence chain.
+
+#### ★ STAGE 5.11 (new, opened by the same run) — the red text box is now MISSING
+
+Same run: the text appeared, **and the red box that used to be behind it disappeared.** Before the
+fix the observed state was "flashing red text box with invisible text"; after it is "legible text,
+no box". A clean inversion.
+
+**Do not assume this is a regression.** The 08-04 archive note already reads: *"The flashing text
+box with invisible text is a blank PSMT4 glyph sheet."* If that framing was right, the red field was
+never a UI element — it was the all-zero glyph sheet being rendered as one solid quad, and its
+disappearance is the artifact being *fixed*, not a new bug. That hypothesis is plausible but **not
+established**, and the rival reading (SDBZ genuinely draws a dialog background here, and we have
+lost a real draw) is equally consistent with what was seen on screen. Do not pick one by reasoning.
+
+**The pixel count already says the box is genuinely absent, not merely dim.** `[present]
+nonblack≈9180`. A dialog background covering even a modest 400×100 region would contribute ~40,000
+non-black pixels on its own — 4× the entire observed count. ~9.2k is the right magnitude for
+*glyph pixels alone* (a ~40-char line of 24×24 glyphs at realistic coverage). So no box pixels are
+reaching the framebuffer at all.
+
+⚠ One mechanism worth *ruling out* rather than assuming: "CLUT[0] is opaque red, so the blank sheet
+drew solid." That does **not** survive arithmetic — `payloadNz=621/4096` means the payload is still
+overwhelmingly index 0, so if CLUT[0] were opaque red we would now see a red box *with* text on it.
+We do not. Whatever produced the red field, it was not simply CLUT[0] on a zero payload.
+
+**Discriminator — a reference screenshot, not a probe.** Boot the same scene in PCSX2 and look at
+whether a red/coloured box sits behind "No memory card". That settles correct-vs-regression in one
+step and costs nothing to instrument.
+
+- **PCSX2 shows no box** ⇒ our frame is correct; close 5.11 immediately, the artifact was the bug.
+- **PCSX2 shows a box** ⇒ a real draw is missing. Then, and only then, instrument: reopen
+  `[psmt4]`'s change-gate past `n=800` so it samples the glyph era, and compare
+  `[gs:frame] nonblack` against `[present] nonblack` to find whether the box is rasterized and lost,
+  or never submitted at all.
+
+#### ✅ 5.11 BRANCH RESOLVED 2026-08-07 — user confirmed the box is real ("it sits behind *No
+memory card*"). Branch B. **And the run-10 log already contains the answer — no rebuild was needed.**
+
+`[fbscan]` (already live from Stage 5.7, change-gated, uncapped) scans **both** halves of the double
+buffer per latch with byte-identical decode, varying only `fbp`. Its 43 records over the 90 s run:
+
+```
+[fbscan] fbp=0x0  ... nonblack=0        (boot, both halves)
+[fbscan] fbp=0x0  ... nonblack=9487     <- text only. fbp=0x70 stays 0 for a long stretch
+[fbscan] fbp=0x70 ... nonblack=9487     <- second half finally starts receiving the text
+[fbscan] fbp=0x0  ... nonblack=64664    <- ★ LAST TWO RECORDS ONLY
+```
+
+**The box IS rasterized.** `64664 − 9487 = 55,177` non-black pixels appear on top of the text — the
+right magnitude for a ~550×100 dialog background, and it matches the independent `[vramcensus]`
+evidence exactly: pages `0x51…0x56` and `0x59,0x5a` report `nonblackwords=2048/2048`, i.e. **fully
+saturated** GS pages. At `fbw=8` those are 64×32 blocks at page-row 10 cols 1–6 and page-row 11
+cols 1–2 — a solid horizontal band, not scattered glyph pixels. Two probes, independent mechanisms,
+same rectangle.
+
+**Two facts that constrain every downstream hypothesis:**
+
+1. **`64664` appears only in the final ~2 records of a 90 s run**, and only at `fbp=0x0`. The box is
+   drawn *late*. The user's on-screen observation may simply predate it.
+2. **`[present] nonblack` never exceeds 9794.** It reported `9180`/`9794` throughout — text-only
+   magnitude. So at no sampled moment did the presented frame carry the box.
+
+**Ruled out — the box is not going to a lost render target.** `[gs:frame-change]` has 1097 records
+and `frame.fbp` is **only ever `0x70` or `0x0`**. Everything draws into the two display buffers.
+Also `primmask=0x40` for the whole run: every rasterized primitive is a **sprite** (prim 6). Pure 2D.
+
+**Not yet distinguished (do not pick by reasoning):**
+- (a) The box simply appears late and the 90 s window ended before `[present]` could sample it —
+  in which case nothing is broken and 5.11 closes.
+- (b) The box lands in `fbp=0x0` while presentation is locked to the other half, so it would never
+  show no matter how long the run — a real flip/present bug.
+
+**★ NEXT ACTION — a longer run. Zero code change, zero rebuild.** Re-run at 150 s and re-query the
+two tags. This separates (a) from (b) in one shot:
+
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 150 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag fbscan
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag present
+```
+
+Pre-registered reading:
+
+| observation | conclusion |
+|---|---|
+| `[present] nonblack` reaches ~64k | ✅ box presents. 5.11 was a timing artifact — CLOSE |
+| `[fbscan]` shows 64664 in **both** `fbp`, `[present]` still ~9.5k | loss is inside `copyDisplaySource`, downstream of the scan |
+| `[fbscan]` 64664 **only** at `fbp=0x0` for many records, `[present]` ~9.5k | flip/present half-selection bug — chase `dispFbp` vs `srcFbp` |
+| `64664` still only in the last ~2 records | box is drawn once at a fixed late point; re-time the question |
+
+⚠ Do **not** rebuild `[psmt4]` or build `[vifsrc]` for this. Both were pre-registered against the
+old "never submitted" hypothesis, which `[fbscan]` has now falsified — the box *is* submitted and
+*is* rasterized. Instrumenting the upload path would answer a question that is already closed.
+
+---
+
+#### ✅ 5.11 RUN 11 RESULT (150 s, 2026-08-07) — none of the four rows. Root cause reframed.
+
+The 150 s run genuinely ran longer (`prims` 231,883 vs run 10's 145,673; `imagebytes` 180 MB vs
+115 MB; `[fbscan]` 61 records vs 43) and **the `64664` never recurred** — max `nonblack` is 9487.
+Run 10's log is gone (`launch_recomp.ps1` writes a single fixed `-Log` path, no archiving), so that
+event is unrepeatable. `-Determinism 0`, so it was a one-off.
+
+**Row 3 is falsified — there is no flip/half-selection bug.** Every `[present]` record carrying
+`nonblack=9794` has `dispFbp` equal to the `[fbscan]` half that holds 9487. Presentation always
+picks the populated buffer.
+
+**What the run *did* settle, from two probes that were already compiled in:**
+
+`[fbdest]` — `lastnbpct=99`, and the black/non-black split is near-identical on both halves
+(`fbp0x0=2227980/14770920`, `fbp0x70=2227980/14770920`). Colour reaches both buffers. Nothing is
+being misaddressed.
+
+`[blackwho]` — the decisive line:
+
+```
+[blackwho] untex=13762560 texzero=15759420 texcol=19860 tail=0,0..511,447
+           | last black store: prim=0x6 texpsm=0x14 tbp=0x2b60 cbp=0x2a48
+             fbmsk=0x1 alpha=0x44 texel=0x0 srcrgb=0x0 xy=0x1bf01ff fbp=0x0
+```
+
+- **`texcol=19,860`** — three orders of magnitude below the others. **Blending, TEXFUNC and FBMSK
+  are exonerated.** Colour that arrives at the pixel pipeline is not being eaten there.
+- **`texzero=15,759,420` is the LARGEST bucket** — larger than the screen clear itself. These are
+  textured sprites whose texel decodes to RGB 0 and which then **store that black over the
+  background**. `texpsm=0x14` = PSMT4. On real GS those pixels are discarded by the alpha test or
+  blended to `Cd`; here they are written.
+
+That mechanism explains every observation at once: only the last-drawn layer survives, which is why
+`[fbscan]` sits at exactly 9487 (the text) and why the box — drawn *before* the text — is gone by
+present time. Run 10's `64664` was `[fbscan]` catching the frame between the box draw and the text
+draw that erased it.
+
+⚠ **Do not conclude from `prim=0x6` in that snapshot.** `0x6` decodes to prim=6, TME=0, ABE=0 — an
+untextured clear. The `snap*` set is overwritten by *every* black store, and the full-screen clear
+always lands last in an interval, so it permanently masks the texzero population. That snapshot
+describes the clear, not the offender.
+
+**★ NEXT ACTION — `[texzero]` probe. Two `.cpp` files, no headers.**
+
+Added `ps2_gs_rasterizer.cpp` (capture, on the texzero branch only) + `ps2_gs_gpu.cpp` (emit).
+Fields: `abeon`/`abeoff`/`ateon` counts, texzero-only `bbox`, and a snapshot of `prim`, raw `test`,
+`alpha`, `srca`, `texel`, `texpsm`, `tbp`, `cbp`, `dstrgb`, `fbp`.
+
+Pre-registered reading — **`abeoff` vs `abeon` first, everything else follows**:
+
+| observation | conclusion |
+|---|---|
+| `abeoff` >> `abeon` | game relies on the alpha TEST to discard index-0 texels and we are not discarding them. Read `test` (bit0 ATE, bits1-3 ATST, bits4-11 AREF, bits12-13 AFAIL) and `srca` — **`srca` nonzero on a `texel` whose alpha is 0 means the PSMT4/CLUT decode is dropping the alpha channel**, which is the fix site |
+| `abeon` >> `abeoff` | the blend ran and still produced black — compare `alpha` against `dstrgb`; if `dstrgb` is nonzero the blend equation is wrong, if zero the background was already lost upstream |
+| `ateon` ≈ 0 | ATE is genuinely off in the guest's TEST register; then the discard must come from `TEX0.TCC`/alpha, not the alpha test |
+| `bbox` is glyph-sized, not `0,0..511,447` | these are UI text sprites, matching the "text erases the box" story |
+
+Build, then run and query:
+
+```powershell
+cmake --build "F:\SDBZ Recomp\build" --config RelWithDebInfo
+```
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag texzero
+```
+
+##### ✅ BUILD STATUS 2026-08-07 — `[texzero]` IS LINKED INTO `ps2EntryRunner.exe`. Run is PENDING.
+
+The build the user ran finished with two `LNK1120` failures and three `C4838` warnings. **Neither
+blocks the run.** Triaged read-only:
+
+- **`iop_harness.exe` (5 × LNK2019) and `ps2x_tests.exe` (1 × LNK2019)** — unresolved
+  `fn_180D30_0x180d30`, `fn_1A4500_0x1a4500`, `fn_1BF2E0_0x1bf2e0`, `fn_22C8F0_0x22c8f0`
+  (from `applySdbzKernelThunkFixes`) and `singleton_get_camera_0x199db0` (from
+  `sdbzPoolBaseProbe199DB0`). All six are **generated `runner/` bodies**. Those two targets link
+  `ps2_runtime.lib` but **not** the runner objects, so these symbols are unresolvable there **by
+  construction** — a pre-existing structural property of the target topology, not a regression.
+  **No error line names `ps2EntryRunner.vcxproj`.** ⚠ Expect these two failures on every future
+  build; do not spend a session on them.
+- **`C4838` at `ps2_gs_gpu.cpp(1305–1307)`** — narrowing `Bitfield<u64,0,9,T>` → `uint32_t` in the
+  pre-existing `[fbscan]` `const uint32_t candidates[4]` initializer. Not the new probe. Harmless.
+- **Timestamp chain proves the probe shipped** (source → obj → lib → exe, strictly increasing):
+  `ps2_gs_rasterizer.cpp` 6:09:51 → `ps2_gs_gpu.cpp` 6:10:17 → both `.obj` (RelWithDebInfo)
+  6:14:31/6:14:33 → `ps2_runtime.lib` 6:16:32 → **`ps2EntryRunner.exe` 8:32:01, 309,074,944 bytes**.
+  Only two `ps2_gs_gpu.obj` exist under `build\` (Debug 8/6, RelWithDebInfo above) — no stale third.
+
+**~~Next session STARTS HERE~~ — DONE. Result below.**
+
+Historical placeholder note: the previous revision of this block ended with a literal
+`-Exe <RelWithDebInfo exe>` placeholder, which is a PowerShell parse error (`<` is reserved).
+Always paste the full path from [[command_log]]:
+
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+- **Text visible** ⇒ Stage 5.10 CLOSED. Advance the stage number and pick the next gate.
+- **Screen non-black but no legible text** ⇒ the 9.2k pixels are something else (background, HUD).
+  Then, and only then, the narrow follow-ups are: rebuild `[psmt4]` with its change-gate opened past
+  `n=800` so it samples the glyph era, and build the `[vifsrc]` probe at the head of
+  `PS2Memory::processVIF1Data`. `clutNz=60/64` is already known-good.
+
+---
+
+#### ✅ 5.11 RUN 12 RESULT (2026-08-07) — `[texzero]` came back. **Row 2 fired, and the texzero hypothesis is DEAD.**
+
+The run had already happened: `run_log.txt` (11:22) postdates the probe-carrying exe (08:32).
+`analyze_run.py --tag texzero` → **22 records, no `[cap]` line, so absence is evidence.**
+
+```
+[texzero] abeon=15,759,420  abeoff=0  ateon=15,759,420  bbox=0,0..511,447
+  family A: prim=0x56 test=0x30003 alpha=0x44 srca=0x00 texel=0x0        texpsm=0x14 (PSMT4)
+  family B: prim=0x56 test=0x3000f alpha=0x44 srca=0x80 texel=0x80000000 texpsm=0x13 (PSMT8)
+```
+
+**`abeoff=0`.** Row 1 of the table is dead — the game does not rely on the alpha test here.
+Row 4 is dead too: `bbox` is full-screen, not glyph-sized. Row 2 fired.
+
+**But the answer is stronger than row 2 predicted: family A is an identity write.** Decoded, not
+inferred, per [[feedback_verify_translations_by_decoding]]:
+
+- `alpha=0x44` → a=0 b=1 c=0 d=1 → **A=Cs, B=Cd, C=As, D=Cd** → `(Cs − Cd)·As + Cd`.
+- `ps2_gs_rasterizer.cpp:610-613` implements exactly that: `br = ((Cs − Cd)*cAlpha >> 7) + Cd`,
+  with `cAlpha = a` when `csel==0`. **The blender matches the GS spec. It is not the bug.**
+- Family A carries **`srca = 0`** ⇒ the expression collapses to `br = dr`. Those 15.7M stores
+  **write the destination back unchanged**. They are classified black only because `Cd` was
+  already black (`dstrgb=0x0` on every snapshot).
+- `test=0x30003` → ATE=1 but **ATST=1 = ALWAYS**, ZTE=1/ZTST=ALWAYS. Nothing is discarded, and
+  nothing needs to be — the stores are no-ops.
+
+**⛔ All three `[blackwho]` buckets are now exonerated.** `texcol` was 3 orders too small,
+`texzero` is a no-op, `untex` is the expected clear. **Nothing in the black-store census destroys
+colour.** Run 11's "textured sprites bury the background" story is retracted.
+
+**Surviving suspect #1 — clear ordering.** `[fbdest] lastnbpct=99` with `tail=0,0..511,447`: after
+the final coloured pixel there is a full-screen black run, ~1% of the sequence ≈ one screen-clear.
+⚠ **But `[fbdest]` is emitted on the ~1/sec THROTTLED interval, so its `seq`/`lastnb` span ~60
+frames.** It cannot distinguish "a clear runs after the draws every frame" (a bug) from "one clear
+landed at the end of the interval" (not a bug). This is also why `[blackwho]`'s `snap*` set was
+permanently owned by the clear. **Unresolvable with the current probes** — hence `[frameord]`.
+
+**Surviving suspect #2 — the PSMT8 family.** `texpsm=0x13`, `texel=0x80000000` = alpha 0x80 with
+**RGB 0**, `test=0x3000f` → ATST=7 NOTEQUAL / AREF=0, so alpha 0x80 passes the test. Same
+`alpha=0x44` blend, but with `As=0x80` the result is ≈ `Cd/2` — it genuinely halves the
+destination on every pass. A CLUT lookup yielding zero RGB with nonzero alpha is the signature of
+a PSMT8/CLUT decode dropping the colour channels. **Look at this only after ordering is settled.**
+
+---
+
+#### ✅ 5.11 RUN 13 RESULT (2026-08-07) — `[frameord]` fired **row 3**, and the cross-check kills ordering.
+
+```
+[frameord] boot:     frames=60 wiped=60  maxtrail=13,074,432   (= 57 screens — the black boot)
+[frameord] steady:   frames=60 wiped=8..20 (13-33%)  maxtrail=229,423  lasttrail=0 or 47
+[present]  steady:   nonblack=9794 / 9180 on EVERY latch — never 0
+[fbdest]   steady:   fbp0x0 ≈ 2.2M nonblack / 14M black, same for fbp0x70
+```
+
+- `maxtrail = 229,423 = 229,376 + 47`, and `229,376 = 512×448` **exactly** — the wiping run is
+  precisely **one** screen-clear, never a stack of them.
+- `lasttrail` is **0 or 47** on the sampled latch ⇒ that frame ended on **coloured** pixels.
+- **`[present] nonblack` is never 0.** The presented buffer always carries ~9,800 coloured pixels,
+  and the count is *constant* across 20 s ⇒ a static image — the memory-card glyphs from 5.10.
+
+**⛔ Suspect #1 (clear ordering) is DEAD.** A per-frame clear-after-draw bug requires
+`wiped ≈ frames` *and* `nonblack = 0`. We have neither. ~20% of frames merely happen to be sampled
+between the clear and the first draw. The screen is **not** black — it is missing one layer.
+
+**The arithmetic names that layer.** Per interval (60 frames):
+
+| bucket | per interval | per frame | reading |
+|---|---|---|---|
+| `untex` | 13.76 M | 229,333 | ≈ **1×** full screen — the expected clear |
+| `texzero` | 15.76 M | 262,667 | ≈ **1×** full screen — a full-screen **textured** quad whose every texel is black |
+| survives to present | — | 9,794 px | the glyphs only |
+
+So every frame draws a **full-screen textured quad that samples nothing but black texels**. That is
+the red box. It is not being erased — **it is being drawn black.**
+
+**⚠ `[texzero]` is a doubly-selected population** (`ps2_gs_rasterizer.cpp:713-756`: the branch is
+entered only when the store is black **and** textured **and** `texel & 0xFFFFFF == 0`). It therefore
+can **never** prove "all texels are zero" — [[feedback_degenerate_result_convicts_the_probe]]. What
+carries the weight is the *volume*: 262k such samples per frame ≈ one full screen.
+
+Full `[texzero]` fields, now including the pointers:
+
+```
+PSMT8 (0x13): tbp=0x2a00 cbp=0x2a40 texel=0x80000000 srca=0x80 test=0x3000f
+PSMT4 (0x14): tbp=0x2b80 cbp=0x2a4c texel=0x00000000 srca=0x00 test=0x30003
+```
+
+**Decoded, not inferred:** `applyTexa()` (`ps2_gs_rasterizer.cpp:163-191`) takes its `default:`
+branch for T4/T8 — it does **not** synthesise alpha. So the `0x80` in `0x80000000` came **straight
+out of the CLUT**. The palette entry really is *opaque black*. Both families reduce to the same
+statement: **every sampled texel resolved to a black palette entry.**
+
+Two ways that happens, needing different fixes:
+- **(a)** the CLUT is empty/black, or
+- **(b)** the CLUT is fine and every *index* is 0 because the texture never landed in VRAM at `tbp`.
+
+Defects found by reading the decode path (real, but **not yet convicted** as this bug):
+1. `ps2_gs_rasterizer.cpp:841` passes `tex.psm` (T4/T8) to `applyTexa`, not the **CLUT** format —
+   compare line 830/835 which pass the texture's own format.
+2. Same line: a **CT16 CLUT entry skips `Rgba5551ToRgba8888`**, while a CT16 *texture* gets it
+   (line 835). A raw 5551 word used as 8888 yields B=0, A=0.
+3. `ReloadClutCacheCSM2` (`ps2_gs_gpu.cpp:4116` + `:4123`) multiplies `texclut.cou` by 16 **twice**.
+   Only reachable when `CSM=1`.
+
+---
+
+#### ✅ 5.11 RUN 14 RESULT — `[vramcen]`, 2026-08-07. **Row 4 fired. Both buffers are populated.**
+
+21 records, no `[cap]`. First 7 are pre-boot zeros (`vramnz=0`) — ignore them. Steady state, two
+recurring texture/palette pairs:
+
+| tbp | texnz | cbp | clutnz | cvnz | clut0 | clut1 | vramnz |
+|---|---|---|---|---|---|---|---|
+| `0x2a00` (PSMT8) | 10188/16384 | `0x2a40` | 954/1024 | 954/1024 | `0x0` | `0x0a000000` | 301,163 |
+| `0x2b80` (PSMT4) | 4107/16384 | `0x2a4c` | 1004/1024 | 716/1024 | `0x0` | `0x08ffffff` | 235,883 |
+| `0x2b60` (PSMT4) | 4107/16384 | `0x2a48` | 1004/1024 | 1004/1024 | `0x0` | `0x08ffffff` | 233,846 |
+
+**Verdict — the last row of the table, unambiguously:**
+
+- `clutnz` = **954–1004 of 1024 bytes nonzero (93–98%)**. A mostly-black palette cannot produce that;
+  a black entry contributes at most 1 nonzero byte (its alpha). **The palette is colourful.**
+- `texnz` = 4107–10188 of 16384. **The texture page is uploaded.**
+- `vramnz` = 233k–447k of 1M words. **Rival-reading guard passes** — VRAM is genuinely populated, so
+  no zero above can be blamed on "nothing was ever uploaded".
+- `cvnz` ≈ `clutnz` on two of three pairs ⇒ the cache faithfully mirrors VRAM at `cbp`.
+  (The `0x2a4c` mismatch, 1004 vs 716, is not decisive: the probe scans the 1 KB at `cbp` **linearly**
+  while GS CLUT storage is block-swizzled, so `cvnz` is only a presence guard, never a byte-for-byte
+  comparison. Do not read more into it than that.)
+
+⛔ **Suspects (a) "CLUT empty" and (b) "texture never uploaded" are BOTH DEAD.**
+
+Cross-check that seals it: the PSMT8 `[texzero]` texel was `0x80000000`, and cache entry 0 is
+`0x00000000`. If the index were 0 the texel would have been `0x00000000`. **The T8 index is not
+zero** — the sampler is reaching a real, varied index and still landing on an opaque-black result.
+
+Remaining layer: **index → entry**, i.e. `ps2_gs_rasterizer.cpp:842` →
+`GS::ReadClutCache` (`ps2_gs_gpu.cpp:4125`) vs `GS::ReloadClutCacheCSM1` (`:4157`).
+
+Read this session, **not yet convicted** — do not fix any of these speculatively:
+
+1. **`resolveClutIndex` (`ps2_gs_rasterizer.cpp:318`) is dead code.** Line 842 calls `ReadClutCache`
+   with the raw index, so `swizzleClutIndexCSM1` and the T4 `csa<<4` merge never run. May be correct
+   by construction (the CSM1 loader already de-swizzles on the *write* side, storing entries linearly
+   from `csa*16`), but it is the single most likely place for the two conventions to disagree.
+2. **`ReadClutCache` bounds.** CT32 path indexes `m_clut_cache[csa*64 + index*4]` **unmasked**, while
+   the loader masks with `& 0x3FF`. `CSA` is a 5-bit TEX0 field; `csa=31, index=255` → offset 3004,
+   far past a `std::array<u8,1024>`. Out-of-bounds read of adjacent members. Needs the real `csa`.
+3. `ReloadClutCacheCSM2` doubles `cou*16` (`:4225` then `:4232`). CSM2 only, still unconfirmed as live.
+4. Line 842 passes `tex.psm` (T4/T8) to `applyTexa`, not the CLUT format. **Provably a no-op for a
+   CT32 CLUT** (T4/T8 take `default:` and `a` is returned unchanged), so this cannot be the cause here
+   unless `cpsm` is CT16 — which `[clutmap]` now reports.
+
+---
+
+#### ★ NEXT ACTION — `[clutmap]` probe (run 15). Two files, one hot-path store.
+
+Written 2026-08-07. Captures the **raw pre-CLUT index** (`t_lastTexIndex`, set at
+`ps2_gs_rasterizer.cpp:842`) plus `csa`/`csm`/`cpsm`, and dumps the first 8 CT32 cache entries and a
+count of how many of the 256 entries have nonzero RGB. All accumulators are written inside the
+already-cold `texzero` branch; the hot path pays one thread-local store.
+
+Pre-registered reading, **in order**:
+
+| observation | conclusion |
+|---|---|
+| `idxsamp` tiny | **rival-reading guard — read this FIRST.** The other fields are not a distribution; nothing below may be concluded |
+| `idxor` = 0, `idxnz` = 0 | every index is 0 despite `texnz>0` ⇒ the texture **fetch** is broken. Fix `ReadTexturePageCache` / `ReloadTexturePageCache` addressing (`base_block`, `pitch`, `page_width2`, stale single-page cache) |
+| `idxor` ≥ `0xF0`, `idxnz` large | indices are real and varied ⇒ the **lookup** is wrong. Convicts suspect #1 or #2 above; compare `csa`/`csm`/`cpsm` against `ent0..ent7` |
+| `idxor` narrow but nonzero (e.g. `0x0F` on a T8 texture) | only the low nibble survives ⇒ T4/T8 expansion bug in `ReadPageToLinearBufferP8` |
+| `rgbnz` small (< 32/256) | ⚠ **retracts the run-14 verdict.** The palette really would be mostly black and the `clutnz` byte-count reading was wrong. Go back to the CLUT upload path |
+| `cpsm` = CT16/CT16S | promotes defect #4 (missing `Rgba5551ToRgba8888` on CLUT entries) from unconvicted to live |
+
+---
+
+#### ✅ 5.11 RUN 13 → `[vramcen]` probe (SUPERSEDED by run 14 above, kept for the address math)
+
+Written 2026-08-07 into the existing throttled emit block, right after `[frameord]`. `self->m_vram`,
+`self->m_vramSize` and `m_clut_cache` are all already in scope there (`PresentProbe` is a local class
+inside a `GS` member function), so this is a once-per-second scan of buffers that already exist.
+
+`TBP0`/`CBP` are **256-byte block units**: `0x2a00 × 256 = 0x2A0000`, inside a 4 MB VRAM. The rival
+reading (8192-byte pages) gives 88 MB and is impossible — **the address math has exactly one
+admissible interpretation**, so a zero result cannot be blamed on it.
+
+Pre-registered reading, **in order**:
+
+| observation | conclusion |
+|---|---|
+| `clutnz` = 0 | **(a)** — the CLUT cache was never populated. Fix in `ReloadClutCache` / `CSM1` or its `CLD` gating, **not** the sampler |
+| `clutnz` > 0 but `cvnz` = 0 | **(a)** — the cache holds stale junk copied from empty VRAM at `cbp` |
+| `clutnz` > 0, `cvnz` > 0, `texnz` = 0 | **(b)** — palette is real, texture page is empty, so every index is 0. Fix in the GIF image-mode / `TRXDIR` upload path |
+| `clutnz` > 0 **and** `texnz` > 0 | both present ⇒ the fault is the index→entry mapping: `csa` offset, `cpsm`, or defect #2 above |
+| `vramnz` tiny | **rival-reading guard.** Nothing is uploaded anywhere; `texnz=0` alone must never be trusted without this field |
+
+---
+
+#### ~~NEXT ACTION — `[frameord]` probe~~ — DONE, result above.
+
+Written 2026-08-07 into `ps2_gs_gpu.cpp` only. The rasterizer already publishes `g_writeSeq`,
+`g_lastNonBlackSeq` and the `g_tail*` trailing-black bbox, so no capture-side edit was needed.
+
+- **Sampler** — in `PresentProbe::~PresentProbe`, placed **before** the `armed` check so it runs on
+  **every latch, unthrottled**. `trail = g_writeSeq − g_lastNonBlackSeq` = stores since the last
+  coloured store. A latch counts as `wiped` when `trail ≥ 114688` (half of 512×448 — only a
+  full-screen fill can be that big).
+- **Emit** — `[frameord]` in the existing throttled block, right after `[texzero]`.
+- ⚠ Known bias, stated up front: on the single latch right after the throttled reset, `lastNb` can
+  still read 0 and inflate `trail`. That is 1 latch in ~60 and **cannot** manufacture a
+  "wiped on every frame" result.
+
+Pre-registered reading — **`wiped/frames` FIRST**:
+
+| observation | conclusion |
+|---|---|
+| `wiped` ≈ `frames` | every frame ends with a full-screen black fill after the last coloured pixel ⇒ **clear-ordering bug**, and it fully explains why only the last-drawn layer (the 9487-pixel text) survives. Fix site is where the clear sprite is issued relative to the draw list, **not** the rasterizer |
+| `wiped` = 0 | no per-frame erasure; `lastnbpct=99` was a single end-of-interval clear. **Ordering exonerated** ⇒ go to suspect #2, the PSMT8 `texel=0x80000000` family, and instrument the CLUT/PSMT8 decode |
+| 0 < `wiped` < `frames` | intermittent — cross-check `wiped` against how many `[present]` records report `nonblack=0` |
+| `maxtrail` huge but `wiped` tiny | one giant wipe (mode change / shutdown clear), not a per-frame bug |
+| `wipebbox` ≠ `0,0..511,447` | the wiping run is a large sprite, not a screen clear — reopen `snap*` with a texzero-style branch-local capture |
+
+Build, run, query:
+
+```powershell
+cmake --build "F:\SDBZ Recomp\build" --config RelWithDebInfo
+```
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag frameord
+```
+
+⚠ Expect `iop_harness` + `ps2x_tests` `LNK1120` again — structural, see the build-status block
+above. The build is good iff **no error line names `ps2EntryRunner.vcxproj`**.
+
+---
+
+Historical note on the sequence that produced this: the regen was affordable only because
+`PS2Recompiler::writeToFile` content-compares before writing (`ps2_recompiler.cpp:2199`), confining
+the rebuild to the genuinely changed TUs. **A regen is not a clean.**
+
+If `analyze_run.py` looks
+short, read the log directly -- it is UTF-16 and has **no newlines**:
+
+```powershell
+python -c "import re; d=open(r'F:\SDBZ Recomp\run_log.txt','rb').read().decode('utf-16','replace'); [print(r.strip()) for r in re.findall(r'\[fontgate\].*?(?=\[[a-z]|\Z)', d, re.S)]"
+```
+
+#### ⚠️ Measurement caveat — PCSX2 EE write watchpoints miss stores here
+
+A write watchpoint on `0x0054BC9C` caught both zero-stores (`0x001127b4`, `0x0011291c`) but
+**never** the incrementer, despite the field provably reading `0x32` mid-frame. Do not trust
+watchpoint-*absence* on this address. The struct semantics above were derived statically from
+the IDA dump instead. (Related: `reference_pcsx2_debugger_quirks` — hit counts and `last_PC`
+stay 0 even when a watchpoint fires.)
+
+### Stage 5.10 — the older `[vifsrc]` lead (still valid, lower priority)
+
+`[psmt4]`/`[gifsrc]` both report
+`eeAddr=0xffffffff region=copy`, because the PATH2 image packet is a `std::vector` built in
+`ps2_vif1_interpreter.cpp` — by the time the GS sees it the guest address is gone.
+
+`[vifsrc]` (added 08-05, **UNBUILT**) sits at the head of `PS2Memory::processVIF1Data`, the
+last point holding the real guest pointer. For every VIF1 buffer ≥ 16 KB it logs the EE
+address, the whole-buffer non-zero count, and the **longest zero run + its offset**:
+
+- mostly non-zero buffer with one long zero run → **our VIF walk is landing at the wrong
+  offset** (`vifops=30000:8000` already hints the opcode histogram is odd).
+- wholly zero buffer → the **producer never wrote the texture**; move upstream of VIF1.
+
+### Upstream status, checked 2026-08-05
+
+Upstream tip is `f49ca4ed` (#191 VU1 refactor). Full merge **deferred** — 150 files,
++8,642/−32,323 across `ps2xRuntime/` + `ps2xRecomp/`, rewriting every file we hold live edits
+in (`ps2_runtime.cpp`, `ps2_memory.cpp`, `ps2_vu1_core.cpp`, `ps2_vu1_lower.cpp`,
+`ps2_vif1_interpreter.cpp`) and deleting our ps2xStudio/RecompDebugger tree, which upstream
+does not carry. Revisit only after the render path is green, as its own rebase session.
+
+Per-commit triage:
+
+| PR | Side | Status |
+|---|---|---|
+| #149 `81f2a7f5` — `sceGifPkRefLoadImage` A+D nloop double-count | runtime | **already present** in our `GS.cpp:509` + `Support.h:1693` |
+| #168 `905b4edf` — advance `ctx->pc` on fallthrough functions | recompiler | **already present** at `function_emitter.cpp:267` (it is our own contribution) |
+| #194 `d87bff42` — MMI2 opcode map for PMADDH/PHMADH/PMSUBH/PHMSBH | recompiler | **APPLIED 08-05** to `instructions.h`. Correct per ps2tek (`0x10/0x11/0x14/0x15`, not `0x14/0x15/0x18/0x19`). Header lives in `ps2xRecomp/`, **not** included by `runner/*.cpp`, so no mass rebuild — but it only takes effect on regeneration. |
+
+### Learned patterns (2026-08-05)
+
+- **A counter read after its own teardown reports the teardown, not the work.** `[psmt4]
+  copied=0` cost a full framing because `EndTransfer()` zeroes the struct the probe then read.
+  Sample completion state *before* the terminator, or log the terminator itself.
+- **A probe that cannot name a guest address cannot assign blame.** Both `[gifsrc]` and
+  `[psmt4]` saw `region=copy`, so neither could distinguish "RAM was blank" from "we read the
+  wrong bytes". Put the census at the last site holding the real pointer.
+- **Honest hardware answers can break a guest that was surviving on a canned lie.** Fixing
+  `QueryMaxFreeMemSize` is what *caused* the arena overflow — the guest immediately asked for
+  960 KB it had never asked for before. Expect a fixed stub to enlarge the demands on
+  everything downstream of it.
+- **Check upstream commits against the local tree before planning to apply them.** Two of the
+  three candidates were already in, one of them authored here.
+
+---
+
+## ★★★ 2026-08-04 (session close) — STAGE 5.9 RE-FRAMED: this is an **asset-load** failure, not a GS/render failure. Watchpoint written, UNBUILT.
+
+### The finding that moved it — `[gifsrc]`, 44 lines
+
+```
+[gifsrc] n=1 path=3 region=rdram eeAddr=0x89d400 nearFrom=0x88d400
+         bytes=262144 nonZero=0 nearBytes=393216 nearNonZero=0
+```
+Repeats on every odd `n` to 31. A **256 KB Path3 upload out of EE RAM `0x89d400` that is
+entirely zero**, and the whole ±64 KB neighbourhood (`0x88d400`–`0x8fd400`, 393,216 B) is zero
+too. Per the probe's own design contract `nearNonZero≈0` means **the asset never landed in RAM**
+— it is not a producer writing a blank sheet.
+
+- Healthy class for contrast: `n=0,2,…22` → `bytes=96 nonZero=12..14 nearNonZero=405..407`.
+- PSMT4 glyph sheets (`n=1221…1971`) arrive `path=2 region=copy bytes=32768 nonZero=0`.
+  `region=copy` has **no recoverable guest address** — `GifArbiter::submit` memcpy's the payload
+  (`ps2_gif_arbiter.cpp`). Do not try to trace a copy packet back to EE RAM.
+
+⇒ The GS is faithfully drawing empty source data. The flashing text box with invisible text is
+the PSMT4 glyph sheet being blank, not a font/colour bug.
+
+### Two hypotheses killed in the same run
+
+- **DISPFB page-flip — DEAD.** `[gsreg]` 128 lines: DISPFB1 and DISPFB2 each toggle
+  `0x1070` ↔ `0x1000`, 32 occurrences of all four combinations, in lockstep and in phase with
+  FRAME.FBP. `[present]` agrees. Frames are not being dropped.
+- **`GS::writePrivReg` GIF path — irrelevant.** `[dispfb]` = **0 lines for a second consecutive
+  run**. DISPFB is written *only* by plain stores through `gsRegPtr()`. `Support.h:1920` and
+  `GS.cpp:1082` need no further probing.
+
+### `tme=0` was a SAMPLING ARTIFACT — closed, do not reopen
+
+`[gs:frame-change]` prints `tme=0` while `[gs:frame] textured=20,235,240`. The two probes read
+**different variables**: the change-triggered probe snapshots the PRIM *register* and catches the
+untextured `prim=0x6` clear sprites (TME is bit 4); `[blackwho]` reads the per-primitive
+`prim.tme`. The rasterizer honours TME at every site.
+
+### Code written this session — ALL UNBUILT
+
+1. **`game_overrides.cpp` — `PS2X_HWWATCH_ADDR` fixed-target mode.** The DR0/VEH machinery
+   already existed but could only follow guest-published addresses (rpc_call's stack slot, the
+   BUG-009 client pointer); neither is guaranteed to run in a MainMenu-only session.
+   - new `hwWatchStaticAddr()` (≈:1515) reads the env var and **overrides** `guestAddr` inside
+     `hwWatchArm` (≈:1534).
+   - unconditional arm inside `sdbzFrameTraceWrapper` (≈:1575) so the armer thread comes up
+     regardless of which guest paths execute.
+2. **`launch_recomp.ps1` — console cleanup + post-run tag census.** Splits concatenated
+   `RUNTIME_LOG` records onto one line each (`$TagSplit`), collapses repeats to `... xN more
+   [tag]`, colours by severity, and prints a raw-regex tag count table after the run. Parse-checked
+   OK. `[HWSTAT]`/`[HWWATCH` added to `$Important`.
+3. **`.github/copilot-instructions.md` rewritten + new `.github/COPILOT_PLAYBOOK.md`.** The old
+   instructions were stale from 07-30 and still asserted `tme` never 1, `tex0.tbp` always 0, and
+   BUG-009 as the live lead — that is why Copilot "made weird choices". Playbook carries ordered
+   Plans A–E with exit tests.
+
+### ★ NEXT ACTION — build, then run Plan A
+
+```powershell
+cd "F:\SDBZ Recomp"
+.\build.ps1 RelWithDebInfo 6
+```
+```powershell
+$env:PS2X_HWWATCH = '1'
+$env:PS2X_HWWATCH_ADDR = '0x89d400'
+$env:PS2X_HWWATCH_VAL = '0xFFFFFFFF'
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger `
+    -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+| `HWSTAT` result | Meaning | Do this |
+|---|---|---|
+| `hits>0` | someone writes it | read the backtrace in `<probe>.hwwatch.txt`, follow the producer |
+| `hits=0, skipped>0` | writes land but the value filter rejected them | you forgot `PS2X_HWWATCH_VAL=0xFFFFFFFF` — re-run |
+| `hits=0 AND skipped=0` | **the region is never written** | Plan B: trace the CD/IOP asset-load path |
+
+⚠️ **Clear those three env vars before any run whose timing matters** — the armer cost
+**19.06 s of CPU in a 96 s run**. Perf numbers from a HWWATCH run are void.
+The armed-and-silent case is only readable because `HWSTAT` heartbeats `{guest, skipped, hits}`
+every 40 ticks — that is what makes "nothing happened" a *result* instead of a dead probe.
+
+### Run validity carried forward
+
+4 saturated probes, so their absences prove nothing: `iop:import` (6), `ARKD:run` (32),
+`ARKD:CALL` (64), `[gsreg] dispfb2` (64). Raising these caps is Plan D.
+`[cputime] wall=96.41s cpu=98.09s` = 101.7 % of one core → CPU-BOUND.
+
+### Learned patterns
+
+- `ForEach-Object` runs its body in a **child scope** — plain assignments are discarded. Any
+  cross-iteration counter in a pipeline needs `$script:`. Cost: a silently-never-incrementing
+  collapse counter.
+- Two probes printing the same-named field can be reading **different variables**. Before calling a
+  contradiction a bug, read both emit sites. (`tme=0` vs `textured=20M`.)
+- A stale agent-instruction file is a bug with a long blast radius. `.github/copilot-instructions.md`
+  must be re-dated whenever a stage closes, or the next agent re-litigates closed threads.
+
+---
+
+## ★★★ 2026-08-04 — STAGE 5.8 ✅ PASSED ITS EXIT TEST. New stage 5.9 opened: colour is written to the framebuffer with RGB already zero.
+
+### 5.8 exit test — **PASSED**, both halves now measured
+
+Exit test was: *one frame with `tme=1` **AND** `tex0.tbp != 0`*.
+
+- `tme=1` — confirmed 08-03d via `[gs:ad] addr=0x0 data=0x56` (PRIM=SPRITE, IIP=0, TME=1, ABE=1).
+- `tex0.tbp != 0` — confirmed 08-04. **Every** `[gs:frame-change]` line in the 156 s run carries
+  `tex0.tbp=0x2b60 tex0.tbw=4 tex0.psm=0x14`. This was the missing half; `[gs:ad]`'s 1-in-1000
+  sampling had simply never caught a TEX0 write ([[feedback_capped_probes_false_negatives]]).
+
+Corroborating: `[gs:frame] textured=20,235,240`, `imagebytes=208,560,192`, `[vramcensus]` top-8
+pages all in the texture region `0x150`–`0x159`. **Textures upload, bind, and sample. 5.8 is closed.**
+
+### ★ Stage 5.9 (opened 2026-08-04) — the frame buffer receives writes whose RGB is already 0
+
+`[gs:frame] px=33,997,800 nonblack=3,886,920` but `[present] nonblack=0` and `[fbscan] nonblack=0`
+on **both** fbp candidates. The `[zbuf]` probe run settled where the loss happens:
+
+| Probe reading | Kills |
+|---|---|
+| `[zbuf] ctx=0/1 frame.fbp=0x0 zbuf.zbp=0xe0 zmsk=0 ztst=2 **alias=0**` | **Z-aliasing.** ZBP=0xe0 starts one page past the 112-page buffer at 0x70 — no overlap. |
+| `[vramcensus] ctx0.fbmsk=0x1 ctx1.fbmsk=0x1` | **FBMSK.** Masks bit 0 of red only. |
+| `[zbuf] rawwords page0x0=0 **page0x70=2048** page0x150=1838` | **Addressing.** Page 0x70 is 2048/2048 words non-zero = 100% occupied, yet `[fbscan] fbp=0x70` scanned the full 512×448 and found zero RGB. |
+
+So: **writes land at the correct VRAM address, and every stored word carries only alpha.** The
+value is black *before* the store. Audited and cleared on the way down: `pack32`
+([ps2_gs_rasterizer.cpp:46](ps2xRuntime/src/lib/ps2_gs_rasterizer.cpp#L46)) puts RGB in the low 24
+bits and alpha in the top byte; `WritePixelCT32` ([ps2_gs_memory.cpp:506](ps2xRuntime/src/lib/ps2_gs_memory.cpp#L506))
+is a plain unmasked 32-bit store; `GSInternal::framePageBaseToBlock` is used identically by the
+colour write, the Z write, and the presentation read, so a base-conversion mismatch is impossible.
+
+**Unit conversions that decode these numbers** (write them down, they were re-derived twice):
+- FBP / ZBP page unit = **8192 bytes** (2048 32-bit words) — what `[vramcensus]` and `rawwords` bucket by.
+- TBP / DBP block unit = **256 bytes**. `dbp=0x2a00` → 2,752,512 B → page **0x150**.
+- A 512×448 CT32 buffer = 917,504 B = **112 pages**. FBP=0x0 spans pages 0x00–0x6F; FBP=0x70 spans 0x70–0xDF.
+
+### ★★ `[fbdest]` — BUILT + RUN 2026-08-04. **Result: colour IS stored, then buried.**
+
+Steady-state reading (~20 of 25 lines identical; each line is a **per-interval delta** — every
+counter is read with `exchange(0)`):
+
+```
+[fbdest] seq=33,997,570  lastnb=33,496,335  lastnbpct=98
+         fbp0x0=1,943,140/15,055,530   fbp0x70=1,943,370/15,055,530
+```
+
+| Reading | Verdict |
+|---|---|
+| ~3.89 M **coloured** pixels stored per interval | ★ **The alpha-blend hypothesis (row 3 below) is DEAD.** The final stored `pixel` is genuinely non-black. Do not reopen [ps2_gs_rasterizer.cpp:467-511](ps2xRuntime/src/lib/ps2_gs_rasterizer.cpp#L467-L511). |
+| Colour split ~evenly across `fbp=0x0` and `fbp=0x70` | Row 1 dead. FBP latch / context selection is fine. |
+| `lastnbpct=98` | Last coloured pixel lands 98% through the interval; the final ~680 k writes (≈3 full 512×448 screens) are all black. |
+| `[fbscan] fbp=0x0 nonblack=0` **and** `fbp=0x70 nonblack=0`, same run | None of those 3.89 M coloured pixels survives to present. |
+
+**Cross-check that seals it:** `[gs:frame] nonblack=3,886,690` (sampled *pre*-mask) ≈ `[fbdest]`
+coloured total 3,886,510. Pre-mask and post-mask agree → nothing between the stat sample and the
+store destroys colour. **The loss is draw ordering, not the pixel pipeline.** → Row 2 wins.
+
+Also from the same run: 89% of all rasterized pixels (30.1 M of 34.0 M) are **black at store time**,
+and `textured=20,235,010` — so most of the black is *textured*. Leading sub-hypothesis: PSMT4
+(`tex0.psm=0x14`) / CLUT decode returns index 0, painting black over the artwork.
+
+Note: this run's `[present]` reads `dispFbp=0x0 srcFbp=0x0 ctx0.fbp=0x70 ctx1.fbp=0x70
+dispfb1=0x1000` (→ DISPFB FBP=0, FBW=8) — the alternating-buffer phase differs from the earlier
+`dispFbp=0x70` line. Both buffers scan black, so this does not change the verdict.
+
+### `[blackwho]` probe — ✅ BUILT + RUN 2026-08-04. **Verdict below.**
+
+```
+untex   = 13,762,560  (45.7%)
+texzero = 16,348,260  (54.3%)
+texcol  =        240  ( 0.0%)
+tail    = 0,0..511,447                      <- full screen
+last black store: prim=0x6 (SPRITE, tme=0, abe=0) texpsm=0x14
+                  tbp=0x2b80 cbp=0x2a4c fbmsk=0x1 alpha=0x44
+                  texel=0x0 srcrgb=0x0 xy=511,447 fbp=0x0
+```
+
+Reading it against the decision table:
+
+- **`texcol` = 240 ≈ 0 → the blend / TEXFUNC / FBMSK row is DEAD.** `srcrgb=0x0` confirms it
+  independently: the colour is already black *entering* `writePixel`, so nothing downstream ate it.
+- **`texzero` dominant (54%) → primary.** Textured sprites at `tbp=0x2b80`, `psm=0x14` (PSMT4),
+  `cbp=0x2a4c` are sampling to RGB 0. Fix target: the PSMT4 unswizzle, the CLUT upload, or
+  `ReadClutCache`.
+- **`untex` 46% → secondary.** Full-screen untextured black sprites. Plausibly *legitimate* clears
+  if they land on the back buffer — but `[fbscan] nonblack=0` on **both** `fbp=0x0` and `fbp=0x70`,
+  and a correct double-buffered clear cannot blacken both.
+
+**Not an anomaly:** consecutive `[blackwho]` lines are byte-identical because the counters use
+`exchange(0)` (every line is a per-interval delta) and MainMenu is a static, deterministic workload.
+`13,762,560 + 16,348,260 + 240 = 30,111,060` matches the `[fbdest]` black total on both lines.
+Probe is sound; magnitudes are trustworthy.
+
+Run validity: the 3 saturated caps (`iop:import`, `ARKD:run`, `ARKD:CALL`) are all non-GS, so the
+GS data is valid.
+
+### Stage 5.9 ROOT CAUSE — found 2026-08-04 by `[gsdump]` + `[gs:image]`
+
+**PSMT4 image transfers issue but do not land in VRAM.**
+
+| VRAM region | uploaded as | census result |
+|---|---|---|
+| `tbp=0x2a00` | dpsm=0x13 (PSMT8) | **48085 / 65536 bytes nonzero** — lands |
+| `tbp=0x2b60` | dpsm=0x14 (PSMT4) | **0 / 65536** — nothing lands |
+| `tbp=0x2b80` | dpsm=0x14 (PSMT4) | 0 (inside the 0x2b60 window) |
+
+- `[gs:image]` proves the transfers are *issued*: `dbp=0x2b60 dpsm=0x14 dbw=4 trxreg=256x256 sizeBytes=32768` **× 434**, and `dbp=0x2b80` **× 440**.
+- CLUT is **exonerated**: `clut_0x2a48.txt` = 255/256 non-black, a valid palette (`08ffffff`, `44ffffff`, …).
+- This explains `texzero=16,348,260` (54.3% of black pixels) exactly: the sprites sample a texture that is not there.
+- `[vramcensus]` agrees — busiest pages are `0x150`–`0x159` (blocks `0x2A00`–`0x2B40`); **`0x2b60` sits just past the populated region**.
+- PCSX2 A/B: a real TEX0 in EE RAM decodes to `TBP0=0x2b60, PSM=0x14, TBW=4, 256×256` — so **`0x2b60` is the correct address**; the draw side is right, the upload side is broken.
+
+**Open ambiguity — must be closed before fixing:** the census is swizzle-blind but *not* zero-blind. It cannot distinguish "never written" from "written all-zero nibbles". Resolve by logging the first 16 source bytes in the `GS_PSM_T4` case of `processImageData` ([ps2_gs_gpu.cpp:3343](ps2xRuntime/src/lib/ps2_gs_gpu.cpp#L3343)) — if the source is non-zero, the fault is in `WritePixelP4` → `LookupPixelAddressP4` ([ps2_gs_memory.cpp:556](ps2xRuntime/src/lib/ps2_gs_memory.cpp#L556)).
+
+Suspect list, in order: `LookupPixelAddressP4` returning an out-of-range or mis-scaled nibble address; `m_transferState.total_pixels` for 4-bit (the T4 loop advances `copied_pixels` by 2 per byte); `EndTransfer()` firing early.
+
+### Stage 5.9 tooling — added 2026-08-04, **BUILT + RUN ✅ — item 1 found the root cause on its first run**
+
+Counters answer one yes/no per build+run cycle (~96 s of run plus a link). Three tools to stop
+paying that:
+
+1. **`[gsdump]`** (`ps2_gs_gpu.cpp`, opt-in via `PS2X_GSDUMP=<dir>`) — writes the already-decoded
+   `[fbscan]` framebuffers as `fb_0x*.tga`, the 256 CLUT words at `cbp` as `clut_0x*.txt`, and a
+   swizzle-blind per-256-byte nonzero census of 64 KB at `tbp` as `tex_0x*.txt`. The census is
+   deliberately independent of the unswizzle code under suspicion: zero bytes stay zero either way,
+   so it separates *"texture never arrived"* from *"arrived but decodes to 0"* in one run.
+2. **`analyze_run.py --gs`** — parses the GS tags out of `run_log.txt` (UTF-16, tag-split not
+   line-split) and prints the black-pixel attribution with percentages. Ends the per-session
+   hand-written regex. Verified working against the 08-04 log.
+3. **PCSX2 A/B — sequenced AFTER 1.** ⚠️ PCSX2 MCP reads **EE RAM, not GS VRAM**, so it cannot dump
+   the reference texture directly; ground truth needs PCSX2's own *Save Single Frame GS dump* at
+   MainMenu. Only needed if `tex_0x2b80.txt` comes back all-zero.
+
+### `[blackwho]` probe — as originally specified
+
+Follows `[fbdest]`. Same header-avoidance pattern (counters in `namespace ps2diag_fbstat` in
+`ps2_gs_rasterizer.cpp`, `extern` in `ps2_gs_gpu.cpp`; **no header touched**).
+
+Splits every **black** store three ways, and names the burying draw:
+
+- `untex` — PRIM.TME=0 → a plain black fill/clear ran after the artwork → **draw/clear ordering**.
+- `texzero` — textured, texel RGB sampled as 0 → **PSMT4 / CLUT decode** returning index 0.
+- `texcol` — texel had colour but we stored black → blending / TEXFUNC / FBMSK ate it.
+- `tail=x0,y0..x1,y1` — bbox of the *trailing* run of black writes, reset by every coloured write.
+  `0,0..511,447` ⇒ the burying draw is full-screen.
+- `last black store: prim= texpsm= tbp= cbp= fbmsk= alpha= texel= srcrgb= xy= fbp=` — GS state
+  snapshot at the last black store, i.e. inside the burying draw. `srcrgb` is the colour *entering*
+  `writePixel` (captured before blending mutates r/g/b), so `srcrgb!=0` with a black store
+  localises the kill to the blend/mask stage.
+
+Edits: 5 in `ps2_gs_rasterizer.cpp` (namespace atomics + `diagSrcRgb` capture + classification block
++ two `t_lastTexel` stores at the textured `writePixel` call sites), 2 in `ps2_gs_gpu.cpp` (externs
++ the `[blackwho]` line beside `[fbdest]` in the `PresentProbe` destructor).
+
+**Decision table for the next run:**
+
+| `[blackwho]` shows | Verdict → fix target |
+|---|---|
+| `untex` dominant, `tail` full-screen | Draw/clear ordering — find the black full-screen sprite issued after the artwork (GIF packet order / context switch) |
+| `texzero` dominant | PSMT4 4-bit unswizzle or CLUT lookup returns 0 → `sampleTexture` / `ReadClutCache` / the tiny CT32 CLUT uploads at `dbp=0x2a40..0x2a4c` |
+| `texcol` dominant | `combineTexture` (TEXFUNC) or the blend stage — `srcrgb` in the snapshot tells which |
+
+---
+
+### `[fbdest]` probe — as originally specified (2026-08-04, now answered above)
+
+4 edits, 2 files, **no header touched** (counters live in a named namespace defined in
+`ps2_gs_rasterizer.cpp`, consumed via `extern` in `ps2_gs_gpu.cpp` — the standard header-avoidance
+pattern; adding members to `GS` would recompile 30,000+ TUs).
+
+- `ps2_gs_rasterizer.cpp` — `namespace ps2diag_fbstat` (4 atomics) + a classification block placed
+  **immediately before the colour `WriteVram`**, so it measures the **final `pixel`** value.
+  This permanently closes the pre-mask stat hazard: `[gs:frame]`'s counter samples `r`/`g`/`b`
+  *before* the fbmask merge, so its `nonblack=3.8M` may never have described what was stored.
+- `ps2_gs_gpu.cpp` — externs + a `[fbdest]` report inside the `PresentProbe` destructor.
+
+Emits `[fbdest] seq= lastnb= lastnbpct= fbp0xNN=<coloured>/<black> …`.
+
+**Decision table for the next run:**
+
+| `[fbdest]` shows | Verdict → fix target |
+|---|---|
+| Colour counts on an fbp that is **not** 0x0/0x70 | Drawing into a buffer we never display → FBP latch / context selection |
+| Colour on the right fbp, `lastnbpct` well below 100 | Artwork drawn then **buried by a later black full-screen sprite** → draw/clear ordering |
+| All buckets `0/<big>` (zero coloured pixels ever stored) | ★ current favourite — the alpha-blend block at [ps2_gs_rasterizer.cpp:467-511](ps2xRuntime/src/lib/ps2_gs_rasterizer.cpp#L467-L511) zeroes RGB after the `[gs:frame]` sample. Matches "alpha survives, colour doesn't" exactly. Fix = `pickRGB`/`cAlpha` selector decode |
+| Colour on the right fbp, `lastnbpct` ≈ 100 | Value is non-black at store time yet VRAM reads black → back into `WriteVram`/`LookupPixelAddressCT32` despite the raw-word evidence |
+
+Also note `page0x0=0` vs `page0x70=2048`: one alternating buffer is **totally untouched**, the other
+totally full. Worth explaining whichever branch wins.
+
+### Next action (user's, both of them)
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo 6
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+### Corroborating context from the 08-04 run
+- `[present] has=1 w=512 h=448 dispFbp=0x70 srcFbp=0x70 pmode=0x7f27 display1=0x1bf9ff0203327c` →
+  decodes to exactly 512×448. **Display geometry is correct — stop re-checking it.**
+- `primmask=0x40` = bit 6 = prim type 6 = **SPRITE**. All rendering is 2D, consistent with
+  `gstate@0x5e6b3c=0` (MainMenu). VU1 idle (`mscal=0 vu1runs=0 xgkicks=0`) is therefore **correct,
+  not a bug**.
+- VIF1 healthy: `[vu:vifbuf] size=127424 endpos=127424 cmds=108 bad=0 badpos=-1`, `vifops=30000:80001`.
+- `[hostprof]` — `writePixel` 25.8% / 28.45 s, `WriteVram` 3.3%, `LookupPixelAddressCT32` 3.3%.
+  The rasterizer is genuinely doing the work.
+- `[cputime] wall=156.32s cpu=189.61s = 121.3% of one core — CPU-BOUND`, auto-stopped.
+- RUN VALIDITY FAILURE named 3 saturated probes: `iop:import`, `ARKD:run`, `ARKD:CALL`. **None are
+  GS-related.** All GS probes (`[fbscan] [present] [gs:frame] [vramcensus] [zbuf]`) are uncapped, so
+  every graphics conclusion above stands.
+- User visually observed the **memory-card loading bar flashing on then off** — independent evidence
+  that *something* briefly reaches the screen. Consistent with the "buried by a later black sprite"
+  branch.
+
+### Learned patterns (2026-08-04)
+- **A probe that refutes its own hypothesis can still break the case open.** `[zbuf]` was built
+  predicting `alias=1` and returned `alias=0`. Its *secondary* reading — `rawwords` — is what
+  eliminated three hypotheses at once. Build probes that report neighbouring facts, not just a
+  yes/no on the hypothesis.
+- **A statistic sampled mid-pipeline describes a value that may never be stored.** `[gs:frame]`
+  counts pre-mask `r/g/b`; `[fbdest]` counts the final `pixel`. When "the counter says X but the
+  memory says Y", check *where in the pipeline the counter reads* before theorising.
+- **100% non-zero words + 0% non-zero RGB is a decisive signature.** It separates "wrong address"
+  from "wrong value" in a single reading. Always pair an RGB-masked scan with a full-32-bit scan.
+
+---
+
+## ★★★ 2026-08-03d — ROOT CAUSE FOUND AND FIXED. VIF1 desync was a DMA chain-assembly bug. `textured` goes 0 → 19.5M.
+
+**The bug:** `ps2_memory.cpp:1666` injected the DMAtag's upper 64 bits (which on VIF0/VIF1 are two
+VIFcodes) only for `id == 1|2|5|6|7`, **omitting id 3/4 (REF/REFS)**. Every REF link's payload
+therefore entered the VIF FIFO with no VIFcode framing it, desynchronising `processVIF1Data` for the
+remainder of the buffer. One omission produced the entire Stage 5.8 signature.
+
+**The fix (applied + built + run):** replaced the `compactVifLocalTag` id-gate with a plain
+`vifChannel` check so the 8-byte tag-upper header is appended for *every* id, and simplified the
+payload append to `appendData(dataAddr, tagQwc)`. Byte-identical for ids 1/2/5/6/7 (there
+`dataAddr == tagAddr + 16`), so the three known-good links could not regress.
+
+**Verification — round 5 dump re-walked, three independent axes:**
+
+| Signal | before | after |
+|---|---|---|
+| `[vu:vifbuf]` on 133 KB buffers | `bad=662 badpos=964` | **`bad=0 badpos=-1`** |
+| `vifops` census | ~57 opcodes, 11 nonexistent | **`30000:80001`** = NOP, FLUSHA, DIRECT, DIRECTHL only |
+| `mscal` / `mscalpc` | 30/frame @ `0x1b9d0` (imm 14138, illegal) | **0** — the phantoms are gone |
+| `datanz` | 6610 | **0** |
+| `[gs:frame] textured` | **0** | **19,494,762** |
+| `primmask` | `0x41` | `0x40` |
+
+Offline reference walker on `vif1_buf2.bin` (67,640 B): `26 commands, end_pos=67640 / 67640,
+NO INVALID OPCODE`. The 67 KB previously read as "compressed asset junk" is a single legitimate
+`DIRECTHL qwc=4096` payload that simply had no VIFcode in front of it.
+
+**TME=1 is confirmed.** `[gs:ad] addr=0x0 data=0x56` → PRIM = SPRITE, IIP=0, **TME=1**, ABE=1.
+`tex0.tbp` is NOT yet confirmed — `[gs:ad]` samples 1-in-1000 writes and caught no TEX0 write, so
+per [[feedback_capped_probes_false_negatives]] that absence is not evidence. **Stage 5.8 exit test is
+half-proven, not passed.**
+
+### What the now-trustworthy data says
+
+1. **VU1 is genuinely idle, and that reading is now reliable.** `mscal=0 mpg=0 vu1runs=0 xgkicks=0`
+   with a provably-synchronised parser and a 4-opcode census. The game sends *no VU1 work at all*
+   over VIF1 in this state — only PATH2 GIF transfers. With `gstate@0x5e6b3c=0` (MainMenu) that may
+   simply be correct: a menu is 2D. **Do not resume hunting a "broken 3D path" until the game is in
+   a state that should render 3D.**
+
+2. **New, sharper contradiction — the next thread.** `[gs:frame] nonblack=3,627,102` but
+   `[present] nonblack=0`. Draw and display targets alternate correctly (`ctx0.fbp=0x0` /
+   `dispFbp=0x70`, then swapped), `fbw=8` → 512 px matching `w=512 h=448`, `pmode=0x7f27` — yet the
+   presented surface reads black. **The game is drawing; we are not reading what it drew.** This is
+   far more concrete than the VU1 thread and should be the next target.
+
+### Retired hypotheses — do not reopen
+- "A variable-length VIF handler (MPG / DIRECT / UNPACK) mis-advances `pos`." **Disproven.**
+  `processVIF1Data` parses its input correctly; its *input* was malformed.
+- "The game never uploads a microprogram." Superseded — it sends no VU1 work here at all.
+- The `ps2_vif1_interpreter.cpp:761` bare-`continue` desync amplifier is real but was a symptom
+  magnifier, not the cause. Still worth hardening later.
+
+### Open follow-up (deliberately deferred)
+CHCR **TTE (bit 6) is never read anywhere in `ps2_memory.cpp`.** Line 1460's `tieEnabled` is bit 7
+(TIE), a different flag. The tag-upper append is therefore unconditional. The three proven-good
+links show TTE is effectively on for this game, so this was left alone rather than changing two
+things at once.
+
+---
+
+## ★★★ 2026-08-03c — ROUND-3 VU1 PROBE RAN. Branch A confirmed, and the framing changes: the VIF1 command stream is being MIS-PARSED.
+
+Build from 08-03b completed clean (exe 17:51, newer than all 7 round-3 sources; `codenz=`/`mscalpc=`
+string-verified present in the binary — no stale-object-file repeat). Ran the canonical command,
+90 s, det=0, RelWithDebInfo. 21 `[vu:frame]` records. Steady state:
+
+```
+vif1calls=61 vif1bytes=7938176 mscal=30 mscnt=0 vu1runs=30 xgkicks=0 xgkickbytes=0
+mpg=0 mpgbytes=0 vu1instrs=1966080 endebit=0 endlimit=30 endrange=0
+codenz=0 datanz=6610 mscalpc=0x1b9d0 vifops=8189a288d87fcdef:ffaf03a71e6fffff
+```
+
+**Pre-registered branch A is confirmed: `codenz=0`.** `probeVu1MemoryOccupancy()` is called at
+`ps2_runtime.cpp:1042`, immediately before `m_vu1.execute(...)` — so this is sampled *at the moment of
+every MSCAL*, not at some unrelated time. VU1 code memory is 100 % zeros when the microprogram is
+invoked. **The bug is upstream, in the upload path. It is not the decode cache.**
+
+Two independent confirmations that the downstream/decode-cache branch is dead:
+- `m_vu1Code` **is** allocated (`ps2_memory.cpp:371-373`), so MPG is *not* being silently dropped by
+  the null guard at `ps2_vif1_interpreter.cpp:449`.
+- The mapped-`0x11008000`-window store path **does** call `markVU1CodeModified()`
+  (`ps2_memory.cpp:940/981/1043/1096/1137`), so the "EE wrote it through the window and the
+  generation counter never bumped" theory cannot hold either. Both halves of the round-3
+  hypothesis space collapse onto the upload path.
+
+### ★ The new finding — `mscal=30/frame` is NOT 30 real MSCALs
+
+`mscalpc=0x1b9d0`. The emit site is `startPC = imm * 8` (`ps2_vif1_interpreter.cpp:375`), so
+`imm = 0x373A = 14138`. **Valid MSCAL immediates are 0…2047** (16 KB code RAM / 8 B per instruction).
+An entry point 7× past the end of VU1 micro memory cannot come from real game code. The MSCALs we
+have been counting for two rounds are mis-decoded bytes that merely happen to carry `0x14`/`0x15` in
+the opcode field.
+
+`vifops` corroborates it. Decoding the census (`opHi` = opcodes `0x40-0x7F`, `opLo` = `0x00-0x3F`):
+~57 distinct opcodes were seen, including `0x40 0x41 0x42 0x43 0x45 0x46 0x47 0x48 0x4B 0x4E 0x4F`,
+**none of which exist in the VIF ISA**. A correctly-synchronized parse sees ~15 opcodes total.
+
+⚠️ **Therefore the MPG bit in `vifops` is worthless as evidence.** `MPG 0x4A` = bit 10 of `opHi`, and
+that bit *is* set — but in a census this polluted it is indistinguishable from noise. Do not report
+"MPG was seen in the stream." This is the [[feedback_capped_probes_false_negatives]] failure mode
+inverted: a polluted probe manufacturing a false *positive*.
+
+### What this re-frames
+
+The blocker is no longer "the game never uploads a microprogram." It is **"we never parse the stream
+well enough to find the upload."** A desynchronized parser explains every symptom at once: MPG is
+never located (`mpg=0`, `codenz=0`), garbage MSCALs still fire 30×/frame burning the full 65536-cycle
+budget on zeros (`vu1instrs = 30 × 65536` exactly, `endlimit=30`, `endebit=0`), `xgkicks=0`, and
+`primmask=0x41` — while UNPACK still lands *something* in data memory (`datanz=6610`), which is why
+the path looked half-alive.
+
+DMA1 chain-following itself looks healthy — `[dma:chain] chan=0x10009000` shows well-formed `id=2`
+(NEXT), `id=3` (REF), `id=7` (END) tags with sane qwc. One tag worth a second look:
+`tag=0x8a644030000800 id=3 qwc=2048 addr=0x8a6440 dataAddr=0x8a6440 data0=0x0` — a 32 KB REF whose
+first quadword is zero. Volume is ~130 KB of VIF1 data per frame (~61 calls / 8 MB per 60-present
+interval), delivered via the assembled `chainData` path (`ps2_memory.cpp:1878`).
+
+### Round 4 — ✅ BUILT AND RAN 08-03d. Probe worked; see the 08-03d section above for the result.
+
+**Status: built, run, and it did its job** — `[vu:vifbuf] bad=662 badpos=964` is what localised the
+desync, and `badpos=-1` is what confirmed the fix. Three edits, all applied:
+
+- `ps2xRuntime/include/runtime/ps2_pipeline_stats.h` — `isValidVif1Opcode()` (written independently
+  of the parser's if-chain, so the probe cannot inherit the parser's own mistake), `struct Vif1Snap`,
+  and a 3-state claim/publish/take slot (`claimVif1Snap` / `publishVif1Snap` / `takeVif1Snap`).
+  Only 5 runtime TUs include this header — verified — so no mass rebuild.
+- `ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp` — three hooks: claim + copy first 128 bytes at
+  entry, validity check at the decode point, publish `endPos` at exit.
+- `ps2xRuntime/src/lib/ps2_gs_gpu.cpp` — new `[vu:vifbuf]` line beside `[vu:frame]`, same interval:
+  `size= endpos= cmds= bad= badpos= badcmd= head=<hex>`.
+
+**How to read it:** `badpos` is the first byte offset provably wrong; the command *before* it is the
+one that advanced `pos` by the wrong amount. `badpos=-1` means that buffer parsed clean.
+`endpos < size` means the loop bailed early. `badpos=0` means the buffer doesn't start on a VIFcode
+at all — a framing problem, not a handler bug.
+
+⚠️ New finding while drafting: `ps2_vif1_interpreter.cpp:761` swallows unrecognized opcodes with a
+bare `continue`, advancing only 4 bytes. A desynced parser can therefore neither recover nor
+complain — which is exactly why round 3 read as "healthy but empty" rather than "broken."
+
+Original rationale below.
+
+Counters are exhausted; the question is now positional. The cheapest decisive probe is a **hex dump
+of the first 128–256 bytes of the buffer handed to `processVIF1Data`**, once per report interval,
+plus the `pos` at which the parser first hits an opcode outside the valid VIF set. Walking one real
+buffer by hand settles in one run whether (a) the buffer starts mid-packet, (b) an opcode handler
+advances `pos` by the wrong amount and desyncs everything after it, or (c) the buffer contains
+non-VIF data entirely. Prime suspects for (b) are the variable-length handlers — `VIF_MPG`
+(`pos += mpgBytes`, unconditional even when the copy is skipped), `VIF_DIRECT`/`DIRECTHL`, and
+`UNPACK`.
 
 ## 2026-08-02 Handoff Update
 - The live tree at `F:\SDBZ Recomp` is the authoritative runtime tree for all boot-blocker work. The worktree copy under `F:\SDBZ Recomp.worktrees\claude-memory-sdbz-recomp-plan` is historical and should not be used for runtime fixes.
@@ -38,8 +9227,15 @@ Pasted watch/GS log (partial — starts mid-run, ends on user-initiated window c
 
 ## Active Runner Command
 ```powershell
-& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 0 -RunSeconds 90 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
 ```
+**Corrected 2026-08-22 — two long-standing wrong defaults in this stored command.**
+- `-Determinism 0` → **1**. This line contradicted [[feedback_determinism_gates_guest_progress]]
+  from Stage 5.15 onward (det=1 → 5/5 runs reach the `.SFD` open, det=0 → 0/4). Anyone
+  copying this block verbatim was running the one setting the memory says never to use.
+- `-RunSeconds 90` → **200**. The Stage 5.17 events of interest occur at **t=121–138**
+  and **t=171–192**. A 90 s run ends before both and reports them as "never happens"
+  ([[feedback_run_window_false_negative]]).
 **Changed 2026-07-28 — use the RelWithDebInfo exe for everything now.** The A/B proved it does **109×** the guest work of the Debug build for the same CPU seconds (`progress` @ t=89: 12 101 → 1 320 490), so a Debug diagnostic run covers ~1 % of the guest execution for the same wall-clock cost. The Debug exe still exists and must not be deleted — it is the control arm — but there is no longer a reason to *run* it.
 
 Raw form, if the launcher is not wanted: `& "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe" "F:\SDBZ Recomp\ELF\SLUS_214.42"`
@@ -71,7 +9267,7 @@ WIP checkpointed as commit `9957294f`. Checked all 7 new upstream commits vs HEA
 
 ## Current Phase
 **Phase 5 — in progress, started 2026-05-27.**
-**Memory-card-prompt goal ABANDONED/deprioritized (2026-08-02)** — repeated attempts across many sessions could not get the memcard prompt to populate no matter what was tried; continuing to target it stopped being productive. The active goal is now whatever the current sub-phase tracker below says (currently 5.8: reach a textured draw). Boot-to-title-screen/main-menu remains the longer-term Phase 5 target once 5.8 closes.
+**Memory-card-prompt goal ABANDONED/deprioritized (2026-08-02)** — repeated attempts across many sessions could not get the memcard prompt to populate no matter what was tried; continuing to target it stopped being productive. The active goal is now whatever the current sub-phase tracker below says (currently **5.15: get the `.SFD` movies to play**). Boot-to-title-screen/main-menu remains the longer-term Phase 5 target once 5.8 closes.
 
 **Provenance note (2026-08-02):** the 2026-08-02 Handoff/Update 2/Update 3 entries above were written from a GitHub Copilot ("fables") session, not a Claude session — flagged here in case terminology, address claims, or tone in those entries need reconciling with this project's conventions. User indicated these can be cleaned up if needed.
 
@@ -80,7 +9276,65 @@ WIP checkpointed as commit `9957294f`. Checked all 7 new upstream commits vs HEA
 **✅ 5.6 CLOSED (2026-07-28)** — build-config A/B ran: RelWithDebInfo does **109×** the guest work for the same CPU (`progress` @ t=89: 12 101 → **1 320 490**; `gif/s` 3–5 → **47–49**, i.e. normal PS2 frame rates). Debug build was the entire performance story. **Throughput is no longer a variable — always measure on the RelWithDebInfo exe.**
 (5.6.1 render-path DMA-kick census and 5.6.2 watchdog `busy%`/`res/s`/`vbl/s` fields both shipped; 5.4.2 CLEARED, 5.5.1/5.5.2/5.5.3 padman chain drained and demoted as blocker candidates, both parked leads triaged and dismissed — all 2026-07-27)
 
-**🔵 ACTIVE: 5.8 (opened 2026-08-01)** — **the guest state machine never advances to a textured draw.** Replaces 5.7's framing, whose surviving lead (BUG-009) is now **CLOSED — benign**. Everything underneath works and is measured: frame loop healthy (~46–49 fps, `vbl/s`≈49, `dma/s`≈98), asset streaming proven end-to-end (1024 reads / 2.1 MB / **zero fails**), GS proven innocent (BUG-028 fixed + verified twice). Yet `primmask=0x40` (SPRITE only), `tme` **never** 1, `tex0.tbp` always 0, `nonblack=0` across ~24 M pixels/interval. **Exit test:** a single frame in which `tme=1` and `tex0.tbp != 0`. **Method (this is the change that matters):** stop reasoning from our own log in a vacuum — *difference against real PCSX2 + the real ISO*, which reaches the memory-card prompt in 7–8 s, using `mcp__pcsx2__*`. Six retractions in this file all came from inferring semantics instead of measuring them against ground truth. First steps: (1) arm `PS2_COVERAGE` — built, documented, and **not armed since 2026-07-29** (last run `cov=0/0`) — it answers "which game-band addresses does the EE actually dispatch" directly, instead of hand-reading 2800-line generated `switch` bodies; (2) watch `0x44D26C` (SRD test-and-set gate: `sub_12F1E8`/`sub_12F7E0` tick only if they win it, `sub_12EB28` can set it to 1 after a 1000-iteration spin — if it sticks at 1 all five SCMD wrappers silently stop being reached, with no log output), `0x463294` (libcdvd bind latch), `0x5AA7D0` (the CCD reply word `sub_1C0A30` actually branches on), `0x5e6b3c` (GameMode); (3) breakpoint `0x1C0A30` on PCSX2 and read `MEM[0x5AA7D0]` per hit — settles whether our `0x30000000` is the advancing answer or the keep-waiting one. **That single measurement may be the whole blocker.**
+**✅ 5.15 CLOSED (2026-08-17, run 61)** — `MOVIE/ATARI.SFD` **opens**; handle `0x54c060` latched at `0x125898`. The blocker *was* sid `0x80000597` (`sceCdSearchFile`), served from `ps2_iop.cpp handleRPC`. Requires `PS2X_DETERMINISM=1` ([[feedback_determinism_gates_guest_progress]]). The func-map hole at `0x186310` closed at run 62; sid `0x80000595` (cdvdfsv N-command) is served and working as of run 63 (`ncmdrd=24 readOk=1`).
+
+**✅ 5.16 CLOSED (2026-08-20, run 69)** — **the read always completed; our own RPC reply said otherwise.** The cdvdman S-command handler in `ps2_iop.cpp` stamped a blanket `word[0] = 1` "benign success" into every recv buffer. But the libcdvd EE wrappers return recv `word[0]` **verbatim as the command's value**, not as a success flag — so `sceCdGetError` (fno 4) answered `0x1`, which SRD reads as a DRIVE ERROR. Replaced with a per-fno decode table (fno 4 → `SCECdErNO`=0, fno 12 → `SCECdStatSpin`=0x02, fno 1 → genuine success flag 1) plus a census-by-distinct-fno probe. **Exit test passed 4/4 in run 69:** `sceCdGetError ret=0x0`; **zero** `SRD: Drive Error` lines (was 248); `12ee20 preStat=0x1 postStat=0x3` — the status byte leaves 2 and reaches **3 = DONE**; `130b80 dvcidone cvfsStat=0x3` — completion propagates to the movie layer. Reads advance across distinct LBNs (`0x157484` → `0x1575ed`) instead of retrying one forever.
+
+> **Transferable rule (new).** A shared RPC recv buffer is not a status channel. Before writing *any* reply word, read the EE-side wrapper's tail: if it does `v1 = MEMORY[recv]; return v1;`, that word **is the return value**, and a placeholder "success" flag silently becomes a bogus result. Same family as the Stage 5.12 memcard rule and the Stage 5.14 rule (*silence must be written, not omitted*) — all three are "we answered, and the answer was wrong", not "we did not answer".
+
+> **Loose end carried into 5.17.** The census reported `[iop:cdscmd] fno=34 UNDECODED -> word0=0x00000001` — a **guessed** reply. It originates from the variable-fno wrapper `sub_187AA0` (send buffer `0x464880` matches; its fno comes from `dword_464DE8` at runtime), one 32-bit arg in, one 32-bit result out. `fno=1` and `fno=4` decoded correctly. **`fno=12` was never reached in run 69**, so the inferred `0x02` status value is still unverified — harmless today, but do not cite it as tested. `sub_1879E8` (fno 22) was *not* reached either, contrary to the pre-run expectation.
+
+### 5.17 narrowed — runs 72/73/74 (2026-08-20)
+
+**The loadscreen is NOT broken.** `sub_3E2FF0`'s 83.0 accumulator is the **timeout arm** of a
+wait-for-the-movie-to-end; the skip arm is `if (MovieUpdate() == 1) acc = 230.0`. `[st4b:stat]`
+shows the accumulator advancing exactly `dt=1/60` per call, `over83=0`. `MovieUpdate` = `0x113920`
+(shares globals with `0x113AA0`, which prints `"MovieCreate: Use Work Size"` — 6x in the log, so the
+handle exists) and returns 1 only once status leaves `{1,2}`. `[movie] stat=1 maxstat=1` on **every**
+record of runs 72/73/74. The movie never reports completion, so the loadscreen correctly waits.
+
+**Run 74 killed the CRI-server-guard theory.** `[crisrv:stat] bail=0 ent=0:1121` — the `0x11D510`
+tick ran 1121x and its step-numbered guard `dword_4407D8` was 0 on every single entry. Healthy.
+
+**Where it actually dies.** `srd_obj` @`0x44D230` reads **all zero**: `devtype=0 stat=0 lsn=0 secs=0
+buf=0`. `sub_12F1E8` dispatches the pump only on `devtype` 1 (HST) or 2 (DVD) — field names taken
+from `sub_12F598`, the game's own `"SRD Info"` printer — so with 0 in there the pump is skipped
+forever. `devtype` is written in exactly one place: **`sub_12E7B0` (srd_read)**, whose only caller is
+**`sub_131190` (CVFS read)**, which has **no `jal` callers at all** — it is reached purely through a
+device-driver function pointer.
+
+The disc path itself is fine: 3 reads issued, 3 completed, consecutive LBNs
+(`0x157484`+`0x168` -> `0x1575ed`), `syncRet=0` always, `12ee20` exit stat always 3.
+
+**Probe added for the next run:** site `cvfsrd.131190` -> `[cvfs:stat]`. Splits *never called* from
+*called and rejected*, with one counter per rejection path (`badObj`/`nsctNeg`/`bufNull`/`stat2`/
+`nsct0`) and `devAfter` proving whether `12E7B0` armed the object. `12E7B0` is deliberately NOT
+wrapped: `sub_131190_0x131190.cpp` has zero `dispatchGuestBranch` calls, so `replaceFunction` there
+would be bypassed ([[feedback_registerfunction_bypass]]).
+
+**Cap fixes validated, and both prior numbers were wrong:** `STACKOOB` 16 -> **>=64**;
+`DEFERINL` 64 -> **>=4096**.
+
+**Retracted:** the `CRITSEC escapes=10` figure reported earlier is not present in any run log.
+
+**🔵 ACTIVE: 5.17 (opened 2026-08-20)** — ⚠️ **run 88 (2026-08-23) retracted the sreg-gate and "never reaches step 0xd" theories; read the 08-23 handoff at the top of this file, not the analysis below.** The exit test is unchanged. — **the movie opens, its reads complete, and then nothing asks for more data.** With 5.16 fixed the SRD layer reports DONE, but only **2** SRD reads issue in a full 300 s run (~1.4 MB) — nowhere near enough to feed 85 s of video. The EE then goes nearly idle waiting on something downstream. Run 69 watchdog shape, both movies identical:
+>
+> | window | state |
+> |---|---|
+> | t=1–106 s | `busy%≈100`, normal execution |
+> | t=119 s | movie opens, `[movie] stat` 0→1 |
+> | t=121–196 s | **`busy%` collapses to ≈10**, `stuckSecs` climbs to 76 |
+> | t=206 s | movie layer gives up, `stat` 1→0 |
+> | t=211–241 s | `busy%` back to ≈100, game resumes |
+> | t=248 s | second movie opens — same shape, still parked at run end |
+>
+> End-of-run state: `[adx:stream] st=2 bsy=1 fd=0x54c060`, `[movie] maxstat=1 objSrc=0x0`. **Exit test:** SRD read count exceeds ~2 per movie (a genuine streaming cadence), `busy%` stays near 100 through the movie window, and `[movie] objSrc` becomes nonzero. **First two candidates:** (a) decode `fno=34` above — the only guessed reply left on the path; (b) find who is supposed to re-arm the next read after `cvfsStat=0x3` and confirm it runs at all (`PS2_COVERAGE=1` first — see the "measure the count before building the theory" rule).
+
+**✅ 5.10 CLOSED (2026-08-07)** — `pcpyh` read `rs` instead of `rt`. Memory-card text legible on screen. *(Historical framing below.)* — **the GS rasterizes but the presented frame is black, because every PSMT4/PSMT8 payload arrives all-zero.** `[gs:frame] textured=19,832,591 maxrgb=255 nonblack=3,757,356` vs `[present] nonblack=0`. **Exit test:** `[present] nonblack > 0`. **Next action:** build + run the `[vifsrc]` probe (written 08-05, UNBUILT) at the head of `PS2Memory::processVIF1Data`. Decision table + full evidence are in the **2026-08-05 section at the top of this file — read that first.**
+
+**✅ 5.9 CLOSED (2026-08-05)** — IOP heap arena too small for ARKD's real 960 KB load buffer; arena enlarged to `0x60000..0x1D0000` + one-shot cursor recycle. Assets load: TOC count=1930, 1.13 MB read, `fails=0`.
+
+**✅ 5.8 CLOSED (2026-08-04)** (opened 2026-08-01) — **the guest state machine never advances to a textured draw.** Replaces 5.7's framing, whose surviving lead (BUG-009) is now **CLOSED — benign**. Everything underneath works and is measured: frame loop healthy (~46–49 fps, `vbl/s`≈49, `dma/s`≈98), asset streaming proven end-to-end (1024 reads / 2.1 MB / **zero fails**), GS proven innocent (BUG-028 fixed + verified twice). Yet `primmask=0x40` (SPRITE only), `tme` **never** 1, `tex0.tbp` always 0, `nonblack=0` across ~24 M pixels/interval. **Exit test:** a single frame in which `tme=1` and `tex0.tbp != 0`. **Method (this is the change that matters):** stop reasoning from our own log in a vacuum — *difference against real PCSX2 + the real ISO*, which reaches the memory-card prompt in 7–8 s, using `mcp__pcsx2__*`. Six retractions in this file all came from inferring semantics instead of measuring them against ground truth. First steps: (1) arm `PS2_COVERAGE` — built, documented, and **not armed since 2026-07-29** (last run `cov=0/0`) — it answers "which game-band addresses does the EE actually dispatch" directly, instead of hand-reading 2800-line generated `switch` bodies; (2) watch `0x44D26C` (SRD test-and-set gate: `sub_12F1E8`/`sub_12F7E0` tick only if they win it, `sub_12EB28` can set it to 1 after a 1000-iteration spin — if it sticks at 1 all five SCMD wrappers silently stop being reached, with no log output), `0x463294` (libcdvd bind latch), `0x5AA7D0` (the CCD reply word `sub_1C0A30` actually branches on), `0x5e6b3c` (GameMode); (3) breakpoint `0x1C0A30` on PCSX2 and read `MEM[0x5AA7D0]` per hit — settles whether our `0x30000000` is the advancing answer or the keep-waiting one. **That single measurement may be the whole blocker.**
 
 > ⚠️ **The "First steps" above are HISTORICAL — they were carried out, and measurements #1–#4 below supersede them.** 5.8 has since narrowed all the way from "never advances to a textured draw" to one named gate: `CAppInit` parks at state 11 waiting on an ARKD completion that four separate breaks prevented from ever being published. **Read § 5.8 measurement #4 first; it holds the root cause, the fix (built, unrun), and the exact next command.**
 
@@ -3083,6 +12337,39 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 
 ## Learned Patterns
 
+### 2026-08-24
+- **★★★ A conditionally-gated write DECOUPLES the call count from the stored value by design — comparing them is not evidence of anything.** I traced 14,192 `svm_lock`/`svm_unlock` dispatches, found the running balance never went negative, saw the counter at `0x45EFC0` sitting at -2, and called it "an airtight contradiction". It is not a contradiction at all: `svm_lock` does `beq $v1,$zero,<exit>` on the null hook and **skips the increment entirely**, so every call made while the hook is null contributes zero. Net +18 calls with a -2 counter is exactly what correct code produces. **When the write is behind a gate, the only balance the counter tracks is the balance inside the gate-open windows** — so measure the gate transitions first, or you are comparing two quantities the hardware never claimed were equal.
+- **★★★ The word "airtight" is a tell. Grep your own draft for it.** Every load-bearing noun in that report — "exactly two writers", "reachable only via", "can only come from", "nothing ever re-zeros" — was a static-analysis *coverage result* re-typed as a *fact about the binary*. [[feedback_no_guessing]] catches these only if you actually re-read the draft looking for absolute quantifiers. **Absolute quantifiers ("only", "exactly", "never", "no others") are the audit targets; each one must name the tool whose coverage it rests on.**
+- **★★ Applying a caveat in one paragraph and ignoring it in the next is the commonest form of this failure.** The same 24h report correctly wrote "types 3/4/5/1000 are not confirmed dispatch-visible, so this is not proof of absence ([[feedback_registerfunction_bypass]])" — and then, six lines earlier, treated the type-1/2 hit counts as a **complete** call census. Same trace, same blind spot, opposite treatment. **A caveat stated about one row of a table applies to every row of that table.**
+- **★★ `eeref`'s `ptr=0 gp=0 imm=N` means "eeref found N", never "there are N".** `refs 0x45efc0` returns `IMM` hits, i.e. `lui`/`addiu` address-formations. A write through a register-held pointer — a `memset` over a range, a struct field store — produces no `IMM` and is **invisible**. In a hook/function-pointer system, indirect access is the expected case, so this is the blind spot most likely to be load-bearing ([[project_eeref_static_xref]]).
+- **★ An address that "obviously" belongs to one subsystem may be shared infrastructure.** I modelled `0x13bc10`/`0x13bc28` as an SVM-private lock/unlock pair. `eeref refs` says **17 and 19 callers** — `VU0_RunMicro`, `sub_12EB28`, `sub_12F4A8`, and more — and the sets are **asymmetric** (two callers issue unlock twice against one lock, the early-return pattern). **Run `eeref refs` on the wrapper before assuming the wrapper is yours**, or you inherit a balance guarantee that was never there ([[feedback_never_convict_by_count_with_two_callers]]).
+
+### 2026-08-19
+- **★★★ A high call count refutes "it is asleep" outright — measure the count before building the theory.** Stage 5.16 spent a full cycle on "the CRI server thread never wakes". One coverage census killed it: `0x130c48` = **727 calls**, 354 `sceCdRead` out, 354 RPC completions back. The thread was running the whole time; the *status byte* simply never reached DONE. **Before hypothesising about scheduling, ask whether the code ran at all** — `PS2_COVERAGE=1` answers it for zero build cost and would have saved the cycle.
+- **★★ Enumerate the outcomes from the code's tail, not from the two you can imagine.** The read path was framed as a 2-way question (status 9 = error vs 3 = done) through several runs. `sub_12EE20`'s actual tail is `sync = sceCdSync(1); chk = sub_12ECC0(obj); if (!sync) obj[2] = chk ? 9 : 3;` — so there is a **third** arm: `sync != 0` leaves the byte at **2 forever**, and that arm has a different fix in a different file. **A decision table built from imagination silently assigns the unlisted outcome to whichever listed one it resembles.**
+- **★★ A short-circuit gate makes "checked and clean" indistinguishable from "never checked".** `sub_12ECC0` returns `0` early whenever `dword_44D27C` is 0 — *without ever calling `sceCdGetError`*. A probe reading only its return value would have reported "no drive error" with full confidence in the exact case where nothing was asked. **Log the gate alongside the verdict, always ([[feedback_probe_gate_on_shape_not_address]])** — the `[srd]` probe emits `gate44d27c=` on every line for this reason.
+- **★ A wrapper on an outer function cannot report its callees' return values unless the inner wrappers relay them — and the relay must be cleared *before* the call.** `sceCdSync` and `sub_12ECC0` both execute **inside** `sub_12EE20`, so their results reach the adjudicating log line only through `g_srdLastSync`/`g_srdLastChk`. Clearing those after the call, or not at all, would let a previous tick's value be reported as this tick's — a stale-but-plausible number, the worst kind ([[feedback_probe_the_final_value]]).
+
+### 2026-08-16
+- **★★★ A backup filename that inserts its suffix *before* the extension stays inside the glob.** `register_functions.cpp` → `register_functions.stub-bak.cpp` still matches `src/runner/*.cpp`, so the file was still declared **and still compiled** — the generator emitted `void register_functions.stub-bak(...)` (a `.` and a `-` in an identifier) into the auto-generated `fn_forward_decls.h`. The safe form appends after the extension: `register_functions.cpp.stub-bak`, which is exactly what `output/register_functions.cpp.legacy-bak` had been doing correctly since Jun 14. **Rename a file out of the pattern, not around it.**
+- **★★ Renaming/restoring one copy of a glob-synced file is half a fix.** `build.ps1:108` syncs `output/` → `src/runner/` on **newer-wins**, so the stale backup in `output/` (Aug 15) would have re-seeded itself over the good file (Jul 23) on the next build. **When a build step mirrors two directories, every file mutation is a two-directory mutation.**
+- **★★ `/FORCE:MULTIPLE` converts a duplicate-symbol *error* into a silent wrong-answer.** Had the bad backup compiled, it would have defined `g_ps2RecompiledFunctionTable*` a second time — all `nullptr` — and the linker was free to pick it. The build log would have been clean and the game would have hung at `0x100008` exactly as before. **On a `/FORCE`-linked target, treat "it linked" as no evidence at all about symbol identity; verify by artifact size or by a runtime read of the symbol.**
+- **★★ A liveness counter that reads zero on a healthy run is not a liveness counter.** I named `cov=` as the pass/fail line before the run; the run came back `cov=0/0` with the game plainly executing. The signals that actually separated the broken runs from the good one were `busy%` / `gif/s` / `dma/s` / `progress`. **Pick the indicator from a known-good run, not from its name** — same failure mode as [[feedback_probe_gate_on_shape_not_address]].
+- **★ Swapping out a subsystem silently retires the probes that lived inside it.** Dropping `ps2_gs_rasterizer.cpp` for upstream's GS left `[drawpath]` **write-only**: VIF1 still stamps `g_curSite`/`g_curSrc` from 8 sites, but nothing reads them. No error, no warning — the tag simply never appears. **After any subsystem swap, enumerate which probes had their reader on the removed side.**
+
+### 2026-08-10
+- **★★ A host-side backend that is fully wired can still be dead code.** `ps2_pad.cpp` had a complete keyboard + USB gamepad map, and reading it said "X and Space should work." They never could: the map terminates at `Kernel/Stubs/Pad.cpp`, and **SDBZ statically links its own libpad**, so the SDK stub layer is never entered for this game. **Before answering "is input mapped?", establish which of the two paths — SDK stub or guest-linked library — the game actually takes.** Same disease as reading an emitted expression to verify a translation ([[feedback_verify_translations_by_decoding]]): the code was correct and irrelevant.
+- **★★ When a game links its own SDK library, the integration point is the library's *memory layout*, not its call sites.** There is no function to hook: `jal` into guest libpad compiles to a direct C++ `fn_` call that bypasses `registerFunction`, and the hardware's own producer (padman) pushes asynchronously on vsync, so there is no per-frame guest call to intercept either. The only durable seam is the buffer both sides agree on — so the offsets have to be **decoded from the guest's decompiled library**, field by field, and every one becomes a load-bearing constant.
+- **★ Two-field state machines fail closed on the field you didn't write.** `scePadGetState` returns STABLE only when `state==6` **and** `reqState==0`; portopen leaves `reqState=2`, and `6 + 2` is special-cased to "busy". Writing the field that obviously means "ready" would have produced a run that looked exactly like no fix at all. **Read the consumer's full predicate, not the field whose name matches your intent** — the generalised form of the 2026-08-01 "read the consumer, not just the callee" entry.
+- **★ A strictly-less comparison in a double-buffer selector makes ties non-neutral.** `0x188320` picks half 1 only when `c0 < c1`, so equal counters always select half 0. A publisher that sets its counter *equal* to the other half would silently never be seen. Fill the stale half, then publish `max(c0,c1)+1` **last**, behind a release fence — the guest EE is a different host thread.
+- **Third misleading-label occurrence, now a standing expectation.** Every one of the nine libpad functions carries an auto-derived name (`mem_compare_unk_e` = `scePadRead`, `mem_fill_z_24` = the half-picker) that is an SDK-signature false positive. After `rpc_handle_valid`, the Stage 5.11 render path, and now all of libpad: **treat a `mem_*`/`fn_*` name in the decompile dump as noise by default**, and identify by body.
+
+### 2026-08-07
+- **★★ A near-zero bucket is the strongest evidence in a three-way split.** `[blackwho]` gave `untex=13.76M texzero=15.76M texcol=19,860`. The two big numbers were ambiguous; the *small* one was decisive — `texcol≈0` exonerated blending, TEXFUNC and FBMSK outright, collapsing the search space in one read. **When instrumenting a "who did it" question, always include the bucket you expect to be empty.** Its emptiness is what makes the others interpretable.
+- **★★ A "last event" snapshot is owned by whatever is most frequent, not by what you care about.** `[blackwho]`'s `snap*` fields are overwritten by *every* black store, and the full-screen clear always lands last in an interval — so the snapshot permanently reports `prim=0x6` (TME=0, ABE=0) and describes the **clear**, never the offender. A one-slot snapshot next to a counter is a trap unless the store is **gated to the same branch as the counter you are reading**. The `[texzero]` probe fixes this by capturing only on the texzero branch. Same family as [[feedback_probe_the_final_value]] and [[feedback_capped_probes_false_negatives]]: the field is populated, plausible, and about the wrong thing.
+- **★ A non-reproducing observation is unrecoverable if the log path is fixed.** Run 10's `nonblack=64664` never recurred, and `launch_recomp.ps1` writes one fixed `-Log` path with **no archiving**, so that log is gone. Under `-Determinism 0`, a one-off worth building a hypothesis on must be **archived at the moment it is seen**. (Not fixed this session — noted so the next agent copies `run_log.txt` aside before re-running.)
+- **★ Judge a build by target topology, not by the presence of `LNK1120`.** `iop_harness.exe` and `ps2x_tests.exe` fail to link `fn_*` runner symbols **by construction** — they link `ps2_runtime.lib` but not the 30,000 runner objects. The only question that matters is whether any failure names `ps2EntryRunner.vcxproj`. **Confirm a probe actually shipped with a monotonic source→obj→lib→exe mtime chain**, not by obj age against wall-clock — 6:14 AM objs look "stale" at 11 AM and are not.
+
 ### 2026-08-01 (later — the ARKD completion-path session)
 - **★★ Any fallthrough that fabricates a return value must name itself.** The IOP import lambda returned `$v0 = 0` for every unhandled `(lib, fid)`. For a boolean-success API that reads as *failed*, and the IRX idiom is `while (!x) x = api(...)` — so **one unlisted ordinal is an infinite spin that consumes the entire interpreter budget and is indistinguishable in the log from "the handler hung."** That is exactly what `sifcmd fid=12` (`sceSifSendCmd`) did to the state-11 audio call, and it cost a session. This is the same disease as a silent probe cap ([[feedback_capped_probes_false_negatives]]) one layer down: a *silent default* manufacturing a zero that reads as data. Fixed generally, not specifically — `[iop:unhandled]` censuses every defaulted import, announces the first hit, and dumps the full census whenever a service run fails to halt (i.e. precisely when something is spinning).
 - **★ Identify an IOP import by its CALL SITE, not by an SDK ordinal table.** `sifcmd fid=12` was pinned by matching the live `[iop:import]` args (`a0=0x80000001 a1=0x53a30 a2=0x18`) against the verbatim decompiled loop in `irx_arkddvd_sub_A3C0`. Guessing semantics from an ordinal list is how this project produced five misleading-name retractions. **Corollary — a deliberate non-action:** `thsemap fid=6/8` and `sifman fid=7/8` fall through the same way and were **left alone**, because their real semantics may already be "return 0 = success". Building the census that will *name* them from live evidence is worth more than four plausible guesses.
@@ -3165,6 +12452,69 @@ Statically traced the full send path this session to find what's *supposed* to r
 Started reading `sub_00327810_0x327810.cpp` (boot state machine, 2819-line generated `switch(ctx->pc)`/state dispatcher) looking for what triggers a fresh wrapper call — read lines 1-1045 (state teardown for states 14→1, generic device-init/retry sequencer), no direct hit on rpc-related addresses in that range. Lines 1046-2819 unread.
 
 **Recommendation for next session:** static reading of the remaining ~1770 lines is expensive for a generated switch; a live breakpoint/HWWATCH on entry to `sub_00186CC0_0x186cc0` (address `0x186cc0`) will show directly and faster whether/when it's re-entered and with what register state — prefer that over continuing the manual disassembly read.
+
+## Session 2026-08-03b — Round-3 VU1 probe BUILDING (unrun); memory system pruned; FPU accumulator item verified closed
+
+**★ Live blocker unchanged and still the whole job: no VU1 microprogram is ever uploaded.** See
+memory `project_stage58_vu1_microcode_missing.md`. Round-2 `[vu:frame]` measured
+`mpg=0 mpgbytes=0 vu1instrs=1966080 endebit=0 endlimit=30 endrange=0` with `mscal=30 vu1runs=30
+xgkicks=0`; `1966080 = 30 × 65536` **exactly**, i.e. every MSCAL burns the full cycle budget
+decoding a zero-filled code image as NOP pairs. `mpg=0` holds across all 22 intervals **including
+boot**, so it is not a per-interval drain artifact. `primmask=0x41` (POINT+SPRITE) = zero triangles
+ever reach the GS. Stage 5.8 exit test is still literally: **one frame with `tme=1` AND
+`tex0.tbp != 0`.**
+
+**Round-3 instrumentation is written and was compiling when this session ended — it has NOT been
+run.** 7 files, all uncommitted on purpose (no point committing an unrun probe):
+`ps2xRuntime/include/runtime/ps2_pipeline_stats.h` (new/untracked; header-only inline atomics, so no
+new TU and no CMakeLists edit), plus `ps2_runtime.cpp`, `include/ps2_runtime.h`, `ps2_gs_gpu.cpp`,
+`ps2_vif1_interpreter.cpp`, `vu/ps2_vu1_core.cpp`, `vu/ps2_vu1_lower.cpp`. New `[vu:frame]` fields:
+`codenz`, `datanz`, `vifops`, `mscalpc`.
+
+**How to read the round-3 output — decide this before looking, it is a clean two-way split:**
+- `codenz=0` → VU1 code memory is genuinely empty. Nothing anywhere uploads it; the MSCALs are
+  executing zeros. The bug is **upstream, in the upload path** (does the EE ever store to
+  `0x11008000`? are DMA1 chain-mode tags carrying MPG being skipped?).
+- `codenz>0` → a microprogram **is** resident, meaning the EE wrote it straight through the mapped
+  `0x11008000` window and bypassed VIF1 MPG entirely. Then the upload is fine and the bug is
+  **ours, downstream** — prime suspect the VU1 decode cache in `ps2_vu1_core.cpp`, which only
+  rebuilds when `getVU1CodeGeneration()` bumps, and only `markVU1CodeModified()` bumps it. A raw EE
+  store through the mapped window never does.
+- Also read `vifops` (cumulative hex bitmask of VIF1 opcodes actually seen; MPG `0x4A` = bit 10 of
+  `opHi`) to learn what the ~8 MB/interval really contains, `datanz` for whether UNPACK lands
+  geometry in VU1 data memory, and `mscalpc` to rule out the game merely calling address 0.
+
+Build status at session end: mid-unity-compile (~1779 of ~4520 TUs), 9 `cl`/`MSBuild`/`link`
+processes live, no errors in `build_log.txt`. On failure, **read `build_log.txt` directly** —
+build.ps1's progress bar swallows the real `C2039`-style errors.
+
+**Memory system pruned** (the session's other work, done while the build occupied the machine).
+`MEMORY.md` went from a flat 89-line list (18,628 B) to a 9-section index (13,240 B, −29%) with the
+VU1 blocker and `command_log` first. Three fully-dead memories were deleted **after** folding their
+content into `project_state_archive.md`: `project_raout_probe_pending`, `project_stale_frame_ra_read`
+(the whole `$ra`-corruption thread — closed; real cause was the persistent `SetVSyncFlag`
+registration, and the archive entry preserves the exonerations of the pool allocator `0x178428`,
+`strlen 0x191898`, `strcpy 0x191780`, and the falsified "14 bisectable slots" framing), and
+`project_uncommitted_fpu_bisect_changes`. All 13 dangling `[[wikilinks]]` repointed; verified zero
+index/disk drift both directions.
+
+**FPU accumulator item verified CLOSED by reading the code, not by assuming.** The memory claimed
+the fix lived in `code_generator.cpp` under a field named `fpuAcc`; both names were wrong, and
+grepping only those two returned zeros — which reads exactly like "the fix was reverted." Widening
+to `MADDA|COP1_ADDA|adda\.s` found it landed and coherent at
+`ps2xRecomp/src/lib/fpu_translator.cpp:80-93` → `FPU_SET_ACC` (`ps2_runtime_macros.h:607`) →
+`ctx->f_acc` (`ps2_runtime.h:136`). The `sdbzBisectGap*` MemSysInit stubs are gone. One harmless
+residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing reads. **This is the
+`capped-probes-are-false-negatives` shape again — a too-narrow grep manufactured a zero.**
+
+**Still open, not worked, user's call:**
+- The `sid=0x500 fno=0x1` IOP spin (`cdvdman fid=12` @ `ra=0x0414d0`, `thbase fid=33` @
+  `ra=0x04abbc`, `sysmem fid=14`, ~31,746 calls each, all defaulting `$v0=0`). Offered as option 2
+  this session; user chose option 1 (chase the textured draw). Never was the state-11 gate and is
+  not the current one.
+- `git prune` for the unreachable loose objects left by July's filter-repo purge.
+- `memory/reference_ps2_sif_boot.md` is 90 KB, ~7× the next largest, and much of it is retired
+  0xA0-IMBAL/stale-pc narrative. Worth a splitting pass; it is a real read-and-judge job.
 
 ## Key Files
 - `PS2Recomp/ps2xRuntime/src/lib/iop/iop_kernel.cpp` — IOP module registry

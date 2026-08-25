@@ -84,6 +84,41 @@ extern "C" uint64_t ps2x_guest_progress()
 }
 
 // ---------------------------------------------------------------------------
+// Guest idle signal (stage 5.17).
+//
+// ps2x_guest_progress() is a progress clock, and the IRQ worker paces vblank
+// off it under PS2X_DETERMINISM. That has no floor: when the guest becomes
+// vsync-GATED rather than compute-bound (the movie/streaming state machine from
+// t=121s in run 69), it retires ~63 progress units/s instead of ~140,000, so the
+// quantum path yields ~0.003 vblanks/s and the guest sleeps waiting for a tick
+// that its own sleeping prevents. Self-reinforcing deadlock.
+//
+// Interrupt.cpp's 50 ms zero-progress fallback does not catch it: a guest that
+// dribbles one progress unit every ~16 ms resets the stall counter long before
+// it reaches the threshold. The condition that actually holds is not "progress
+// froze", it is "no guest thread is runnable" -- which the scheduler already
+// tracks exactly, in g_run_queue / g_running_fiber.
+//
+// try_to_lock rather than a blocking lock: this is polled from the IRQ worker,
+// and a failed acquire means some thread is mutating scheduler state right now,
+// i.e. the guest is demonstrably NOT idle. Reporting busy on contention is the
+// conservative answer and costs at most one extra poll period. Race-free: both
+// pointers are only ever read here under g_sched_mutex.
+//
+// extern "C" for the same reason as the accessors above -- declaring this in
+// ps2_scheduler.h would rebuild ~30,000 generated runner TUs (Sec.3).
+// ---------------------------------------------------------------------------
+extern "C" int ps2x_guest_idle()
+{
+    std::unique_lock<std::mutex> lk(g_sched_mutex, std::try_to_lock);
+    if (!lk.owns_lock())
+    {
+        return 0;
+    }
+    return (g_run_queue == nullptr && g_running_fiber == nullptr) ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // Guest execution duty cycle (stage 5.6.2).
 //
 // ps2x_guest_progress() measures how MUCH guest code ran, but not what share of
@@ -753,6 +788,15 @@ void ps2sched::create_fiber(int tid, int priority, uint32_t entry,
     fc->rdram    = rdram;
 
     fc->cpu.pc = entry;
+    // Interrupts-enabled Status, matching the boot context in
+    // PS2Runtime::PS2Runtime() -- see the full derivation there. A fiber
+    // inherits nothing from its creator, so without this every thread the game
+    // spawns would itself be unable to start a further thread: the SDK's
+    // StartThread wrapper gates on Status.IE (0x175770) and Status.EIE
+    // (DIntr, 0x17ed60) and returns -1 silently when either reads clear.
+    // Fixing only the boot context would move the failure one level deep
+    // instead of removing it.
+    fc->cpu.cop0_status = 0x00000001u /* IE */ | 0x00010000u /* EIE */;
     SET_GPR_U32(&fc->cpu, 29, sp);  // $sp
     SET_GPR_U32(&fc->cpu, 28, gp);  // $gp
     SET_GPR_U32(&fc->cpu, 4,  arg); // $a0 (passed directly, not smuggled through other registers)
@@ -1155,6 +1199,33 @@ void ps2sched::maybe_yield()
     {
         std::lock_guard<std::mutex> lk(g_sched_mutex);
         if (g_run_queue && g_run_queue->priority < fc->priority)
+        {
+            enqueue_locked(fc); // enqueue Ready before yielding
+            yield = true;
+        }
+    }
+    if (yield) ps2fiber_yield();
+}
+
+namespace ps2sched { void force_reschedule(); }
+
+// Unconditional reschedule, matching the EE kernel's documented "forcing a
+// thread reschedule" (ps2tek syscall 29h ChangeThreadPriority; contrast 2Ah
+// iChangeThreadPriority, which explicitly does NOT). maybe_yield() only gives
+// up the fiber for a STRICTLY higher-priority head, so a guest that boosts a
+// worker to its OWN priority -- SDBZ's sub_11E690 boosts 0x4418F0==1 while
+// itself running at 1 -- never yields, and its [0x441924] spin-wait can never
+// be ACKed. enqueue_locked() is stable-FIFO after equal-priority nodes, so
+// re-enqueueing self here puts the caller behind the peer it just boosted,
+// which is what the rotate in _iRotateThreadReadyQueue achieves on hardware.
+void ps2sched::force_reschedule()
+{
+    FiberContext* fc = tls_current_fiber;
+    if (!fc) return; // called from a host worker: no-op
+    bool yield = false;
+    {
+        std::lock_guard<std::mutex> lk(g_sched_mutex);
+        if (g_run_queue && g_run_queue->priority <= fc->priority)
         {
             enqueue_locked(fc); // enqueue Ready before yielding
             yield = true;

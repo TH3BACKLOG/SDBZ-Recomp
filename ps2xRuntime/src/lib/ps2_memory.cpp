@@ -3,6 +3,7 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "ps2_log.h"
 #include "runtime/ps2_diag.h"
+#include "Kernel/Ipu/ps2_ipu_core.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -13,6 +14,64 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+
+// ---- [chainord] -- Stage 5.11 run 33 ------------------------------------
+// PCSX2 ground truth (2026-08-09, game paused on the memory-card dialog):
+// the guest's own VIF1 source chain is laid out strictly ascending, one
+// sprite per link, and the background link PRECEDES the box-body link:
+//
+//   0x00771470  full-screen clear   (untextured)
+//   0x007717d0  background 512x448  (v0 XYZ2 = 0x7000/0x7200 @ +0x40)
+//   0x00771a00  box body   464x120  (v0 XYZ2 = 0x7180/0x84e0 @ +0x40)
+//   0x00771a70+ the 8x120 / 464x8 borders
+//
+// Verified by decoding the DMAtag at 0x00771a60: ID=2(next) QWC=6
+// ADDR=0x00771ad0 -- i.e. address order IS chain order.
+//
+// This records the EE source address of every chunk our own chain walk
+// gathers, so the two walks can be compared directly. If our sequence also
+// puts 0x7717d0 before 0x771a00 then the chain we hand to VIF1 is correct
+// and the measured box-before-background inversion is introduced further
+// downstream. If it does not, our recompiled guest built a different chain.
+//
+// Ring of the most recent kCoRing chunks; snapshotted by the [drawpath]
+// emit site in ps2_gs_gpu.cpp so both windows describe the same frame --
+// deliberately NOT gated on any address (see the probe-gating rule).
+// Run 34 widens the ring from 64 to 1024. At 64 the window held only the tail
+// of a ~5500-append frame, so the background link fell outside it and its
+// position had to be inferred from the 0x70 link stride. The ring is also now
+// a lookup table: resolveSrc() maps a byte offset inside the gathered buffer
+// back to the EE address it came from, which is what lets each individual GS
+// draw carry its own source address instead of borrowing one by position.
+namespace ps2diag_chainord
+{
+constexpr uint32_t kCoRing = 1024;
+std::atomic<uint32_t> g_coSeq{0};
+std::atomic<uint32_t> g_coAddr[kCoRing];
+std::atomic<uint32_t> g_coQwc[kCoRing];
+std::atomic<uint32_t> g_coOff[kCoRing];
+
+// Newest-first so the current chain wins over any stale entry left by an
+// earlier gather. Returns 0xFFFFFFFF when no chunk spans pos -- an explicit
+// "unresolved", never a plausible-looking wrong address.
+uint32_t resolveSrc(uint32_t pos)
+{
+    const uint32_t seq = g_coSeq.load(std::memory_order_relaxed);
+    const uint32_t n = (seq < kCoRing) ? seq : kCoRing;
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        const uint32_t k = (seq - 1u - j) % kCoRing;
+        const uint32_t qwc = g_coQwc[k].load(std::memory_order_relaxed);
+        if (qwc == 0u)
+            continue;
+        const uint32_t off = g_coOff[k].load(std::memory_order_relaxed);
+        if (pos >= off && pos < off + qwc * 16u)
+            return g_coAddr[k].load(std::memory_order_relaxed) + (pos - off);
+    }
+    return 0xFFFFFFFFu;
+}
+}
+// -------------------------------------------------------------------------
 
 namespace
 {
@@ -48,6 +107,44 @@ namespace
     inline bool isIoRegister(uint32_t addr)
     {
         return Ps2AddressInRange(addr, PS2_IO_BASE, PS2_IO_SIZE);
+    }
+
+    // ---- IPU DMA glue ---------------------------------------------------
+    // These are free functions rather than PS2Memory members on purpose:
+    // adding a member would mean editing runtime/ps2_memory.h, which every one
+    // of the ~30,000 generated runner TUs includes.
+
+    // Fold a DMA completion edge into D_STAT (status bit + the OR-of-masked
+    // summary in bit 31), matching the SPR channel path further down.
+    inline void raiseDmacStatBit(std::unordered_map<uint32_t, uint32_t> &io, uint32_t chBit)
+    {
+        uint32_t dstat = io.count(0x1000E010u) ? io[0x1000E010u] : 0u;
+        dstat |= (1u << chBit);
+        const uint32_t st = dstat & 0x3FFu;
+        const uint32_t mk = (dstat >> 16) & 0x3FFu;
+        if ((st & mk) != 0u)
+            dstat |= (1u << 31);
+        else
+            dstat &= ~(1u << 31);
+        io[0x1000E010u] = dstat;
+    }
+
+    // Mirror the IPU engine's live channel state back into the register file
+    // and raise D_STAT for whichever channel just finished.
+    // Channel 3 = IPU_FROM, channel 4 = IPU_TO.
+    inline void syncIpuChannels(std::unordered_map<uint32_t, uint32_t> &io)
+    {
+        for (const uint32_t base : {ps2_ipu::kChanFrom, ps2_ipu::kChanTo})
+        {
+            io[base + 0x00u] = ps2_ipu::peekChannelReg(base + 0x00u);
+            io[base + 0x10u] = ps2_ipu::peekChannelReg(base + 0x10u);
+            io[base + 0x20u] = ps2_ipu::peekChannelReg(base + 0x20u);
+            io[base + 0x30u] = ps2_ipu::peekChannelReg(base + 0x30u);
+        }
+        if (ps2_ipu::takeFromCompletion())
+            raiseDmacStatBit(io, 3u);
+        if (ps2_ipu::takeToCompletion())
+            raiseDmacStatBit(io, 4u);
     }
 
     inline uint64_t *gsRegPtr(GSRegisters &gs, uint32_t addr)
@@ -99,6 +196,40 @@ namespace
         default:
             return nullptr;
         }
+    }
+
+    // [gsreg] Stage 5.9. GS privileged register writes that arrive as plain stores to
+    // 0x1200xxxx never reach GS::writePrivReg's switch -- they go straight through
+    // gsRegPtr into the register struct. That is why the [dispfb] probe on the GS side
+    // stayed silent while [present] kept reporting a live dispfb1 value. Watch the two
+    // display-buffer registers here instead, change-gated so a static register goes
+    // quiet after its first write.
+    inline void gsRegWriteProbe(uint32_t regOff, uint64_t newVal)
+    {
+        if (regOff != 0x0070u && regOff != 0x0090u)
+            return;
+        if (!ps2_diag::enabled())
+            return;
+
+        static uint64_t s_last[2] = {~0ull, ~0ull};
+        static uint32_t s_emit[2] = {0u, 0u};
+        const int idx = (regOff == 0x0070u) ? 0 : 1;
+        if (newVal == s_last[idx])
+            return;
+        s_last[idx] = newVal;
+        if (s_emit[idx] >= 64u)
+            return;
+        ++s_emit[idx];
+
+        RUNTIME_LOG("[gsreg] dispfb" << std::dec << (idx + 1)
+                                     << " raw=0x" << std::hex << newVal
+                                     << " fbp=0x" << (newVal & 0x1FFull)
+                                     << std::dec
+                                     << " fbw=" << ((newVal >> 9) & 0x3Full)
+                                     << " psm=0x" << std::hex << ((newVal >> 15) & 0x1Full)
+                                     << std::dec
+                                     << " n=" << s_emit[idx]
+                                     << (s_emit[idx] == 64u ? " [cap]" : ""));
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
@@ -385,6 +516,12 @@ bool PS2Memory::initialize(size_t ramSize)
         {
             iopSelfTest();
         }
+
+        // Hand the IPU its view of guest memory. It pulls bitstream quadwords
+        // straight out of the IPU_TO descriptor and writes decoded macroblocks
+        // back through IPU_FROM, so it needs RDRAM and the scratchpad directly.
+        ps2_ipu::attachMemory(m_rdram, static_cast<uint32_t>(ramSize),
+                              m_scratchpad, PS2_SCRATCHPAD_SIZE);
 
         return true;
     }
@@ -872,6 +1009,16 @@ uint64_t PS2Memory::read64(uint32_t address)
         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
     }
 
+    // IPU_CMD and IPU_TOP are genuinely 64-bit: bit 63 is the busy /
+    // not-enough-data flag and the guest reads them with `ld` (0x424bd4 and
+    // 0x423e24). They must come from the engine, not the register mirror.
+    if (ps2_ipu::isRegister(address))
+    {
+        const uint32_t lo = readIORegister(address);
+        const uint32_t hi = readIORegister(address + 4);
+        return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+    }
+
     // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
@@ -909,6 +1056,15 @@ __m128i PS2Memory::read128(uint32_t address)
     {
         inRange(vuOffset, sizeof(__m128i), vuLimit, "read128 vu", address);
         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
+    }
+
+    // IPU output FIFO: a quadword `lq` from 0x10007000 pops one entry.
+    if (ps2_ipu::isFifo(physAddr))
+    {
+        alignas(16) uint8_t buf[16];
+        ps2_ipu::readFifo128(physAddr, buf);
+        syncIpuChannels(m_ioRegisters);
+        return _mm_loadu_si128(reinterpret_cast<const __m128i *>(buf));
     }
 
     // 128-bit reads are primarily for quad-word loads in the EE, which are only valid for RAM areas
@@ -1015,6 +1171,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             *reg = newVal;
+            gsRegWriteProbe(regOff, newVal);
         }
         return;
     }
@@ -1070,6 +1227,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            gsRegWriteProbe(regOff, value);
         }
         return;
     }
@@ -1139,6 +1297,17 @@ void PS2Memory::write128(uint32_t address, __m128i value)
             return;
         }
     }
+    // IPU input FIFO: an `sq` to 0x10007010 pushes one quadword whole. It must
+    // NOT be split into two 64-bit stores -- the FIFO is quadword-granular.
+    if (ps2_ipu::isFifo(physAddr))
+    {
+        alignas(16) uint8_t buf[16];
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(buf), value);
+        ps2_ipu::writeFifo128(physAddr, buf);
+        syncIpuChannels(m_ioRegisters);
+        return;
+    }
+
     if (isIoRegister(physAddr))
     {
         // Non-RAM 128-bit stores are modeled as two 64-bit stores.
@@ -1189,27 +1358,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
             *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            gsRegWriteProbe(regOff, *reg);
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
-    if (address >= 0x10002000 && address <= 0x10002030)
+    if (ps2_ipu::isRegister(address))
     {
-        if (address == 0x10002010)
-        {
-            m_ioRegisters[address] = value & ~(1u << 31);
-            if (value & (1u << 30))
-            {
-                m_ioRegisters[0x10002000] = 0;
-                m_ioRegisters[0x10002020] = 0;
-                m_ioRegisters[0x10002030] = 0;
-            }
-        }
-        else
-        {
-            m_ioRegisters[address] = value;
-        }
+        // Real IPU: writing IPU_CMD runs the command synchronously against
+        // whatever the IPU_TO descriptor can supply (see ps2_ipu_core.cpp).
+        m_ioRegisters[address] = value;
+        ps2_ipu::writeReg(address, value);
+        syncIpuChannels(m_ioRegisters);
         return true;
     }
 
@@ -1308,6 +1469,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003800u && address < 0x10003A00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // IPU_FROM (ch3) and IPU_TO (ch4) are owned by the IPU engine, which walks
+    // the descriptor itself so MADR/QWC/TADR stay truthful while a command is
+    // mid-flight. They must be claimed before the generic DMA path below.
+    if (ps2_ipu::isDmaChannel(address & 0xFFFFFF00u) &&
+        address >= 0x1000B000u && address < 0x1000B500u)
+    {
+        m_ioRegisters[address] = value;
+        if ((address & 0xFFu) == 0x00u && (value & 0x100u) != 0u)
+            m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+        ps2_ipu::writeChannelReg(address, value);
+        syncIpuChannels(m_ioRegisters);
         return true;
     }
 
@@ -1465,6 +1640,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     {
                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
                         uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+                        const uint32_t totalBytes = bytes;
                         const bool scratch = isScratchpad(srcAddr);
                         uint32_t src = 0;
                         src = translateAddress(srcAddr);
@@ -1481,6 +1657,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             maxSz2 = PS2_RAM_SIZE;
                         }
 
+                        const size_t chunkStart = chainBuf.size();
+
+                        // [chainord] run 33: EE address + gathered offset of this chunk.
+                        {
+                            using namespace ps2diag_chainord;
+                            const uint32_t s = g_coSeq.fetch_add(1, std::memory_order_relaxed);
+                            const uint32_t k = s % kCoRing;
+                            g_coAddr[k].store(srcAddr, std::memory_order_relaxed);
+                            g_coQwc[k].store(qwCount, std::memory_order_relaxed);
+                            g_coOff[k].store(static_cast<uint32_t>(chunkStart), std::memory_order_relaxed);
+                        }
+
                         while (bytes > 0)
                         {
                             if (src >= maxSz2)
@@ -1493,6 +1681,46 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
                             bytes -= chunk;
                             src += chunk;
+                        }
+
+                        if (ps2_diag::enabled())
+                        {
+                            static std::atomic<uint64_t> s_appendN{0};
+                            uint64_t n = s_appendN.fetch_add(1);
+                            if (n < 4000)
+                            {
+                                uint64_t nonZero = 0;
+                                for (size_t i = chunkStart; i < chainBuf.size(); ++i)
+                                    if (chainBuf[i] != 0)
+                                        ++nonZero;
+                                RUNTIME_LOG("[dma:append] n=" << std::dec << n
+                                    << " srcAddr=0x" << std::hex << srcAddr
+                                    << " scratch=" << std::dec << (scratch ? 1 : 0)
+                                    << " bytes=" << totalBytes
+                                    << " nonZero=" << nonZero);
+                            }
+
+                            // [dma:zerosrc] Stage 5.10. Targeted probe: does THIS chunk land
+                            // inside the [vifsrc] n=202 zero run (chainBuf offset
+                            // [92120, 92120+32768))? If so, log the guest source address that
+                            // fed it -- that's the address to watchpoint to see whether real
+                            // texel data is ever written there, or whether the read simply
+                            // races ahead of the asset load.
+                            const size_t chunkEnd = chainBuf.size();
+                            const size_t zeroRunStart = 92120;
+                            const size_t zeroRunEnd = 92120 + 32768;
+                            if (chunkStart < zeroRunEnd && chunkEnd > zeroRunStart)
+                            {
+                                uint64_t nonZero = 0;
+                                for (size_t i = chunkStart; i < chunkEnd; ++i)
+                                    if (chainBuf[i] != 0)
+                                        ++nonZero;
+                                RUNTIME_LOG("[dma:zerosrc] srcAddr=0x" << std::hex << srcAddr
+                                    << " scratch=" << std::dec << (scratch ? 1 : 0)
+                                    << " chunkStart=" << chunkStart
+                                    << " chunkBytes=" << totalBytes
+                                    << " nonZero=" << nonZero);
+                            }
                         }
                     };
 
@@ -1551,6 +1779,22 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
+
+                        // Stage 5.10 [dma:tagsrc] -- id==3/4 (ref/refe) tags set
+                        // dataAddr = addr directly (see switch below), and this is
+                        // the tag word that hands 0x8a6440 to the VIF1 chain reader.
+                        // TRAPVAL missed the write (likely built via a bulk
+                        // memcpy/template copy that bypasses the guest write-watch
+                        // hook rather than a WRITE32/64/128 store). Log the tag's
+                        // OWN address here instead -- it is far more stable frame to
+                        // frame than the payload data address -- so it can be
+                        // targeted with PS2X_HWWATCH_ADDR next.
+                        if (addr == 0x8a6440u && ps2_diag::enabled())
+                        {
+                            RUNTIME_LOG("[dma:tagsrc] tagAddr=0x" << std::hex << currentTagAddr
+                                << " addr=0x" << addr << " id=" << std::dec << id
+                                << " qwc=" << tagQwc << std::hex);
+                        }
 
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
@@ -1663,19 +1907,23 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             }
                         }
 
-                        const bool compactVifLocalTag =
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                            (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                        if (compactVifLocalTag)
+                        // On VIF0/VIF1 the DMAtag's upper 64 bits are VIFcodes and are pushed
+                        // into the VIF FIFO ahead of the link's payload -- for EVERY tag id, not
+                        // just the ones whose payload happens to follow the tag. Restricting this
+                        // to id 1/2/5/6/7 dropped the 8-byte VIFcode header off every REF/REFS
+                        // (id 3/4) link, so those payloads entered the stream unframed and
+                        // desynced the parser for the rest of the buffer.
+                        //
+                        // dataAddr is already the right source for every id (tagAddr+16 for
+                        // 1/2/5/6/7, addr for 0/3/4), so the old currentTagAddr+16 special case
+                        // was redundant where it was correct and wrong where it was not.
+                        const bool vifChannel =
+                            (channelBase == 0x10009000u || channelBase == 0x10008000u);
+                        if (vifChannel)
                             appendCompactVif1TagData(currentTagAddr, 0u);
 
                         if (hasPayload)
-                        {
-                            if (compactVifLocalTag)
-                                appendData(currentTagAddr + 16u, tagQwc);
-                            else
-                                appendData(dataAddr, tagQwc);
-                        }
+                            appendData(dataAddr, tagQwc);
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -2017,6 +2265,75 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     if (!data || sizeBytes < 16)
         return;
 
+    // [gifsrc] Stage 5.9. Every GIF path funnels through here, and this is the last
+    // point that still holds a live pointer -- GifArbiter::submit memcpy's the payload
+    // into its own staging buffer, so anything downstream (including the GS) sees an
+    // address that cannot be resolved back to guest RAM. Classify the source region by
+    // pointer range rather than trusting a caller-supplied address, because the DMA
+    // chain path hands us a std::vector copy with no guest address at all.
+    if (ps2_diag::enabled())
+    {
+        static std::atomic<uint64_t> s_n{0};
+        static std::atomic<uint32_t> s_zeroEmit{0};
+        const uint64_t n = s_n.fetch_add(1, std::memory_order_relaxed);
+
+        const char *region = "copy";
+        uint32_t eeAddr = 0xFFFFFFFFu;
+        if (m_rdram && data >= m_rdram && data < m_rdram + PS2_RAM_SIZE)
+        {
+            region = "rdram";
+            eeAddr = static_cast<uint32_t>(data - m_rdram);
+        }
+        else if (m_scratchpad && data >= m_scratchpad && data < m_scratchpad + PS2_SCRATCHPAD_SIZE)
+        {
+            region = "spr";
+            eeAddr = static_cast<uint32_t>(data - m_scratchpad);
+        }
+
+        uint32_t nz = 0;
+        for (uint32_t i = 0; i < sizeBytes; ++i)
+            if (data[i] != 0)
+                ++nz;
+
+        // First 24 of any size calibrate the size/path distribution -- the previous
+        // attempt guessed a >=8192 threshold and emitted nothing at all. After that
+        // only all-zero bulk payloads matter: those are the blank PSMT4 glyph sheets.
+        bool emit = (n < 24);
+        if (nz == 0 && sizeBytes >= 1024 && s_zeroEmit.fetch_add(1, std::memory_order_relaxed) < 32)
+            emit = true;
+
+        if (emit)
+        {
+            // Widen the zero test around the payload. If the neighbourhood is empty too
+            // the asset never landed in RAM; if it has data then only this buffer is blank.
+            uint32_t nearBytes = 0;
+            uint32_t nearNZ = 0;
+            uint32_t nearFrom = 0;
+            if (region[0] == 'r')
+            {
+                nearFrom = (eeAddr > 0x10000u) ? (eeAddr - 0x10000u) : 0u;
+                uint32_t nearTo = eeAddr + sizeBytes + 0x10000u;
+                if (nearTo > static_cast<uint32_t>(PS2_RAM_SIZE))
+                    nearTo = static_cast<uint32_t>(PS2_RAM_SIZE);
+                nearBytes = nearTo - nearFrom;
+                for (uint32_t i = nearFrom; i < nearTo; ++i)
+                    if (m_rdram[i] != 0)
+                        ++nearNZ;
+            }
+
+            RUNTIME_LOG("[gifsrc] n=" << std::dec << n
+                                      << " path=" << static_cast<int>(pathId)
+                                      << " region=" << region
+                                      << " eeAddr=0x" << std::hex << eeAddr
+                                      << " nearFrom=0x" << nearFrom
+                                      << std::dec
+                                      << " bytes=" << sizeBytes
+                                      << " nonZero=" << nz
+                                      << " nearBytes=" << nearBytes
+                                      << " nearNonZero=" << nearNZ);
+        }
+    }
+
     if (pathId == GifPathId::Path3)
     {
         if (m_path3Masked)
@@ -2036,10 +2353,22 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         m_gifArbiter->drain();
 }
 
+// [psmt4] Stage 5.9 plumbing. The GS only ever sees a raw `const uint8_t *` for
+// image payloads, so it cannot name the EE address the bytes came from. Publishing
+// the RDRAM base here lets the GS-side probe recover the guest physical address by
+// pointer arithmetic. File-scope + extern on purpose: adding this to a header would
+// recompile 30,000+ runner TUs. Diagnostic only -- nothing reads these on the hot path.
+const uint8_t *g_ps2DiagRdramBase = nullptr;
+uint32_t g_ps2DiagRdramSize = 0;
+
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 {
     if (!m_rdram || qwCount == 0)
         return;
+
+    g_ps2DiagRdramBase = m_rdram;
+    g_ps2DiagRdramSize = static_cast<uint32_t>(PS2_RAM_SIZE);
+
     const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
     uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
     uint32_t bytesLeft = sizeBytes;
@@ -2053,6 +2382,13 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
         if (chunk == 0)
             break;
 
+        // [gifsrc] Stage 5.9. The GIF arbiter memcpy's every packet into its own
+        // staging buffer, so by the time the GS sees the payload the pointer no
+        // longer lies inside RDRAM and cannot be resolved back to a guest address.
+        // This is the only place that still holds the exact EE physical source, so
+        // the zero-census has to happen here. Emits the first few unconditionally
+        // for calibration, then only all-zero payloads -- those are the blank PSMT4
+        // glyph sheets we are hunting.
         m_seenGifCopy = true;
         m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
         submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, chunk);
@@ -2372,25 +2708,10 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         return 0u;
     }
 
-    if (address >= 0x10002000 && address <= 0x10002030)
+    if (ps2_ipu::isRegister(address))
     {
-        uint32_t val = 0;
-        switch (address)
-        {
-        case 0x10002000:
-            val = m_ioRegisters[address];
-            break;
-        case 0x10002010:
-            val = m_ioRegisters[address] & ~(1u << 31);
-            break;
-        case 0x10002020:
-        case 0x10002030:
-            val = m_ioRegisters[address];
-            break;
-        default:
-            val = 0;
-            break;
-        }
+        const uint32_t val = ps2_ipu::readReg(address);
+        syncIpuChannels(m_ioRegisters);
         return val;
     }
     if (address >= 0x10000000 && address < 0x10010000)
@@ -2403,6 +2724,16 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
             }
             auto timerIt = m_ioRegisters.find(address);
             return timerIt != m_ioRegisters.end() ? timerIt->second : 0u;
+        }
+
+        // IPU channels answer from the engine: their STR bit is real, and a
+        // streaming IPU_FROM stays started until the guest clears it.
+        if (address >= 0x1000B000u && address < 0x1000B500u &&
+            ps2_ipu::isDmaChannel(address & 0xFFFFFF00u))
+        {
+            const uint32_t val = ps2_ipu::readChannelReg(address);
+            syncIpuChannels(m_ioRegisters);
+            return val;
         }
 
         if (address >= 0x10008000 && address < 0x1000F000)

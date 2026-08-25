@@ -12,6 +12,13 @@ param(
     # encoding and console line-wrapping cannot corrupt it. Query with
     # build_scripts\analyze_run.py. Per-run path lets a batch keep them apart.
     [string]$Probe = "F:\SDBZ Recomp\run_probe.jsonl",
+    # Every run used to overwrite the previous $Log and $Probe, so comparing a
+    # run against the one before it was impossible after the fact. The previous
+    # pair is now moved (not copied) into $ArchiveDir under the timestamp it was
+    # last written, before the new run starts.
+    [string]$ArchiveDir = "F:\SDBZ Recomp\logs\archive",
+    [int]$KeepLogs = 20,       # 0 = keep everything
+    [switch]$NoArchive,
     [string]$CdRoot = "F:\SDBZ Recomp\Super Dragon Ball Z ISO\Arcade Version\SDBZ ISO 2",
     [switch]$NoDebugger,
     # Turn on the in-process CPU sampling profiler. Prints a [hostprof] report
@@ -40,8 +47,48 @@ param(
     # det=0 (Phase A). Exposed as a parameter because reaching for the env var
     # by hand has already cost one confusing empty run.
     [ValidateSet('', '0', '1')]
-    [string]$Determinism = ''
+    [string]$Determinism = '',
+    # Run the whole launch N times back to back, archiving each run, then print
+    # the analyze_run.py --runs inventory. Exists because the events being hunted
+    # are INTERMITTENT: the Stage 5.15 movie open fired in only 2 of 7 otherwise
+    # identical runs, so a single run's silence was repeatedly mistaken for
+    # "it never happens". One batch answers what three lone runs could not.
+    [int]$Repeat = 1
 )
+
+# --- Repeat driver ------------------------------------------------------------
+# Re-invokes this script once per iteration rather than looping the run section,
+# so every iteration gets the full archive/prune/env setup exactly as a lone run
+# would. Anything else would make batch runs subtly non-comparable to solo ones.
+if ($Repeat -gt 1) {
+    if ($RunSeconds -le 0) {
+        Write-Error "-Repeat $Repeat needs -RunSeconds > 0, otherwise each iteration runs until closed by hand and the batch never finishes."
+        return
+    }
+    $childArgs = @{}
+    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+        if ($kv.Key -ne 'Repeat') { $childArgs[$kv.Key] = $kv.Value }
+    }
+    # A batch is unattended by definition: nobody is watching N debugger windows go
+    # by, and PS2X_DEBUGSHM costs a 2 KB cross-process memcpy on EVERY guest call --
+    # which perturbs exactly the IOP/EE timing the intermittent events depend on.
+    # Explicit -NoDebugger:$false still wins, because it lands in PSBoundParameters.
+    if (-not $childArgs.ContainsKey('NoDebugger')) {
+        $childArgs['NoDebugger'] = $true
+        Write-Host "[launch_recomp] batch mode: debugger off by default (pass -NoDebugger:`$false to keep it)" -ForegroundColor DarkGray
+    }
+    for ($i = 1; $i -le $Repeat; $i++) {
+        Write-Host ""
+        Write-Host "[launch_recomp] ================ repeat $i/$Repeat ================" -ForegroundColor Magenta
+        & $PSCommandPath @childArgs
+    }
+    Write-Host ""
+    Write-Host "[launch_recomp] batch of $Repeat done -- inventory across all archived runs:" -ForegroundColor Magenta
+    $analyzer = Join-Path (Split-Path -Parent $PSCommandPath) 'build_scripts\analyze_run.py'
+    if (Test-Path -LiteralPath $analyzer) { & python $analyzer --runs }
+    else { Write-Warning "analyze_run.py not found at $analyzer" }
+    return
+}
 
 # --- Tracers -----------------------------------------------------------------
 # Baked-in env tracers. Add a new one = add a line here; it's set automatically.
@@ -124,7 +171,29 @@ Write-Host "[launch_recomp] cdRoot: $env:PS2_CD_ROOT" -ForegroundColor Cyan
 # --- Console filter -----------------------------------------------------------
 # Full stream always goes to $Log. Console shows only lines matching this unless
 # -Full is passed. Add patterns here as new tracers/errors matter.
-$Important = '\[hostprof\]|\[ARKD:|\[iop:|\[launch_recomp\]|\[trapval\]|\[gpr\]|\[stack\]|\[frametrace|\[determinism\]|\[present\]|\[gs-activity\]|SIF_DIAG|watchdog|error|fail|assert|warn|exception|unhandled'
+#
+# Kept as an array and joined, so adding a tracer is a one-line diff instead of
+# an edit inside a 200-char regex nobody can read.
+$ImportantParts = @(
+    '\[launch_recomp\]'                       # this script's own lines
+    '\[hostprof\]', '\[determinism\]'         # measurement harness
+    '\[ARKD:', '\[iop:'                       # IOP / ARKD_DVD progress
+    '\[trapval\]', '\[gpr\]', '\[stack\]', '\[frametrace'  # derail hunt
+    '\[present\]', '\[gs-activity\]'          # render-path liveness
+    '\[HWSTAT\]', '\[HWWATCH'                 # hardware watchpoint heartbeat
+    'SIF_DIAG', 'watchdog'
+    'error', 'fail', 'assert', 'warn', 'exception', 'unhandled'
+)
+$Important = $ImportantParts -join '|'
+
+# Console readability. RUNTIME_LOG does not always terminate a record, so a
+# single physical line can carry a dozen unrelated tags -- that is the main
+# reason the console reads as a wall of noise, and why Select-String line counts
+# undercount so badly. Splitting on the tag boundary is display-only; $Log still
+# receives the raw stream via Tee-Object, so nothing is lost for grepping.
+$TagSplit = '(?=\[[A-Za-z][A-Za-z0-9:_.-]*\])'
+$Severe = 'error|fail|assert|exception|unhandled|NOT MIRRORED'
+$Warn = 'warn|watchdog|\[cap\]'
 # Known/understood spam suppressed from CONSOLE only (still in $Log). Add patterns
 # here once a message is diagnosed so it stops flooding the screen.
 # Post-derail dispatch-miss spin: once $ra is clobbered the dispatcher jumps to
@@ -173,7 +242,29 @@ if ($HostProfile) {
 if ($HwWatch) {
     $env:PS2X_HWWATCH = '1'
     Write-Host "[launch_recomp] -HwWatch: DR0 watchpoint armed -- adds ~20% CPU, do not trust perf numbers from this run" -ForegroundColor Yellow
+    if ($env:PS2X_HWWATCH_ADDR) {
+        Write-Host "[launch_recomp] -HwWatch: fixed target PS2X_HWWATCH_ADDR=$($env:PS2X_HWWATCH_ADDR) val=$(if ($env:PS2X_HWWATCH_VAL) { $env:PS2X_HWWATCH_VAL } else { '(default 0x1 -- set 0xFFFFFFFF to record every store)' })" -ForegroundColor Cyan
+    }
+    # 2026-08-09: vblank window gate. Unset = whole run, which with
+    # PS2X_HWWATCH_VAL=0xFFFFFFFF on a hot address spends the entire 16384-slot
+    # ring on boot traffic. Echo it so a run that recorded the wrong frames says
+    # so on screen instead of in the analysis an hour later.
+    if ($env:PS2X_HWWATCH_VBL_LO -or $env:PS2X_HWWATCH_VBL_HI) {
+        Write-Host "[launch_recomp] -HwWatch: recording only vblank [$(if ($env:PS2X_HWWATCH_VBL_LO) { $env:PS2X_HWWATCH_VBL_LO } else { '0' }), $(if ($env:PS2X_HWWATCH_VBL_HI) { $env:PS2X_HWWATCH_VBL_HI } else { 'end' })) -- stores outside it are counted in HWSTAT outwin, not recorded" -ForegroundColor Cyan
+    } else {
+        Write-Host "[launch_recomp] -HwWatch: no vblank window set -- the ring will fill with boot traffic. Set PS2X_HWWATCH_VBL_LO/_HI to aim it." -ForegroundColor Yellow
+    }
 } else {
+    # 2026-08-05: this Remove-Item silently voided a whole Stage 5.9 run. The
+    # operator set PS2X_HWWATCH/_ADDR/_VAL by hand and omitted -HwWatch; the
+    # launcher deleted PS2X_HWWATCH, hwWatchEnabled() went false, hwWatchArm
+    # early-returned, no armer thread came up and the log carried ZERO [HWSTAT]
+    # lines. That is indistinguishable from "the region is never written" --
+    # the exact conclusion the probe exists to test. Refuse to swallow it.
+    if ($env:PS2X_HWWATCH_ADDR -or $env:PS2X_HWWATCH_VAL -or $env:PS2X_HWWATCH_CLIENT -or
+        $env:PS2X_HWWATCH_VBL_LO -or $env:PS2X_HWWATCH_VBL_HI) {
+        throw "PS2X_HWWATCH_ADDR/_VAL/_CLIENT/_VBL_LO/_VBL_HI are set but -HwWatch was not passed. The launcher would clear PS2X_HWWATCH and the watchpoint would never arm, producing a log with no [HWSTAT] lines that looks exactly like a negative result. Re-run with -HwWatch, or clear those vars."
+    }
     Remove-Item Env:PS2X_HWWATCH -ErrorAction SilentlyContinue
 }
 
@@ -193,11 +284,105 @@ if ($Watch) {
     Remove-Item Env:PS2X_WATCH -ErrorAction SilentlyContinue
 }
 
+# ---- archive the previous run before it is overwritten -----------------------
+# Timestamp comes from the file's own LastWriteTime, not from now, so an archived
+# name says when that run happened rather than when it was filed away.
+if (-not $NoArchive) {
+    # A launch that died before the guest started (a bad pipeline, a missing exe)
+    # leaves a log holding nothing but the [runmeta] header. Archiving those is
+    # actively destructive: the prune is by COUNT, so three failed launches
+    # silently evict three real runs. That happened -- do not archive them.
+    $logIsEmptyRun = $false
+    if (Test-Path -LiteralPath $Log) {
+        $li = Get-Item -LiteralPath $Log
+        if ($li.Length -lt 65536) {
+            try {
+                $by = [IO.File]::ReadAllBytes($Log)
+                $txt = [Text.Encoding]::Unicode.GetString($by) + "`n" +
+                       [Text.Encoding]::UTF8.GetString($by)
+                # Any tag that is not [runmeta] means the guest produced output.
+                $logIsEmptyRun = -not ($txt -match '\[(?!runmeta)[A-Za-z]')
+            } catch { }
+        }
+    }
+
+    $archived = @()
+    foreach ($src in @($Log, $Probe)) {
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        if ($src -eq $Log -and $logIsEmptyRun) {
+            Write-Host "[launch_recomp] previous run produced NO guest output -- not archiving it (it would evict a real run)" -ForegroundColor Yellow
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $ArchiveDir)) {
+            New-Item -ItemType Directory -Force -Path $ArchiveDir | Out-Null
+        }
+        $item  = Get-Item -LiteralPath $src
+        $stamp = $item.LastWriteTime.ToString('yyyyMMdd-HHmmss')
+        $dest  = Join-Path $ArchiveDir ("{0}.{1}{2}" -f $item.BaseName, $stamp, $item.Extension)
+        # Two runs inside the same second would collide; disambiguate rather
+        # than clobber, since clobbering is the exact failure being fixed.
+        $n = 1
+        while (Test-Path -LiteralPath $dest) {
+            $dest = Join-Path $ArchiveDir ("{0}.{1}-{2}{3}" -f $item.BaseName, $stamp, $n, $item.Extension)
+            $n++
+        }
+        Move-Item -LiteralPath $src -Destination $dest -Force
+        $archived += (Split-Path $dest -Leaf)
+    }
+    if ($archived.Count -gt 0) {
+        Write-Host "[launch_recomp] archived previous run: $($archived -join ', ')" -ForegroundColor DarkGray
+    }
+
+    # Prune per prefix so a big probe file cannot evict the run logs.
+    #
+    # GOLDEN RUNS ARE NEVER PRUNED. A run that actually reached the .SFD open is
+    # the only ground truth for what a working movie path looks like, and such a
+    # run has occurred in roughly 2 of 7 attempts. Run 57 survived to be compared
+    # against only because the archive happened not to have rolled over yet --
+    # losing it would have cost the whole Stage 5.15 comparison.
+    if ($KeepLogs -gt 0 -and (Test-Path -LiteralPath $ArchiveDir)) {
+        $logPrefix = [IO.Path]::GetFileNameWithoutExtension($Log)
+        foreach ($prefix in @($logPrefix,
+                              [IO.Path]::GetFileNameWithoutExtension($Probe))) {
+            $candidates = Get-ChildItem -LiteralPath $ArchiveDir -File -Filter "$prefix.*" |
+                          Sort-Object LastWriteTime -Descending |
+                          Select-Object -Skip $KeepLogs
+            foreach ($f in $candidates) {
+                if ($prefix -eq $logPrefix) {
+                    # FAIL-SAFE: keep the file if the golden test cannot be run at
+                    # all. Guessing the encoding wrong here would silently delete
+                    # exactly the runs that are hardest to reproduce, and a stale
+                    # log costs disk while a deleted golden run costs a session.
+                    # Byte-level search so it works whether the log is UTF-16 or
+                    # UTF-8, rather than trusting either.
+                    $isGolden = $true
+                    try {
+                        $bytes = [IO.File]::ReadAllBytes($f.FullName)
+                        $u16 = [Text.Encoding]::Unicode.GetString($bytes)
+                        $u8  = [Text.Encoding]::UTF8.GetString($bytes)
+                        $isGolden = ($u16.Contains('DVCI') -or $u8.Contains('DVCI'))
+                    } catch {
+                        Write-Host "[launch_recomp] could not scan $($f.Name) -- keeping it rather than risk deleting a golden run" -ForegroundColor Yellow
+                    }
+                    if ($isGolden) {
+                        Write-Host "[launch_recomp] keeping golden run (reached the .SFD open): $($f.Name)" -ForegroundColor Green
+                        continue
+                    }
+                }
+                Remove-Item -LiteralPath $f.FullName -Force
+            }
+        }
+    }
+}
+
 Write-Host "[launch_recomp] tracers: $($Tracers.Keys -join ', ')" -ForegroundColor Cyan
 Write-Host "[launch_recomp] exe: $Exe" -ForegroundColor Cyan
 Write-Host "[launch_recomp] elf: $Elf" -ForegroundColor Cyan
 Write-Host "[launch_recomp] log: $Log  (full stream)" -ForegroundColor Cyan
 Write-Host "[launch_recomp] probe sink: $Probe" -ForegroundColor Cyan
+if (-not $NoArchive) {
+    Write-Host "[launch_recomp] archive: $ArchiveDir (keeping $KeepLogs per stream)" -ForegroundColor DarkGray
+}
 # Say this out loud. A det=1 run simply does not derail, so analyze_run.py
 # reports nothing and the run reads as healthy when it is only quiet.
 if ($Tracers.PS2X_DETERMINISM -eq 1) {
@@ -309,13 +494,90 @@ if ($RunSeconds -gt 0) {
     Write-Host "[launch_recomp] auto-stop after ${RunSeconds}s" -ForegroundColor Cyan
 }
 
+# --- Provenance header --------------------------------------------------------
+# Written BEFORE the run so the log self-identifies. Archived logs previously
+# carried no exe path, no exe mtime and no env block, so a run could not be
+# attributed to a build after the fact -- which is exactly what was needed when
+# runs started diverging and the question became "which build was that?".
+# ENCODING IS PINNED EXPLICITLY, here and on every Tee-Object below. Tee-Object's
+# default is host-dependent -- Windows PowerShell 5.1 writes UTF-16, pwsh 7 writes
+# UTF-8 -- so an unqualified Tee wrote a different encoding depending on which
+# shell launched the run. Every existing log and every reader in build_scripts/
+# assumes UTF-16, so UTF-16 is what gets written, regardless of host. Without the
+# explicit -Encoding on both, the header and the guest stream land in the file in
+# two different encodings and the whole log decodes to garbage.
+$exeItem = Get-Item -LiteralPath $Exe -ErrorAction SilentlyContinue
+$headerLines = @(
+    "[runmeta] launched=$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+    "[runmeta] exe=$Exe"
+    "[runmeta] exeWritten=$(if ($exeItem) { $exeItem.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') } else { 'MISSING' }) exeBytes=$(if ($exeItem) { $exeItem.Length } else { 0 })"
+    "[runmeta] elf=$Elf"
+    "[runmeta] cdRoot=$CdRoot"
+    "[runmeta] runSeconds=$RunSeconds full=$([bool]$Full) noDebugger=$([bool]$NoDebugger) hostProfile=$([bool]$HostProfile) hwWatch=$([bool]$HwWatch) watch=$([bool]$Watch)"
+)
+foreach ($e in (Get-ChildItem Env: | Where-Object { $_.Name -like 'PS2*' } | Sort-Object Name)) {
+    $headerLines += "[runmeta] env $($e.Name)=$($e.Value)"
+}
+$headerLines += "[runmeta] ---- end of header, guest output follows ----"
+$headerLines | Out-File -LiteralPath $Log -Encoding Unicode
+
+# Tee-Object's -Encoding parameter EXISTS ONLY IN pwsh 6+. Windows PowerShell 5.1
+# has no such parameter and hard-errors on it, which killed three runs before the
+# game ever started. 5.1's Tee default is already Unicode (that is why every log
+# in this project is UTF-16); pwsh 7's default is UTF-8 and must be overridden.
+# So: pass -Encoding only where it is supported, and let 5.1 use its default.
+# Both paths therefore write UTF-16, matching the header written just above.
+$TeeArgs = @{ FilePath = $Log; Append = $true }
+if ((Get-Command Tee-Object).Parameters.ContainsKey('Encoding')) {
+    $TeeArgs['Encoding'] = 'Unicode'
+}
+Write-Host "[launch_recomp] provenance header written ($($headerLines.Count) lines)" -ForegroundColor DarkGray
+
 # Full stdout+stderr is ALWAYS captured to $Log via Tee-Object. The console is
 # then filtered to the important lines unless -Full is passed, so nothing scrolls
 # past too fast and the full record is still on disk for grepping.
+# -Append: the provenance header above already created the file.
 if ($Full) {
-    & $Exe $Elf 2>&1 | Tee-Object -FilePath $Log
+    & $Exe $Elf 2>&1 | Tee-Object @TeeArgs
 } else {
-    & $Exe $Elf 2>&1 | Tee-Object -FilePath $Log | Where-Object { $_ -match $Important -and $_ -notmatch $Mute }
+    # One tag per console line, muted spam dropped, consecutive repeats of the
+    # same tag collapsed to a single "xN" line, and colour by severity. The
+    # collapse matters more than it looks: the dispatch-miss spin and the GS
+    # per-frame tracers both emit the same tag thousands of times in a row, and
+    # scrolling them is what buries the two or three lines that changed.
+    # $script: on every one of these: ForEach-Object runs its body in a child
+    # scope, so a plain assignment would be discarded and the collapse counter
+    # would silently never advance.
+    $script:prevTag = $null
+    $script:repeat = 0
+    $flushRepeat = {
+        if ($script:repeat -gt 0) {
+            Write-Host ("      ... x{0} more {1}" -f $script:repeat, $script:prevTag) -ForegroundColor DarkGray
+            $script:repeat = 0
+        }
+    }
+    & $Exe $Elf 2>&1 | Tee-Object @TeeArgs | ForEach-Object {
+        foreach ($part in ($_ -split $TagSplit)) {
+            $line = $part.Trim()
+            if ($line -eq '' -or $line -notmatch $Important -or $line -match $Mute) { continue }
+
+            $tag = if ($line -match '^(\[[^\]]+\])') { $Matches[1] } else { '<untagged>' }
+            if ($tag -eq $script:prevTag -and $tag -ne '<untagged>' -and $line -notmatch $Severe) {
+                $script:repeat++
+                continue
+            }
+            & $flushRepeat
+            $script:prevTag = $tag
+
+            $colour =
+                if ($line -match $Severe) { 'Red' }
+                elseif ($line -match $Warn) { 'Yellow' }
+                elseif ($tag -eq '[launch_recomp]') { 'Cyan' }
+                else { 'Gray' }
+            Write-Host $line -ForegroundColor $colour
+        }
+    }
+    & $flushRepeat
 }
 
 # --- Post-run CPU verdict -----------------------------------------------------
@@ -355,8 +617,46 @@ if ($sampler) {
 # In all three the danger is the same: absence of evidence reads as evidence of
 # absence. Say so loudly rather than leaving it to a grep nobody runs.
 if (Test-Path $Log) {
-    $gate = @()
     $logText = Get-Content -LiteralPath $Log -Raw -ErrorAction SilentlyContinue
+
+    # --- Tag census -----------------------------------------------------------
+    # Counted off the RAW text with the tag regex, never with Select-String:
+    # records get concatenated onto one physical line, so a line count can be
+    # off by an order of magnitude. This table is the first thing to read after
+    # a run -- it answers "did my probe fire at all" before any grepping, and a
+    # count of 0 for a tag you just added means the probe is dead, not the game.
+    $tagCounts = @{}
+    foreach ($m in [regex]::Matches($logText, '\[[A-Za-z][A-Za-z0-9:_.-]*\]')) {
+        $t = $m.Value
+        # 5.1-safe: no '??' -- the launcher must parse under Windows PowerShell too.
+        if ($tagCounts.ContainsKey($t)) { $tagCounts[$t]++ } else { $tagCounts[$t] = 1 }
+    }
+    if ($tagCounts.Count -gt 0) {
+        Write-Host ''
+        Write-Host '--- tag census (raw counts, most frequent first) ---' -ForegroundColor Cyan
+        $rows = $tagCounts.GetEnumerator() | Sort-Object Value -Descending
+        foreach ($row in ($rows | Select-Object -First 25)) {
+            Write-Host ("  {0,8}  {1}" -f $row.Value, $row.Key) -ForegroundColor DarkGray
+        }
+        # The tail is where a brand-new probe that fired once or twice lives, so
+        # never truncate it away silently.
+        $silent = @($rows | Where-Object { $_.Value -le 2 } | ForEach-Object { $_.Key })
+        if ($silent.Count -gt 0) {
+            Write-Host ("  rare (<=2 hits): {0}" -f ($silent -join ' ')) -ForegroundColor DarkGray
+        }
+        Write-Host ("  {0} distinct tags. Full record: {1}" -f $tagCounts.Count, $Log) -ForegroundColor DarkGray
+    }
+
+    $gate = @()
+
+    # FIRST, because everything below it is meaningless if the guest never ran.
+    # Three runs once "passed" this gate having produced nothing but the
+    # [runmeta] header: the launch pipeline had errored before the exe started,
+    # and a gate that only looks for known failure strings saw a clean log.
+    # Absence of evidence was being reported as evidence of health.
+    if ($logText -notmatch '\[(?!runmeta)[A-Za-z]') {
+        $gate += 'NO GUEST OUTPUT AT ALL -- the log holds only the [runmeta] header, so the runner never produced a line. The launch failed before the guest started; scroll up for the error. Nothing about this run is interpretable.'
+    }
 
     if ($logText -match 'NOT MIRRORED') {
         $gate += 'SREG NOT MIRRORED -- PS2_SIF_EE_SREG_BASE did not take. The 08-01 ARKD/SREG completion fix was INERT this run.'

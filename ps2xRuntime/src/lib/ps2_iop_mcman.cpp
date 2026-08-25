@@ -318,14 +318,36 @@ namespace ps2_iop_mcman
 
         case kRpcGetInfo:
         {
+            // GetInfo does NOT use the word0=port/word1=slot packing the file
+            // commands use, and it does NOT return the card info in the RPC
+            // recv buffer. Ground truth is the game's own libmc client,
+            // sceMcGetInfo @ EE 0x189E88, which fills the shared 48-byte
+            // command struct as:
+            //     +0x04 port          +0x08 slot
+            //     +0x0C wantFormat    +0x10 wantFree      +0x14 wantType
+            //     +0x1C EE address of a 192-byte result block
+            // and asks for only FOUR recv bytes (the result code). mcserv DMAs
+            // the card info into that result block; the guest's RPC end
+            // callback @ 0x189E30 then copies it out at +0x00 (type),
+            // +0x04 (free clusters) and +0x90 (format) into the caller's
+            // out-pointers. The old `recvSize >= 12` guard could therefore
+            // never fire -- we wrote nothing at all, not even the result code.
+            uint32_t infoPort = 0u;
+            uint32_t infoSlot = 0u;
+            uint32_t infoBlockAddr = 0u;
+            readGuestU32(rdram, sendBufAddr + 0x04u, infoPort);
+            readGuestU32(rdram, sendBufAddr + 0x08u, infoSlot);
+            readGuestU32(rdram, sendBufAddr + 0x1Cu, infoBlockAddr);
+            infoBlockAddr &= 0x1FFFFFFFu; // strip KSEG/uncached-mirror bits
+
             int32_t cardType = 0;
             int32_t freeBlocks = 0;
             int32_t format = kMcUnformatted;
             int32_t result = kMcResultNoEntry;
 
-            if (isValidMcPortSlot(static_cast<int32_t>(port), static_cast<int32_t>(slot)))
+            if (isValidMcPortSlot(static_cast<int32_t>(infoPort), static_cast<int32_t>(infoSlot)))
             {
-                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
+                McPortState &state = g_mcPorts[static_cast<size_t>(infoPort)];
                 cardType = kMcTypePs2;
                 freeBlocks = state.formatted ? kMcFreeClusters : 0;
                 format = state.formatted ? kMcFormatted : kMcUnformatted;
@@ -333,24 +355,61 @@ namespace ps2_iop_mcman
             }
 
             setMcCommandResultLocked(static_cast<int32_t>(kRpcGetInfo), result);
-            if (uint8_t *dst = getMemPtr(rdram, recvBufAddr))
+
+            // The reply proper is just the result code; sceMcSync @ 0x189D68
+            // hands it straight back as sceMcGetInfo's return value.
+            if (recvSize >= sizeof(int32_t))
             {
-                if (recvSize >= 12u)
+                writeResultI32(rdram, recvBufAddr, result);
+            }
+
+            if (infoBlockAddr != 0u)
+            {
+                writeResultI32(rdram, infoBlockAddr + 0x00u, cardType);
+                writeResultI32(rdram, infoBlockAddr + 0x04u, freeBlocks);
+                writeResultI32(rdram, infoBlockAddr + 0x90u, format);
+            }
+            else if (recvSize >= 12u)
+            {
+                // Legacy inline layout, kept for clients that really do want
+                // the triple in the recv buffer.
+                if (uint8_t *dst = getMemPtr(rdram, recvBufAddr))
                 {
                     std::memcpy(dst + 0u, &cardType, sizeof(cardType));
                     std::memcpy(dst + 4u, &freeBlocks, sizeof(freeBlocks));
                     std::memcpy(dst + 8u, &format, sizeof(format));
                 }
             }
+
+            if (traceMcserv)
+            {
+                std::fprintf(stderr,
+                             "[iop:mcserv] GetInfo port=%u slot=%u block=0x%08X -> type=%d free=%d format=%d result=%d\n",
+                             infoPort, infoSlot, infoBlockAddr, cardType, freeBlocks, format, result);
+            }
+
             resultPtr = recvBufAddr;
             return true;
         }
 
         case kRpcGetDir:
         {
-            const std::string rawPath = readGuestPath(rdram, sendBufAddr + 0x08u);
+            // Same shape as GetInfo: the payload does not ride the recv buffer.
+            // Ground truth is the game's own sceMcGetDir @ EE 0x18A078, which
+            // packs the 1044-byte command struct as:
+            //     +0x00 port    +0x04 slot    +0x08 mode
+            //     +0x0C maxent  +0x10 EE address of the caller's entry table
+            //     +0x14 name (1023 bytes, NUL-terminated)
+            // and asks for only FOUR recv bytes (the entry count). It flushes
+            // the table with cache_writeback_range(table, maxent << 6), which
+            // is what pins the entry stride at 64 bytes; mcserv DMAs the
+            // entries straight into that EE block.
+            const std::string rawPath = readGuestPath(rdram, sendBufAddr + 0x14u);
             uint32_t maxEntries = 0u;
-            readGuestU32(rdram, sendBufAddr + 0x08u + static_cast<uint32_t>(kMcMaxPathLen), maxEntries);
+            uint32_t tableAddr = 0u;
+            readGuestU32(rdram, sendBufAddr + 0x0Cu, maxEntries);
+            readGuestU32(rdram, sendBufAddr + 0x10u, tableAddr);
+            tableAddr &= 0x1FFFFFFFu; // strip KSEG/uncached-mirror bits
 
             std::vector<SceMcTblGetDir> entries;
             int32_t result = kMcResultNoEntry;
@@ -470,16 +529,17 @@ namespace ps2_iop_mcman
 
                         const size_t entryCount =
                             std::min(entries.size(), maxEntries > 0u ? static_cast<size_t>(maxEntries) : 0u);
-                        if (entryCount == 0u || recvBufAddr == 0u)
+                        if (entryCount == 0u || tableAddr == 0u)
                         {
+                            // A zero count is a legitimate answer (empty card),
+                            // and a caller may legitimately pass no table when
+                            // it only wants the count.
                             result = static_cast<int32_t>(entryCount);
                         }
-                        else if (uint8_t *dst = getMemPtr(rdram, recvBufAddr))
+                        else if (uint8_t *dst = getMemPtr(rdram, tableAddr))
                         {
-                            const size_t maxBytes = std::min<size_t>(entryCount * sizeof(SceMcTblGetDir), recvSize);
-                            const size_t copyBytes = (maxBytes / sizeof(SceMcTblGetDir)) * sizeof(SceMcTblGetDir);
-                            std::memcpy(dst, entries.data(), copyBytes);
-                            result = static_cast<int32_t>(copyBytes / sizeof(SceMcTblGetDir));
+                            std::memcpy(dst, entries.data(), entryCount * sizeof(SceMcTblGetDir));
+                            result = static_cast<int32_t>(entryCount);
                         }
                         else
                         {
@@ -490,6 +550,20 @@ namespace ps2_iop_mcman
             }
 
             setMcCommandResultLocked(static_cast<int32_t>(kRpcGetDir), result);
+
+            // The reply proper is just the entry count / error code.
+            if (recvSize >= sizeof(int32_t))
+            {
+                writeResultI32(rdram, recvBufAddr, result);
+            }
+
+            if (traceMcserv)
+            {
+                std::fprintf(stderr,
+                             "[iop:mcserv] GetDir port=%u slot=%u path='%s' maxent=%u table=0x%08X -> entries=%d\n",
+                             port, slot, rawPath.c_str(), maxEntries, tableAddr, result);
+            }
+
             resultPtr = recvBufAddr;
             return true;
         }

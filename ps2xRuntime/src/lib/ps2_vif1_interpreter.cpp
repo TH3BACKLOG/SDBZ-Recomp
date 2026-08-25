@@ -1,6 +1,31 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_pipeline_stats.h"
+#include "runtime/ps2_diag.h"
+#include "ps2_log.h"
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+
+// [drawpath] run 33: stamp which VIF1 submission site carried each packet.
+// Every dialog draw came back path=2, so the fork that remains is whether the
+// two Path2 sites are being serviced out of order (a runtime bug) or the guest
+// really submits background-last (a recompiled-code divergence).
+// Defined in ps2_gif_arbiter.cpp; declared here so no header changes.
+namespace ps2diag_gifpath
+{
+extern std::atomic<uint32_t> g_curSite;
+extern std::atomic<uint32_t> g_curSrc;
+}
+
+// Run 34: byte offset inside the gathered chain buffer -> originating EE
+// address. Defined in ps2_memory.cpp alongside the ring it reads.
+namespace ps2diag_chainord
+{
+uint32_t resolveSrc(uint32_t pos);
+}
 
 enum VIFCmd : uint8_t
 {
@@ -256,10 +281,171 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+namespace
+{
+    // Round 5. Round 4 proved the parse is in sync at offset 0 and provably
+    // desynced by offset 964 on every large buffer (badcmd=0xc1c1c1c1, which is
+    // float payload being read as a VIFcode). The 128-byte head is too short to
+    // see which handler over-/under-advanced pos, and chasing it 128 bytes at a
+    // time costs a build+run per step. So dump one whole buffer to disk instead
+    // and walk all of it offline with scripts/vif_gif_surgeon.py.
+    //
+    // Opt-in only: set PS2X_VIF1_DUMP to a writable file path. Unset => the
+    // probe costs one relaxed atomic load per VIF1 call and nothing else.
+    // Fires once per process, on the first buffer at least kVif1DumpMinBytes
+    // long -- the small 256/488 B buffers already parse clean and are not the
+    // ones we need.
+    constexpr uint32_t kVif1DumpMinBytes = 65536u;
+    std::atomic<bool> g_vif1DumpDone{false};
+
+    // getenv() once; empty string means the probe is off for this process.
+    const char *vif1DumpPath()
+    {
+        static const std::string path = []
+        {
+            const char *env = std::getenv("PS2X_VIF1_DUMP");
+            return std::string(env ? env : "");
+        }();
+        return path.empty() ? nullptr : path.c_str();
+    }
+
+    // True if this buffer is the one we still want on disk. Cheap enough to
+    // evaluate per VIF1 call: one compare, one relaxed load.
+    bool vif1DumpArmed(uint32_t sizeBytes)
+    {
+        return sizeBytes >= kVif1DumpMinBytes && !g_vif1DumpDone.load(std::memory_order_relaxed) &&
+               vif1DumpPath() != nullptr;
+    }
+
+    void maybeDumpVif1Buffer(const uint8_t *data, uint32_t sizeBytes, uint32_t endPos,
+                             uint32_t firstBadPos, uint32_t firstBadCmd)
+    {
+        if (!vif1DumpArmed(sizeBytes))
+            return;
+
+        const char *path = vif1DumpPath();
+
+        // Claim before touching the file so two DMA threads cannot interleave
+        // writes into the same path.
+        bool expected = false;
+        if (!g_vif1DumpDone.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+            return;
+
+        FILE *f = std::fopen(path, "wb");
+        if (!f)
+        {
+            RUNTIME_LOG("[vu:vifdump] FAILED to open " << path << "\n");
+            return;
+        }
+        const size_t written = std::fwrite(data, 1, sizeBytes, f);
+        std::fclose(f);
+
+        RUNTIME_LOG("[vu:vifdump] wrote " << std::dec << written << "/" << sizeBytes
+                                          << " bytes to " << path
+                                          << " endpos=" << endPos
+                                          << " badpos="
+                                          << static_cast<int64_t>(static_cast<int32_t>(firstBadPos))
+                                          << " badcmd=0x" << std::hex << firstBadCmd
+                                          << std::dec << "\n");
+    }
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+
+    ps2_pipeline_stats::g_vif1Calls.fetch_add(1, std::memory_order_relaxed);
+    ps2_pipeline_stats::g_vif1Bytes.fetch_add(sizeBytes, std::memory_order_relaxed);
+
+    // [vifsrc] Stage 5.10. Every PSMT4 upload reaches the GS all-zero, but the
+    // GS-side probe only ever sees a std::vector copy (eeAddr=0xffffffff), so it
+    // cannot say whether EE RAM was already blank or whether our VIF walk picked
+    // the wrong offset. This is the last point holding the real guest pointer.
+    // Emitting the whole-buffer zero census next to the EE address separates the
+    // two: a buffer that is mostly non-zero with a zero image region means the
+    // walk is landing wrong; a wholly zero buffer means the producer never wrote.
+    if (ps2_diag::enabled())
+    {
+        static std::atomic<uint64_t> s_vn{0};
+        const uint64_t vn = s_vn.fetch_add(1, std::memory_order_relaxed);
+        if (sizeBytes >= 16384u && vn < 4096u)
+        {
+            const char *region = "copy";
+            uint32_t eeAddr = 0xFFFFFFFFu;
+            if (m_rdram && data >= m_rdram && data < m_rdram + PS2_RAM_SIZE)
+            {
+                region = "rdram";
+                eeAddr = static_cast<uint32_t>(data - m_rdram);
+            }
+            else if (m_scratchpad && data >= m_scratchpad && data < m_scratchpad + PS2_SCRATCHPAD_SIZE)
+            {
+                region = "spr";
+                eeAddr = static_cast<uint32_t>(data - m_scratchpad);
+            }
+
+            // Longest zero run as well as the total: a texture payload embedded in
+            // an otherwise live packet shows up as one long run, not a low total.
+            uint32_t nz = 0, run = 0, maxRun = 0, maxRunAt = 0;
+            for (uint32_t i = 0; i < sizeBytes; ++i)
+            {
+                if (data[i] != 0)
+                {
+                    nz++;
+                    run = 0;
+                }
+                else if (++run > maxRun)
+                {
+                    maxRun = run;
+                    maxRunAt = i + 1u - run;
+                }
+            }
+
+            RUNTIME_LOG("[vifsrc] n=" << std::dec << vn
+                                      << " region=" << region
+                                      << " eeAddr=0x" << std::hex << eeAddr
+                                      << std::dec
+                                      << " bytes=" << sizeBytes
+                                      << " nonZero=" << nz
+                                      << " maxZeroRun=" << maxRun
+                                      << " at=" << maxRunAt);
+        }
+    }
+
+    // Round 4 positional probe: capture the first buffer of each report
+    // interval verbatim, so a real packet can be walked by hand instead of
+    // inferred from aggregates the mis-parse has already poisoned.
+    ps2_pipeline_stats::Vif1Snap *snap = nullptr;
+    if (ps2_pipeline_stats::claimVif1Snap())
+    {
+        snap = &ps2_pipeline_stats::g_vif1Snap;
+        *snap = ps2_pipeline_stats::Vif1Snap{};
+        snap->sizeBytes = sizeBytes;
+        snap->firstBadPos = 0xFFFFFFFFu;
+        snap->headBytes = (sizeBytes < ps2_pipeline_stats::kVif1SnapHeadBytes)
+                              ? sizeBytes
+                              : ps2_pipeline_stats::kVif1SnapHeadBytes;
+        std::memcpy(snap->head, data, snap->headBytes);
+    }
+
+    // The snapshot slot and the disk dump are claimed independently, so the
+    // dumped buffer is usually NOT the one [vu:vifbuf] describes. Track its own
+    // first-bad offset so the .bin arrives with a matching badpos.
+    const bool dumpArmed = vif1DumpArmed(sizeBytes);
+    uint32_t dumpBadPos = 0xFFFFFFFFu;
+    uint32_t dumpBadCmd = 0u;
+
+    // [drawsrc] run 34. When the caller handed us a pointer straight into EE
+    // RAM the source address is exact arithmetic; when it handed us a gathered
+    // copy we have to ask the [chainord] ring. Resolving both ways here means
+    // the DIRECT and image submit sites below stay identical either way.
+    uint32_t dsBaseEE = 0xFFFFFFFFu;
+    if (m_rdram && data >= m_rdram && data < m_rdram + PS2_RAM_SIZE)
+        dsBaseEE = static_cast<uint32_t>(data - m_rdram);
+    const auto dsSrcAt = [dsBaseEE](uint32_t p) -> uint32_t {
+        return (dsBaseEE != 0xFFFFFFFFu) ? (dsBaseEE + p)
+                                         : ps2diag_chainord::resolveSrc(p);
+    };
 
     uint32_t pos = 0;
 
@@ -281,11 +467,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 (static_cast<uint64_t>(kGifFmtImage) << 58);
             std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
             std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+            ps2diag_gifpath::g_curSite.store(1u, std::memory_order_relaxed);
+            ps2diag_gifpath::g_curSrc.store(dsSrcAt(pos), std::memory_order_relaxed);
             submitGifPacket(GifPathId::Path2,
                             imagePacket.data(),
                             static_cast<uint32_t>(imagePacket.size()),
                             true,
                             m_vif1PendingPath2DirectHl);
+            ps2diag_gifpath::g_curSite.store(0u, std::memory_order_relaxed);
+            ps2diag_gifpath::g_curSrc.store(0xFFFFFFFFu, std::memory_order_relaxed);
 
             pos += chunkQw * 16u;
             m_vif1PendingPath2ImageQwc -= chunkQw;
@@ -306,6 +496,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         const bool irq = (cmd & 0x80000000u) != 0u;
 
         // Track most-recent command for VIFn_CODE emulation.
+        ps2_pipeline_stats::noteVif1Opcode(opcode);
+        if (dumpArmed && dumpBadPos == 0xFFFFFFFFu && !ps2_pipeline_stats::isValidVif1Opcode(opcode))
+        {
+            dumpBadPos = pos - 4u;
+            dumpBadCmd = cmd;
+        }
+        if (snap)
+        {
+            ++snap->cmdCount;
+            if (!ps2_pipeline_stats::isValidVif1Opcode(opcode))
+            {
+                ++snap->badCount;
+                if (snap->firstBadPos == 0xFFFFFFFFu)
+                {
+                    snap->firstBadPos = pos - 4u;
+                    snap->firstBadCmd = cmd;
+                }
+            }
+        }
         vif1_regs.code = cmd;
         vif1_regs.num = num;
         if (irq)
@@ -384,6 +593,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            ps2_pipeline_stats::g_mscal.fetch_add(1, std::memory_order_relaxed);
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
@@ -402,6 +612,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            ps2_pipeline_stats::g_mscnt.fetch_add(1, std::memory_order_relaxed);
             if (m_vu1MscntCallback)
                 m_vu1MscntCallback(runTop, runItop);
             continue;
@@ -448,6 +659,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
+                    ps2_pipeline_stats::g_mpgUploads.fetch_add(1, std::memory_order_relaxed);
+                    ps2_pipeline_stats::g_mpgBytes.fetch_add(copyBytes, std::memory_order_relaxed);
                 }
             }
             pos += mpgBytes;
@@ -468,7 +681,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
+                ps2diag_gifpath::g_curSite.store(directHl ? 8u : 2u, std::memory_order_relaxed);
+                ps2diag_gifpath::g_curSrc.store(dsSrcAt(pos), std::memory_order_relaxed);
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+                ps2diag_gifpath::g_curSite.store(0u, std::memory_order_relaxed);
+                ps2diag_gifpath::g_curSrc.store(0xFFFFFFFFu, std::memory_order_relaxed);
 
                 const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
                 if (imageQw != 0u)
@@ -754,4 +971,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             continue;
         }
     }
+
+    if (snap)
+    {
+        snap->endPos = pos;
+        ps2_pipeline_stats::publishVif1Snap();
+    }
+
+    maybeDumpVif1Buffer(data, sizeBytes, pos, dumpBadPos, dumpBadCmd);
 }
