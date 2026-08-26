@@ -3017,7 +3017,7 @@ void PS2Runtime::run()
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetGsSyncVCallbackState();
     ps2_stubs::resetMpegStubState();
-    ps2_syscalls::initializeGuestKernelState(m_memory.getRDRAM());
+    ps2_syscalls::initializeGuestKernelState(m_memory.getRDRAM(), this);
     m_cpuContext.r[4] = _mm_setzero_si128();
     m_cpuContext.r[5] = _mm_setzero_si128();
     // Bootstrap $sp at top of RAM, as the hardware loader does; the guest's
