@@ -2,20 +2,12 @@
 #include "GS.h"
 #include "ps2_log.h"
 #include "runtime/ps2_gs_common.h"
+#include "runtime/ee_scheduler.h"
 
 namespace ps2_stubs
 {
     namespace
     {
-        std::mutex g_gs_sync_v_mutex;
-        uint64_t g_gs_sync_v_base_tick = 0u;
-        std::mutex g_gs_sync_v_callback_mutex;
-        uint32_t g_gs_sync_v_callback_func = 0u;
-        uint32_t g_gs_sync_v_callback_gp = 0u;
-        uint32_t g_gs_sync_v_callback_sp = 0u;
-        uint32_t g_gs_sync_v_callback_stack_base = 0u;
-        uint32_t g_gs_sync_v_callback_stack_top = 0u;
-        uint32_t g_gs_sync_v_callback_bad_pc_logs = 0u;
         uint64_t makeClearPrim(bool useContext2)
         {
             return static_cast<uint64_t>(GS_PRIM_SPRITE) |
@@ -597,10 +589,10 @@ namespace ps2_stubs
         setReturnU32(ctx, terminatePacketBuilderState(rdram, ctx, runtime));
     }
 
-    static void resetGsSyncVState()
+    static void resetGsSyncVState(PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_gs_sync_v_mutex);
-        g_gs_sync_v_base_tick = ps2_syscalls::GetCurrentVSyncTick();
+        g_gs_sync_v_base_tick = ps2_syscalls::GetCurrentVSyncTick(runtime);
     }
 
     static int32_t getGsSyncVFieldForTick(uint64_t tick)
@@ -972,8 +964,6 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
-            resetGsSyncVState();
-
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
@@ -1456,14 +1446,10 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint64_t tick = ps2_syscalls::WaitForNextVSyncTick(rdram, runtime);
-        if (g_gparam.interlace != 0u)
-        {
-            setReturnS32(ctx, getGsSyncVFieldForTick(tick));
-            return;
-        }
-
-        setReturnS32(ctx, 1);
+        ps2_syscalls::WaitVSyncTick(rdram,
+                                    ctx,
+                                    runtime,
+                                    g_gparam.interlace != 0u ? -1 : 1);
     }
 
     void sceGsSyncVCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1474,17 +1460,9 @@ namespace ps2_stubs
         const uint32_t gp = getRegU32(ctx, 28);
         const uint32_t sp = getRegU32(ctx, 29);
 
-        uint32_t oldCallback = 0u;
-        {
-            std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
-            oldCallback = g_gs_sync_v_callback_func;
-            g_gs_sync_v_callback_func = newCallback;
-            if (newCallback != 0u)
-            {
-                g_gs_sync_v_callback_gp = gp;
-                g_gs_sync_v_callback_sp = sp;
-            }
-        }
+        EeScheduler &ee = runtime->eeScheduler();
+        ee.bindMainContextForSyscall(*ctx, rdram);
+        const uint32_t oldCallback = ee.setGsVSyncCallback(newCallback, gp, sp);
 
         static uint32_t s_syncVCallbackLogCount = 0u;
         if (s_syncVCallbackLogCount < 128u)
@@ -1499,11 +1477,6 @@ namespace ps2_stubs
                                                               << std::dec << std::endl);
             });
             ++s_syncVCallbackLogCount;
-        }
-
-        if (newCallback != 0u)
-        {
-            ps2_syscalls::EnsureVSyncWorkerRunning(rdram, runtime);
         }
 
         setReturnU32(ctx, oldCallback);
