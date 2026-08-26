@@ -299,6 +299,14 @@ public:
     int releaseWait(int id, bool interruptSafe);
     void transferIfRequested(bool interruptSafe);
 
+    // Ported off ps2sched::force_reschedule() (Phase 3d): if a ready thread at
+    // or above the current thread's priority exists, request and immediately
+    // act on a reschedule (synchronous -- unlike checkpointDue()'s polled
+    // model, this is for call sites like ReferThreadStatus's cross-thread
+    // handshake fix that need the handoff to happen right now, not at the
+    // next checkpoint).
+    void yieldIfHigherPriorityReady(bool interruptSafe);
+
     int createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option);
     int deleteSemaphore(int id, bool interruptSafe);
     int signalSemaphore(int id, bool interruptSafe);
@@ -351,6 +359,23 @@ public:
     [[nodiscard]] int currentThreadId() const noexcept;
     [[nodiscard]] R5900Context *currentContext();
     [[nodiscard]] uint8_t *rdram() const noexcept;
+
+    // True when no guest thread is running or ready (Phase 3d watchdog probe,
+    // ported from ps2sched::ps2x_guest_idle()). Reads the same mutex-guarded
+    // snapshot() the debug UI uses, so it is safe to call from another thread,
+    // but can lag the live state by up to kDebugPublishDispatchInterval
+    // dispatches -- fine for a 1Hz diagnostic, not for scheduling decisions.
+    [[nodiscard]] bool isIdle() const;
+
+    // Serializes a host thread's direct guest-code invocation (e.g. GS.cpp's
+    // dispatchGsSyncVCallback, called from the IRQ worker thread to run a
+    // recompiled sceGsSyncVCallback body) against run()'s own function-
+    // dispatch bracket on the game thread. Ported off ps2sched's
+    // AsyncGuestScope (Phase 3d): EeScheduler assumes single-threaded guest
+    // execution, so any OTHER thread invoking a recompiled function directly
+    // (bypassing the normal thread/invocation queue) must hold this lock for
+    // the duration, e.g. `std::lock_guard lock(scheduler.hostInvocationMutex());`.
+    [[nodiscard]] std::mutex &hostInvocationMutex() noexcept { return m_hostInvocationMutex; }
 
     // Direct syscall tests use the same main-thread record without starting a
     // second executor. Production execution calls reset() before run().
@@ -426,6 +451,7 @@ private:
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};
+    std::mutex m_hostInvocationMutex;
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;

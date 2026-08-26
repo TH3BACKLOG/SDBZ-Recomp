@@ -630,7 +630,7 @@ namespace ps2_stubs
         uint32_t callback = 0u;
         uint32_t gp = 0u;
         uint32_t callbackStackTop = 0u;
-        const uint64_t callbackTick = (tick != 0u) ? tick : ps2_syscalls::GetCurrentVSyncTick();
+        const uint64_t callbackTick = (tick != 0u) ? tick : ps2_syscalls::GetCurrentVSyncTick(runtime);
         {
             std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
             callback = g_gs_sync_v_callback_func;
@@ -676,13 +676,14 @@ namespace ps2_stubs
 
         try
         {
-            // Acquire the guest token before running recompiled PS2 code. This
-            // dispatch runs on the interrupt worker (a host thread); without the
-            // token the callback executes concurrently with whatever fiber the
-            // guest executor is running, violating the N=1 invariant. It also
-            // makes the worker a visible g_host_token_waiters waiter, which the
-            // executor's resume predicate is gated on.
-            AsyncGuestScope guestScope;
+            // Acquire the guest-invocation lock before running recompiled PS2
+            // code. This dispatch runs on the interrupt worker (a host
+            // thread); without it the callback would execute concurrently
+            // with EeScheduler::run()'s own dispatch on the game thread,
+            // violating the single-execution-context invariant. Ported off
+            // ps2sched's AsyncGuestScope (Phase 3d) -- see
+            // EeScheduler::hostInvocationMutex()'s comment.
+            std::lock_guard<std::mutex> guestLock(runtime->eeScheduler().hostInvocationMutex());
             R5900Context callbackCtx{};
             SET_GPR_U32(&callbackCtx, 28, gp);
             SET_GPR_U32(&callbackCtx, 29, (callbackStackTop != 0u) ? callbackStackTop : kAsyncCallbackFallbackSp);

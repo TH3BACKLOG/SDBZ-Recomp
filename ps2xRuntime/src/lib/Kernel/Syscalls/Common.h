@@ -1,7 +1,6 @@
 #include "ps2_syscalls.h"
 #include "ps2_log.h"
 #include "ps2_runtime.h"
-#include "ps2_scheduler.h"
 #include "runtime/ps2_iop_audio.h"
 #include "runtime/ee_scheduler.h"
 #include "ps2_runtime_macros.h"

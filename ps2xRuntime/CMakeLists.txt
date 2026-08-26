@@ -464,7 +464,6 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_runtime.cpp
-    src/lib/ps2_scheduler.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
@@ -510,12 +509,6 @@ file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
 
 target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
-)
-
-# Fiber backend (ucontext on POSIX; SceFiber on Vita; Win32 Fibers on Windows;
-# pthread under PS2X_FIBER_PTHREAD for Linux TSan testing)
-target_sources(ps2_runtime PRIVATE
-    src/lib/ps2_fiber.cpp
 )
 
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
@@ -614,18 +607,18 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
 
-# Private include dir so Kernel/Syscalls/*.cpp can reach ps2_scheduler_internal.h
-# and ps2_fiber.h without relative path hacks.
+# Private include dir so Kernel/Syscalls/*.cpp can reach src/lib headers
+# without relative path hacks.
 target_include_directories(ps2_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
 
-# ps2_scheduler.cpp and ps2_fiber.cpp use std::thread/std::mutex/std::atomic
-# which require pthread on Linux. Link explicitly so the dependency is not
-# implicit via raylib (ps2_host_backend). The Vita toolchain provides its own
-# pthread; the ucontext default build on Linux also needs it.
+# EeScheduler.cpp (and the rest of ps2_runtime) uses std::thread/std::mutex/
+# std::atomic, which require pthread on Linux. Link explicitly so the
+# dependency is not implicit via raylib (ps2_host_backend). The Vita
+# toolchain provides its own pthread.
 if(NOT PS2X_IS_VITA)
     find_package(Threads REQUIRED)
     target_link_libraries(ps2_runtime PUBLIC Threads::Threads)

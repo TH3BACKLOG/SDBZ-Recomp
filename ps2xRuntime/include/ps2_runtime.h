@@ -27,7 +27,6 @@
 #include <unordered_set>
 
 #include "ps2_log.h"
-#include "ps2_scheduler.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"

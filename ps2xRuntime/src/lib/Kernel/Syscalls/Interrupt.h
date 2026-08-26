@@ -23,13 +23,6 @@ namespace ps2_syscalls
         extern std::mutex g_irq_worker_mutex;
         extern std::condition_variable g_irq_worker_cv;
         extern std::mutex g_vsync_flag_mutex;
-        // Each entry pairs the guest tid with the parking fiber's identity token
-        // (from ps2sched::current_fiber_token(), which encodes the fiber's
-        // generation). signalVSyncFlag delivers the wakeup only to the exact
-        // fiber that parked, so a recycled tid cannot receive a stale tick.
-        // Borrowed host workers (g_currentThreadId == -1, FiberToken{}) never park
-        // here, so every stored entry has a non-zero token.
-        extern std::vector<std::pair<int, ps2sched::FiberToken>> g_vsync_waitList;
         extern std::atomic<bool> g_irq_worker_stop;
         extern std::atomic<bool> g_irq_worker_running;
         extern std::thread g_irq_worker_thread; // joinable worker handle

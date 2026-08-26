@@ -68,12 +68,14 @@ extern "C" uint64_t ps2x_vblank_ticks();
 // through StartThread, so it is safe to leave armed in every run.
 extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site);
 
-// Guest interrupt-disable preemption gate (ps2_scheduler.cpp, 2026-07-26).
+// Guest interrupt-disable preemption gate (2026-07-26; ported to
+// Kernel/EeScheduler.cpp in Phase 3d, retiring ps2_scheduler.cpp).
 // SDBZ brackets its shared-structure critical sections with the EE kernel's
 // DisableIntr (0x17ed60, `cop0 0x39`) / EnableIntr (0x17edb0, `cop0 0x38`).
 // The runtime has no COP0 Status EIE bit, so those calls used to be invisible
 // to the scheduler and yield_point could hand the guest token to the IRQ
-// worker mid-section. The wrappers for those two addresses call these to tell
+// worker mid-section; under EeScheduler the equivalent gate lives in
+// checkpointDue(). The wrappers for those two addresses call these to tell
 // the scheduler when the guest considers interrupts masked; the depth/escape
 // accessors are for the CRITSEC probe below. Same extern-between-.cpp rule.
 extern "C" void ps2x_guest_intr_disable_enter();
@@ -3781,7 +3783,7 @@ namespace
         // idiom `old = DisableIntr(); ...; if (old) EnableIntr();` skips the
         // enable on a nested section. enter/leave therefore set and clear a
         // single bit rather than pushing and popping a counter -- see the long
-        // comment on tls_intr_disabled in ps2_scheduler.cpp.
+        // comment on tls_intr_disabled in Kernel/EeScheduler.cpp.
         const bool isIntrDisable = (funcStart == 0x0017ED60u);
         const bool isIntrEnable  = (funcStart == 0x0017EDB0u);
         if (isIntrDisable)

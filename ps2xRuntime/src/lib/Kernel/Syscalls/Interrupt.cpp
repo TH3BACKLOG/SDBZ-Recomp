@@ -2,14 +2,13 @@
 #include "Interrupt.h"
 #include "ps2_log.h"
 #include "Stubs/GS.h"
-#include "ps2_fiber.h"
 #include "runtime/ee_scheduler.h"
 
 #include <bit>
 #include <cstdlib> // std::getenv / std::strtoull for the determinism knobs below
 
 // Cross-.cpp externs (no header edit: a .h change forces a full rebuild of all
-// 30,000+ generated runner TUs). Defined in ps2_scheduler.cpp and
+// 30,000+ generated runner TUs). Defined in Kernel/EeScheduler.cpp and
 // game_overrides.cpp respectively. The depth counter is thread_local, so on the
 // IRQ worker thread it always reads 0 -- only the inline, on-guest-fiber dispatch
 // path can ever observe a non-zero value, which is exactly the case being probed.
@@ -344,7 +343,10 @@ namespace ps2_syscalls
 
     static void interruptWorkerMain(uint8_t *rdram, PS2Runtime *runtime)
     {
-        g_currentThreadId = -1;
+        // Phase 3d: this worker no longer touches guest context directly (it
+        // posts EeEventType::VBlankStart/End via runtime->postEeEvent() below,
+        // processed on the game thread), so it no longer needs to mark itself
+        // as "not a guest thread" the way it did under ps2sched's g_currentThreadId.
 
         using clock = std::chrono::steady_clock;
         auto nextTick = clock::now() + kVblankPeriod;

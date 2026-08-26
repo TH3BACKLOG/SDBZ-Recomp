@@ -2,6 +2,7 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "recomp_debug_writer.h"
 
 #include <algorithm>
 #include <cassert>
@@ -63,9 +64,143 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------
+// Watchdog/determinism diagnostics ported from the retired ps2_scheduler.cpp
+// (Phase 3d). extern "C" rather than declared in ee_scheduler.h, for the same
+// reason as before: ps2_runtime.cpp and Kernel/Syscalls/Interrupt.cpp
+// re-declare these symbols locally instead of paying a header-wide rebuild.
+//
+// ps2x_guest_progress() MUST keep the exact "one tick per 128 guest
+// back-edges" cadence: Interrupt.cpp's PS2X_DET_VBLANK_QUANTUM pacing
+// (Stage 5.17, [[reference_det_vblank_quantum]]) divides real time by this
+// counter's rate, and that stage's determinism validation was measured
+// against that exact cadence. checkpointDue() is called from the same
+// call sites yield_point() used to be (recompiler-emitted intra-function
+// back-edges, now via eeCheckpointDue(); the former dispatchLoop's
+// per-iteration call, now EeScheduler::run()'s own checkpointDue() call),
+// so gating this counter's increment behind the identical "128 calls" fast
+// path reproduces the old cadence rather than guessing a new one.
+static std::atomic<uint64_t> g_guest_progress{0};
+static thread_local uint32_t tls_progress_backedge_counter = 0u;
+
+extern "C" uint64_t ps2x_guest_progress()
+{
+    return g_guest_progress.load(std::memory_order_relaxed);
+}
+
+// Guest execution duty cycle (ported from ps2_scheduler.cpp's stage 5.6.2
+// counters). Timed around EeScheduler::run()'s function(...) dispatch
+// bracket -- the direct successor of the old fiber-resume bracket.
+static std::atomic<uint64_t> g_guest_busy_ns{0};
+static std::atomic<uint64_t> g_guest_resumes{0};
+
+extern "C" uint64_t ps2x_guest_busy_ns()
+{
+    return g_guest_busy_ns.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_resumes()
+{
+    return g_guest_resumes.load(std::memory_order_relaxed);
+}
+
+// "No guest thread runnable" signal (ported from ps2sched::ps2x_guest_idle()).
+// s_activeScheduler is set once by the constructor below; there is only ever
+// one EeScheduler/PS2Runtime instance per process, same assumption the old
+// singleton-style ps2sched code made.
+static EeScheduler *s_activeScheduler = nullptr;
+
+// Current guest thread id, or 0 if none is running (ported off ps2sched's
+// thread_local g_currentThreadId, which used -1 for "none" -- 0 works
+// identically here since real guest tids start at 1 and never collide with
+// either sentinel). Unlike the old value this is NOT thread_local: only one
+// OS thread ever runs guest code under EeScheduler, so a single instance
+// member read through the scheduler is equivalent and needs no per-thread
+// storage. Kept as a free function (not a header-declared method call) so
+// callers with no PS2Runtime*/EeScheduler* in scope (e.g. Thread.cpp's
+// ps2x_stack_check(), called from deep inside dispatch) can still read it.
+extern "C" int ps2x_guest_current_thread_id()
+{
+    return s_activeScheduler ? s_activeScheduler->currentThreadId() : 0;
+}
+
+extern "C" int ps2x_guest_idle()
+{
+    return (s_activeScheduler && s_activeScheduler->isIdle()) ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// EIE gate (ported verbatim from ps2_scheduler.cpp, 2026-07-26): the SDBZ pool
+// allocator at 0x178428 relies on DisableIntr()/EnableIntr() (game_overrides.cpp)
+// meaning what they mean on hardware -- while the guest holds interrupts
+// disabled, no interrupt handler may run and no other guest thread may be
+// scheduled in. Under EeScheduler, both of those only happen when
+// checkpointDue() reports a checkpoint due (EeScheduler::run() then calls
+// processPendingEvents() / reschedules), so the gate now lives there instead
+// of in ps2sched::yield_point(). Escape hatch preserved unchanged: after
+// kIntrDisableYieldEscape samples inside one critical section the gate opens
+// anyway, so a runaway section surfaces as data (ps2x_guest_intr_disable_escapes()
+// nonzero) rather than a hang.
+static constexpr uint32_t kIntrDisableYieldEscape = 4096u;
+static thread_local bool tls_intr_disabled = false;
+static thread_local uint32_t tls_intr_disable_samples = 0u;
+static std::atomic<uint64_t> g_intr_disable_escapes{0};
+static std::atomic<uint64_t> g_intr_disable_sections{0};
+static std::atomic<uint64_t> g_intr_disable_redundant{0};
+static std::atomic<uint64_t> g_intr_disable_stray{0};
+
+extern "C" void ps2x_guest_intr_disable_enter()
+{
+    if (tls_intr_disabled)
+    {
+        g_intr_disable_redundant.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    tls_intr_disabled = true;
+    tls_intr_disable_samples = 0u;
+    g_intr_disable_sections.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void ps2x_guest_intr_disable_leave()
+{
+    if (!tls_intr_disabled)
+    {
+        g_intr_disable_stray.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    tls_intr_disabled = false;
+    tls_intr_disable_samples = 0u;
+}
+
+extern "C" uint32_t ps2x_guest_intr_disable_depth()
+{
+    return tls_intr_disabled ? 1u : 0u;
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_escapes()
+{
+    return g_intr_disable_escapes.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_sections()
+{
+    return g_intr_disable_sections.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_redundant()
+{
+    return g_intr_disable_redundant.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t ps2x_guest_intr_disable_stray()
+{
+    return g_intr_disable_stray.load(std::memory_order_relaxed);
+}
+
 EeScheduler::EeScheduler(PS2Runtime &runtime)
     : m_runtime(runtime)
 {
+    s_activeScheduler = this;
 }
 
 EeScheduler::~EeScheduler()
@@ -220,6 +355,30 @@ void EeScheduler::run()
         m_runtime.m_debugSp.store(getRegU32(&context, 29), std::memory_order_relaxed);
         m_runtime.m_debugGp.store(getRegU32(&context, 28), std::memory_order_relaxed);
 
+        // RecompDebugger IPC: publish this thread's pc/gpr/hi/lo into the
+        // shared-memory RecompDebugState once per scheduler iteration, and
+        // service any armed breakpoint for this thread. Ported here (Phase 3d)
+        // from the retired dispatchLoop() -- this is now the sole per-iteration
+        // point where a guest thread's context is live just before dispatch.
+        {
+            uint32_t dbg_gpr[32];
+            for (int i = 0; i < 32; ++i)
+                dbg_gpr[i] = getRegU32(&context, i);
+            RecompDbg::Update(m_currentThreadId, context.pc, dbg_gpr,
+                               static_cast<uint32_t>(context.hi),
+                               static_cast<uint32_t>(context.lo),
+                               context.insn_count,
+                               m_rdram, PS2_RAM_SIZE);
+            if (RecompDbg::CheckBreakpoint(m_currentThreadId, context.pc & 0x1FFFFFFFu, dbg_gpr))
+            {
+                // Breakpoint/step handling may have edited dbg_gpr (a debugger-armed
+                // register write); mirror only the low 32-bit lane back into the live
+                // 128-bit MMI register so the other lanes are left untouched.
+                for (int i = 1; i < 32; ++i)
+                    SET_GPR_U32(&context, i, dbg_gpr[i]);
+            }
+        }
+
         if (context.pc == 0u)
         {
             if (!running->invocations.empty())
@@ -281,18 +440,27 @@ void EeScheduler::run()
             continue;
         }
 
+        const auto dispatchStart = std::chrono::steady_clock::now();
         try
         {
+            // See hostInvocationMutex()'s comment: excludes GS.cpp's
+            // dispatchGsSyncVCallback (run directly on the IRQ worker thread)
+            // for the duration of this thread's own guest-code invocation.
+            std::lock_guard<std::mutex> hostLock(m_hostInvocationMutex);
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            g_guest_busy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - dispatchStart).count()), std::memory_order_relaxed);
+            g_guest_resumes.fetch_add(1, std::memory_order_relaxed);
         }
         catch (const EeDispatcherTransfer &)
         {
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
+            g_guest_busy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - dispatchStart).count()), std::memory_order_relaxed);
+            g_guest_resumes.fetch_add(1, std::memory_order_relaxed);
         }
         catch (...)
         {
@@ -347,10 +515,29 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
 
+    if ((++tls_progress_backedge_counter & 127u) == 0u)
+    {
+        g_guest_progress.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
         return true;
+    }
+
+    // EIE gate: see the file-scope comment above ps2x_guest_intr_disable_enter().
+    // Terminate/stop (above) always wins; everything below this point is a
+    // voluntary yield (interrupt delivery, reschedule) that the gate withholds
+    // while the guest holds interrupts disabled.
+    if (tls_intr_disabled)
+    {
+        if (++tls_intr_disable_samples < kIntrDisableYieldEscape)
+        {
+            return false;
+        }
+        g_intr_disable_escapes.fetch_add(1, std::memory_order_relaxed);
+        tls_intr_disable_samples = 0u;
     }
 
     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
@@ -783,6 +970,17 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     m_timeSliceExpired = false;
     publishSnapshot();
     throw EeDispatcherTransfer{};
+}
+
+void EeScheduler::yieldIfHigherPriorityReady(bool interruptSafe)
+{
+    assertExecutor();
+    const GuestThread *self = currentThread();
+    if (self != nullptr && hasReadyAtOrAbovePriority(self->currentPriority))
+    {
+        m_rescheduleRequested = true;
+    }
+    transferIfRequested(interruptSafe);
 }
 
 int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
@@ -1447,6 +1645,23 @@ EeKernelSnapshot EeScheduler::snapshot() const
 {
     std::lock_guard lock(m_snapshotMutex);
     return m_snapshot;
+}
+
+bool EeScheduler::isIdle() const
+{
+    const EeKernelSnapshot snap = snapshot();
+    if (snap.runningThreadId != 0)
+    {
+        return false;
+    }
+    for (const EeThreadSnapshot &t : snap.threads)
+    {
+        if (t.status == EeThreadStatus::Ready)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 void EeScheduler::publishSnapshot()

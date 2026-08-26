@@ -18,6 +18,10 @@ extern "C" void ps2x_probe_kv(const char *name, int n,
 // .cpp rule as ps2x_probe_kv: a header edit costs a full rebuild.
 extern "C" uint32_t ps2x_on_irq_handler_stack();
 
+// Defined in Kernel/EeScheduler.cpp (Phase 3d, replacing ps2sched's
+// thread_local g_currentThreadId). Same extern-in-.cpp rule as above.
+extern "C" int ps2x_guest_current_thread_id();
+
 // ---------------------------------------------------------------------------
 // Phase C -- stack-bounds guard.
 //
@@ -91,7 +95,7 @@ extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
     if (ps2x_on_irq_handler_stack() != 0u)
         return 0;
 
-    const int tid = g_currentThreadId;
+    const int tid = ps2x_guest_current_thread_id();
     GuestStackRange r;
     {
         std::lock_guard<std::mutex> lock(g_stackRangeMutex);
@@ -131,25 +135,16 @@ extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
     return 1;
 }
 
-// NOTE (Phase 3c-3b, EE scheduler merge): force_reschedule()/g_currentThreadId
-// still resolve to the pre-EeScheduler ps2sched globals (ps2_scheduler.h/.cpp),
-// which are already broken (dispatchLoop removed in sub-phase 3a) and are
-// slated for wholesale retirement in Phase 3d. refstatYieldEnabled()'s
-// force_reschedule() call below and ps2x_stack_check()'s g_currentThreadId read
-// are cross-cutting dependencies that must be re-pointed at EeScheduler
-// (m_rescheduleRequested/transferIfRequested and EeScheduler::currentThreadId(),
-// respectively) when ps2_scheduler.cpp/.h are retired in Phase 3d.
-namespace ps2sched { void force_reschedule(); }
-
 // Stage 5.17 -- equal-priority yield inside ReferThreadStatus, env-gated OFF.
 //
 // The guest's cross-thread handshake sub_11E690 sets [0x441924]=1, boosts the
 // worker to its OWN priority via 29h, then spins on 0x30 ReferThreadStatus until
-// the worker ACKs. Our 29h already calls force_reschedule() (below, ~line 1131),
-// so the FIRST handoff works. But once the worker blocks inside the pump and
-// later becomes Ready again, nothing can hand it the slot back: maybe_yield()
-// and yield_point() step 3 both select a STRICTLY higher-priority head, and 0x30
-// -- the only syscall inside the spin -- has no yield at all. Measured cost in
+// the worker ACKs. Our 29h (ChangeThreadPriority, below) already reschedules
+// natively on a self-boost -- see ChangeThreadPriority's own comment -- so the
+// FIRST handoff works. But once the worker blocks inside the pump and later
+// becomes Ready again, nothing can hand it the slot back: EeScheduler's own
+// checkpoint/reschedule paths only select a STRICTLY higher-priority head, and
+// 0x30 -- the only syscall inside the spin -- has no yield at all. Measured cost in
 // run 20260824-101518: one handshake takes 8 wall seconds with the worker
 // reading NOT-RUNNING for 3 consecutive seconds, and vbl/s collapses to 1 while
 // it holds.
@@ -589,7 +584,7 @@ namespace ps2_syscalls
         // already released. See refstatYieldEnabled() above for why this is
         // gated and what it fixes.
         if (refstatYieldEnabled())
-            ps2sched::force_reschedule();
+            scheduler(rdram, ctx, runtime).yieldIfHigherPriorityReady(false);
     }
 
     void iReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
