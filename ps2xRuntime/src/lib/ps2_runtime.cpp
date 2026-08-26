@@ -5028,7 +5028,7 @@ void PS2Runtime::run()
                         // scheduled"; currentPriority checks whether the guest's
                         // boost actually outranks the spinner.
                         const std::vector<ps2_syscalls::ThreadDebugSnapshot> th =
-                            ps2_syscalls::getThreadDebugSnapshot();
+                            ps2_syscalls::getThreadDebugSnapshot(this);
                         std::cerr << " nTh=" << th.size();
                         for (const ps2_syscalls::ThreadDebugSnapshot &s : th)
                         {
@@ -5579,7 +5579,7 @@ void PS2Runtime::run()
             const uint64_t nextSeq = logSnap.empty() ? 1 : (logSnap.back().seq + 1);
             RecompDbg::UpdateExtended(dbgGs, dbgPad, dbgLogs.data(), logCount, nextSeq);
 
-            const std::vector<ps2_syscalls::ThreadDebugSnapshot> threadSnap = ps2_syscalls::getThreadDebugSnapshot();
+            const std::vector<ps2_syscalls::ThreadDebugSnapshot> threadSnap = ps2_syscalls::getThreadDebugSnapshot(this);
             const uint32_t threadCount = static_cast<uint32_t>(
                 std::min<size_t>(threadSnap.size(), kDbgMaxThreads));
             std::array<DbgThreadInfo, kDbgMaxThreads> dbgThreads{};
