@@ -29,7 +29,6 @@ namespace ps2_syscalls
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
     void initializeGuestKernelState(uint8_t *rdram, PS2Runtime *runtime);
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId);
-    void notifyRuntimeStop();
     void resetSoundDriverRpcState();
     void setSoundDriverCompatLayout(const PS2SoundDriverCompatLayout &layout);
     void clearSoundDriverCompatLayout();

@@ -52,7 +52,6 @@ namespace ps2_syscalls
     // defaults so regression tests are order-independent.
     void resetInterruptHandlerState();
     void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
-    uint64_t GetCurrentVSyncTick();
     void stopInterruptWorker();
     // Signal-only variant: sets the stop flag and wakes the worker but does
     // NOT join. For callers on the guest executor thread (a fiber calling
@@ -62,8 +61,8 @@ namespace ps2_syscalls
     // The join happens later in scheduler_shutdown() on the main thread
     // (stopInterruptWorker is idempotent).
     void signalInterruptWorkerStop();
-    uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
-    void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
+    uint64_t GetCurrentVSyncTick(PS2Runtime *runtime);
+    void WaitVSyncTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, int fixedResult);
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void EnableIntc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void iEnableIntc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

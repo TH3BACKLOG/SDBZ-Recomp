@@ -2,46 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <thread>
 
 inline std::unordered_map<int, FILE *> g_fileDescriptors;
 inline int g_nextFd = 3; // Start after stdin, stdout, stderr
-
-struct ThreadInfo
-{
-    uint32_t entry = 0;
-    uint32_t stack = 0;
-    uint32_t stackSize = 0;
-    uint32_t gp = 0;
-    uint32_t priority = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t arg = 0;
-    bool started = false;
-    bool ownsStack = false;
-    uint32_t tlsBase = 0;
-
-    // Thread Status
-    int status = 0x10; // THS_DORMANT
-    int waitType = 0;  // TSW_NONE
-    int waitId = 0;
-    int wakeupCount = 0;
-    int currentPriority = 0;
-    int suspendCount = 0;
-    std::atomic<uint32_t> currentPc{0};
-
-    std::mutex m;
-    std::atomic<bool> forceRelease{false};
-    std::atomic<bool> terminated{false};
-    // Set true when StartThread mints this thread's g_activeThreads token
-    // (fetch_add). Cleared by exactly ONE consumer via exchange(true->false):
-    // on_fiber_exit for a normal exit, ExitDeleteThread when it removes its own
-    // g_threads entry, notifyRuntimeStop when it reaps residual guest threads,
-    // or StartThread's own create_fiber failure path. Whoever wins the exchange
-    // performs the single matching fetch_sub: one token per started thread,
-    // exactly one decrement.
-    std::atomic<bool> activeCounted{false};
-};
 
 // Thread status
 #define THS_RUN 0x01
@@ -146,6 +109,24 @@ struct ee_thread_status_t
     uint32_t wakeupCount; // 0x2C
 };
 
+// PS2SDK EE kernel.h t_ee_thread. CreateThread consumes this full 0x24-byte
+// descriptor; it is not the attr-first IOP thread descriptor.
+struct ee_thread_t
+{
+    int status;
+    uint32_t func;
+    uint32_t stack;
+    int stack_size;
+    uint32_t gp_reg;
+    int initial_priority;
+    int current_priority;
+    uint32_t attr;
+    uint32_t option;
+};
+
+static_assert(sizeof(ee_thread_t) == 0x24u);
+static_assert(sizeof(ee_thread_status_t) == 0x30u);
+
 struct ee_sema_t
 {
     int count;
@@ -156,47 +137,7 @@ struct ee_sema_t
     uint32_t option;
 };
 
-struct SemaInfo
-{
-    int count = 0;
-    int maxCount = 0;
-    int initCount = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    // Wait list of blocked guest threads. Each entry is {tid, generation token}
-    // where the token was captured via ps2sched::current_fiber_token() at push
-    // time. Protected by m; never hold m across a scheduling yield.
-    std::vector<std::pair<int, ps2sched::FiberToken>> waitList;
-};
-
-struct EventFlagInfo
-{
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t initBits = 0;
-    uint32_t bits = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    // See SemaInfo::waitList.
-    std::vector<std::pair<int, ps2sched::FiberToken>> waitList;
-};
-
-struct AlarmInfo
-{
-    int id = 0;
-    uint16_t ticks = 0;
-    uint32_t handler = 0;
-    uint32_t commonArg = 0;
-    uint32_t gp = 0;
-    uint32_t sp = 0;
-    uint8_t *rdram = nullptr;
-    PS2Runtime *runtime = nullptr;
-    std::chrono::steady_clock::time_point dueAt;
-};
+static_assert(sizeof(ee_sema_t) == 0x18u);
 
 struct io_stat_t
 {
@@ -215,50 +156,6 @@ static constexpr uint32_t kFioSoIfDir = 0x0020;
 static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
-
-inline std::unordered_map<int, std::shared_ptr<ThreadInfo>> g_threads;
-inline int g_nextThreadId = 2; // Reserve 1 for the main thread
-extern thread_local int g_currentThreadId;
-inline std::mutex g_thread_map_mutex;
-
-inline std::unordered_map<int, std::shared_ptr<SemaInfo>> g_semas;
-inline int g_nextSemaId = 1;
-inline std::mutex g_sema_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<EventFlagInfo>> g_eventFlags;
-inline int g_nextEventFlagId = 1;
-inline std::mutex g_event_flag_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<AlarmInfo>> g_alarms;
-inline int g_nextAlarmId = 1;
-inline std::mutex g_alarm_mutex;
-inline std::condition_variable g_alarm_cv;
-// Stop mechanism. g_alarm_thread is joinable so stopAlarmWorker() can join it
-// before rdram/runtime are destroyed.
-inline std::thread g_alarm_thread;
-inline std::atomic<bool> g_alarm_stop_flag{false};
-// Plain resettable flag (not once-only) so stopAlarmWorker() can clear it and
-// allow ensureAlarmWorkerRunning() to restart the thread in a subsequent
-// scheduler cycle (e.g. repeated init/shutdown in the test suite).
-// Protected by g_alarm_mutex.
-inline bool g_alarm_worker_running{false};
-inline std::atomic<int> g_activeThreads{0};
-
-// Mint/consume pair for ThreadInfo::activeCounted (see the field comment
-// above). MINT bumps g_activeThreads FIRST, then publishes the token with
-// release, so a consumer observing activeCounted==true is guaranteed to also
-// see the matching +1. CONSUME is the sole arbiter for a given token: the
-// exchange(false) only the winner of the true->false transition performs the
-// matching fetch_sub, so concurrent consumers (e.g. on_fiber_exit racing
-// notifyRuntimeStop over the same shared_ptr) can never double-decrement.
-static inline void mintActiveToken(const std::shared_ptr<ThreadInfo> &info)
-{
-    g_activeThreads.fetch_add(1, std::memory_order_relaxed);
-    info->activeCounted.store(true, std::memory_order_release);
-}
-static inline void consumeActiveToken(const std::shared_ptr<ThreadInfo> &info)
-{
-    if (info && info->activeCounted.exchange(false, std::memory_order_acq_rel))
-        g_activeThreads.fetch_sub(1, std::memory_order_release);
-}
 
 inline std::mutex g_fd_mutex;
 
@@ -463,23 +360,10 @@ static uint32_t dtxAllocUrpcHandleLocked()
     return layout.urpcObjBase;
 }
 
-struct ExitHandlerEntry
-{
-    uint32_t func = 0;
-    uint32_t arg = 0;
-};
-
-inline std::mutex g_exit_handler_mutex;
-inline std::unordered_map<int, std::vector<ExitHandlerEntry>> g_exit_handlers;
-
 inline std::mutex g_bootmode_mutex;
 inline bool g_bootmode_initialized = false;
 inline uint32_t g_bootmode_pool_offset = 0;
 inline std::unordered_map<uint8_t, uint32_t> g_bootmode_addresses;
-
-inline std::mutex g_syscall_override_mutex;
-inline std::unordered_map<uint32_t, uint32_t> g_syscall_overrides;
-inline std::unordered_set<uint32_t> g_syscall_mirror_addrs;
 
 static constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
 static constexpr uint32_t kGuestSyscallTablePhysBase = kGuestSyscallTableGuestBase & 0x1FFFFFFFu;
