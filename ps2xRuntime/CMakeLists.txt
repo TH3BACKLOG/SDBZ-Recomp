@@ -19,6 +19,7 @@ option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" OFF)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
+option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -86,82 +87,82 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
-    if(NOT PS2X_IS_ANDROID)
-    FetchContent_Declare(
-        imgui
-        GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG "docking"
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(imgui)
-
-    if(NOT imgui_POPULATED)
-        FetchContent_Populate(imgui)
-    endif()
-
-    set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
-
-    add_library(imgui STATIC
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
-    )
-    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
-
-    FetchContent_Declare(
-        rlImGui
-        GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-        GIT_TAG "Raylib_5_5"
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(rlImGui)
-
-    if(NOT rlimgui_POPULATED)
-        FetchContent_Populate(rlImGui)
-    endif()
-
-    set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
-
-    add_library(rlImGui STATIC
-        "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-    )
-    target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-    target_link_libraries(rlImGui PUBLIC raylib imgui)
-
-    # --- Standalone RecompDebugger GUI dependencies (SDL2 + ImGui's SDL2/
-    # OpenGL backend + a file dialog widget). Distinct from the imgui/rlImGui
-    # pair above, which backs the in-game raylib overlay panel; the
-    # standalone debugger is a separate windowed app so it can stay open
-    # (and keep breakpoints armed) independently of ps2EntryRunner.
-    # Restored 2026-07-14 for the RecompDebugger revival (dropped when the
-    # repo was flattened; see ps2x_imgui_lib below).
-    if(WIN32)
+    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
-            SDL2
-            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-            GIT_TAG        release-2.32.10
-            GIT_SHALLOW    TRUE
+            imgui
+            GIT_REPOSITORY https://github.com/ocornut/imgui.git
+            GIT_TAG "v1.92.7-docking"
+            GIT_SHALLOW TRUE
         )
-        set(SDL_SHARED ON  CACHE BOOL "" FORCE)
-        set(SDL_STATIC OFF CACHE BOOL "" FORCE)
-        FetchContent_MakeAvailable(SDL2)
+        FetchContent_GetProperties(imgui)
 
-        FetchContent_Declare(
-            imgui_file_dialog
-            GIT_REPOSITORY https://github.com/aiekick/ImGuiFileDialog.git
-            GIT_TAG        d0e97b2adc3d3452d72c750c7305dc0291acd052 # master, pinned to avoid refetch/rebuild on every configure
-            GIT_SHALLOW    TRUE
-        )
-        FetchContent_GetProperties(imgui_file_dialog)
-        if(NOT imgui_file_dialog_POPULATED)
-            FetchContent_Populate(imgui_file_dialog)
+        if(NOT imgui_POPULATED)
+            FetchContent_Populate(imgui)
         endif()
 
-        find_package(OpenGL REQUIRED)
+        set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
+
+        add_library(imgui STATIC
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
+        )
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
+
+        FetchContent_Declare(
+            rlImGui
+            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
+            GIT_TAG "Raylib_5_5"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(rlImGui)
+
+        if(NOT rlimgui_POPULATED)
+            FetchContent_Populate(rlImGui)
+        endif()
+
+        set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
+
+        add_library(rlImGui STATIC
+            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
+        )
+        target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
+        target_link_libraries(rlImGui PUBLIC raylib imgui)
+
+        # --- Standalone RecompDebugger GUI dependencies (SDL2 + ImGui's SDL2/
+        # OpenGL backend + a file dialog widget). Distinct from the imgui/rlImGui
+        # pair above, which backs the in-game raylib overlay panel; the
+        # standalone debugger is a separate windowed app so it can stay open
+        # (and keep breakpoints armed) independently of ps2EntryRunner.
+        # Restored 2026-07-14 for the RecompDebugger revival (dropped when the
+        # repo was flattened; see ps2x_imgui_lib below).
+        if(WIN32)
+            FetchContent_Declare(
+                SDL2
+                GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+                GIT_TAG        release-2.32.10
+                GIT_SHALLOW    TRUE
+            )
+            set(SDL_SHARED ON  CACHE BOOL "" FORCE)
+            set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+            FetchContent_MakeAvailable(SDL2)
+
+            FetchContent_Declare(
+                imgui_file_dialog
+                GIT_REPOSITORY https://github.com/aiekick/ImGuiFileDialog.git
+                GIT_TAG        d0e97b2adc3d3452d72c750c7305dc0291acd052 # master, pinned to avoid refetch/rebuild on every configure
+                GIT_SHALLOW    TRUE
+            )
+            FetchContent_GetProperties(imgui_file_dialog)
+            if(NOT imgui_file_dialog_POPULATED)
+                FetchContent_Populate(imgui_file_dialog)
+            endif()
+
+            find_package(OpenGL REQUIRED)
+        endif()
     endif()
-    endif() # NOT PS2X_IS_ANDROID
 endif()
 
 if(PS2X_SANITIZE STREQUAL "thread" AND NOT PS2X_FIBER_PTHREAD)
@@ -646,7 +647,7 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
-if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )

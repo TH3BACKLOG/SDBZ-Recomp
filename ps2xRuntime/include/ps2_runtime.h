@@ -667,8 +667,8 @@ private:
     ps2_iop m_iop;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
-    VU1Interpreter m_vu0;
-    VU1Interpreter m_vu1;
+    VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
+    VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;

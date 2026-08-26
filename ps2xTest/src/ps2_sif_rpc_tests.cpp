@@ -127,7 +127,7 @@ namespace
 
     std::atomic<uint32_t> g_lotrSoundCallbackHits{0u};
 
-    void lotrSoundEndCallbackShouldNotRun(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void lotrSoundEndCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
         (void)runtime;
@@ -489,7 +489,7 @@ void register_ps2_sif_rpc_tests()
             PS2Runtime::setIoPaths(oldPaths);
         });
 
-        tc.Run("LotR sound RPC completes HLE callback without invoking guest loop", [](TestCase &t)
+        tc.Run("LotR sound RPC invokes guest callback to consume HLE response", [](TestCase &t)
         {
             TestEnv env;
 
@@ -536,8 +536,8 @@ void register_ps2_sif_rpc_tests()
             SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
 
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should succeed for LotR sound RPC");
-            t.Equals(g_lotrSoundCallbackHits.load(), 0u,
-                     "HLE-completed LotR sound callback should not invoke the guest callback");
+            t.Equals(g_lotrSoundCallbackHits.load(), 1u,
+                     "LotR SOUND_JP callback should consume the HLE response");
             t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u), 0u,
                      "LotR sound response should report no active stream records");
             t.IsTrue(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u) != 0u,

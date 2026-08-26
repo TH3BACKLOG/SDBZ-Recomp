@@ -28,6 +28,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_gsdump_replay_tests.cpp
     src/ps2_sif_rpc_tests.cpp
     src/ps2_sif_dma_tests.cpp
+    src/ps2_iop_tests.cpp
     src/ps2_recompiler_tests.cpp
     src/ps2_runtime_expansion_tests.cpp
     src/ps2_scheduler_workload_regression_tests.cpp
@@ -46,6 +47,7 @@ target_link_libraries(ps2_test_lib PRIVATE
     ps2_recomp_lib
     ps2_analyzer_lib
     ps2_runtime
+    ps2_iop
 )
 
 add_executable(ps2x_tests
