@@ -19,10 +19,12 @@
 #include <atomic>
 #include <array>
 #include <mutex>
-#include <condition_variable>
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "ps2_log.h"
 #include "ps2_scheduler.h"
@@ -34,6 +36,17 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
+#include "ps2x/iop/iop_types.h"
+
+namespace ps2x::iop
+{
+    class IopSubsystem;
+}
+
+class PS2IopHostAdapter;
+class PS2IopTransport;
+class EeScheduler;
+struct EeEvent;
 
 enum PS2Exception
 {
@@ -502,32 +515,6 @@ public:
         SkipCallDebug = 3,
     };
 
-    // No-op RAII guards. Only one fiber ever executes guest code at a time
-    // under the N=1 cooperative scheduler, and exclusion between the fiber
-    // executor and borrowed host worker threads is provided by
-    // ps2sched::async_guest_begin/async_guest_end (AsyncGuestScope). Kept as
-    // no-ops only so code that still references them (MPEG/IPU decoder stubs)
-    // compiles unchanged.
-    class GuestExecutionScope
-    {
-    public:
-        explicit GuestExecutionScope(PS2Runtime *) noexcept {}
-        ~GuestExecutionScope() = default;
-
-        GuestExecutionScope(const GuestExecutionScope &) = delete;
-        GuestExecutionScope &operator=(const GuestExecutionScope &) = delete;
-    };
-
-    class GuestExecutionReleaseScope
-    {
-    public:
-        explicit GuestExecutionReleaseScope(PS2Runtime *) noexcept {}
-        ~GuestExecutionReleaseScope() = default;
-
-        GuestExecutionReleaseScope(const GuestExecutionReleaseScope &) = delete;
-        GuestExecutionReleaseScope &operator=(const GuestExecutionReleaseScope &) = delete;
-    };
-
     bool replaceFunction(uint32_t address, RecompiledFunction func);
     // TODO remove this later need to update all tests
     bool registerFunction(uint32_t address, RecompiledFunction func);
@@ -585,12 +572,29 @@ public:
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
-    void dispatchLoop(uint8_t *rdram, R5900Context *ctx);
     void drainCompletedDmacHandlers(uint8_t *rdram);
-    bool shouldPreemptGuestExecution();
+
     void requestStop();
     void requestStopFlagOnly();
     bool isStopRequested() const;
+
+    EeScheduler &eeScheduler();
+    const EeScheduler &eeScheduler() const;
+    void postEeEvent(EeEvent event);
+    bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
+    [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
+
+    struct EeExitHandlerRegistration
+    {
+        uint32_t function = 0;
+        uint32_t argument = 0;
+    };
+    void addEeExitHandler(int threadId, uint32_t function, uint32_t argument);
+    std::vector<EeExitHandlerRegistration> takeEeExitHandlers(int threadId);
+    void removeEeExitHandlers(int threadId);
+    bool findEeSyscallOverride(uint32_t syscallNumber, uint32_t &handler) const;
+    void setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, uint32_t handler);
+    void initializeEeKernelState(uint8_t *rdram);
 
     uint8_t Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr);
     uint16_t Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr);
@@ -660,6 +664,10 @@ private:
 
     void HandleIntegerOverflow(R5900Context *ctx);
 
+    // ps2x::iop bridge methods (selectIopRpcAbi/handleIopRpc/notifyIopSifTransfer/resetIop)
+    // deferred to Phase 7 — ps2_iop_host.cpp/PS2IopTransport don't exist in this tree yet.
+    friend class EeScheduler;
+
 private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
@@ -670,6 +678,11 @@ private:
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
+    std::unique_ptr<EeScheduler> m_eeScheduler;
+    mutable std::mutex m_eeKernelStateMutex;
+    std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
+    std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
+    std::unordered_set<uint32_t> m_eeSyscallMirrorAddresses;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;
     std::vector<GuestHeapBlock> m_guestHeapBlocks;
