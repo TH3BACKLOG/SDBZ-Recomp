@@ -231,6 +231,11 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    // SDBZ: arbitrary INTC cause dispatch, posted from interruptWorkerMain's
+    // drainPendingIntc() (a separate OS thread) via postEvent() -- dispatchIrq()
+    // itself asserts it runs on the executor thread. id = cause. See
+    // [[project_upstream_full_catchup_plan]] Phase 3c-2.
+    Intc,
 };
 
 struct EeEvent

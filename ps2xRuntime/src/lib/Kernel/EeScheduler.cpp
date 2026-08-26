@@ -133,9 +133,13 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
-                  EeEvent{EeEventType::VBlankStart, 0, 0});
+    // SDBZ: do NOT self-seed the wall-clock vblank timer here. Upstream drives
+    // vblank purely off kVBlankPeriodCycles/kVBlankPeriod real time, with no
+    // awareness of PS2X_DETERMINISM's guest-progress-quantum pacing (Stage
+    // 5.17, see Interrupt.cpp's deterministicVblankQuantum()/
+    // interruptWorkerMain()). SDBZ's IRQ worker thread is the sole source of
+    // EeEventType::VBlankStart via postEvent() instead - seeding one here too
+    // would create a second, uncoordinated vblank source racing the real one.
     publishSnapshot();
 }
 
@@ -1858,6 +1862,13 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        dispatchIrq(true, event.id);
+        break;
+    case EeEventType::Intc:
+        // SDBZ: posted by drainPendingIntc() for causes other than vblank
+        // (kIntcVblankStart/End are delivered directly via VBlankStart/End
+        // above). event.id = cause.
+        dispatchIrq(false, event.id);
         break;
     case EeEventType::Alarm:
     {
