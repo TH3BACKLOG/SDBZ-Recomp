@@ -21,13 +21,13 @@ namespace ps2_syscalls
         constexpr uint32_t kSoundDriverGuestPoolBase = 0x00120000u;
         constexpr uint32_t kSoundDriverGuestPoolLimit = 0x00200000u;
 
-        SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx)
+        SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
             event.op = op;
             event.pc = ctx ? ctx->pc : 0u;
             event.ra = ctx ? getRegU32(ctx, 31) : 0u;
-            event.threadId = static_cast<uint32_t>(g_currentThreadId);
+            event.threadId = runtime ? static_cast<uint32_t>(runtime->eeScheduler().currentThreadId()) : 0u;
             return event;
         }
 
@@ -762,46 +762,6 @@ namespace ps2_syscalls
     namespace
     {
 
-        bool signalRpcCompletionSema(uint32_t semaId)
-        {
-            if (semaId == 0u || semaId > 0xFFFFu)
-            {
-                return false;
-            }
-
-            auto sema = lookupSemaInfo(static_cast<int>(semaId));
-            if (!sema)
-            {
-                return false;
-            }
-
-            bool signaled = false;
-            int wokenTid = 0;
-            ps2sched::FiberToken wokenToken{};
-            {
-                std::lock_guard<std::mutex> lock(sema->m);
-                if (!sema->deleted && sema->count < sema->maxCount)
-                {
-                    sema->count++;
-                    signaled = true;
-                    if (!sema->waitList.empty())
-                    {
-                        wokenTid   = sema->waitList.front().first;
-                        wokenToken = sema->waitList.front().second;
-                        sema->waitList.erase(sema->waitList.begin());
-                    }
-                }
-            }
-
-            if (wokenTid != 0)
-            {
-                // Called from the RPC worker (non-guest host thread). Use the
-                // validated variant to avoid stale wakeups if the tid was recycled.
-                ps2sched::enqueue_external_wakeup_validated(wokenTid, wokenToken);
-            }
-            return signaled;
-        }
-
         const char *dtxUrpcCommandName(uint32_t command)
         {
             switch (command)
@@ -1281,6 +1241,15 @@ namespace ps2_syscalls
             dtxConsumeActivePs2RnaStreamsLocked();
         }
 
+        bool signalRpcCompletionSema(PS2Runtime *runtime, uint32_t semaId)
+        {
+            if (!runtime || semaId == 0u || semaId > 0xFFFFu)
+            {
+                return false;
+            }
+            return runtime->eeScheduler().signalSemaphore(static_cast<int>(semaId), true) >= 0;
+        }
+
     } // namespace
 
     void noteDtxSifDmaTransfer(uint8_t *rdram, uint32_t srcAddr, uint32_t dstAddr, uint32_t sizeBytes)
@@ -1569,7 +1538,7 @@ namespace ps2_syscalls
             g_soundDriverRpcState.initialized = false;
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("InitRpc", ctx);
+        SifRpcDebugEvent event = makeRpcDebugEvent("InitRpc", ctx, runtime);
         event.result = 0;
         pushSifRpcDebugEventLocked(event);
         setReturnS32(ctx, 0);
@@ -1597,7 +1566,7 @@ namespace ps2_syscalls
 
         if (!client)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx);
+            SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx, runtime);
             event.clientPtr = clientPtr;
             event.sid = rpcId;
             event.mode = mode;
@@ -1689,7 +1658,7 @@ namespace ps2_syscalls
             }
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx);
+        SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx, runtime);
         event.clientPtr = clientPtr;
         event.serverPtr = serverPtr;
         event.sid = rpcId;
@@ -1706,7 +1675,7 @@ namespace ps2_syscalls
         // Nowait completion uses. Bounded log so we can confirm which sid was signalled.
         if (gameBindWaitSema > 0)
         {
-            const bool signalled = signalRpcCompletionSema(static_cast<uint32_t>(gameBindWaitSema));
+            const bool signalled = signalRpcCompletionSema(runtime, static_cast<uint32_t>(gameBindWaitSema));
             static std::atomic<uint32_t> s_bindSignalLogs{0u};
             if (s_bindSignalLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
             {
@@ -1852,7 +1821,7 @@ namespace ps2_syscalls
 
         if (!client)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx);
+            SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx, runtime);
             event.clientPtr = clientPtr;
             event.rpcNum = rpcNum;
             event.sid = boundSidHint;
@@ -1981,7 +1950,7 @@ namespace ps2_syscalls
                     {
                         semaId = endParam;
                     }
-                    (void)signalRpcCompletionSema(semaId);
+                    (void)signalRpcCompletionSema(runtime, semaId);
                 }
             }
         }
@@ -2662,7 +2631,7 @@ namespace ps2_syscalls
                 {
                     semaId = endParam;
                 }
-                (void)signalRpcCompletionSema(semaId);
+                (void)signalRpcCompletionSema(runtime, semaId);
                 if (rdram && soundCompat.busyFlagAddr != 0u && soundCompat.matchesClearBusyCallback(endFunc))
                 {
                     if (uint32_t *busy = reinterpret_cast<uint32_t *>(getMemPtr(rdram, soundCompat.busyFlagAddr)))
@@ -2679,7 +2648,7 @@ namespace ps2_syscalls
                 {
                     semaId = endParam;
                 }
-                const bool fallbackSignaledSema = signalRpcCompletionSema(semaId);
+                const bool fallbackSignaledSema = signalRpcCompletionSema(runtime, semaId);
 
                 static uint32_t unresolvedEndFuncWarnCount = 0;
                 if (unresolvedEndFuncWarnCount < 32u)
@@ -2734,7 +2703,7 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].busy = false;
         }
 
-        SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx);
+        SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx, runtime);
         event.clientPtr = clientPtr;
         event.serverPtr = serverPtr;
         event.sid = sid;
@@ -2777,7 +2746,7 @@ namespace ps2_syscalls
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
         {
-            SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx);
+            SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx, runtime);
             event.serverPtr = sdPtr;
             event.sid = sid;
             event.sendBuf = buf;
@@ -2859,7 +2828,7 @@ namespace ps2_syscalls
         }
 
         RUNTIME_LOG("[SifRegisterRpc] sid=0x" << std::hex << sid << " sd=0x" << sdPtr << std::dec);
-        SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx);
+        SifRpcDebugEvent event = makeRpcDebugEvent("RegisterRpc", ctx, runtime);
         event.serverPtr = sdPtr;
         event.sid = sid;
         event.sendBuf = buf;
