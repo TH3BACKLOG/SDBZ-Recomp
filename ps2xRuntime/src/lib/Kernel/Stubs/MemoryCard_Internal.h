@@ -79,6 +79,7 @@ namespace ps2_stubs::mc_internal
     extern int32_t g_mcNextFd;
     extern int32_t g_mcLastCmd;
     extern int32_t g_mcLastResult;
+    extern bool g_mcCommandPending;
     extern std::unordered_map<int32_t, McOpenFile> g_mcFiles;
     extern std::array<McPortState, 2> g_mcPorts;
 

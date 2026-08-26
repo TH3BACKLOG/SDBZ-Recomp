@@ -17,6 +17,12 @@ ps2xRuntime/include/ps2_recompiled_functions.h
 ps2xRuntime/include/ps2_recompiled_stubs.h
 ps2xRuntime/outputbuild-*/
 
+# Android/IDE build artifacts (upstream PR #179)
+android/app/.cxx/
+android/local.properties
+android/.gradle/
+.idea/
+
 # ---------------------------------------------------------------------------
 # RECOMPILED GAME CODE — must never be committed.
 #

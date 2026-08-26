@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 8 CACHE STRING "Unity build batch size for ps2EntryRunner")
 set(PS2X_RUNNER_CL_JOBS 6 CACHE STRING "cl.exe /MP worker count for ps2EntryRunner")
+option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 option(PS2X_FIBER_PTHREAD "Build the pthread fiber backend on a non-Vita host (for TSan/ASan testing)" OFF)
 # PS2X_SANITIZE is declared and applied in the top-level CMakeLists.txt so the
@@ -43,6 +44,12 @@ if((CMAKE_C_COMPILER MATCHES "arm-vita-eabi") OR
     set(PS2X_IS_VITA ON)
 endif()
 
+set(PS2X_IS_ANDROID OFF)
+
+if(ANDROID)
+    set(PS2X_IS_ANDROID ON)
+endif()
+
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
 set(PS2X_VITA_APP_NAME "PS2 Retro X" CACHE STRING "Display name for the Vita bubble")
 set(PS2X_VITA_TITLEID "RANJ00001" CACHE STRING "9-character Vita title id")
@@ -67,6 +74,10 @@ else()
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
+    if(PS2X_IS_ANDROID)
+        set(PLATFORM "Android" CACHE STRING "" FORCE)
+    endif()
+
     FetchContent_Declare(
         raylib
         GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
@@ -75,6 +86,7 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
+    if(NOT PS2X_IS_ANDROID)
     FetchContent_Declare(
         imgui
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -149,6 +161,7 @@ else()
 
         find_package(OpenGL REQUIRED)
     endif()
+    endif() # NOT PS2X_IS_ANDROID
 endif()
 
 if(PS2X_SANITIZE STREQUAL "thread" AND NOT PS2X_FIBER_PTHREAD)
@@ -196,6 +209,8 @@ if(PS2X_IS_VITA)
         libIMGEGL_stub_weak
         libgpu_es4_ext_stub_weak
         libGLESv2_stub_weak
+        libGL_stub_weak
+        libGLESv1_CM_stub_weak
     )
 
     set(PS2X_VITA_INCLUDE_DIRS
@@ -226,19 +241,21 @@ if(PS2X_IS_VITA)
 
     function(ps2x_find_vita_library out_var library_name)
         string(MAKE_C_IDENTIFIER "${library_name}" library_id)
-        find_library(${out_var}
+        set(cache_var "PS2X_VITA_LIB_${library_id}")
+
+        find_library(${cache_var}
             NAMES "${library_name}" "${library_name}.a" "lib${library_name}.a"
             PATHS "${PS2X_VITA_LIBRARY_DIR}"
             NO_DEFAULT_PATH
         )
 
-        if(NOT ${out_var})
+        if(NOT ${cache_var})
             message(FATAL_ERROR
                 "Could not find Vita library '${library_name}' under ${PS2X_VITA_LIBRARY_DIR}. "
                 "Install Quenom/raylib-5.5-vita and its SDL2/PVR dependencies into VitaSDK first.")
         endif()
 
-        set(${out_var} "${${out_var}}" PARENT_SCOPE)
+        set(${out_var} "${${cache_var}}" PARENT_SCOPE)
     endfunction()
 
     set(PS2X_VITA_RESOLVED_LIBRARIES "")
@@ -258,6 +275,10 @@ if(PS2X_IS_VITA)
     )
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
+
+    if(PS2X_IS_ANDROID)
+        target_link_libraries(ps2_host_backend INTERFACE log android)
+    endif()
 endif()
 
 # Standalone RecompDebugger GUI's ImGui build: SDL2 + OpenGL3 backends plus
@@ -290,7 +311,18 @@ if(WIN32 AND NOT PS2X_IS_VITA)
     endif()
 endif()
 
-if(WIN32)
+if(PS2X_IS_ANDROID)
+    set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
+else()
+    set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
+endif()
+
+option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
+
+if(NOT PS2X_ENABLE_FFMPEG)
+    message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
+    add_library(ffmpeg INTERFACE)
+elseif(WIN32)
     include(ExternalProject)
 
     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
@@ -467,6 +499,10 @@ if(PS2X_STRICT_RETURN_DIAGNOSTICS)
     )
 endif()
 
+target_compile_definitions(ps2_runtime PRIVATE
+    PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
+)
+
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
 )
@@ -494,9 +530,17 @@ elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
 endif()
 
-add_executable(ps2EntryRunner
-    ${RUNNER_SRC_FILES}
-)
+if(PS2X_IS_ANDROID)
+    add_library(ps2EntryRunner SHARED
+        ${RUNNER_SRC_FILES}
+    )
+
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--undefined=ANativeActivity_onCreate")
+else()
+    add_executable(ps2EntryRunner
+        ${RUNNER_SRC_FILES}
+    )
+endif()
 
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     set_target_properties(ps2EntryRunner PROPERTIES
@@ -526,6 +570,28 @@ foreach(_bomb IN LISTS PS2X_OPT_BOMB_SOURCES)
         endif()
     endif()
 endforeach()
+
+if(PS2X_ENABLE_RUNNER_PCH)
+    set(PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
+    )
+
+    foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
+            list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
+        endif()
+    endforeach()
+
+    list(APPEND PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_stubs.h"
+    )
+
+    target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
+endif()
 
 if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
     target_compile_definitions(ps2EntryRunner PRIVATE
@@ -580,7 +646,7 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
-if(NOT PS2X_IS_VITA)
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )
@@ -602,13 +668,33 @@ if(NOT PS2X_IS_VITA)
 endif()
 
 if(PS2X_IS_VITA)
-    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1") 
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
     if(PS2X_VITA_CREATE_PACKAGE)
+        set(PS2X_VITA_VPK_FILES "")
+
+        foreach(PS2X_VITA_MODULE IN ITEMS
+            libgpu_es4_ext.suprx
+            libIMGEGL.suprx
+            libGLESv2.suprx
+            libpvrPSP2_WSEGL.suprx
+            libGL.suprx)
+            set(PS2X_VITA_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vita/module/${PS2X_VITA_MODULE}")
+
+            if(EXISTS "${PS2X_VITA_MODULE_PATH}")
+                list(APPEND PS2X_VITA_VPK_FILES FILE "${PS2X_VITA_MODULE_PATH}" "module/${PS2X_VITA_MODULE}")
+            else()
+                message(WARNING
+                    "Missing ${PS2X_VITA_MODULE_PATH}; the vpk will rely on ur0:data/external/ for it")
+            endif()
+        endforeach()
+
         vita_create_self(eboot.bin ps2EntryRunner UNSAFE)
         vita_create_vpk(ps2EntryRunner.vpk ${PS2X_VITA_TITLEID} eboot.bin
             VERSION ${PS2X_VITA_VERSION}
             NAME ${PS2X_VITA_APP_NAME}
+            ${PS2X_VITA_VPK_FILES}
         )
     endif()
 endif()
@@ -760,13 +846,27 @@ if(WIN32 AND NOT PS2X_IS_VITA AND TARGET ps2x_imgui_lib AND DEBUGGER_SRC_FILES)
     )
 endif()
 
+# Vita: Work around for GCC 10's LTO plugin
+if(PS2X_IS_VITA)
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_vita_runtime.cpp)
+    set_source_files_properties(src/lib/ps2_vita_runtime.cpp PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
+        COMPILE_OPTIONS "-fno-lto"
+    )
+endif()
+
+if(PS2X_IS_ANDROID)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
+endif()
+
 install(TARGETS ps2_runtime ps2EntryRunner
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
 
-if(WIN32)
+if(WIN32 AND PS2X_ENABLE_FFMPEG)
     install(DIRECTORY "${FFMPEG_BIN_DIR}/"
         DESTINATION bin
         FILES_MATCHING

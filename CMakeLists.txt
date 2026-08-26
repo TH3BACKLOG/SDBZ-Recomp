@@ -19,6 +19,14 @@ option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)
 option(PS2X_BUILD_TEST "Build ps2xTest" ON)
 option(PS2X_BUILD_STUDIO "Build ps2xStudio" ON)
 
+if(ANDROID)
+    message(STATUS "Android target detected, building runtime only")
+    set(PS2X_BUILD_RECOMP OFF)
+    set(PS2X_BUILD_ANALYZER OFF)
+    set(PS2X_BUILD_TEST OFF)
+    set(PS2X_BUILD_STUDIO OFF)
+endif()
+
 # Sanitizer flags must apply to EVERY target that links ps2_runtime (including
 # ps2x_tests in a sibling directory), so they are set here at the root rather
 # than inside ps2xRuntime/. PS2X_SANITIZE=thread additionally requires

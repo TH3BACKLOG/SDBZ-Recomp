@@ -1219,6 +1219,7 @@ namespace ps2_syscalls
             const uint8_t *srcPtr = getConstMemPtr(rdram, src);
             if (destPtr && srcPtr)
             {
+                ps2TraceGuestRangeWrite(rdram, dest, size, "syscallCopy", ctx);
                 std::memcpy(destPtr, srcPtr, size);
             }
         }
