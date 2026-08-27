@@ -1,3 +1,122 @@
+## HANDOFF 2026-08-27 (session 4, part 7) — Phase 8 (ps2xTest reconciliation) CLOSED. All 6 previously-uncharacterized files now read. 8-phase catchup plan is DONE.
+
+Read every file left uncharacterized in part 6. Same "SDBZ ahead" pattern held
+for 5 of 6; one genuine production-code gap found and deliberately deferred
+per user decision; one real test file ported.
+
+**`ps2_memory_tests.cpp` — SDBZ ahead, no action.** Upstream *removed* its
+deterministic per-cycle EE timer tests (independent per-timer COUNT/MODE/COMP,
+Timer2 compare/overflow raising INTC_TIM2, EQUF/OVFF latch-and-clear-on-write,
+ZRET) in favor of a simpler host-time `sleep_for`-based single test. SDBZ kept
+the hardware-accurate deterministic tests. The `GSPSMCT32::addrPSMCT32` vs
+`GSMem::LookupPixelAddressCT32` diff is just Phase 4's deferred GS-split
+naming, expected.
+
+**`ps2_sif_dma_tests.cpp` — mostly SDBZ ahead, but surfaced one real,
+verified production-code gap:** SDBZ's `sceSifAllocIopHeap`
+(`kIopHeapBase`/`kIopHeapLimit` in
+[Support.h:39-40](ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h:39))
+still hands out addresses at `0x01A00000`-`0x01F00000` — **inside real EE
+RDRAM** — and `allocateSifHeapBlock` is bookkeeping-only, so any DMA/guest
+read-write to that range passes straight through to live `rdram[address]`.
+Upstream (`14b1e5cb`) fixed this: moved the range to `0x04000000`-`0x04500000`
+(outside `PS2_RAM_SIZE`) backed by a dedicated `g_sifHeapStorage` array,
+intercepted via `isSifIopHeapAddress`/`readSifIopHeap`/`writeSifIopHeap` in
+the DMA path. SDBZ's own upstream-inherited test even names the failure mode:
+"IOP DMA must not overwrite the old 0x01A00000 EE alias range." **User
+decision: defer, don't port** — real risk only if the game actually touches
+that EE RAM range for something else, which isn't yet confirmed; revisit if a
+memory-corruption symptom ever points there. The scheduler-based DMAC-handler
+test upstream has was correctly simplified in SDBZ (now uses direct syscalls
+instead of a full `eeScheduler().run()` loop) because SDBZ has a *dedicated*
+`register_scheduler_dmac_guest_dispatch_tests()` suite covering that ground
+separately (see expansion-tests finding below).
+
+**`ps2_sif_rpc_tests.cpp` — SDBZ ahead, no action.** Missing tests
+(MCSERV/DBCMAN/LIBSD-via-bridge, DTX-dispatcher) are all Phase-7
+bridge-dependent, already decided. The one non-bridge-looking miss ("RECVX
+sound callbacks complete in HLE...") is superseded by SDBZ's own two new
+tests ("snddrv HLE dispatches all configured subcommand semantics" /
+"...unconfigured layout is inert") — a generalized, table-driven
+`handleSoundDriverRpcService`/`PS2SoundDriverCompatLayout` mechanism that
+replaces upstream's per-game hardcoded SID/callback constants. Confirmed by
+reading both: SDBZ's "stop" subcommand test covers the same busy-flag-clear
+behavior upstream's RECVX-specific test checked, just generically.
+
+**`ps2_runtime_interrupt_tests.cpp` — SDBZ ahead, one narrow test-only gap
+noted.** SDBZ (1055 lines vs upstream's 616) replaced old
+`ps2_scheduler`/fiber-era tests (VBlank deadline/IRQ invocation,
+"scheduler stop wakes an idle VSync wait") with new `EeScheduler`-era
+equivalents (`WaitVSyncTick returns when runtime stop is requested`, INTC
+pending-cause age-window tests, MMIO DMAC-dispatch-from-CHCR tests) — expected
+given Phase 3 fully retired the old scheduler. One real gap: upstream has
+IRQ-ordering unit tests for `iSignalSema`/`DelayThread`-via-Timer2
+("defers selection until IRQ return", "wakes a DelayThread-style semaphore
+wait") with no SDBZ equivalent anywhere in the test tree (grepped all of
+`ps2xTest/src/`). Both syscalls exist and are implemented in production code
+(`Kernel/Syscalls/Sync.cpp`) — this is a test-coverage gap only, not a known
+behavior bug. Not ported (would need behavior verification against SDBZ's
+actual EeScheduler IRQ-return ordering, which needs a build to check).
+
+**`ps2_recompiler_tests.cpp` — clean SDBZ ahead, confirmed by diff, no
+action.** 38 SDBZ tests vs 17 upstream; the full sorted-name diff has **zero
+`<` lines** (zero upstream tests missing from SDBZ) — pure superset. The 21
+extras cover external-call-target collection, data-embedded thread-entry
+decoding, oversized-TU manifests, and the giant-function O1 pipeline.
+
+**`ps2_runtime_kernel_tests.cpp` — clean SDBZ ahead, confirmed, no
+action. Also closes out the previously-open question about
+`ps2_runtime_expansion_tests.cpp`.** The 15 tests only upstream has are all
+old `ps2_scheduler`/`ps2_fiber`-API tests (`RotateThreadReadyQueue`,
+"EE scheduler selects absolute priority then FIFO", "SetSyscall override runs
+as a scheduler invocation," etc.) — verified every one has a direct, often
+more rigorous, equivalent already in
+`ps2_runtime_expansion_tests.cpp`'s ~29 dedicated scheduler suites (e.g.
+`ChangeThreadPriority raises X above Y causing X to preempt Y`,
+`RotateThreadReadyQueue reorders equal-priority ready fibers`, `DeleteSema
+wakes all N waiters with KE_WAIT_DELETE via pair-based drain`). SDBZ's 12
+additions (thread/semaphore EE-layout-decode tests, syscall-override
+fallback tests) are real additive coverage. **This confirms the part-6 "5.4x
+bigger, SDBZ ahead" read on `ps2_runtime_expansion_tests.cpp` was correct —
+no further action needed there.**
+
+**`ps2_gs_tests.cpp` — blocked on Phase 4, not reconcilable without undoing
+that decision.** Confirmed via include-list diff: upstream's version is
+built entirely against the split `runtime/gs/gs_frontend.h` +
+`ps2_gs_memory.h`/`ps2_gs_psmct32.h`/`ps2_gs_psmt4.h`/`ps2_gs_psmt8.h`
+headers from the deferred GS refactor. SDBZ's version uses the monolithic
+`runtime/ps2_gs_gpu.h`. No separate action possible here; tied 1:1 to the
+already-made Phase 4 deferral.
+
+**Ported: `ps2_vu_tests.cpp` (upstream-only, 1045 lines, VU0 macro-mode
+coverage).** Every function name the test calls (`sceVu0MulMatrix`,
+`sceVu0RotMatrixX`, `sceVu0ecossin`, etc. — 63 distinct calls) already
+exists with an identical signature in SDBZ's own independent VU0 stub
+(`Kernel/Stubs/VU.h`, introduced in old commit `0a619813` "Feature/runtime
+ecosystem refactor (#107)" — predates and is unrelated to upstream's own
+VU0 PR #183). Cross-checked every call resolves in SDBZ's headers/test
+tree before copying. Zero production-code changes; pure additive test
+coverage for a subsystem that had none. Wired into `main.cpp` and
+`ps2xTest/CMakeLists.txt`. Committed `a0d26d73`. **Not yet build-verified**
+(user runs builds).
+
+**Phase 8 is now CLOSED — this closes the whole 8-phase catchup plan.**
+Two things still need a user-run build to actually take effect:
+1. Phase 5's `#210` fix in `control_flow_analyzer.cpp` needs a recompiler
+   regen (regenerates every `fn_*.cpp` in `runner/`) before it does anything.
+2. This session's `register_ps2_iop_tests()` fix and the new
+   `ps2_vu_tests.cpp` need `ps2x_tests.exe` rebuilt to confirm they actually
+   compile/link/pass.
+
+**Known deferred items, not bugs, intentionally left open:**
+- IOP heap aliasing gap above (production code, user said defer).
+- `iSignalSema`/`DelayThread` IRQ-ordering test gap (test-only).
+- Phase 4's GS frontend/backend split (whole subsystem, user said defer).
+- Phase 7's ADX audio IOP-bridge gap (whole subsystem, narrow, already
+  reasoned through in Stage 5.16/5.17).
+
+---
+
 ## HANDOFF 2026-08-27 (session 4, part 6) — Phase 8 (ps2xTest reconciliation) STARTED, one real fix landed, large reconciliation work characterized but NOT done. Checkpoint, not closed.
 
 Compared SDBZ's `ps2xTest/src/*.cpp` file list against upstream tip
