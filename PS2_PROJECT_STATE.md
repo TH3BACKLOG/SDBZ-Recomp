@@ -1,3 +1,66 @@
+## HANDOFF 2026-08-27 (session 4, part 2) — Phase 4 (#204 GS refactor): SPLIT DEFERRED by user decision. Phase 4 CLOSED at type-layer-only scope.
+
+Continued from the part-1 entry directly below. Started sub-phase 4b (the actual
+content port) by reading `ps2_gs_gpu.h` in full and tracing real call sites in
+`ps2_gs_gpu.cpp` for the CLUT/texture-page-cache methods, to build an exact
+member-by-member frontend/backend split map before writing any new code.
+
+**What that tracing found:**
+- `ReloadClutCache`/`InvalidateTexturePageCache` etc. are called as immediate
+  side effects of register writes (`GS_REG_TEX0_1/2` → `ReloadClutCache`,
+  `GS_REG_TEXFLUSH` → `InvalidateTexturePageCache`, in `writeRegisterPacked`),
+  not lazily during rasterization. Confirmed via direct grep + read of
+  `ps2_gs_gpu.cpp` lines 4930-4990 and 5171-5177. This means the frontend needs
+  a way to command these on the backend — upstream's own `GSRasterBackend`
+  interface has no such methods (upstream has no CLUT cache at all), so I
+  extended `gs_backend.h` with 6 SDBZ-only methods (`ReadTexturePageCache`,
+  `ReloadTexturePageCache`, `InvalidateTexturePageCache`, `ReadClutCache`,
+  `ReloadClutCacheCSM1`, `ReloadClutCacheCSM2`, `ReloadClutCache`) mirroring
+  `GS`'s existing public API 1:1. **This edit is committed and kept** — it's a
+  correct, low-risk addition regardless of the split decision below.
+- Also found a `PresentProbe` local-struct diagnostic (destructor spans
+  roughly `ps2_gs_gpu.cpp` lines 1833-2900+, feeds the `[vramcen]`/`[clutlive]`
+  probes used in stages 5.14-5.17) whose destructor reads fields that would
+  land on **both** sides of a real split in the same block: frontend-owned
+  `m_hostPresentationFrame`/`m_hostPresentationWidth` alongside backend-owned
+  `m_vram`/`m_clut_cache`. Not an isolated case — `ps2_gs_gpu.cpp` is full of
+  this kind of diagnostic scaffolding built up across stages 5.8-5.17, layered
+  directly on top of the rendering internals, not cleanly separable from them.
+
+**Decision point raised with user:** full hand-port of all 6527+3085 lines into
+a real `GSCpuBackend` (matching upstream's architecture exactly, multi-session
+effort, real risk of silent rendering regressions with no build/run available
+to verify against) vs. deferring the split (keep `ps2_gs_gpu.cpp/.h` completely
+untouched and working, keep the new `gs_types.h`/`gs_backend.h` headers
+unused as scaffolding for whenever a future PR actually needs to call through
+`GSRasterBackend`).
+
+**User chose: defer the split.** Nothing in SDBZ today requires the
+frontend/backend interface to exist in order to function — it's pure
+architectural alignment with upstream, not a functional gap, and the
+regression surface (silent visual corruption in code that took multiple
+stages — 5.8/5.11/5.14-5.17 — to get render/movie-correct) isn't worth taking
+on for zero current benefit.
+
+**Phase 4 is CLOSED at this scope:**
+- ✅ 4a — type/interface layer (`gs_types.h`, `gs_backend.h`, now with the 6
+  CLUT/texture-cache methods added) — committed, unused, safe.
+- ❌ 4b/4c (frontend/backend content port) — explicitly NOT done, NOT planned.
+  `ps2_gs_gpu.cpp`/`.h` and `ps2_gs_rasterizer.cpp/.h` remain exactly as they
+  were before Phase 4 started — this is a deliberate no-op, not a gap to fill
+  later, unless a future upstream PR actually forces the issue.
+- ❌ 4d/4e/4f — moot; nothing to reconcile since nothing moved.
+
+If a future upstream PR depends on `GSRasterBackend` existing as a real
+implementation (not just a header), that PR's own catch-up phase is where this
+gets revisited — don't reopen this deferral speculatively.
+
+**Next: Phase 5** (`ps2_runtime` core + `#210`/`#214`) — not yet started. Note
+Phase 5 per the original 8-phase plan requires a user-run recompiler
+regeneration (30h+) at some point; confirm scope before diving in.
+
+---
+
 ## HANDOFF 2026-08-27 (session 4) — Phase 4 (#204 GS refactor) started; scope confirmed LARGER than Phase 3
 
 User said "continue integration, we'll worry about troubleshooting later" — proceeding
