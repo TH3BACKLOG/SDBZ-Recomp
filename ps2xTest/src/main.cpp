@@ -17,6 +17,7 @@ void register_ps2_sif_rpc_tests();
 void register_ps2_sif_dma_tests();
 void register_ps2_recompiler_tests();
 void register_ps2_runtime_expansion_tests();
+void register_ps2_iop_tests();
 void register_scheduler_tests();
 void register_scheduler_protocol_tests();
 void register_scheduler_race_tests();
@@ -81,6 +82,7 @@ int main(int argc, char **argv)
     register_ps2_sif_dma_tests();
     register_ps2_recompiler_tests();
     register_ps2_runtime_expansion_tests();
+    register_ps2_iop_tests();
     register_scheduler_tests();
     register_scheduler_protocol_tests();
     register_scheduler_race_tests();
