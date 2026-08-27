@@ -450,6 +450,23 @@ namespace
     // value observed before a freeze names the deepest function reached.
     std::atomic<uint32_t> g_lastDispatchPc{0u};
 
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-27):
+    // g_lastDispatchPc only advances on the NEXT table-dispatched call, so a
+    // syscall that never returns (a blocking primitive that mis-binds under
+    // EeScheduler's blockCurrent instead of cleanly resuming) freezes it at
+    // the SYSCALL TRAMPOLINE's address forever -- never at the syscall itself.
+    // handleSyscall stores here before dispatching and clears back to the
+    // sentinel after a normal return, so a watchdog that finds this still set
+    // has its answer directly: which EE syscall number (encoded the same way
+    // as the Dispatcher.cpp switch -- negative "i" variants are
+    // static_cast<uint32_t>(-N)) was entered, and the guest PC ($ctx->pc,
+    // i.e. approximately the syscall instruction's own address) that issued
+    // it. If dispatch instead unwinds via an exception rather than returning,
+    // this stays set too -- also the correct diagnostic outcome.
+    constexpr uint32_t kNoSyscallInFlight = 0xFFFFFFFFu;
+    std::atomic<uint32_t> g_syscallInFlightNumber{kNoSyscallInFlight};
+    std::atomic<uint32_t> g_syscallInFlightPc{0u};
+
     // Cross-thread snapshot ring (diagnostic-only, PS2_PC_WATCHDOG). The per-thread
     // DispatchHistory above is thread_local, so the watchdog (its own OS
     // thread) reads its own empty history. This global ring keeps the last N
@@ -2168,13 +2185,18 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
 
+    g_syscallInFlightNumber.store(syscallId, std::memory_order_relaxed);
+    g_syscallInFlightPc.store(ctx->pc, std::memory_order_relaxed);
+
     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
+        g_syscallInFlightNumber.store(kNoSyscallInFlight, std::memory_order_relaxed);
         return;
     }
 
     // God help you
     ps2_syscalls::TODO(rdram, ctx, this, encodedSyscallId);
+    g_syscallInFlightNumber.store(kNoSyscallInFlight, std::memory_order_relaxed);
 }
 
 void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
@@ -5345,6 +5367,17 @@ void PS2Runtime::run()
                               // callback that entered and never returned.
                               << " cb=0x"
                               << g_sdbzCb13C4F8InFlight.load(std::memory_order_relaxed)
+                              // 0xffffffff unless a syscall dispatch is in flight
+                              // right now; a value that's still set once the
+                              // syscall should long since have returned names
+                              // the EE syscall number (Dispatcher.cpp encoding)
+                              // and the guest PC that issued it -- see the
+                              // g_syscallInFlightNumber comment above for why
+                              // this survives where lastCall alone cannot.
+                              << " sysNum=0x"
+                              << g_syscallInFlightNumber.load(std::memory_order_relaxed)
+                              << " sysPc=0x"
+                              << g_syscallInFlightPc.load(std::memory_order_relaxed)
                               << std::dec
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
                 }

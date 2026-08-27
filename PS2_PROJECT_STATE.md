@@ -1,3 +1,57 @@
+## HANDOFF 2026-08-27 (session 4, part 8) — session-3 stall probe WRITTEN (unbuilt): syscall-in-flight watchdog field, per [[feedback_write_probes_dont_ask]]
+
+The 8-phase catchup plan (below) is closed; this returns to the one item still
+flagged urgent, the session-3 finding that a post-Phase-3-build-gate run of
+`ps2EntryRunner.exe` never leaves early init (`g_lastDispatchPc`/"lastCall"
+frozen at the `syscall_stub_z_35` trampoline `0x17eec0` for all 198s, `bssnz=0`
+the whole run, `.SFD` never opened). That handoff's own "next diagnostic step"
+was pre-written but not yet built: log the syscall number ($v1) + calling PC
+whenever a dispatched syscall doesn't return. Written now, not asked, per the
+standing rule that an obvious next probe gets written on sight.
+
+**What was added — `ps2xRuntime/src/lib/ps2_runtime.cpp` only, 3 sites:**
+1. Two new file-scope atomics next to `g_lastDispatchPc` (~line 451):
+   `g_syscallInFlightNumber` (sentinel `kNoSyscallInFlight = 0xFFFFFFFFu`) and
+   `g_syscallInFlightPc`.
+2. `PS2Runtime::handleSyscall` (~line 2176): stores `syscallId` + `ctx->pc`
+   into those atomics *before* calling `dispatchNumericSyscall`, and clears
+   the number back to the sentinel on every return path (both the
+   `dispatchNumericSyscall` success return and the `TODO` fallthrough).
+3. The `[watchdog]` print line (~line 5363): two new fields, `sysNum=0x...`
+   and `sysPc=0x...`, read right after the existing `cb=0x...` (0x13c4f8
+   callback-in-flight) field — same pattern, same author intent.
+
+**Why this, not a game_overrides.cpp hook.** The prior handoff's phrasing
+("a game_overrides.cpp probe") named the *style* (a lightweight in-flight
+flag set/cleared around a call, mirroring `g_sdbzCb13C4F8InFlight`), not the
+file — `handleSyscall` already lives in `ps2_runtime.cpp`, which is runtime
+code, not a generated `runner/*.cpp`, so instrumenting it directly is in
+scope per [[feedback_no_runner_file_patches]] and needs no indirection.
+
+**Why this survives where `lastCall` doesn't.** `g_lastDispatchPc` only
+advances on the *next* table-dispatched call — a syscall that blocks forever
+(the suspected EeScheduler `blockCurrent` mis-bind under an exception-unwind
+model, still unconfirmed) never produces a "next" call, so it freezes at the
+syscall's own *trampoline*, not the syscall. `sysNum=`/`sysPc=` are written
+synchronously inside `handleSyscall` itself, so if the run stalls with
+`sysNum=` still != `0xffffffff`, the next run names the exact EE syscall
+number (decode via the `Dispatcher.cpp` switch — negative "i" variants are
+`static_cast<uint32_t>(-N)`) and the guest PC that issued it, closing the
+"which syscall number" question the session-3 handoff left explicitly open.
+If dispatch instead unwinds via a C++ exception rather than returning, the
+flag *also* stays set — that's the correct diagnostic outcome, not a bug in
+the probe.
+
+**Status: UNBUILT.** Per [[feedback_user_runs_builds]] this needs a
+user-triggered incremental rebuild of `ps2EntryRunner` (touches one runtime
+`.cpp`, no header changed, so no 30h rebuild) before the next
+`launch_recomp.ps1 -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile`
+run can show `sysNum=`/`sysPc=` in the watchdog line. Read those two fields
+first in the next run's tail — they should name the blocking syscall
+directly, no further probe needed to get that far.
+
+---
+
 ## HANDOFF 2026-08-27 (session 4, part 7) — Phase 8 (ps2xTest reconciliation) CLOSED. All 6 previously-uncharacterized files now read. 8-phase catchup plan is DONE.
 
 Read every file left uncharacterized in part 6. Same "SDBZ ahead" pattern held
