@@ -1,3 +1,67 @@
+## HANDOFF 2026-08-27 (session 4, part 6) — Phase 8 (ps2xTest reconciliation) STARTED, one real fix landed, large reconciliation work characterized but NOT done. Checkpoint, not closed.
+
+Compared SDBZ's `ps2xTest/src/*.cpp` file list against upstream tip
+(`14b1e5cb`) file-by-file, then sized every file's diff (CRLF-normalized).
+
+**One concrete fix applied:** `register_ps2_iop_tests()` was DEAD CODE —
+defined in `ps2_iop_tests.cpp` (added back in Phase 2's `2ed84d64` VU1-refactor
+merge, commit message literally says "wasn't present locally") but never
+called from `main.cpp`, so it's been compiling and linking into
+`ps2x_tests.exe` this whole time without ever running. It unit-tests
+`ps2x::iop::IopSubsystem` in isolation — no `PS2Runtime`/bridge dependency, so
+this is safe regardless of Phase 7's bridge-deferral decision, and `ps2_iop`
+(the `ps2xIOP` static lib) is already linked into `ps2_test_lib` via
+`CMakeLists.txt`. Added the declaration + call. Restores real coverage, zero
+new test-writing. **Not yet build-verified.**
+
+**File-by-file characterization (CRLF-normalized diff size against upstream tip):**
+
+| File | Upstream lines | SDBZ lines | Diff size | Read? | Verdict |
+|---|---|---|---|---|---|
+| `ps2_vu1_tests.cpp` | — | — | 12 | ✅ full | Trivial — pure GS-refactor include-path/API rename (upstream's split GS API SDBZ doesn't have, per Phase 4 deferral). No action. |
+| `ps2_runtime_io_tests.cpp` | — | — | 39 | ✅ full | Trivial — cosmetic ABI-arg-passing helper refactor (stack args vs `$t0`/`$t1`), same behavior either way. No action needed, low priority to even adopt. |
+| `main.cpp` | — | — | 97→~10 after fix | ✅ full | Was missing only the one dead-code wiring gap above; otherwise SDBZ already calls MORE registration functions than upstream (all the `register_scheduler_*` suites, `register_ps2_gsdump_replay_tests`) — SDBZ ahead here too. |
+| `code_generator_tests.cpp` | — | — | 200 | partial | Diff is mostly Phase 5's own `#210` test addition (this session) plus pre-existing SDBZ-only test cases upstream lacks. Not further reconciled. |
+| `ps2_memory_tests.cpp` | 1965 | 1873 | 149 | ❌ not read | Comparable size both sides — genuine reconciliation candidate, NOT characterized yet. |
+| `ps2_sif_dma_tests.cpp` | 1138 | 1133 | 312 | ❌ not read | Nearly identical size — genuine reconciliation candidate, NOT characterized yet. |
+| `ps2_sif_rpc_tests.cpp` | 1299 | 1136 | 851 | ❌ not read | Comparable size, upstream somewhat bigger — NOT characterized yet. |
+| `ps2_runtime_interrupt_tests.cpp` | 616 | 1055 | 1200 | ❌ not read | SDBZ ~1.7x bigger — NOT characterized yet, could be ahead or genuinely divergent. |
+| `ps2_recompiler_tests.cpp` | 1089 | 2276 | 1203 | ❌ not read | SDBZ ~2x bigger — likely ahead pattern (per #210 precedent, SDBZ's recompiler is more test-covered), NOT confirmed. |
+| `ps2_gs_tests.cpp` | 4536 | 4399 | 1816 | ❌ not read | Comparable size, but upstream's version almost certainly tests the NEW GS frontend/backend split API — since Phase 4 deferred that split, this is likely NOT reconcilable without undoing that decision. Needs a read to confirm before touching. |
+| `ps2_runtime_kernel_tests.cpp` | 1537 | 1606 | 1927 | ❌ not read | Comparable size, biggest diff-to-size ratio of the "comparable size" group — genuine reconciliation candidate, NOT characterized yet. |
+| `ps2_runtime_expansion_tests.cpp` | 1491 | 8084 | 7361 | ❌ not read (structure only) | SDBZ is **5.4x bigger** — contains 21 of upstream's ~29 `register_scheduler_*`/EE-scheduler test suites already, hand-written directly in this file. Almost certainly the "SDBZ ahead" pattern like Audio.cpp/main.cpp, not a gap. |
+
+**Files that exist on only one side:**
+- Upstream-only: `ps2_vu_tests.cpp` (1045 lines, VU0-specific coverage via
+  `Kernel/Stubs/VU.h` — SDBZ has no VU0 test file at all; this is a genuine,
+  low-risk, additive porting candidate since it's pure new test coverage with
+  no production-code dependency change). `fake_iop_bad_abi.c`/
+  `fake_iop_missing_symbol.cpp`/`fake_iop_plugin.cpp` — all test the
+  `ps2xIOP` plugin-loading path, irrelevant per the Phase 7 bridge-deferral
+  decision, skip.
+- SDBZ-only: `ps2_gsdump_replay_tests.cpp`, `ps2_observability_tests.cpp`,
+  `ps2_scheduler_workload_regression_tests.cpp` (defines the other 9 of the
+  ~29 scheduler suites — combined with `ps2_runtime_expansion_tests.cpp`'s
+  21, this accounts for ALL of upstream's scheduler-test surface plus 2 SDBZ
+  extras), `recomp_override_stubs.cpp` — keep all, nothing to reconcile.
+
+**Established pattern this phase (matches Phase 6/7): SDBZ is very often AHEAD
+of upstream's test coverage, not behind.** A blind line-level "reconcile
+toward upstream" on the still-uncharacterized files risks the same mistake
+Phase 6 almost made on `Audio.cpp` — replacing SDBZ's more complete tests
+with upstream's simpler ones. Each remaining file needs an actual read before
+touching, same discipline as Phases 4/6/7, not a mechanical merge.
+
+**Phase 8 is a checkpoint, not closed.** Remaining work: read and
+characterize the 6 "not yet read" files above (`ps2_memory_tests.cpp`
+through `ps2_runtime_kernel_tests.cpp`), decide on `ps2_vu_tests.cpp`
+porting, and confirm `ps2_runtime_expansion_tests.cpp`'s 5.4x-bigger read is
+really all "SDBZ ahead" and not hiding a real gap in the parts upstream still
+differs on. This is genuinely the largest remaining piece of the whole
+8-phase plan by file count.
+
+---
+
 ## HANDOFF 2026-08-27 (session 4, part 5) — Phase 7 (ps2xIOP bridge): plan doc's premise was STALE. CLOSED, zero code changes — nothing upstream has here that SDBZ lacks.
 
 Read the plan doc's Phase 7 section fresh, then read the actual new upstream
