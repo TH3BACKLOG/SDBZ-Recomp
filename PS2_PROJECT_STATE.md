@@ -1,3 +1,55 @@
+## HANDOFF 2026-08-27 (session 4, part 3) — Phase 5 (#210, #214): #210 applied, #214 already independently fixed. Both isolated, low-risk. ⚠️ Needs user-run recompiler regen.
+
+Moved to Phase 5 per the plan doc (`C:\Users\mwlab\.claude\plans\warm-painting-kahn.md`)
+after closing Phase 4 (see part-2 entry below). Phase 5 is just two small,
+isolated upstream fixes (`git show` read in full for each, not assumed):
+
+- **#210 (`d9ea4fb6`, syscall resume-entry-point) — APPLIED, not yet built.**
+  `ps2xRecomp/src/lib/control_flow_analyzer.cpp`: the analyzer only queued
+  scheduler resume-entry-points for JAL/JALR, not `syscall`. A guest thread
+  that installs its own syscall handler via `SetSyscall` gets suspended and
+  resumed at syscall+4 by `EeScheduler`, but with no entry point registered
+  there `hasFunction()` failed and the thread went dormant instead of
+  resuming — silent, no error, looks like clean shutdown. Confirmed via grep
+  that SDBZ's `control_flow_analyzer.cpp` has the exact same pre-fix shape
+  upstream patched (same `queueResumeEntryTarget` lambda, same loop
+  structure) — applied verbatim, +8 lines. Test ported to
+  `ps2xTest/src/code_generator_tests.cpp` too (+40 lines, exact diff-stat
+  match against upstream) — `makeSyscall()` helper + one new test case,
+  inserted at the same spot upstream did (right before "resume entry targets
+  emit a top-level pc switch").
+  ⚠️ **This changes `control_flow_analyzer.cpp`, which means every `fn_*.cpp`
+  in `runner/` needs the recompiler re-run to regenerate — per the standing
+  rule, only the user runs that (30h+ full rebuild potential). Not yet done.**
+  Until that regen happens this fix has zero runtime effect (existing
+  `runner/` output was generated before this change).
+
+- **#214 (`14b1e5cb`, COP0 Status.IE) — ALREADY FIXED independently, no-op.**
+  Checked `ps2_runtime.cpp` (`PS2Runtime::PS2Runtime()`, ~line 1093) before
+  touching anything: SDBZ already sets
+  `m_cpuContext.cop0_status = COP0_STATUS_IE | COP0_STATUS_EIE` right after
+  the `memset`, with its own detailed comment tracing the exact same
+  `StartThread`/`DIntr` guard-clause bug upstream's #214 describes (both cite
+  a thread-can't-start symptom from Status defaulting to zero). This was
+  fixed here independently, at some earlier point before this catch-up effort
+  — nothing to do. Matches the Phase 1 precedent of convergent fixes
+  ("expect no-op/trivial conflict").
+
+**Phase 5 status: functionally done except the recompiler regen.** Nothing
+else in Phase 5 remains — the plan doc's expectation that "most of what
+shrank `ps2_runtime.cpp` should already be resolved as a byproduct of Phases
+2-4" doesn't apply here since Phases 2-4 were hand-reconciled, not
+`git merge`d, but there's no leftover `ps2_runtime.cpp` diff to chase because
+Phase 4 was deferred rather than merged (no upstream restructuring of
+`ps2_runtime.cpp` was ever pulled in to begin with).
+
+**Next: hand off the recompiler regen command to the user for #210 to take
+effect, then move to Phase 6** (MPEG.cpp/Audio.cpp manual merge) once that's
+done, or proceed to Phase 6 investigation in parallel since it doesn't depend
+on the regen.
+
+---
+
 ## HANDOFF 2026-08-27 (session 4, part 2) — Phase 4 (#204 GS refactor): SPLIT DEFERRED by user decision. Phase 4 CLOSED at type-layer-only scope.
 
 Continued from the part-1 entry directly below. Started sub-phase 4b (the actual
