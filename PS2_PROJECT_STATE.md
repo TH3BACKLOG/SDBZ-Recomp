@@ -1,3 +1,72 @@
+## HANDOFF 2026-08-27 (session 4) — Phase 4 (#204 GS refactor) started; scope confirmed LARGER than Phase 3
+
+User said "continue integration, we'll worry about troubleshooting later" — proceeding
+through the 8-phase plan's Phase 4. Committed sub-phase 3e's fixture fix +
+session-3 handoff first (`2dfab050`), then began Phase 4.
+
+**Scope reality check (verified via direct file/line comparison, not assumed):**
+upstream #204 (`d74a3ce1`) deletes `ps2_gs_gpu.cpp`(2961 lines)/`ps2_gs_rasterizer.cpp`
+(1102 lines) wholesale and replaces them with a `GSRasterBackend` interface +
+`gs_frontend.cpp`(1733)/`gs_cpu_backend.cpp`(1894). SDBZ's actual current files are
+**`ps2_gs_gpu.cpp`=6527 lines, `ps2_gs_rasterizer.cpp`=3085 lines** — more than
+double/triple upstream's pre-refactor size, from PR #144's CLUT cache, extra
+texture formats, zbuf, and the box-tex/texfetch/glyphfate/shadow/fbsplit/fbaddr/
+uvspan diagnostics seen in every run log's tag census. None of the "renamed" files
+in upstream's diff (`ps2_gif_arbiter`, `ps2_gs_common`, `ps2_gs_memory`, the new
+`ps2_gs_gpr.h`-equivalent) are clean moves for us — confirmed via CRLF-normalized
+diff (see [[feedback_line_ending_false_diffs]], caught the false whole-file-diff
+trap again before concluding anything) that every GS file has heavy SDBZ-only
+content layered on the old architecture. **This makes Phase 4 bigger in raw
+hand-port volume than Phase 3.**
+
+**Good news found while sizing this up:** SDBZ's `ps2_gs_gpr.h` (737 lines) already
+has a MORE evolved register model than upstream's new `gs_types.h` (315 lines) —
+SDBZ uses `Bitfield<u64,...>`-based unions for every GS register (`GSAlphaReg`,
+`GSPrimReg`, `GSTex0Reg`, etc., richer than upstream's plain-struct fields), and
+`ps2_gs_gpu.h` already has its own `GSContext`/`GSGpr` split. Upstream's
+`gs_types.h` mostly duplicates registers SDBZ already models better — its only
+genuinely NEW content is the batch/transfer/presentation orchestration types the
+`GSRasterBackend` interface needs: `GSVertex`, `GSDrawState`, `GSPrimitiveBatch`,
+`GSTransferCommand`, `GSTransferSnapshot`, `GSPresentationRequest`,
+`PresentationFrame`, `GSSyncReason`.
+
+**Revised Phase 4 sub-phase plan:**
+- **4a (IN PROGRESS)** — type/interface layer. Added `ps2xRuntime/include/runtime/gs_types.h`
+  (new orchestration types only, built on SDBZ's existing `GSContext`/`GSPrimReg`/
+  `GSTexaReg`/`GSTexClutReg`/`GSBitBltBufReg`/`GSTrxPosReg`/`GSTrxReg`/`GSFrameReg`
+  rather than redefining them) and `ps2xRuntime/include/runtime/gs_backend.h`
+  (the `GSRasterBackend` pure-virtual interface, verbatim from upstream since it's
+  wholly new). Both are flat in `runtime/` for now (NOT yet in a `gs/` subdirectory
+  like upstream) — kept minimal-diff on purpose; the directory move is deferred to
+  4e so it doesn't tangle with the content port. ⚠️ Not yet compiled — nothing
+  includes these two files yet, so they can't break the build, but also haven't
+  been build-verified. Next in 4a: nothing else needed here; move to 4b.
+- **4b (not started)** — `gs_frontend.cpp`/`.h`: port SDBZ's GIF-packet-parsing/
+  register-dispatch logic (currently in `ps2_gs_gpu.h/.cpp`) into the new frontend
+  shape, replacing direct rasterizer calls with calls through `GSRasterBackend`.
+- **4c (not started)** — `gs_cpu_backend.cpp`/`.h`: port SDBZ's rasterizer core
+  (`ps2_gs_rasterizer.cpp`) + PR #144's CLUT cache + texture-format handling into
+  a `GSCpuBackend : GSRasterBackend` implementation.
+- **4d (not started)** — mechanical relocation: `ps2_gs_memory.h/.cpp`,
+  `ps2_gif_arbiter.h/.cpp`, `ps2_gs_common.h` — SDBZ content preserved, just
+  reconciled against upstream's minor changes to each.
+- **4e (not started)** — cross-cutting fixups: `CMakeLists.txt`, `Kernel/Stubs/GS.cpp`,
+  `ps2_runtime.h/.cpp`, VU1 core/lower call sites (the `GetCurrentVSyncTick()` arity
+  bug already flagged in Phase 3d as "same class, deliberately left for Phase 4"
+  lives in `ps2_gs_gpu.cpp` — fix it here), delete old `ps2_gs_gpu.cpp`/
+  `ps2_gs_rasterizer.cpp/.h`, do the `gs/` subdirectory move to match upstream.
+- **4f (not started)** — `ps2xTest` reconciliation (`ps2_gs_tests.cpp`,
+  `ps2_memory_tests.cpp`, `ps2_vu1_tests.cpp`, `ps2_runtime_expansion_tests.cpp`) —
+  likely folds into Phase 8 alongside 3e's remaining test debt.
+
+**Not yet re-validated:** Stages 5.8-5.17 will need re-validation after Phase 4
+closes too, same as Phase 3 — GS is directly load-bearing for the movie/render
+milestones those stages depend on, and this run is already stalled short of that
+milestone under the new EeScheduler (see session-3 entry below) before Phase 4
+even touches it.
+
+---
+
 ## HANDOFF 2026-08-27 (session 3) — 🔴 LIKELY REGRESSION: post-Phase-3-build-gate run never leaves early init; two golden runs from 1-2 days ago reach `ATARI.SFD` in the same wall-clock budget
 
 **What was run.** Step 2 of "1 to 3": sanity-check the Phase 3 build-gate fixes
