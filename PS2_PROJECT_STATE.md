@@ -1,3 +1,66 @@
+## HANDOFF 2026-08-27 (session 4, part 5) — Phase 7 (ps2xIOP bridge): plan doc's premise was STALE. CLOSED, zero code changes — nothing upstream has here that SDBZ lacks.
+
+Read the plan doc's Phase 7 section fresh, then read the actual new upstream
+files it calls for (`ps2_iop_host.h`/`.cpp`, `ps2_iop_transport.h`, 669 lines
+total, saved to scratchpad and read in full) before writing anything.
+
+**First finding, before even getting to CRI_ADXI:** the plan's premise that
+this is "build 3 new files + wire in `ps2xIOP`" undersells what's already
+here. SDBZ has its own hand-built, validated, closed-stage IOP module
+implementations living directly in `ps2xRuntime/src/lib/`:
+`ps2_iop_mcman.cpp` (612 lines, closed Stage 5.12), `ps2_iop_cl.cpp` (514),
+`ps2_iop_sdrdrv.cpp` (325), `ps2_iop_dbcman.cpp` (89), `ps2_iop_audio.cpp`
+(37, dispatches `IOP_SID_LIBSD` through the real `audioBackend()`). The
+separate `ps2xIOP` static lib (extracted, unwired, from Phase 1's #170) has
+its own independent, never-tested reimplementation of the exact same
+services (`mcserv.cpp`, `clfile.cpp`, `sdrdrv.cpp`, `dbcman.cpp`,
+`libsd.cpp`). Wiring the full bridge in would mean running two competing
+implementations of already-validated subsystems side by side — same
+regression shape as Phase 4's GS split. **Put this to the user; chose to
+scope down to just the plan's named "genuinely open gap" (CRI_ADXI.IRX)
+instead of the full bridge.**
+
+**Then checked that gap itself, and it dissolved too.** The plan doc says
+CRI_ADXI's import fids `[4,5,6,11,17,18,19,20,26,28]` "still need real
+IOP-side stubs" — but `ps2_iop.cpp` lines 131-156 already contain a fully
+reasoned, deliberate design decision, NOT a TODO:
+- The sid `0x90000200` SJX/DTX handshake is answered locally rather than by
+  loading real `CRI_ADXI.IRX`, with an explicit comment addressing
+  `[[feedback_no_iop_faking]]` head-on: the DTX handle that crosses back to
+  the EE is proven (via a real-PCSX2 comparison at `0x44DAF0`) to be an
+  opaque IOP-address token the EE never dereferences, just stores and
+  echoes — so minting one loses no information, unlike ARKD_DVD's payload
+  bytes (the case that rule was written for).
+- `Kernel/Stubs/SIF.cpp` lines 1665-1688 (part of the already-CLOSED
+  Stage 5.16, `project_stage516_srd_completion.md`) hand-derives the ADX
+  stream ring's ack-advance mechanism from the guest ELF's own disassembly
+  and synthesizes the ack **count** (not fabricated stream data) to match
+  real transfers, precisely because the real IOP-side consumer inside
+  `CRI_ADXI.IRX` is never loaded.
+- Both together mean the real, current cost of not loading `CRI_ADXI.IRX` is
+  narrow and already understood: **no actual ADX audio output** (no sound
+  from movie/music streams), not a stall, crash, or faked-data violation.
+  Fixing that for real needs a whole new subsystem (a second real IOP module
+  load alongside `ARKD_DVD.IRX` + a from-scratch libsd/SPU2 backend) — this
+  is a **feature build**, not "finish an unfinished stub," and it's not
+  something upstream's own PR #170 provides either (the plan doc's own
+  caveat: "`ps2xIOP`'s `libsd.cpp` is EE-side only").
+
+**Phase 7 CLOSED with zero code changes.** There is nothing in upstream's
+`ps2xIOP` bridge that SDBZ is missing and that upstream itself actually
+solves — the bridge would only introduce redundant, unvalidated
+reimplementations of subsystems SDBZ already has working. Real ADX audio
+output remains a known, bounded, separately-scoped feature gap (not a
+catch-up item) if the user wants to pursue it later.
+
+**Next: Phase 8** (`ps2xTest` reconciliation) — the last phase in the plan.
+Folds in sub-phase 3e's already-known remaining test debt (3 test files still
+broken against `EeScheduler`, from Phase 3) alongside whatever else `+7,195/
+−13,943` of upstream test diff turns out to still be relevant after Phases
+1-7 landed in this (hand-reconciled, not merged) form.
+
+---
+
 ## HANDOFF 2026-08-27 (session 4, part 4) — Phase 6 (MPEG.cpp/Audio.cpp): MPEG got a real 1-line leak fix + ffmpeg-guard widening. Audio.cpp left UNTOUCHED — SDBZ is ahead of upstream, not behind. Phase 6 CLOSED.
 
 The plan doc sized this at "~50 hunks both directions, needs judgment merge,"
