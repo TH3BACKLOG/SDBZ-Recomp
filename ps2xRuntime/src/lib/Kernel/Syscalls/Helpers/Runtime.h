@@ -91,6 +91,147 @@ static bool readStackU32(uint8_t *rdram, uint32_t sp, uint32_t offset, uint32_t 
     return true;
 }
 
+enum class RpcInvokeExitReason
+{
+    Returned,
+    NullPc,
+    MissingFunction,
+    StepLimit,
+    SamePcLimit
+};
+
+static const char *rpcInvokeExitReasonName(RpcInvokeExitReason reason)
+{
+    switch (reason)
+    {
+    case RpcInvokeExitReason::Returned:
+        return "returned";
+    case RpcInvokeExitReason::NullPc:
+        return "null-pc";
+    case RpcInvokeExitReason::MissingFunction:
+        return "missing-function";
+    case RpcInvokeExitReason::StepLimit:
+        return "step-limit";
+    case RpcInvokeExitReason::SamePcLimit:
+        return "same-pc-limit";
+    default:
+        return "unknown";
+    }
+}
+
+// rpcInvokeFunction runs on the CALLING FIBER (the guest thread that issued
+// the RPC syscall), not on a worker thread. Do NOT wrap calls to this in
+// AsyncGuestScope -- the calling fiber already holds the guest execution slot.
+// Restored 08-26 (Phase 3 build-gate): Phase 3c-1 deleted this in favor of
+// EeScheduler::queueInvocation(), but that API is fire-and-forget (returns
+// void, no synchronous result), while RPC.cpp's 4 call sites need a
+// synchronous run-to-completion result (handled/resultPtr) right where they
+// are. Porting RPC dispatch to the async queueInvocation model is a real
+// redesign, not a build-gate fix -- kept as a bridge until that lands.
+static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
+                              uint32_t funcAddr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *outV0)
+{
+    if (!runtime || !ctx || !funcAddr || !runtime->hasFunction(funcAddr))
+        return false;
+
+    constexpr uint32_t kRpcInvokeStackSize = 0x4000u;
+    constexpr uint32_t kRpcInvokeReturnSentinel = 0x00FFF000u;
+    constexpr uint32_t kRpcInvokeMaxSteps = 0x8000u;
+
+    R5900Context tmp = *ctx;
+    setRegU32(&tmp, 4, a0);
+    setRegU32(&tmp, 5, a1);
+    setRegU32(&tmp, 6, a2);
+    setRegU32(&tmp, 7, a3);
+
+    // Per-invocation scratch stack: a fresh guest-heap region reserved for the
+    // duration of THIS invoke and released by RAII on every return path below
+    // (and on a ThreadExitException thrown out of the invoke loop). Isolates
+    // interleaving fibers -- the N=1 executor runs them all on one OS thread --
+    // AND same-fiber re-entry: a nested override or an exit-handler invoke gets
+    // its own stack and never clobbers the outer frame.
+    GuestScratchStack invokeStack(runtime, kRpcInvokeStackSize);
+    if (invokeStack.valid())
+    {
+        setRegU32(&tmp, 29, invokeStack.top());
+    }
+
+    setRegU32(&tmp, 31, kRpcInvokeReturnSentinel);
+    tmp.pc = funcAddr;
+
+    uint32_t steps = 0u;
+    uint32_t lastPc = 0xFFFFFFFFu;
+    uint32_t samePcCount = 0u;
+    RpcInvokeExitReason exitReason = RpcInvokeExitReason::MissingFunction;
+    while (tmp.pc != 0u &&
+           tmp.pc != kRpcInvokeReturnSentinel &&
+           runtime->hasFunction(tmp.pc) &&
+           steps < kRpcInvokeMaxSteps)
+    {
+        const uint32_t pc = tmp.pc;
+        if (pc == lastPc)
+        {
+            ++samePcCount;
+            if (samePcCount > 0x2000u)
+            {
+                exitReason = RpcInvokeExitReason::SamePcLimit;
+                break;
+            }
+        }
+        else
+        {
+            lastPc = pc;
+            samePcCount = 0u;
+        }
+
+        PS2Runtime::RecompiledFunction func = runtime->lookupFunction(pc);
+        func(rdram, &tmp, runtime);
+        ++steps;
+    }
+
+    if (outV0)
+    {
+        *outV0 = getRegU32(&tmp, 2);
+    }
+
+    if (tmp.pc == kRpcInvokeReturnSentinel)
+    {
+        return true;
+    }
+
+    if (tmp.pc == 0u)
+    {
+        exitReason = RpcInvokeExitReason::NullPc;
+    }
+    else if (steps >= kRpcInvokeMaxSteps)
+    {
+        exitReason = RpcInvokeExitReason::StepLimit;
+    }
+    else if (!runtime->hasFunction(tmp.pc))
+    {
+        exitReason = RpcInvokeExitReason::MissingFunction;
+    }
+
+    static std::atomic<uint32_t> s_rpcInvokeFailureLogs{0u};
+    constexpr uint32_t kMaxRpcInvokeFailureLogs = 64u;
+    const uint32_t logIndex = s_rpcInvokeFailureLogs.fetch_add(1u, std::memory_order_relaxed);
+    if (logIndex < kMaxRpcInvokeFailureLogs)
+    {
+        PS2_IF_AGRESSIVE_LOGS({
+            std::cerr << "[SyscallOverride:invoke-failed]"
+                      << " func=0x" << std::hex << funcAddr
+                      << " exitPc=0x" << tmp.pc
+                      << " ra=0x" << getRegU32(&tmp, 31)
+                      << std::dec
+                      << " steps=" << steps
+                      << " reason=" << rpcInvokeExitReasonName(exitReason)
+                      << std::endl;
+        });
+    }
+
+    return false;
+}
+
 static uint32_t rpcAllocPacketAddr(uint8_t *rdram)
 {
     if (kRpcPacketPoolCount == 0)

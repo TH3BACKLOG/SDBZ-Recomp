@@ -1333,11 +1333,12 @@ GS::GS()
     reset();
 }
 
-void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs, PS2Runtime *runtime)
 {
     m_vram = vram;
     m_vramSize = vramSize;
     m_privRegs = privRegs;
+    m_runtime = runtime;
     reset();
 }
 
@@ -1493,7 +1494,7 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
         return;
     }
 
-    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    const uint64_t tick = m_runtime ? ps2_syscalls::GetCurrentVSyncTick(m_runtime) : 0ull;
     if (m_debugLastVsyncTick == UINT64_MAX)
     {
         m_debugLastVsyncTick = tick;
@@ -4045,7 +4046,7 @@ void GS::latchHostPresentationFrameUnlocked()
     const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
     const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
     const bool applyFieldMode = smode2.interlaced && !smode2.frameMode;
-    const bool oddField = (ps2_syscalls::GetCurrentVSyncTick() & 1ull) != 0ull;
+    const bool oddField = m_runtime && ((ps2_syscalls::GetCurrentVSyncTick(m_runtime) & 1ull) != 0ull);
     const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
     const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);

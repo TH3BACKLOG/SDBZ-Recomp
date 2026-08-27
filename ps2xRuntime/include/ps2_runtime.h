@@ -35,7 +35,6 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
-#include "ps2x/iop/iop_types.h"
 
 namespace ps2x::iop
 {
@@ -581,6 +580,11 @@ public:
     const EeScheduler &eeScheduler() const;
     void postEeEvent(EeEvent event);
     bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
+    // Compat shim: control_flow_emitter.cpp emits eeCheckpointDue() now, but
+    // Kernel/recovered/*.cpp (hole-recovery output, not yet regenerated -- a
+    // ~30h ps2_recomp.exe run) still calls this old name. Remove once that
+    // regen has landed and no callers of this name remain.
+    bool shouldPreemptGuestExecution() noexcept { return eeCheckpointDue(); }
     [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
 
     struct EeExitHandlerRegistration

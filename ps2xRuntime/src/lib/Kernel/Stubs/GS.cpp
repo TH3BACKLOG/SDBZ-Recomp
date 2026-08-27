@@ -8,6 +8,16 @@ namespace ps2_stubs
 {
     namespace
     {
+        std::mutex g_gs_sync_v_mutex;
+        uint64_t g_gs_sync_v_base_tick = 0u;
+        std::mutex g_gs_sync_v_callback_mutex;
+        uint32_t g_gs_sync_v_callback_func = 0u;
+        uint32_t g_gs_sync_v_callback_gp = 0u;
+        uint32_t g_gs_sync_v_callback_sp = 0u;
+        uint32_t g_gs_sync_v_callback_stack_base = 0u;
+        uint32_t g_gs_sync_v_callback_stack_top = 0u;
+        uint32_t g_gs_sync_v_callback_bad_pc_logs = 0u;
+
         uint64_t makeClearPrim(bool useContext2)
         {
             return static_cast<uint64_t>(GS_PRIM_SPRITE) |
@@ -617,7 +627,10 @@ namespace ps2_stubs
             g_gs_sync_v_callback_stack_top = 0u;
             g_gs_sync_v_callback_bad_pc_logs = 0u;
         }
-        resetGsSyncVState();
+        {
+            std::lock_guard<std::mutex> lock(g_gs_sync_v_mutex);
+            g_gs_sync_v_base_tick = 0u;
+        }
     }
 
     void dispatchGsSyncVCallback(uint8_t *rdram, PS2Runtime *runtime, uint64_t tick)
@@ -965,6 +978,8 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
+            resetGsSyncVState(runtime);
+
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);

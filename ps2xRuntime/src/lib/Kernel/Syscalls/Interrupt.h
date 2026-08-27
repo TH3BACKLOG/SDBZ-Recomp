@@ -20,12 +20,7 @@ namespace ps2_syscalls
         };
 
         extern std::mutex g_irq_handler_mutex;
-        extern std::mutex g_irq_worker_mutex;
-        extern std::condition_variable g_irq_worker_cv;
         extern std::mutex g_vsync_flag_mutex;
-        extern std::atomic<bool> g_irq_worker_stop;
-        extern std::atomic<bool> g_irq_worker_running;
-        extern std::thread g_irq_worker_thread; // joinable worker handle
         // Written by Enable/DisableIntc(Dmac) and read by dispatchIntcHandlersForCause /
         // dispatchDmacHandlersForCause from the IRQ worker thread. Atomic (rather
         // than g_irq_handler_mutex) because the dispatch call sites read the mask
@@ -34,7 +29,6 @@ namespace ps2_syscalls
         extern std::atomic<uint32_t> g_enabled_dmac_mask;
         extern uint64_t g_vsync_tick_counter;
         extern VSyncFlagRegistration g_vsync_registration;
-        extern std::atomic<uint32_t> g_pending_intc_causes;
         constexpr uint32_t kPendingIntcMaxAgeTicks = 120u;
     }
 

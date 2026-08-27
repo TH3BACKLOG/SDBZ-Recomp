@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -195,6 +196,22 @@ extern "C" uint64_t ps2x_guest_intr_disable_redundant()
 extern "C" uint64_t ps2x_guest_intr_disable_stray()
 {
     return g_intr_disable_stray.load(std::memory_order_relaxed);
+}
+
+// Restored 08-27 (Phase 3 build-gate): de9288f8 ported every other
+// ps2x_guest_* diagnostic above out of the retired ps2_scheduler.cpp, but
+// missed this one -- Interrupt.cpp's interruptWorkerMain() still forward-
+// declares and calls it (PS2X_DET_VBLANK_QUANTUM pacing gate, see
+// [[reference_det_vblank_quantum]]), so it was left link-broken.
+extern "C" int ps2x_determinism_enabled()
+{
+    // Read once; the env var is fixed for the lifetime of the process.
+    static const int enabled = []() -> int
+    {
+        const char *e = std::getenv("PS2X_DETERMINISM");
+        return (e && *e && *e != '0') ? 1 : 0;
+    }();
+    return enabled;
 }
 
 EeScheduler::EeScheduler(PS2Runtime &runtime)
