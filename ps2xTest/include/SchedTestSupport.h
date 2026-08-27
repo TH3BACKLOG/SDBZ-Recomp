@@ -7,14 +7,15 @@
 #pragma once
 
 #include "ps2_runtime.h"
-#include "ps2_scheduler.h"
 #include "ps2_syscalls.h"
+#include "runtime/ee_scheduler.h"
 #include "runtime/ps2_memory.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -59,16 +60,21 @@ namespace ps2x_test
         return pred();
     }
 
-    // Waits for the guest executor to fully quiesce (every dispatched thread
-    // has exited and g_activeThreads has settled back to <= 0). This is the
-    // teardown/drain poll almost every scheduler workload test ends on; a
-    // thin wrap of waitUntil so call sites collapse to one line without
-    // changing the wait semantics.
-    inline bool drainedWithin(std::chrono::milliseconds timeout)
+    // Waits for the guest executor to fully quiesce (no thread running or
+    // ready). This is the teardown/drain poll almost every scheduler workload
+    // test ends on; a thin wrap of waitUntil so call sites collapse to one
+    // line without changing the wait semantics.
+    //
+    // Post-EeScheduler (Phase 3d): there is no more process-global
+    // g_activeThreads -- each PS2Runtime owns its own EeScheduler instance,
+    // so the drain check is scoped to the runtime under test via
+    // EeScheduler::isIdle() (a snapshot() read, kept fresh by publishSnapshot()
+    // after every kernel-object mutation, not just inside run()'s loop).
+    inline bool drainedWithin(PS2Runtime &runtime, std::chrono::milliseconds timeout)
     {
-        return waitUntil([]
+        return waitUntil([&]
         {
-            return g_activeThreads.load(std::memory_order_acquire) <= 0;
+            return runtime.eeScheduler().isIdle();
         }, timeout);
     }
 
@@ -129,28 +135,32 @@ namespace ps2x_test
         return next.fetch_add(size, std::memory_order_relaxed);
     }
 
-    // Owns the runtime + guest RAM a scheduler test dispatches fibers against.
-    // Construction clears residual thread/sema/handler state from a previous
-    // test (notifyRuntimeStop) and brings up a fresh scheduler epoch
-    // (scheduler_init, which also heals any g_activeThreads drift left by a
-    // prior epoch's shutdown races); destruction tears the scheduler down and
-    // requests the runtime stop, in that order, so a test body only needs to
-    // add its own test-specific drains (signaling semas it created, joining
-    // threads it spawned) before falling out of scope.
+    // Owns the runtime + guest RAM a scheduler test dispatches guest threads
+    // against.
+    //
+    // Post-EeScheduler (Phase 3d): the old ps2sched::scheduler_init()/
+    // scheduler_shutdown() pair existed because the fiber scheduler was
+    // process-global state shared across successive tests -- init healed
+    // drift left by the previous test's teardown races, shutdown tore that
+    // shared state down again. EeScheduler has no such global: `runtime` is a
+    // brand-new PS2Runtime (and therefore a brand-new, already-clean
+    // EeScheduler) per SchedFixture instance, so there is nothing left over
+    // to heal at construction. Destruction just requests the stop, mirroring
+    // PS2Runtime::requestStop()'s own production behavior (which now calls
+    // straight through to EeScheduler::requestStop() -- see
+    // ps2_runtime.cpp -- in place of the retired
+    // ps2_syscalls::notifyRuntimeStop() this fixture used to call itself).
+    //
+    // A test body only needs to add its own test-specific drains (signaling
+    // semas it created, joining threads it spawned) before falling out of
+    // scope.
     struct SchedFixture
     {
         PS2Runtime runtime;
         std::vector<uint8_t> rdram = std::vector<uint8_t>(PS2_RAM_SIZE, 0u);
 
-        SchedFixture()
-        {
-            ps2_syscalls::notifyRuntimeStop();
-            ps2sched::scheduler_init();
-        }
-
         ~SchedFixture()
         {
-            ps2sched::scheduler_shutdown();
             runtime.requestStop();
         }
     };
@@ -192,23 +202,42 @@ namespace ps2x_test
         }
     };
 
-    // RAII non-fiber host worker that parks in async_guest_begin() for the
-    // guest token (the interrupt-worker shape: g_currentThreadId == -1, so it
-    // borrows the token rather than holding a fiber's own). Replaces the
-    // hand-rolled atomic<bool> pair + std::thread duplicated across the
-    // token-handoff regression cases: a caller just needs to know when the
-    // worker won the token and when it finished; the destructor joins
-    // unconditionally so callers never have to remember to.
+    // RAII non-fiber host worker that briefly takes EeScheduler's
+    // hostInvocationMutex() -- Phase 3d's replacement for the retired
+    // ps2sched::async_guest_begin()/async_guest_end() guest-token pair
+    // (see ee_scheduler.h's hostInvocationMutex() doc comment: it is the
+    // same "a host thread wants to act while the executor might be
+    // dispatching guest code" serialization, just a plain mutex instead of a
+    // token a thread could park on). There is no more g_currentThreadId
+    // token-borrowing identity to set -- EeScheduler's single-executor model
+    // has no concept of a fiber's own identity for a non-guest thread to
+    // impersonate.
+    //
+    // ⚠️ Not a verified behavioral equivalent: the OLD token had an explicit
+    // starvation-avoidance gate (g_host_token_waiters) so a parked worker was
+    // GUARANTEED to win within bounded time even while fibers kept the run
+    // queue non-empty. A plain std::mutex only has whatever fairness the host
+    // OS/STL happens to provide around EeScheduler::run()'s own per-dispatch
+    // lock/unlock (see run()'s dispatch loop, EeScheduler.cpp) -- there is no
+    // explicit fairness gate. Tests that assert bounded-time acquisition under
+    // contention (the old token-handoff starvation regressions) need that
+    // re-verified against the new scheduler before being trusted, not just
+    // recompiled against this replacement. Left to whoever picks up the
+    // ps2xTest reconciliation this class was flagged for.
+    //
+    // A caller just needs to know when the worker won the lock and when it
+    // released it; the destructor joins unconditionally so callers never have
+    // to remember to.
     struct ParkedHostWorker
     {
         std::atomic<bool> acquired{false}, done{false};
         std::thread th;
-        ParkedHostWorker() : th([this]
+        explicit ParkedHostWorker(EeScheduler &scheduler) : th([this, &scheduler]
         {
-            g_currentThreadId = -1;
-            ps2sched::async_guest_begin();
-            acquired.store(true, std::memory_order_release);
-            ps2sched::async_guest_end();
+            {
+                std::lock_guard<std::mutex> lock(scheduler.hostInvocationMutex());
+                acquired.store(true, std::memory_order_release);
+            }
             done.store(true, std::memory_order_release);
         })
         {

@@ -1,3 +1,178 @@
+## HANDOFF 2026-08-27 (session 3) — 🔴 LIKELY REGRESSION: post-Phase-3-build-gate run never leaves early init; two golden runs from 1-2 days ago reach `ATARI.SFD` in the same wall-clock budget
+
+**What was run.** Step 2 of "1 to 3": sanity-check the Phase 3 build-gate fixes
+(commits `657e1f08`/`0667f348`) by running the exe.
+`launch_recomp.ps1 -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile`
+against `ps2EntryRunner.exe` (RelWithDebInfo). Full console tail + `run_log.txt`
+pasted/read back.
+
+**Comparison baseline (verified, not assumed).** Read the two most recently
+archived logs, `logs/archive/run_log.20260826-141501.txt` and
+`.../run_log.20260825-195843.txt` — both det=1, both ~197-198s watchdog
+duration (i.e. directly comparable to this run, not cherry-picked for length).
+Both:
+- `busy%=84-90` from `t=1s`, `vbl/s=6`, real `res/s`
+- `bssnz` climbing 11,326 → 41,746 over the run (BSS actually getting written)
+- `gstate@0x5e6b3c` transitions `0,0,0,0` → `0,0,0,1` (`gchg=1`) partway through
+- both open `\MOVIE\ATARI.SFD;1` (`.SFD` appears 22× in each log)
+
+**This run, same duration, same det=1:**
+- `busy%=0` for the entire 197s (one anomalous `busy%=19930` at the final
+  t=199 sample — almost certainly a counter artifact at auto-stop, not real)
+- `bssnz=0` for every single second — BSS never gets touched at all
+- `gstate@0x5e6b3c=0,0,0,0` never changes, `gchg=0` for the whole run
+- `vbl/s=0` constant
+- `.SFD`/`ATARI.SFD` never appears anywhere in `run_log.txt` — the movie path
+  is never reached
+- `pc=0x100008` (ELF entry) for every sample — expected on its own (documented
+  at `ps2_runtime.cpp:445-450`: the outer snapshot freezes at a function's
+  entry while its whole call tree runs), **but** `lastCall=0x17eec0` is ALSO
+  frozen for all 198 samples. `g_lastDispatchPc` (`lastCall`) is specifically
+  the counter meant to catch what the outer snapshot can't — it's documented
+  to advance on every table-dispatched call, globally, across all threads
+  (`ps2_runtime.cpp:445-451`). Frozen for 198s straight means zero new
+  top-level guest-function dispatches the entire run.
+- `0x17eec0` decompiles to `syscall_stub_z_35` (`ida_scripts/decompiles_SLUS_214_42.txt:99459`)
+  — a raw MIPS `syscall` trampoline, not game logic. So the last thing the
+  guest dispatched through the table was a syscall, and nothing has been
+  table-dispatched since.
+- Meanwhile `progress` climbs to ~30.8M and `[hostprof]` shows
+  `EeScheduler::checkpointDue` alone burning 11.8% (22.53s / 194s window) of
+  a CPU pinned at 122% of one core the whole run. `ps2x_guest_progress()`
+  increments once per 128 **intra-function back-edges**
+  (`EeScheduler.cpp:74-83`), i.e. loop iterations *inside* an
+  already-dispatched function's call tree — not at dispatch boundaries. So
+  "huge progress + frozen lastCall" is not a contradiction: the guest is
+  spinning at a very high rate inside whatever function was reached from the
+  0x17eec0 syscall call, without that spin ever bottoming out in a new table
+  dispatch, syscall return, or state change.
+
+**Verified vs hypothesis.** Verified: the regression itself (no BSS writes,
+no state change, no SFD open, frozen lastCall, all in stark contrast to two
+comparable recent golden runs). NOT yet verified: *why*. Candidates, not yet
+checked — do not act on these as fact:
+- Which syscall number 0x17eec0's trampoline carried (the trampoline is
+  generic; the number lives in `$v1` at call time, not in the trampoline
+  address) — needs a register-dump probe at that call site, not yet written.
+- Whether this is caused by the Phase 3d `EeScheduler` migration itself
+  (e.g. a blocking syscall that used to suspend-and-resume the old fiber
+  cleanly now mis-binds under `bindMainContextForSyscall`/`blockCurrent`'s
+  exception-unwind model) vs. an unrelated effect of this session's 4
+  build-gate fixes (`GetCurrentVSyncTick` arity, etc.) vs. something already
+  broken before either change that just hadn't been re-run since.
+- ~~Whether the two comparison logs predate or postdate Phase 3d~~ — CHECKED:
+  `git log` shows Phase 3d landed 08-26 18:10-19:26 (`6aa34593`→`514cb03c`).
+  Both comparison logs (08-25 19:58, 08-26 14:15) are **before** that window —
+  i.e. both golden runs were captured on the OLD `ps2sched` fiber scheduler.
+  There is no post-Phase-3d / pre-build-gate golden run to compare against,
+  because Phase 3d couldn't build+link at all until today's 4 build-gate
+  fixes landed (`657e1f08`, 02:04 today) — **this run is the first time
+  `EeScheduler` has ever driven the real game**, not a regression against an
+  otherwise-identical EeScheduler baseline. So the honest framing is: the new
+  scheduler's first live run stalls well short of where the old one got,
+  not "we broke something that used to work under EeScheduler." Narrows the
+  suspect list to EeScheduler's syscall-blocking path specifically (the
+  frozen-stack-fiber vs exception-unwind-redispatch difference already
+  flagged in this session's sub-phase 3e finding above) rather than the 4
+  build-gate symbol fixes, none of which touch scheduling/blocking semantics.
+
+**Next diagnostic step (not yet taken):** a game_overrides.cpp probe on the
+generic syscall dispatch path logging `$v1` (syscall number) + calling PC
+whenever the dispatched syscall is one the guest hasn't returned from within
+N seconds, so the next run names the actual syscall instead of just the
+trampoline address. Per [[feedback_write_probes_dont_ask]] this is a probe
+worth writing on request — not written yet, this handoff is the finding only.
+
+---
+
+## HANDOFF 2026-08-27 (session 2) — Sub-phase 3e scoped correctly: it's an architecture-level test redesign, not an API port. Fixture fixed; 3 test .cpp files deliberately left broken.
+
+**3e's logged scope was wrong.** The prior handoff named only 2 files
+(`SchedTestSupport.h`, `ps2_scheduler_workload_regression_tests.cpp`). Actual
+scope, confirmed by grep across `ps2xTest/`:
+
+| File | Lines | Retired-API hits |
+|---|---|---|
+| `SchedTestSupport.h` | 233 | shared fixture — fixed this session |
+| `ps2_scheduler_workload_regression_tests.cpp` | 1,501 | 5, but 9 suites/13 cases all built on the retired model |
+| `ps2_runtime_expansion_tests.cpp` | 8,084 | **95** |
+| `ps2_runtime_kernel_tests.cpp` | 1,606 | 8 |
+
+**The real finding: this isn't a rename job.** Confirmed by reading
+`EeScheduler::blockCurrent()` (`EeScheduler.cpp:1877-1885`) and `run()`'s
+dispatch loop (`EeScheduler.cpp:298-481`):
+- Old `ps2sched` model: each guest thread was a real OS-level fiber/coroutine.
+  A blocking call (`WaitSema` etc.) froze the actual C++ call stack via a real
+  context switch and resumed it later, mid-function, exactly where it left
+  off. Host threads could park waiting to win a shared "guest execution
+  token" (`async_guest_begin`/`async_guest_end`).
+- New `EeScheduler` model: a block throws `EeDispatcherTransfer`, unwinding
+  the WHOLE C++ stack. Resuming means re-dispatching `lookupFunction(ctx->pc)`
+  as a fresh call — there is no frozen stack, no token, no per-thread OS
+  fiber. This is correct and sufficient for real recompiled MIPS code (which
+  always keeps `ctx->pc` current before anything that might block), but fatal
+  for hand-written test step functions that do "block mid-loop, then keep
+  going in the same C++ frame after" — e.g. the old
+  `ps2_scheduler_workload_regression_tests.cpp`'s `stepInvokeRecordA`
+  (records a value, signals, waits, sets `ctx->pc` **after** the wait — that
+  last line never runs on the block path under the new model; the function
+  just gets re-entered from the top instead). A few tests happen to be
+  stateless-enough loops that restart-from-top is accidentally equivalent to
+  continue-after-block; most aren't, and mechanically porting them would
+  produce tests that compile and pass while silently not testing what their
+  names claim.
+
+**Given that, user chose (2026-08-27): fix the fixture only, leave the 3 test
+`.cpp` files broken, park the full redesign for a dedicated future session.**
+Do NOT attempt to mechanically port those 3 files without re-deriving,
+per test, whether the bug class it regression-tests can even recur under a
+single-executor exception-unwind scheduler — several structurally cannot
+(the fiber-pool/OS-thread-per-fiber races), and are candidates for deletion
+with a comment, not a port.
+
+**What's actually fixed this session** — `SchedTestSupport.h` compiles clean
+against `EeScheduler` (verify with the next `ps2xTest` build attempt, not
+done yet this session):
+- `SchedFixture`: dropped `ps2sched::scheduler_init()/scheduler_shutdown()`
+  and the retired `ps2_syscalls::notifyRuntimeStop()` call entirely. Each
+  fixture now owns a brand-new `PS2Runtime` (and therefore a brand-new
+  `EeScheduler`), so there's no more global fiber-pool state for a previous
+  test to leave dirty — the old calls existed only to heal/reset shared
+  global state that no longer exists. Destructor still calls
+  `runtime.requestStop()` (production's own `PS2Runtime::requestStop()` now
+  routes straight to `EeScheduler::requestStop()` in place of the retired
+  `notifyRuntimeStop()` — confirmed via `git show de9288f8`).
+- `drainedWithin()`: swapped the retired global `g_activeThreads` for
+  `EeScheduler::isIdle()`, scoped to the fixture's own runtime.
+  **Signature changed** — now takes `PS2Runtime &runtime` as its first
+  param (there's no global left to default to). Every call site in the 2
+  broken `.cpp` files will need updating when 3e resumes.
+- `ParkedHostWorker`: swapped `g_currentThreadId = -1` +
+  `async_guest_begin()/async_guest_end()` for
+  `std::lock_guard<std::mutex>(scheduler.hostInvocationMutex())` — the
+  EeScheduler doc comment's own named successor mechanism, not a guess.
+  **Signature changed** — constructor now takes `EeScheduler &scheduler`.
+  **Flagged, not verified**: the old token had an explicit starvation-avoidance
+  gate (`g_host_token_waiters`) guaranteeing bounded-time acquisition even
+  under fiber contention; a plain mutex has no such gate. The
+  `SchedulerTokenHandoff` suite (H1-H3) that exercises exactly this needs
+  re-verification against the new scheduler, not just a recompile, before
+  anyone trusts a green result from it.
+
+**Next for 3e (whenever picked back up)**: go file by file
+(`ps2_scheduler_workload_regression_tests.cpp` first, smallest and already
+read in full this session — 9 suites: `SchedulerTokenHandoff`,
+`SchedulerRpcLoopPark`, `SchedulerGuestContextStop`, `RuntimeAsyncStackPool`,
+`SchedulerDmacGuestDispatch`, `SchedulerRecoveryIsolation`,
+`SchedulerStackIsolation`, `SchedulerOverrideIsolation`,
+`SchedulerJoinStarvation`), and for each test case decide: still-applicable
+invariant → redesign against exception-unwind-and-redispatch semantics;
+structurally-impossible-now bug class → delete with a comment saying why.
+`ps2_runtime_expansion_tests.cpp` (95 hits) and `ps2_runtime_kernel_tests.cpp`
+(8 hits) not yet read in detail — do that before touching either.
+
+**None of this session's SchedTestSupport.h change is committed yet.**
+
 ## HANDOFF 2026-08-27 — Phase 3 BUILD-GATE PASSED: `ps2EntryRunner.exe` links clean, +04:57. Fixes committed.
 
 Four incomplete-migration gaps had to be bridged before the tree would
