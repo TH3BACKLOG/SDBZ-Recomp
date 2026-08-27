@@ -1,3 +1,170 @@
+## HANDOFF 2026-08-27 — Phase 3 BUILD-GATE PASSED: `ps2EntryRunner.exe` links clean, +04:57. Fixes committed.
+
+Four incomplete-migration gaps had to be bridged before the tree would
+compile+link. Three are the 3d-retirement class (a Phase-3d commit ported
+every sibling symbol in a family except one, leaving a still-live caller
+pointed at nothing):
+- `shouldPreemptGuestExecution()` restored as a shim in `ps2_runtime.h`
+  (header touch — full ~30k-TU rebuild cost, already paid).
+- `rpcInvokeFunction()`/`RpcInvokeExitReason` restored in
+  `Kernel/Syscalls/Helpers/Runtime.h` (header touch — same rebuild already
+  paid; `RPC.cpp`'s 4 call sites are the live callers, deferred long-term
+  port to `EeScheduler::queueInvocation()`'s async model noted in-comment).
+- `ps2x_determinism_enabled()` restored in `EeScheduler.cpp` alongside its
+  `ps2x_guest_*` diagnostic siblings (`.cpp`-only, no header — cheap
+  relink, confirmed via `git show de9288f8` diff showing it deleted
+  immediately adjacent to the correctly-ported `ps2x_guest_resumes()`).
+  Also added the now-required `#include <cstdlib>` for `std::getenv`.
+
+The 4th is the arity-mismatch class the 08-26 handoff had explicitly logged
+as "deliberately NOT fixed (Phase 4 territory)" — it turned out to actually
+block the build, so it got fixed after all, superseding that note:
+- `ps2_gs_gpu.cpp`'s `recordDebugEventUnlocked`/
+  `latchHostPresentationFrameUnlocked` called the 0-arg
+  `GetCurrentVSyncTick()` against the already-1-arg header. Fixed by
+  threading a `PS2Runtime*` through: `GS::init()` gained a `runtime`
+  param (`ps2_gs_gpu.h`), `PS2Runtime::syncCoreSubsystems()` now passes
+  `this` (`ps2_runtime.cpp`), both call sites use the stored `m_runtime`
+  (null-guarded — `latchHostPresentationFrameUnlocked` treats null as
+  even field rather than crashing). `Stubs/GS.cpp`'s `resetGsSyncVState`
+  also picked up mutex-guarded field resets as part of the same pass.
+  Left the rest of PR #204's GS refactor territory untouched — this was
+  the minimum to compile, not a GS redesign.
+
+All four found via the same method: grep the symptom file/repo for the
+symbol, `git log --all -S"<symbol>"` pickaxe when local search comes up
+empty, `git show <commit> | grep -B/-A` to pull the exact deleted body
+before restoring it verbatim with a rationale comment.
+
+**Next: sub-phase 3e** — `ps2xTest/*` (`SchedTestSupport.h`,
+`ps2_scheduler_workload_regression_tests.cpp`) still built against the
+retired `ps2sched::` API, expected broken, not yet touched. Then the
+recompiler regen for the `shouldPreemptGuestExecution` shim removal, then
+re-validate Stages 5.8/5.12/5.15/5.16/5.17 against `EeScheduler` before
+Phase 3 can close for real.
+
+## HANDOFF 2026-08-26 (session 2) — Phase 3d DONE: ps2_runtime.cpp core merged, ps2_scheduler.cpp/.h + ps2_fiber.cpp/.h retired wholesale.
+
+Continuing [[project_upstream_full_catchup_plan]] Phase 3 (EE scheduler,
+PR #184). Sub-phase 3d — the big one — is closed across 3 commits:
+`9db52003` (main.cpp + ps2_debug_panel.cpp), `de9288f8` (ps2_runtime.cpp
+core + file deletions), `514cb03c` (EeScheduler.cpp/ee_scheduler.h +
+cross-cutting fixes — a bad `git add` pathspec silently aborted staging
+these in the same batch as `de9288f8`; caught via `git status` after the
+commit, re-staged, committed separately — **lesson: never mix a
+just-deleted path into the same multi-path `git add` as still-modified
+files; the fatal on the missing pathspec aborts the whole add silently**).
+
+### What changed
+- `ps2_runtime.cpp`: retired `dispatchLoop()`/`GuestExecutionScope`/
+  `shouldPreemptGuestExecution()`/the whole mutex-handoff mechanism.
+  `run()` now spawns one `gameThread` calling
+  `m_eeScheduler->reset()`/`run()`, replacing the old
+  `ps2sched::create_fiber()` bootstrap entirely. `PS2Runtime` gained
+  `eeScheduler()`/`postEeEvent()`/`eeCheckpointDue()`/`eeWaitVSyncTicks()`/
+  `addEeExitHandler()`/`setEeSyscallOverride()`/`initializeEeKernelState()`.
+  `m_iopHost`/`m_iopSubsystem` construction deferred to Phase 7 (types are
+  forward-declared only, no definition anywhere in-tree yet — confirmed via
+  grep before touching, NOT assumed).
+- **The real work was the fallout**, discovered only by grepping every
+  remaining `ps2sched::`/`g_currentThreadId`/`AsyncGuestScope` reference
+  repo-wide before deleting the header:
+  - `ps2x_guest_progress/busy_ns/resumes/idle` + the EIE gate
+    (`ps2x_guest_intr_disable_*`, the SDBZ pool-allocator DisableIntr/
+    EnableIntr race fix) — all ported into `Kernel/EeScheduler.cpp`, NOT
+    dropped. Progress counter's "128 back-edges" cadence preserved exactly
+    (Stage 5.17's `PS2X_DET_VBLANK_QUANTUM` pacing divides by it — see
+    [[reference_det_vblank_quantum]]) by gating the increment behind an
+    identical call-count fast path inside `checkpointDue()`, the direct
+    successor of `yield_point()` at the same call sites.
+  - **New correctness fix, not just a port**: `GS.cpp`'s
+    `dispatchGsSyncVCallback` runs a recompiled guest callback DIRECTLY on
+    the IRQ worker thread (a real OS thread) — under EeScheduler's
+    single-execution-context model that races `EeScheduler::run()`'s own
+    dispatch on the game thread. Old `AsyncGuestScope` prevented exactly
+    this against the fiber pool; added `EeScheduler::hostInvocationMutex()`
+    as its replacement, locked in both places. Also fixed a latent
+    `GetCurrentVSyncTick()` arity bug in that same function (0-arg call
+    against the already-1-arg header — a downstream-call-site-not-updated
+    bug, same class as 3c-3c's `initializeGuestKernelState` fix).
+  - `Thread.cpp`'s flagged 3c-3b TODOs fixed: `g_currentThreadId` read in
+    `ps2x_stack_check()` → new `ps2x_guest_current_thread_id()`;
+    `ps2sched::force_reschedule()` in `ReferThreadStatus` → new
+    `EeScheduler::yieldIfHigherPriorityReady()`.
+  - RecompDebugger IPC hook (`RecompDbg::Update`/`CheckBreakpoint`) moved
+    from the retired `dispatchLoop()` into `EeScheduler::run()`'s own
+    per-iteration dispatch point — would have been silently dropped
+    otherwise (debugger breakpoints/live register view).
+- Deleted `ps2_scheduler.cpp/.h/_internal.h` + `ps2_fiber.cpp/.h` wholesale,
+  updated `CMakeLists.txt`. Also deleted a dead `g_currentThreadId`-based
+  init block in the `PS2Runtime` constructor (referenced
+  `ensureCurrentThreadInfo()`, which Phase 3c already deleted along with
+  `g_threads` — a leftover from before 3c, unrelated to my edits, caught by
+  the same repo-wide grep) and a dead `g_vsync_waitList` extern declaration
+  in `Interrupt.h` (definition already removed in 3c-2, only the
+  declaration was left behind).
+
+### ⚠️ Known gap, deliberately NOT fixed (Phase 4 territory)
+`ps2_gs_gpu.cpp` has a PRE-EXISTING `GetCurrentVSyncTick()` arity mismatch
+(0-arg calls against the 1-arg header) — confirmed via `git show
+f4309cd1~1`/`f4309cd1` that this predates the whole catch-up effort. Left
+alone per the plan's own precedent (Phase 2 deferred this exact file for
+the same reason: PR #204's GS refactor replaces it wholesale, so fixing it
+now is wasted work).
+
+### ⚠️ `ps2xTest` WILL fail to compile now — expected, deferred to 3e
+`SchedTestSupport.h` and `ps2_scheduler_workload_regression_tests.cpp` are
+built entirely against the retired `ps2sched::` API. This is explicitly
+sub-phase 3e's job per the plan ("3e ps2xTest/*"), not a regression from
+this session. Per [[project_msbuild_unity_parallelism]]-adjacent memory
+"Aux Target Link Failures Are Normal": `ps2x_tests` breaking is tolerated
+as long as `ps2EntryRunner` builds clean.
+
+### Next session: build-gate check, then sub-phase 3e
+**This is the actual "does the whole tree compile" moment for Phase 3** —
+first real build since Phase 3 began. Do NOT run the build — user runs
+`build.ps1`. If `ps2EntryRunner` builds clean (ignore `ps2x_tests`/
+`iop_harness` failures), sub-phase 3d is confirmed closed and 3e
+(ps2xTest reconciliation against the new EeScheduler API) is next, then
+the recompiler regen (pulled forward per the Phase 3 plan), then
+re-validate Stages 5.8/5.12/5.15/5.16/5.17 against the new scheduler
+before Phase 3 can close for real.
+
+## HANDOFF 2026-08-26 — Phase 3c-3 CLOSED (EE scheduler #184, Kernel/Syscalls/*.cpp done). Paused before 3d at user's request.
+
+Continuing [[project_upstream_full_catchup_plan]] Phase 3 (full-replace `ps2sched`
+-> `EeScheduler`, PR #184). Sub-phase 3c-3 = the four `Kernel/Syscalls/*.cpp`
+files, all now merged, resolved, and committed:
+
+| File | Commit | Notes |
+|---|---|---|
+| Sync.cpp | `c9e9192a` | byte-identical to upstream; deleted alarm-worker-thread machinery |
+| Thread.cpp | `d086a473` | kept STACKOOB guard + RecompDebugger snapshot + 5.17 yield fix; fixed a real merge bug (undeclared `runtime` in `referThreadStatusImpl`) |
+| RPC.cpp | `f7a0dc03` | kept 100% of SDBZ sound-driver/DTX/URPC dispatch untouched; only `makeRpcDebugEvent`/`signalRpcCompletionSema` rewired to EeScheduler |
+| System.cpp | `6aa34593` | kept kernel-query HLE; fixed a **latent bug in upstream's own code** (`dispatchSyscallOverride` missing `return true;`); fixed a stale 1-arg call site in `ps2_runtime.cpp` left from an earlier sub-phase |
+
+**New hard rule found this stretch:** large `git apply --3way` conflict spans
+(500-1000+ lines) in RPC.cpp were repeatedly diff-algorithm resyncs on a
+coincidental line match, not real large changes — the true diff was often
+2-3 lines. See [[feedback_large_conflict_spans_can_be_misaligned]]. Caught 3
+self-introduced structural mistakes (dropped brace, dangling conflict
+markers) before they reached a commit, via re-grepping markers after every
+`Edit` and running a brace-depth trace before every commit.
+
+**Paused here at explicit user instruction** ("Pause here for now") — did
+NOT start sub-phase 3d. Nothing at risk: all four files build-clean
+individually verified via brace-depth trace + diff-against-upstream, tree
+will not compile as a whole until 3d lands (`ps2_scheduler.cpp`/`.h` still
+present, `force_reschedule()`/`g_currentThreadId` in Thread.cpp still point
+at it — flagged in-file for 3d to fix).
+
+**Next session, resume with sub-phase 3d:** `ps2_runtime.cpp` core (fix
+`ps2_syscalls::notifyRuntimeStop()` call ~line 2994), retire
+`ps2_scheduler.cpp`/`.h` wholesale, `ps2_debug_panel.cpp`, `main.cpp` —
+excludes `ps2_iop_host.cpp` (deferred to Phase 7). This is the point where
+the whole tree should compile again for the first time since Phase 3 began.
+Do not run the build — user runs `build.ps1`.
+
 ## HANDOFF 2026-08-24h (PS2X_ORDER, 12 wrappers + 2 anchors) - CORRECTED 08-24. THE "CONTRADICTION" WAS NEVER ONE.
 
 **UNCAPPED.** `[order] total=14192 logged=14192`. Both anchors fired twice
