@@ -1,3 +1,59 @@
+## HANDOFF 2026-08-27 (session 4, part 4) — Phase 6 (MPEG.cpp/Audio.cpp): MPEG got a real 1-line leak fix + ffmpeg-guard widening. Audio.cpp left UNTOUCHED — SDBZ is ahead of upstream, not behind. Phase 6 CLOSED.
+
+The plan doc sized this at "~50 hunks both directions, needs judgment merge,"
+based on the assumption Phases 2-4 would land via real `git merge` and sweep
+these files up as a byproduct. Since Phases 1-4 were hand-reconciled instead
+(and Phase 4 deferred entirely), neither file had actually moved — checked by
+diffing straight against upstream tip (`14b1e5cb`), CRLF-normalized, same
+trap as Phase 4 (`feedback_line_ending_false_diffs`).
+
+**`MPEG.cpp` — diff was only 14 lines, not ~50 hunks. Two real changes applied:**
+1. **Leak fix (the only actual bug):** `dispatchGuestStreamCallback`'s
+   `writeMpegCallbackData` failure path returned without calling
+   `runtime->guestFree(cbDataAddr)` — the buffer is only freed via the
+   `GuestInvocation`'s `onComplete` lambda, which never runs if the invocation
+   is never queued. `git blame` traced the missing free back to the original
+   `11f47e23` (Feature/mpeg decoder #120, 2026-06-26) and confirmed via
+   `git log -p` that it was never explicitly removed by SDBZ — upstream fixed
+   this independently sometime after the two diverged. Applied verbatim.
+2. **`PS2X_HAS_FFMPEG` guard widened** to also cover the ffmpeg includes and
+   `ffmpegErrorString`/`configureFfmpegLogLevel` (previously only guarded
+   `MpegFfmpegDecoder`), matching upstream — lets a no-ffmpeg build skip the
+   headers entirely. Zero risk: `ps2xRuntime/CMakeLists.txt:503` already
+   defines `PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>` unconditionally via
+   generator expression, so the macro is always defined and SDBZ's build
+   (ffmpeg always enabled) behaves identically either way. Left SDBZ's removal
+   of upstream's redundant `#if !defined(PS2X_HAS_FFMPEG) #define ... 1
+   #endif` header fallback alone — genuinely dead code once CMake always
+   defines it, no reason to re-add.
+
+**`Audio.cpp` — deliberately left untouched.** The diff shows SDBZ is
+strictly ahead here, not behind:
+- SDBZ tracks per-core (`kLibSdCoreCount=2`) transfer state
+  (`VoiceTransferState`/`BlockTransferState` arrays); upstream has one global
+  non-per-core state.
+- SDBZ distinguishes real SDK commands `sceSdVoiceTrans` (0x80D0) from
+  `sceSdBlockTrans` (0x80E0) as genuinely different operations; upstream
+  conflates both under one "BlockTrans" handler and has no voice-transfer
+  support at all.
+- SDBZ handles the transfer-stop direction (`kLibSdTransStop`) and loop/bank
+  reporting (bit 24 of the status word, `kLibSdTransLoop`) for real
+  interleaved-loop playback position; upstream's simplified model has neither.
+- SDBZ has `kLibSdCmdVoiceTransStatus` handling; upstream doesn't.
+
+Nothing in upstream's version does anything SDBZ's doesn't already do more
+completely — merging upstream's shape in would be a functional regression
+(losing voice-transfer support, per-core isolation, and loop/stop semantics),
+not a fix. **Left alone on purpose, not a gap to revisit** unless a future
+upstream PR specifically improves on one of these areas.
+
+**Phase 6 CLOSED.** Not yet build-verified (no build run this session, per
+standing rule). **Next: Phase 7** (`ps2xIOP` bridge — build
+`ps2_iop_host.cpp/.h` + `ps2_iop_transport.h` implementing
+`ps2x::iop::IopHost`, per the plan doc's Phase 7 section) — not yet started.
+
+---
+
 ## HANDOFF 2026-08-27 (session 4, part 3) — Phase 5 (#210, #214): #210 applied, #214 already independently fixed. Both isolated, low-risk. ⚠️ Needs user-run recompiler regen.
 
 Moved to Phase 5 per the plan doc (`C:\Users\mwlab\.claude\plans\warm-painting-kahn.md`)

@@ -2,6 +2,7 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+#if PS2X_HAS_FFMPEG
 extern "C"
 {
 #include <libavcodec/avcodec.h>
@@ -9,6 +10,7 @@ extern "C"
 #include <libavutil/log.h>
 #include <libswscale/swscale.h>
 }
+#endif
 
 #include <deque>
 #include <memory>
@@ -28,6 +30,7 @@ namespace ps2_stubs
             std::vector<uint8_t> rgba;
         };
 
+#if PS2X_HAS_FFMPEG
         std::string ffmpegErrorString(int err)
         {
             std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
@@ -51,7 +54,6 @@ namespace ps2_stubs
                            });
         }
 
-#if PS2X_HAS_FFMPEG
         class MpegFfmpegDecoder
         {
         public:
@@ -1591,6 +1593,7 @@ namespace ps2_stubs
             }
             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
             {
+                runtime->guestFree(cbDataAddr);
                 return;
             }
 
