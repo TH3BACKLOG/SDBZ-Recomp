@@ -1,3 +1,63 @@
+## HANDOFF 2026-08-27 (session 4, part 9) — probe still UNCONFIRMED live: user's rebuild targeted the wrong target+config
+
+Session picked up mid-verification of part 8's probe (`sysNum=`/`sysPc=` watchdog
+fields added to `ps2_runtime.cpp`, commit `fe190f2a`). Two things happened,
+both process/build-hygiene findings, zero new code:
+
+**1. First re-check confirmed the exe was still stale.** `ls -la` on
+`build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe` showed mtime unchanged
+at 01:59, predating `fe190f2a` (04:22:51) — the probe was not in the tested
+binary. Gave the user `cmake --build "F:/SDBZ Recomp/build" --target ps2_runtime`.
+
+**2. That command was insufficient — user ran it, but it built the wrong
+thing.** The pasted build log's final line: `ps2_runtime.vcxproj ->
+F:\SDBZ Recomp\build\ps2xRuntime\Debug\ps2_runtime.lib`. Two problems with
+the command I gave, both now corrected:
+- **Wrong target.** `--target ps2_runtime` only rebuilds the static library,
+  not `ps2EntryRunner.exe` (the actual diagnostic binary) — needed
+  `--target ps2EntryRunner` to relink the exe.
+- **Wrong config.** No `--config` flag on this multi-config (VS/MSBuild)
+  generator defaulted to **Debug**, not the **RelWithDebInfo** every prior
+  run in this investigation depends on (109× guest work/sec, per
+  [[project_framerate_instrumentation]]). `ps2_runtime.cpp` *was* recompiled
+  (confirmed in the file list) but only into the Debug-config lib — the
+  RelWithDebInfo `ps2EntryRunner.exe` was not touched by this build at all.
+
+**Correction (same turn) — the raw-cmake command above was itself wrong.**
+`command_log.md` (this project's canonical command reference, per
+[[feedback_use_command_log_for_dirs]]) explicitly says "Never raw
+cmake/MSBuild" for building — the one documented exception is a single
+user-run `cmake -S ... -B ... -DPS2X_ENABLE_RUNTIME_LOGS=ON` configure step,
+already done, not a build. I reconstructed a `cmake --build` invocation
+instead of reading that file first, which is exactly the failure mode
+[[feedback_use_command_log_for_dirs]] exists to prevent. The actual
+corrected command, now handed to the user, not yet run/confirmed:
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+(full runner build, ~48 min; per `command_log.md` the config argument is
+mandatory — a bare `build.ps1` silently builds only Debug and leaves
+RelWithDebInfo untouched, the same trap as the target/config mistake above.)
+
+**Status: still UNBUILT in the config that matters.** Next session/turn:
+confirm the user ran `build.ps1 RelWithDebInfo`, check the RelWithDebInfo
+exe's mtime is now > `fe190f2a` (04:22:51) — or better, diff the run log's
+own `[runmeta] exeWritten=` line against `ps2_runtime.cpp`'s mtime per
+`command_log.md`'s own advice — then re-run the Active Runner Command above
+and read `sysNum=`/`sysPc=` from `run_log.txt` (UTF-16LE — convert before
+grepping). This closes the "which syscall" question part 8 left open.
+
+**Learned pattern for the index:** before handing the user ANY build
+command in this project, read `command_log.md`'s `## Build` section first —
+raw `cmake --build` (even with correct `--target`/`--config`) is banned here
+in favor of `build.ps1 <Config>`, and guessing cmake flags instead of
+checking the log produces a wrong command that still "succeeds" and wastes
+a full round trip. This is the same class of mistake
+[[feedback_use_command_log_for_dirs]] already names — this entry is a fresh,
+concrete instance of it, not a new rule.
+
+---
+
 ## HANDOFF 2026-08-27 (session 4, part 8) — session-3 stall probe WRITTEN (unbuilt): syscall-in-flight watchdog field, per [[feedback_write_probes_dont_ask]]
 
 The 8-phase catchup plan (below) is closed; this returns to the one item still

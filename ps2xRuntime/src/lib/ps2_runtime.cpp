@@ -467,6 +467,27 @@ namespace
     std::atomic<uint32_t> g_syscallInFlightNumber{kNoSyscallInFlight};
     std::atomic<uint32_t> g_syscallInFlightPc{0u};
 
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28):
+    // the 2026-08-28 run showed sysNum toggling 0x83/sentinel every watchdog
+    // sample rather than staying pinned non-returning -- FindAddress (0x83)
+    // is a synchronous bounded scan that always returns, so a stall pinned at
+    // its call site means the guest is RE-ISSUING it from the same PC in a
+    // tight retry loop, not blocked inside one call. These capture the a0
+    // (table start) / a1 (table end) / a2 (target) args at the same point
+    // sysNum is stored, so a frozen watchdog can show whether it's polling
+    // the same table/target every time (waiting on someone else to write it)
+    // or thrashing across different targets.
+    std::atomic<uint32_t> g_syscallInFlightA0{0u};
+    std::atomic<uint32_t> g_syscallInFlightA1{0u};
+    std::atomic<uint32_t> g_syscallInFlightA2{0u};
+
+    // 2026-08-28: sysA0/A1/A2 came back pinned (a0=0x3 a1=0x80080000 a2=0x17ee80)
+    // on the FindAddress(0x83) call sitting at the frozen PC -- that's a ~2GB
+    // scan range, not a small table. Capturing $ra (reg 31) here to find the
+    // actual guest call site and check whether a1 is legitimate or a
+    // mis-passed/uninitialized register.
+    std::atomic<uint32_t> g_syscallInFlightRa{0u};
+
     // Cross-thread snapshot ring (diagnostic-only, PS2_PC_WATCHDOG). The per-thread
     // DispatchHistory above is thread_local, so the watchdog (its own OS
     // thread) reads its own empty history. This global ring keeps the last N
@@ -2187,6 +2208,10 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
 
     g_syscallInFlightNumber.store(syscallId, std::memory_order_relaxed);
     g_syscallInFlightPc.store(ctx->pc, std::memory_order_relaxed);
+    g_syscallInFlightA0.store(getRegU32(ctx, 4), std::memory_order_relaxed);
+    g_syscallInFlightA1.store(getRegU32(ctx, 5), std::memory_order_relaxed);
+    g_syscallInFlightA2.store(getRegU32(ctx, 6), std::memory_order_relaxed);
+    g_syscallInFlightRa.store(getRegU32(ctx, 31), std::memory_order_relaxed);
 
     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
@@ -5378,6 +5403,14 @@ void PS2Runtime::run()
                               << g_syscallInFlightNumber.load(std::memory_order_relaxed)
                               << " sysPc=0x"
                               << g_syscallInFlightPc.load(std::memory_order_relaxed)
+                              << " sysA0=0x"
+                              << g_syscallInFlightA0.load(std::memory_order_relaxed)
+                              << " sysA1=0x"
+                              << g_syscallInFlightA1.load(std::memory_order_relaxed)
+                              << " sysA2=0x"
+                              << g_syscallInFlightA2.load(std::memory_order_relaxed)
+                              << " sysRa=0x"
+                              << g_syscallInFlightRa.load(std::memory_order_relaxed)
                               << std::dec
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
                 }
