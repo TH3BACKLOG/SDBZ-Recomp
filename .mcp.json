@@ -11,6 +11,10 @@
     "ghidra": {
       "command": "C:\\Users\\mwlab\\AppData\\Roaming\\ghidra\\ghidra_12.0.4_PUBLIC\\Extensions\\GhidraMCP\\data\\os\\win_x86_64\\mcp_bridge.exe",
       "args": ["--host", "localhost", "--port", "8765"]
+    },
+    "x64dbg": {
+      "command": "C:\\Python314\\python.exe",
+      "args": ["F:\\SDBZ Recomp\\x64dbg\\x64dbg.py"]
     }
   }
 }

@@ -1,5 +1,7 @@
 #include "Common.h"
 #include <cstdlib>
+#include <chrono>
+#include <cstdint>
 #include "Thread.h"
 #include "runtime/ee_scheduler.h"
 
@@ -21,6 +23,63 @@ extern "C" uint32_t ps2x_on_irq_handler_stack();
 // Defined in Kernel/EeScheduler.cpp (Phase 3d, replacing ps2sched's
 // thread_local g_currentThreadId). Same extern-in-.cpp rule as above.
 extern "C" int ps2x_guest_current_thread_id();
+
+// ---------------------------------------------------------------------------
+// 2026-09-03 part 56 -- probe budgets that cannot go blind on the stall.
+//
+// The 09-03 00:44 run raised CHGPRI/THLIFE from 400/600 to 6000 and BOTH still
+// saturated at guest progress 0xe80793 (~15.2M), while the stall did not begin
+// until roughly t=336s at progress ~36M. A first-N cap spends its whole budget
+// on the healthy phase, so raising it only moves the blind spot -- it never
+// reaches the window we need (feedback_capped_probes_false_negatives). That is
+// why the 6000-record CHGPRI census shows thread 6 exactly ONCE (its creation
+// priority 0x19) even though the watchdog caught ChangeThreadPriority(6, 1)
+// live at t=394s: the probe was already blind by then.
+//
+// Replaced with two overlapping budgets:
+//   * "early"  -- the first `warm` records, unconditional, for the boot history.
+//   * "steady" -- after that, at most `perSec` records per wall second, forever.
+//
+// A run of any length therefore carries records from every second of it at a
+// bounded cost, and `n` (the TRUE call count, incremented even when the record
+// is thinned) is emitted so a thinned stream can never be misread as a low call
+// rate -- the failure mode a plain cap has.
+class ProbeBudget
+{
+public:
+    ProbeBudget(unsigned warm, unsigned perSec) : m_warm(warm), m_perSec(perSec) {}
+
+    bool allow()
+    {
+        ++m_calls;
+        if (m_calls <= m_warm)
+        {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_windowStart >= std::chrono::seconds(1))
+        {
+            m_windowStart = now;
+            m_inWindow = 0;
+        }
+        if (m_inWindow >= m_perSec)
+        {
+            return false;
+        }
+        ++m_inWindow;
+        return true;
+    }
+
+    uint64_t calls() const { return m_calls; }
+
+private:
+    unsigned m_warm;
+    unsigned m_perSec;
+    uint64_t m_calls = 0;
+    unsigned m_inWindow = 0;
+    std::chrono::steady_clock::time_point m_windowStart{};
+};
+
 
 // ---------------------------------------------------------------------------
 // Phase C -- stack-bounds guard.
@@ -163,6 +222,20 @@ static bool refstatYieldEnabled()
     return on;
 }
 
+// 2026-09-02 part 50. ps2tek 29h/2Ah say ChangeThreadPriority / iChangeThreadPriority
+// return the thread's OLD priority on success. We returned KE_OK (0). Set
+// PS2X_CHGPRI_RET=0 to restore the old status-code return for A/B testing;
+// unset (the default) is the ps2tek-conformant behaviour.
+static bool chgPriReturnsOldPriority()
+{
+    static const bool on = []() -> bool
+    {
+        const char *e = std::getenv("PS2X_CHGPRI_RET");
+        return !(e && *e == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
 namespace ps2_syscalls
 {
     namespace
@@ -273,7 +346,93 @@ namespace ps2_syscalls
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
-            setReturnS32(ctx, result);
+            // 2026-09-01 part 48 -- the second candidate producer of -403.
+            if (result == KE_ILLEGAL_PRIORITY)
+            {
+                static const char *const k[] = {"thid", "prio", "isafe", "pc", "ra"};
+                const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                                      static_cast<uint64_t>(static_cast<uint32_t>(priority)),
+                                      interruptSafe ? 1u : 0u,
+                                      ctx->pc,
+                                      getRegU32(ctx, 31)};
+                ps2x_probe_kv("PRIOREJECT", 5, k, v);
+            }
+            // 2026-09-02 part 50 -- ps2tek 29h/2Ah: ChangeThreadPriority returns
+            // the thread's OLD priority on success, not a status code. We were
+            // returning KE_OK (0) and discarding oldPriority, which breaks the
+            // guest's own save/restore pair around its critical section:
+            //
+            //   0x11e5d4  jal 0x174b30         ; ChangeThreadPriority(self, boost=1)
+            //   0x11e5e0  sw  $v0, -28144($v1) ; saved = $v0   <-- got 0
+            //   ...
+            //   0x11e668  jal 0x174b30         ; ChangeThreadPriority(self, saved)
+            //
+            // Every critical-section EXIT therefore pinned the caller at
+            // priority 0 -- the top of the ready queue. In the 2026-09-02 04:24
+            // run that left main RUNNING at pri 0 forever while the sub_11EAC8
+            // acker sat READY at the guest's boost level of 1 and could never
+            // preempt it ([thsync] VERDICT=WORKER-NOT-RUNNING, nTh=6).
+            //
+            // Failure codes are left alone: our KE_* values are the house
+            // convention and PRIOREJECT above keys off KE_ILLEGAL_PRIORITY.
+            // Gated so one binary serves both arms of the A/B.
+            const int returned =
+                (result == KE_OK && chgPriReturnsOldPriority()) ? oldPriority : result;
+
+            // Every call, not just the rejects: the open question after the
+            // priority-0 fix is whether the guest ever raises main above the
+            // boost level at all, or whether main stays at 0 from ExecPS2
+            // onward (ps2tek 07h creates the main thread at priority 0). Only a
+            // full census of thid/prio/old answers that; a reject-only probe
+            // cannot. Capped, and the cap is reported in the record so a
+            // saturated probe cannot be read as an absence.
+            {
+                // Thread 6 gets its own budget: it appears ONCE in the whole
+                // 6000-record 09-03 census (creation, prio 0x19), so its warm
+                // budget is guaranteed still intact when the stall starts, and
+                // the separate n6 counter gives its true call rate even after
+                // the steady-state thinning kicks in.
+                static ProbeBudget budget(1500u, 24u);
+                static ProbeBudget t6Budget(400u, 24u);
+                const bool anyBudget = budget.allow();
+                // Budget on the RESOLVED thread, not the argument: a caller
+                // passing id == 0 ("self") would otherwise log thid=0x0 and
+                // miss the thread-6 budget entirely. The three known callers
+                // (enter_critsec ra=0x11e5dc, leave_critsec ra=0x11e670,
+                // spinner sub_11E690) all pass an explicit tid via GetThreadId,
+                // but the caller that pins thread 6 is exactly what is not yet
+                // known, so do not assume it follows the same shape.
+                const int callerId = ps2x_guest_current_thread_id();
+                const int resolvedId = (id == 0) ? callerId : id;
+                const bool t6Budgeted = (resolvedId == 6) && t6Budget.allow();
+                if (anyBudget || t6Budgeted)
+                {
+                    // "cur" = the thread that ISSUED this call, as opposed to
+                    // "rid" (the thread being changed). Part 59 took the static
+                    // graph as far as it goes: the spinner sub_11E690 is reached
+                    // only through callback slot 6, dispatched from cblist_run(6)
+                    // (0x13c6e8), which has FOUR call sites (0x11e390, 0x11e480,
+                    // 0x11e53c, 0x11eb3c) and is not confined to one thread -- so
+                    // no static read can name the spinner's host. "cur" on the
+                    // ra=0x11e6e8 records answers it directly, and "cur" on the
+                    // ra=0x11e5dc records confirms whether the poisoned save is
+                    // thread 6 saving its own already-boosted priority.
+                    static const char *const k[] = {"thid", "prio", "old", "ret", "isafe", "ra", "n", "n6", "rid", "cur"};
+                    const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(priority)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(oldPriority)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(returned)),
+                                          interruptSafe ? 1u : 0u,
+                                          getRegU32(ctx, 31),
+                                          budget.calls(),
+                                          t6Budget.calls(),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(resolvedId)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(callerId))};
+                    ps2x_probe_kv("CHGPRI", 10, k, v);
+                }
+            }
+
+            setReturnS32(ctx, returned);
             ee.transferIfRequested(interruptSafe);
         }
 
@@ -284,6 +443,16 @@ namespace ps2_syscalls
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const int result = ee.rotateReadyQueue(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            // 2026-09-01 part 48 -- the third and last producer of -403.
+            if (result == KE_ILLEGAL_PRIORITY)
+            {
+                static const char *const k[] = {"prio", "isafe", "pc", "ra"};
+                const uint64_t v[] = {static_cast<uint64_t>(getRegU32(ctx, 4)),
+                                      interruptSafe ? 1u : 0u,
+                                      ctx->pc,
+                                      getRegU32(ctx, 31)};
+                ps2x_probe_kv("ROTREJECT", 4, k, v);
+            }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -420,7 +589,32 @@ namespace ps2_syscalls
             param->initial_priority,
             param->option,
         };
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        // 2026-09-01 part 48 -- THCREATE. The t=140s stall polls
+        // ReferThreadStatus(a0 = -403). -403 is KE_ILLEGAL_PRIORITY
+        // (EeScheduler.cpp:19), NOT a pseudo-thread id -- part 47's PSEUDOTID
+        // probe fired 0 times, so GetThreadId never leaked one and that
+        // hypothesis is dead. The remaining producers of -403 are
+        // createThread / changePriority / rotateReadyQueue. Of those only a
+        // createThread return is plausibly stored by the guest as a thread id
+        // and later handed back to ReferThreadStatus -- but that is still
+        // INFERENCE, so all three are probed rather than assumed. CreateThread
+        // is low volume (the game makes tens of threads, not thousands), so
+        // this logs every call, not just the failures: knowing which thread
+        // was refused matters as much as knowing that one was.
+        const int createResult = scheduler(rdram, ctx, runtime).createThread(decoded);
+        {
+            static const char *const k[] = {"res",  "prio", "func", "attr",
+                                            "stksz", "stk",  "ra"};
+            const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(createResult)),
+                                  static_cast<uint64_t>(static_cast<uint32_t>(param->initial_priority)),
+                                  param->func,
+                                  param->attr,
+                                  static_cast<uint64_t>(static_cast<uint32_t>(param->stack_size)),
+                                  param->stack,
+                                  getRegU32(ctx, 31)};
+            ps2x_probe_kv("THCREATE", 7, k, v);
+        }
+        setReturnS32(ctx, createResult);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -438,6 +632,75 @@ namespace ps2_syscalls
             runtime->guestFree(ownedStack);
         }
         setReturnS32(ctx, result);
+    }
+
+    // 2026-09-02 part 52 -- THLIFE probe.
+    //
+    // Thread 3 (entry 0x11e7e0) has sat at status SUSPEND on its own entry PC
+    // for three consecutive 200s runs and has never executed one instruction of
+    // its body. The acker sub_11EAC8 ends every run polling it through
+    // thread_resume_if_suspended (0x11ed90 -> ReferThreadStatus 0x174ba0, ra
+    // 0x11edb4). Whether the guest suspends it, our resumeThread fails to clear
+    // the flag, or a resume succeeds and is immediately undone is not decidable
+    // from a 1 Hz status snapshot -- all three look identical. Record every
+    // Start/Suspend/Resume with the status on both sides of the call.
+    static int lifecycleStatusOf(EeScheduler &ee, int id)
+    {
+        GuestThread *t = ee.thread(id);
+        return t ? rawThreadStatus(t->status) : -1;
+    }
+
+    static int lifecyclePriorityOf(EeScheduler &ee, int id)
+    {
+        GuestThread *t = ee.thread(id);
+        return t ? t->currentPriority : -1;
+    }
+
+    // 2026-09-02 part 53 -- THLIFE now also answers WHY no preemption happens.
+    //
+    // Part 52 measured the ping-pong: resume_if_suspended (0x11ed90) puts
+    // thread 3 SUSPEND->READY, then suspend_if_running (0x11edf8) puts it
+    // READY->SUSPEND, 283 times, with no guest progress in between. Our
+    // resumeThread is correct -- st1 is READY every time. What never happens
+    // is the context switch: EeScheduler::resumeThread calls
+    // requestPreemptionIfHigher(), which bails when
+    //     readyThread.currentPriority >= running->currentPriority
+    // On real hardware, resuming a priority-8 thread from a lower-priority
+    // caller switches immediately, so thread 3 runs before the suspend lands.
+    //
+    // That comparison is the whole question and it is not visible from any
+    // existing probe: THCREATE gives creation priority, CHGPRI gives requested
+    // changes, neither gives the RUNNING thread at the moment of the resume.
+    // thread_resume_if_suspended has 11 static callers, so the caller cannot be
+    // attributed by counting. Record both sides of the comparison instead:
+    // me/mypri = the thread that issued the syscall, tpri = the target's
+    // priority. A record with tpri >= mypri explains the missing switch; a
+    // record with tpri < mypri means the bail is elsewhere and this hypothesis
+    // is dead.
+    static void probeThreadLifecycle(
+        EeScheduler &ee, char op, int id, int st0, int st1, int res, uint32_t ra)
+    {
+        static ProbeBudget budget(1500u, 24u);
+        if (!budget.allow())
+        {
+            return;
+        }
+        const int me = ee.currentThreadId();
+        static const char *const k[] = {"op",  "thid",  "st0",  "st1", "res",
+                                       "ra",  "me",    "mypri", "tpri", "n"};
+        const uint64_t v[] = {static_cast<uint64_t>(static_cast<unsigned char>(op)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(st0)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(st1)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(res)),
+                              static_cast<uint64_t>(ra),
+                              static_cast<uint64_t>(static_cast<uint32_t>(me)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(
+                                  lifecyclePriorityOf(ee, me))),
+                              static_cast<uint64_t>(static_cast<uint32_t>(
+                                  lifecyclePriorityOf(ee, id))),
+                              budget.calls()};
+        ps2x_probe_kv("THLIFE", 10, k, v);
     }
 
     void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -485,7 +748,9 @@ namespace ps2_syscalls
             ps2x_stack_register(id, 0, 0);
         }
 
+        const int before = rawThreadStatus(target->status);
         const int result = ee.startThread(id, arg, *ctx, false);
+        probeThreadLifecycle(ee, 'S', id, before, lifecycleStatusOf(ee, id), result, getRegU32(ctx, 31));
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }
@@ -517,7 +782,10 @@ namespace ps2_syscalls
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
+        const int susId = static_cast<int>(getRegU32(ctx, 4));
+        const int susBefore = lifecycleStatusOf(ee, susId);
+        const int result = ee.suspendThread(susId, false);
+        probeThreadLifecycle(ee, 'U', susId, susBefore, lifecycleStatusOf(ee, susId), result, getRegU32(ctx, 31));
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }
@@ -525,14 +793,47 @@ namespace ps2_syscalls
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
+        const int resId = static_cast<int>(getRegU32(ctx, 4));
+        const int resBefore = lifecycleStatusOf(ee, resId);
+        const int result = ee.resumeThread(resId, false);
+        probeThreadLifecycle(ee, 'R', resId, resBefore, lifecycleStatusOf(ee, resId), result, getRegU32(ctx, 31));
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }
 
+    // 2026-09-01 part 47 -- PSEUDOTID probe.
+    //
+    // The t=129s stall ends with iReferThreadStatus(a0=0xfffffe6d = -403).
+    // Negative ids are minted ONLY by EeScheduler::acquireInvocationThread()
+    // (EeScheduler.cpp:2940, m_nextInvocationThreadId--), and no real PS2
+    // thread id is ever negative. The suspected path is that the guest read
+    // one out of GetThreadId while an async invocation was standing in for a
+    // real thread, stored it, and asked about it later.
+    //
+    // That last link is INFERRED, so it gets measured rather than assumed:
+    // "raw" is what currentThreadId() would have returned, "given" is what the
+    // guest actually receives. raw != given proves the leak existed and that
+    // PS2X_PSEUDO_TID_HIDE suppressed it. Uncapped on purpose -- if the fix
+    // works this fires a handful of times, and a cap here would turn the
+    // interesting case (it kept happening) into a false negative.
+    std::atomic<uint64_t> g_pseudoTidSeen{0};
+
     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).currentThreadId());
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        const int raw = ee.currentThreadId();
+        const int given = ee.guestVisibleThreadId();
+        if (raw < 0)
+        {
+            const uint64_t n =
+                g_pseudoTidSeen.fetch_add(1, std::memory_order_relaxed) + 1u;
+            static const char *const k[] = {"raw", "given", "pc", "ra", "n"};
+            const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(raw)),
+                                  static_cast<uint64_t>(static_cast<uint32_t>(given)),
+                                  ctx->pc, getRegU32(ctx, 31), n};
+            ps2x_probe_kv("PSEUDOTID", 5, k, v);
+        }
+        setReturnS32(ctx, given);
     }
 
     // Shared body. Takes no scheduler action of any kind, so both 0x30 and the
@@ -549,6 +850,20 @@ namespace ps2_syscalls
             id = ee.currentThreadId();
         }
         const GuestThread *thread = ee.thread(id);
+        // 2026-09-01 part 47 -- the consumer half of PSEUDOTID. A negative id
+        // arriving here means one leaked out of GetThreadId earlier in the run,
+        // and "found" says whether the pseudo-thread record still exists (it is
+        // erased on exit, EeScheduler.cpp:1804) or the guest gets KE_UNKNOWN_THID
+        // for a thread it believes it owns. This is the syscall the t=129s
+        // watchdog line names, so it is the exact point to watch.
+        if (id < 0)
+        {
+            static const char *const k[] = {"thid", "found", "pc", "ra"};
+            const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                                  thread != nullptr ? 1u : 0u,
+                                  ctx->pc, getRegU32(ctx, 31)};
+            ps2x_probe_kv("PSEUDOREFER", 4, k, v);
+        }
         if (!thread)
         {
             setReturnS32(ctx, KE_UNKNOWN_THID);

@@ -735,6 +735,19 @@ namespace ps2_stubs
                     break;
                 }
 
+                if (callbackCtx.pc == 0x178a08u)
+                {
+                    static std::atomic<uint32_t> s_fillZ18GsCbLogs{0u};
+                    const uint32_t n = s_fillZ18GsCbLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (n <= 32u)
+                    {
+                        std::cerr << "[semwatch:fillz18-gscb] #" << n
+                                  << " ra=0x" << std::hex << getRegU32(&callbackCtx, 31)
+                                  << " sp=0x" << getRegU32(&callbackCtx, 29)
+                                  << " a0=0x" << getRegU32(&callbackCtx, 4)
+                                  << std::dec << std::endl;
+                    }
+                }
                 auto step = runtime->lookupFunction(callbackCtx.pc);
                 if (!step)
                 {

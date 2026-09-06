@@ -357,6 +357,13 @@ public:
     [[nodiscard]] GuestThread *currentThread();
     [[nodiscard]] const GuestThread *currentThread() const;
     [[nodiscard]] int currentThreadId() const noexcept;
+    // 2026-09-01 part 47 -- the id GetThreadId (syscall 2Fh) may hand the
+    // guest. acquireInvocationThread() mints pseudo-threads with NEGATIVE
+    // ids; those are an internal device and no real PS2 thread id is ever
+    // negative. Leaking one lets the guest store it and later ask about it
+    // (iReferThreadStatus), which is the t=129s stall. Returns the last
+    // REAL current thread instead. Internal callers keep currentThreadId().
+    [[nodiscard]] int guestVisibleThreadId() const noexcept;
     [[nodiscard]] R5900Context *currentContext();
     [[nodiscard]] uint8_t *rdram() const noexcept;
 
@@ -443,6 +450,7 @@ private:
     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
     int m_currentThreadId = 0;
+    int m_lastRealThreadId = 0;
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;

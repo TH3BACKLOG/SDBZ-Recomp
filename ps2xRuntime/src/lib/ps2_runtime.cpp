@@ -15,6 +15,7 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Stubs/Pad.h"
 #include "Kernel/Syscalls/Thread.h"
+#include "Kernel/Syscalls/Interrupt.h"
 #include "ps2_host_backend.h"
 #include "runtime/ps2_diag.h"
 #include "runtime/ps2_guestwatch.h"
@@ -366,6 +367,29 @@ namespace
 // Defined here rather than in game_overrides.cpp so every target that links
 // ps2_runtime resolves it without depending on the overrides TU.
 std::atomic<uint32_t> g_sdbzCb13C4F8InFlight{0u};
+
+// Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28):
+// declared (not defined) here, defined with external linkage in
+// Kernel/Syscalls/System.cpp -- same extern-between-.cpp-without-a-header
+// rule as everything else on this page. Must sit outside the anonymous
+// namespace below, or these would silently bind to a same-named-but-distinct
+// (anonymous namespace)::ps2_syscalls instead of the real one.
+namespace ps2_syscalls
+{
+    extern std::atomic<uint32_t> g_findAddressCallCount;
+    extern std::atomic<uint32_t> g_findAddressLastScannedWords;
+    extern std::atomic<uint32_t> g_findAddressLastResult;
+    extern std::atomic<uint32_t> g_findAddressLastAborted;
+
+    // faCalls stayed pinned at 0 for a full 200s run despite sysNum sampling
+    // 0x83 repeatedly -- dispatchSyscallOverride() intercepts syscall 0x83
+    // before the real FindAddress() below is ever reached. These identify
+    // which of its exit branches fires (1=kernel-query HLE, 2=reentrancy
+    // decline, 3=no-function KE_ERROR, 4=real scheduler invoke).
+    extern std::atomic<uint32_t> g_syscallOverrideCallCount;
+    extern std::atomic<uint32_t> g_syscallOverrideLastHandler;
+    extern std::atomic<uint32_t> g_syscallOverrideLastBranch;
+}
 
 namespace
 {
@@ -1706,6 +1730,26 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
+    // 2026-08-30 part 32 -- catch-all: the scheduler-loop and dispatchGuestBranch
+    // probes (and three step-loop probes added the same day in SIF.cpp,
+    // GS.cpp, and Syscalls/Helpers/Runtime.h) all recorded ZERO hits for
+    // 0x178a08 despite it appearing every second in the watchdog's global
+    // dispatch ring, which only pushDispatchPc() (called right above,
+    // unconditionally, from every lookupFunction() caller) can feed. This is
+    // the one place every call site funnels through, so it WILL fire if any
+    // of them do; it can't show $ra/$sp/$a0 (no ctx here), but paired with
+    // the five site-tagged probes it pins down which caller is responsible
+    // by elimination.
+    if (address == 0x178a08u)
+    {
+        static std::atomic<uint32_t> s_fillZ18LookupLogs{0u};
+        const uint32_t n = s_fillZ18LookupLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 32u)
+        {
+            std::cerr << "[semwatch:fillz18-lookup] #" << n << std::endl;
+        }
+    }
+
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(address, slot))
     {
@@ -2074,6 +2118,11 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// Defined in Kernel/EeScheduler.cpp. Declared here (namespace scope -- a
+// linkage-specification is not permitted at block scope) so the one chokepoint
+// that sees real function entries can feed the cold-resume witness table.
+extern "C" void ps2x_witness_true_entry(uint32_t entryPc, uint32_t sp);
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -2128,6 +2177,46 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+
+    // 2026-09-01 part 45 -- witness this as a TRUE entry. Only for calls: a call
+    // target is by construction a function's entry point, so the prologue is
+    // about to run. Jumps and returns can land mid-function and must never be
+    // witnessed as entries or the table would vouch for the very resumes it
+    // exists to convict.
+    if (isCall)
+    {
+        ps2x_witness_true_entry(targetPc, GPR_U32(ctx, 29));
+    }
+
+    // 2026-08-30 part 31 -- [semwatch:fillz18entry] in EeScheduler.cpp never
+    // fired (0 hits across a full 200s run) even though the watchdog's
+    // global dispatch ring showed 0x178a08 repeatedly: that probe was gated
+    // on the SCHEDULER's own while-loop re-dispatching ctx->pc == 0x178a08,
+    // but mem_fill_z_18 is a widely-shared helper (callers=19) almost
+    // certainly reached through THIS inline dispatchGuestBranch path
+    // instead -- a nested C++ call that never round-trips back through the
+    // scheduler loop. This is the call site lookupFunction()'s pushDispatchPc
+    // actually feeds the ring from (ps2_runtime.cpp:1730), so it is also the
+    // right place to read $ra/$sp/$a0 on entry, plus sourcePc/kind which the
+    // scheduler-loop probe could never see directly. Capped; unconditional
+    // read only.
+    if (targetPc == 0x178a08u)
+    {
+        static std::atomic<uint32_t> s_fillZ18DispatchLogs{0u};
+        const uint32_t n = s_fillZ18DispatchLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 32u)
+        {
+            std::cerr << "[semwatch:fillz18dispatch] #" << n
+                      << " sourcePc=0x" << std::hex << sourcePc
+                      << " kind=" << describeGuestBranchKind(kind)
+                      << " ra=0x" << GPR_U32(ctx, 31)
+                      << " sp=0x" << GPR_U32(ctx, 29)
+                      << " a0=0x" << GPR_U32(ctx, 4)
+                      << std::dec
+                      << std::endl;
+        }
+    }
+
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -3295,6 +3384,16 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+
+    // SDBZ: EeScheduler's own VBlank re-arm loop is deliberately inert (see
+    // EeScheduler.cpp's reset()) - Interrupt.cpp's interruptWorkerMain() is the
+    // sole source of EeEventType::VBlankStart/End via postEvent(). That worker
+    // only ever started from unit tests (EnsureVSyncWorkerRunning had no
+    // production call site), so the guest's first genuine VSync-wait blocked
+    // EeScheduler::waitForEvent() forever with nothing left to wake it -
+    // session 5's boot freeze. Must start before gameThread so the worker
+    // exists before the guest can reach that wait.
+    ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
 
     // EeScheduler (Phase 3d, replacing ps2sched's fiber pool) runs all guest
     // threads cooperatively on this single game thread; multi-guest-thread
@@ -5329,6 +5428,18 @@ void PS2Runtime::run()
                                       << " h2a=0x" << rd(kHook13bb20Arg)
                                       << " n=0x" << rd(kCallCount)
                                       << " obj=0x" << rd(kObj) << std::dec;
+                            // 2026-09-02 part 51. The acker (sub_11EAC8, cblist L6)
+                            // only reaches its SleepThread when cblist_run(6) returns 0.
+                            // Its single entry sub_154FA8 returns 0 iff [gate+16]==1,
+                            // where get_data_ptr (0x14e4d0) is the constant 0x45F678;
+                            // sub_155210 short-circuits to 0 iff [0x45F674]!=1. The
+                            // 2026-09-02 05:33 run had the acker spinning 183k/s with
+                            // dTick tracking tick exactly, i.e. the return was never 0 --
+                            // these two words say which gate is holding it open.
+                            constexpr uint32_t kPumpEnable = 0x0045F674u;
+                            constexpr uint32_t kPumpIdle   = 0x0045F688u;
+                            std::cerr << " pmpEn=0x" << std::hex << rd(kPumpEnable)
+                                      << " pmpIdle=0x" << rd(kPumpIdle) << std::dec;
                             std::cerr << " s:";
                             for (uint32_t i = 0; i < 8u; ++i)
                             {
@@ -5337,11 +5448,498 @@ void PS2Runtime::run()
                             }
                             std::cerr << std::endl;
                         }
+
+                        // 2026-09-04 part 61. PCSX2 decoded the movie pump's return value end to
+                        // end. sub_155210 returns "still busy" (non-zero) from exactly one place:
+                        //
+                        //     s1 = 0;
+                        //     if ([0x460F04] != 1)          // f_1556f8, the top-level done flag
+                        //         s1 = (f_1651d8() == 0);   // 0 == some stream handle still busy
+                        //     if (s1) return 1;             // <- our runtime, 49.4M times running
+                        //
+                        // f_1651d8 (0x1651d8) walks EIGHT HANDLE POINTERS at 0x461164 -- a table
+                        // distinct from the inline stream objects at base+0x6C that [pump] already
+                        // prints. For each non-null handle it calls f_1651b0 (0x1651b0):
+                        //
+                        //     st = [h+72]; if ((st - 1) unsigned < 4) return ([h+68] == 0);
+                        //     else return 1;
+                        //
+                        // so a handle is BUSY iff its state is one of 1..4 and its pending count
+                        // [h+68] is non-zero. One busy handle makes f_1651d8 return 0, which keeps
+                        // the pump reporting work forever.
+                        //
+                        // Measured on PCSX2 2026-09-04 with the stream idle: the single live handle
+                        // was 0x01B12CC0 with st=4 (active) and pd=0 (drained), so f_1651b0 returned
+                        // 1, f_1651d8 returned 1, and the pump returned 0. That is the state we never
+                        // reach. This line says which of the two exits we are failing and, when it is
+                        // a handle, which handle and how much it still thinks is outstanding.
+                        //
+                        // 0x460F58 is written by sif_is_bound (0x15b560) on every accepted handle, so
+                        // it names whichever handle f_1651d8 looked at last.
+                        {
+                            constexpr uint32_t kDoneFlag  = 0x00460F04u; // get_data_ptr() + 6284
+                            constexpr uint32_t kHandleTbl = 0x00461164u; // 8 x uint32_t handle ptrs
+                            constexpr uint32_t kCurHandle = 0x00460F58u; // last handle sif_is_bound saw
+                        
+                            std::cerr << "[sofdec] t=" << std::dec << (t + 1) << "s"
+                                      << " done=0x" << std::hex << rd(kDoneFlag)
+                                      << " cur=0x" << rd(kCurHandle) << std::dec;
+                        
+                            uint32_t live = 0u;
+                            uint32_t busy = 0u;
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                const uint32_t h = rd(kHandleTbl + i * 4u);
+                                if (h == 0u)
+                                    continue;
+                                ++live;
+                                const uint32_t st = rd(h + 72u);
+                                const uint32_t pd = rd(h + 68u);
+                                // Mirrors f_1651b0 exactly, including the unsigned wrap that makes
+                                // st==0 fall out of the active range rather than into it.
+                                const bool hBusy = ((st - 1u) < 4u) && (pd != 0u);
+                                if (hBusy)
+                                    ++busy;
+                                std::cerr << " h" << i << "=0x" << std::hex << h << std::dec
+                                          << " st" << i << "=" << st
+                                          << " pd" << i << "=" << pd
+                                          << (hBusy ? "*" : "");
+                            }
+                            // live=0 with done!=1 would mean the table was never populated, which is
+                            // a different failure from a handle that never drains -- do not conflate
+                            // them. busy=0 and done!=1 means f_1651d8 returns 1 and the pump should
+                            // already be returning 0; if that ever prints while the wall is up, the
+                            // gate is not here and this whole line is the wrong instrument.
+                                // 2026-09-04 part 61b. Measured: the handle is stuck at st=1 pd=1 from
+                        // t=126s to the end of the run. sub_165300 (0x165300) is the ONLY clear of
+                        // [h+68] (the `sw $zero,68($s1)` at 0x165338), and its own two guards --
+                        // state in 1..4, pending != 0 -- BOTH PASS for st=1/pd=1. So the servicer is
+                        // never being called at all.
+                        //
+                        // Its live caller chain is the pump itself: sub_155210's reset loop calls
+                        // sub_155320(obj) for all 8 inline objects, and sub_155320 tail-reaches
+                        // wrap_sif_is_bound_h (0x165250) -> sub_165300 with a0 = [obj+60]. Three
+                        // guards stand in the way:
+                        //
+                        //     [obj+0]    == 1      -- known GOOD: [pump] s: prints "1 0 0 0 0 0 0 0"
+                        //     [obj+96]   != 1      -- f_155520 (0x155520 = `lw $v0,96($a0)`)
+                        //     [0x45F69C] != 1      -- f_1555e8 (0x1555e8 = [get_data_ptr()+36])
+                        //
+                        // The first is already proven, so the bail is one of the other two and these
+                        // four words say which. o0h should read 0x1b12cc0 -- if it does not, the
+                        // object and the handle table disagree and that is a different bug again.
+                        // (sub_1652A8, the other sweep over 0x461164, is UNREACHABLE in the static
+                        // image, so this chain is the only way the handle can ever be serviced.)
+                        constexpr uint32_t kObj0 = 0x0045F678u + 0x6Cu;
+                        std::cerr << " o0st=" << rd(kObj0)
+                                  << " o0lock=" << rd(kObj0 + 96u)
+                                  << " o0flag=" << rd(kObj0 + 100u)
+                                  << " o0h=0x" << std::hex << rd(kObj0 + 60u) << std::dec
+                                  << " g36=" << rd(0x0045F678u + 36u);
+
+                        // 2026-09-04 part 63 -- the class-6 callback slot.
+                        //
+                        // HWWATCH named the writer of g36: wrap_get_data_ptr_p
+                        // (0x1555a0), called twice by 0x155630, which is a plain
+                        // bracket:
+                        //     f_1555a0(obj, 1);   // g36 = 1
+                        //     sub_154950();       // == run_callbacks(6)
+                        //     f_1555a0(obj, 0);   // g36 = 0
+                        // The last set (vbl 1030) has NO matching clear anywhere in
+                        // the rest of the run, so run_callbacks(6) never returned.
+                        //
+                        // run_callbacks is a single-slot dispatcher (0x13c448):
+                        //     tbl = 0x54EBA0;  fnp = [tbl + class*8];
+                        //     if (fnp == 0) return 0;
+                        //     jalr fnp (a0 = [tbl + class*8 + 4]);   // ra = 0x13c478
+                        // so class 6 lives at 0x54EBD0 (fn) / 0x54EBD4 (arg).
+                        //
+                        // 0x13c478 is exactly the `ra` the part-58/60 work recorded
+                        // for the park spinner sub_11E690 with target a0=6, which
+                        // makes "the class-6 callback IS sub_11E690" the obvious
+                        // reading -- but that is INFERENCE from a matching return
+                        // address, and [feedback_tail_jump_hides_the_caller] plus
+                        // [feedback_register_snapshot_is_not_an_argument] both say
+                        // an ra match is not an identity. Print the slot itself.
+                        //
+                        // Reading it:
+                        //   cb6=0x11e690 -> confirmed. The SofDec render wall and the
+                        //     sub_11E690 park-spinner thread are ONE bug: the spinner
+                        //     stops returning, g36 stays 1 forever, guard 3 of
+                        //     sub_155320 bails, sub_165300 never clears [h+68], the
+                        //     stream handle freezes and the renderer dies ~17s later.
+                        //   cb6=<something else> -> the ra match was a coincidence and
+                        //     the hang is in a different class-6 callback; disassemble
+                        //     whatever this prints.
+                        //   cb6=0x0 -> the slot is EMPTY, so run_callbacks(6) returns
+                        //     immediately and cannot be where we are stuck. In that
+                        //     case the bracket was torn (the clear was skipped, not
+                        //     blocked) and the question becomes what unwound past it.
+                        constexpr uint32_t kCbTable = 0x0054EBA0u;
+                        std::cerr << " cb6=0x" << std::hex << rd(kCbTable + 6u * 8u)
+                                  << " cb6a=0x" << rd(kCbTable + 6u * 8u + 4u) << std::dec;
+                        // ---- part 64: the class-6 worker thread -------------------------
+                        // ANSWERED: cb6 read back 0x11e778 == noop_wrapper___, a 2-insn
+                        // thunk that tail-jumps into 0x11e690.  So the class-6 callback IS
+                        // the park spinner; the earlier ra match was real, not coincidence.
+                        //
+                        //   0x11e778:  a0 = [0x44198C]   (a thread id)
+                        //              a1 = [0x441908]
+                        //              j  0x11e690
+                        //
+                        //   sub_11E690(tid, x):
+                        //       [0x441924] = 1                      ; "worker busy"
+                        //       loop { sub_11ED28(tid);
+                        //              thread_resume_if_suspended(tid); }
+                        //       until [0x441924] == 0, or 0x0BEBC1FF iterations.
+                        //
+                        // sub_11F0C8 CreateThread()s entry 0x11eac8, stack 0x445210, and
+                        // stores the new tid at 0x44198C -- the very word the thunk loads.
+                        // So the thing being waited on is the sub_11EAC8 worker thread.
+                        // Its loop body is:
+                        //
+                        //       [0x441960]++                        ; per-iteration tick
+                        //       [0x441934] = 1
+                        //       dispatch5(6)                        ; 6 slots @ 0x54EB10
+                        //       [0x441934] = 0
+                        //       if ([0x441924] == 1) [0x441924] = 0 ; <-- WAKE
+                        //       ...
+                        //       if ([0x4419D8] == 0) loop
+                        //
+                        // The clear is reached on EVERY iteration, so a single worker
+                        // iteration is enough to release the spinner.
+                        //
+                        // Reading key for w6tick (the counter at 0x441960):
+                        //   w6tick RISING while g36=1 -> the worker IS running and the
+                        //     clear is being skipped.  Suspect dispatch5(6) not returning;
+                        //     wdisp stuck at 1 confirms that.
+                        //   w6tick FROZEN while g36=1 -> the worker thread is never
+                        //     scheduled.  That is a scheduler bug, not a SofDec bug, and
+                        //     wtid names the thread to chase.
+                        constexpr uint32_t kWork = 0x00441900u;
+                        std::cerr << " w6tick=" << rd(kWork + 0x60u)
+                                  << " wbusy=" << rd(kWork + 0x24u)
+                                  << " wdisp=" << rd(kWork + 0x34u)
+                                  << " wexit=" << rd(kWork + 0xD8u)
+                                  << " wtid=" << rd(kWork + 0x8Cu);
+                        // ---- part 65 (09-04): the PRIORITY LATCH.
+                        // Measured, oracle-discriminated: PCSX2 holds [0x449210]
+                        // == 0x18 (a real un-boosted priority); our run holds 1.
+                        // Mechanism, all decoded:
+                        //   sub_11E598 CriLock   boosts caller to [0x4418F0] (=1)
+                        //                        and saves ChangeThreadPriority's
+                        //                        RETURN (the CURRENT priority) at
+                        //                        [0x449210]; nest count [0x441920].
+                        //   sub_11E620 CriUnlock restores [0x449210] on 1->0.
+                        // If the park spinner sub_11E690 has ALREADY boosted th6 to
+                        // 1 (its jal at 0x11e6e0, seen once at seq 0x14e3), the very
+                        // next CriLock captures 1 as the "original" and every later
+                        // unlock restores 1.  th6 is then pinned at priority 1 -- the
+                        // highest -- and starves main (24) forever.
+                        // savepri==1 with nest small is that latch, live.
+                        // d5fn/d5arg are the class-6 dispatch5 slot 0; the oracle has
+                        // fn=0x154fa8 arg=0x4bd7d0, so a mismatch is a separate bug.
+                        // g688/g674 are that handler's two early-bail gates
+                        // (0x154ff0 reads [0x45F688]; 0x155210 reads [0x45F674]).
+                        // The worker skips its SleepThread iff dispatch5(6) returns
+                        // NON-ZERO (bne $s0,$zero,0x11ebbc), which is why w6tick can
+                        // run at 181k/s while the sleep counters stay flat.
+                        std::cerr << " savepri=" << rd(0x00449210u)
+                                  << " savetid=" << rd(0x00449214u)
+                                  << " nest=" << rd(kWork + 0x20u)
+                                  << " d5fn=0x" << std::hex << rd(0x0054EB10u)
+                                  << " d5arg=0x" << rd(0x0054EB18u) << std::dec
+                                  << " g688=" << rd(0x0045F688u)
+                                  << " g674=" << rd(0x0045F674u)
+                                  << " origpri=" << rd(0x00441908u)
+                                  // ---- part 67 (09-04): is g36 a LATCH, or just
+                                  // toggling too fast to catch outside its bracket?
+                                  // g36's ONLY setter (0x1555a0) is reached from
+                                  // exactly two STRAIGHT-LINE brackets --
+                                  // 0x14e92c/0x14e940 in sub_14E8B0 and
+                                  // 0x155648/0x15565c in sub_155630 -- and each wraps
+                                  // `jal 0x154950`, which is run_class(6) via
+                                  // 0x13c448.  So g36 is a re-entrancy guard held
+                                  // across a NESTED class-6 dispatch; the 0x1553a4
+                                  // bail on g36==1 is CORRECT for the nested pass.
+                                  //
+                                  //   d6n  = [0x45EFE0] -- run_class(6)'s dispatch
+                                  //          counter, bumped once per call at
+                                  //          0x13c5b0 ($a0 = 0x45EFC8 + cls*4).
+                                  //   d6in = [0x45F000] -- run_class(6)'s in-callback
+                                  //          flag, set 0x13c55c / cleared 0x13c568
+                                  //          ($s1 = 0x45EFE8 + cls*4).
+                                  //   d5n  = [0x45EFDC] -- same counter for class 5,
+                                  //          which no server loop drives (its thunk
+                                  //          0x13c6d0 is called only from the CRI
+                                  //          lock band 0x11e320..0x11e524).
+                                  //
+                                  // Reading key, against w6tick ([0x441960] = the
+                                  // outer sub_11EAC8 loop count):
+                                  //   d6n ~= 2x w6tick -> nesting happens every pass,
+                                  //     so g36 IS toggling and is INNOCENT; the outer
+                                  //     pass runs with g36=0 and the block is further
+                                  //     down the chain (re-audit 0x155320 -> 0x165300).
+                                  //   d6n ~= 1x w6tick -> the bracket is never entered,
+                                  //     so g36 was set once and never cleared: it IS
+                                  //     latched, and a thread is parked inside
+                                  //     0x154950.  h92 then says which bracket.
+                                  << " d6n=" << rd(0x0045EFE0u)
+                                  << " d6in=" << rd(0x0045F000u)
+                                  << " d5n=" << rd(0x0045EFDCu)
+                                  // slot stride is 12 (fn,arg,pad) per 0x13c4f8's
+                                  // `addiu $s0,$s0,0xc`, and the dispatcher loads the
+                                  // arg from +4 -- the existing d5arg reads +8, the
+                                  // pad, so carry both rather than lose continuity.
+                                  << " d5arg4=0x" << std::hex << rd(0x0054EB14u) << std::dec
+                                  // ---- part 65f (09-04): the decision point.
+                                  // dispatch5(6)'s handler 0x154fa8 -> 0x155210
+                                  // proceeds only if 0x1548a0 (tail j to 0x13c880)
+                                  // returns 1, with a0 = 0x45F678+0x58 = 0x45F6D0.
+                                  //   0x13c880:  fn = [0x54EBF8]
+                                  //              if (fn) return fn(a0);
+                                  //              lock; old = *a0; *a0 = 1; unlock;
+                                  //              return (old == 0);
+                                  // i.e. a HOOKABLE test-and-set.  With no hook it
+                                  // acquires whenever the flag reads 0, the handler
+                                  // does full decode work and returns non-zero, and
+                                  // the worker skips its SleepThread -- our 186k/s.
+                                  // Hardware sleeps at ~10/s with g688/g674 IDENTICAL
+                                  // to ours, so the divergence must be here.
+                                  // tshook==0 while PCSX2 holds a pointer is the
+                                  // finding; tsflag says which way the fallback went.
+                                  << " tshook=0x" << std::hex << rd(0x0054EBF8u)
+                                  << std::dec << " tsflag=" << rd(0x0045F6D0u);
+
+                        // ---- part 65g (09-04): THE TERMINUS.
+                        // dispatch5(6)'s handler returns s1, and s1 is set only
+                        // here (0x1552c4..0x1552d8):
+                        //   v0 = 0x1556f8()            ; = [0x460F04] "done"
+                        //   if (v0 == 1) skip          ; done -> s1 keeps 0
+                        //   v0 = 0x1651d8()
+                        //   s1 = (v0 != 1)
+                        // s1 == 0 -> handler returns 0 -> worker SLEEPS.
+                        // 0x1651d8 walks EIGHT u32 slots at 0x461164:
+                        //   for i in 0..7:
+                        //     h = slot[i]
+                        //     if (0x15b560(h) != 0) continue
+                        //     if (0x1651b0(h) == 0) return 0     <-- incomplete
+                        //   return 1
+                        // So it returns 1 -- and the worker sleeps -- only when ALL
+                        // EIGHT report complete. One stuck slot spins forever, which
+                        // is our 186k/s. Hardware sleeps at ~10/s, so on hardware all
+                        // eight settle. Dump them and diff slot-for-slot.
+                        {
+                            std::cerr << " sl=[";
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                std::cerr << (i ? "," : "") << "0x" << std::hex
+                                          << rd(0x00461164u + i * 4u) << std::dec;
+                            }
+                            std::cerr << "]";
+
+                            // ---- part 65h (09-04): the two words that decide it.
+                            // Both predicates read the SAME field, [h+72]:
+                            //   0x15b560: h==0 || [h+72]==0 -> COMPLETE, skip
+                            //   0x1651b0: [h+72] in 1..4 && [h+68] != 0
+                            //                              -> INCOMPLETE -> spin
+                            // Oracle, worker ASLEEP: h44=1, h48=0. Deref `cur`
+                            // rather than a literal so this survives a different
+                            // allocation; cur has been 0x1B12CC0 on both sides.
+                            const uint32_t h = rd(0x00460F58u);
+                            std::cerr << " h=0x" << std::hex << h << std::dec;
+                            if (h >= 0x100000u && h < 0x02000000u)
+                            {
+                                // ---- part 66 (09-04): the command word decides everything.
+                                //
+                                // Verified chain, all static:
+                                //   0x1651b0  slot incomplete iff [h+72] in 1..4 && [h+68] != 0
+                                //   0x165300  pump: gates on the same pair, CLEARS [h+68] on
+                                //             entry, then [h+72] = handler(h) via the jump
+                                //             table at 0x4BF510 indexed by state.
+                                //   state 1 -> 0x165458:
+                                //         v1 = [h+76]                  // command word
+                                //         if (v1 < 2)  return [h+72];  // STAY 1
+                                //         if (v1 < 5)  return 2;       // advance
+                                //         if (v1 == 6) return 2;       // advance
+                                //         return [h+72];               // STAY 1
+                                //
+                                // So state 1 leaves idle ONLY for command in {2,3,4,6}.
+                                // 0x166998 is one such setter: `[h+76] = 4; return 0`.
+                                //
+                                // Ours is pinned at h48=1 with h44=1 for the whole run while
+                                // the oracle sits at h48=0 (terminal). If h4c reads 0 or 1,
+                                // the command was NEVER ISSUED and this is a movie-gate /
+                                // SVM problem, not a scheduler or stream-pump problem --
+                                // the pump is behaving exactly as written.
+                                //
+                                // h40 is printed only to pin the diff: oracle reads 0x4000.
+                                // h92 = [h+92], the bracket-C mirror. set_g36
+                                // (0x1555a0) writes it at 0x1555c0 ONLY when its
+                                // $a0 != 0, and bracket A (0x14e92c/0x14e940)
+                                // passes $a0 = 0 while bracket C (0x155648/
+                                // 0x15565c) passes the handle -- so h92 names
+                                // WHICH g36 bracket is currently open.
+                                std::cerr << " h40=0x" << std::hex << rd(h + 64u) << std::dec
+                                          << " h44=" << rd(h + 68u)
+                                          << " h48=" << rd(h + 72u)
+                                          << " h4c=" << rd(h + 76u)
+                                          << " h92=" << rd(h + 92u);
+                            }
+                        }
+
+                        // ---- part 65d (09-04): WHERE IS MAIN PARKED?
+                        // The park spinner sub_11E690(tid, origPri) is
+                        //   0x11e6e0  jal 0x174b30      boost th6 to [0x4418F0]=1
+                        //   0x11e6f0..0x11e714          spin: wake+resume th6 until
+                        //                               [0x441924] clears (<=0x0BEBC1FF)
+                        //   0x11e744  j   0x174b30      TAIL JUMP: restore th6 to $s5
+                        // $s5 comes from its only two callers (0x11e778 / 0x11e7a0,
+                        // both tail `j`), which load a1 from [0x441908] / [0x44190C]
+                        // -- STATIC cells, oracle says [0x441908]=0x19 (25). So the
+                        // restore target cannot itself be poisoned; origpri proves it.
+                        // The tail `j` is also why the part-64 CHGPRI count never saw
+                        // a restore from the spinner: ra is the spinner's own caller,
+                        // not 0x11e6e8.  [feedback_tail_jump_hides_the_caller]
+                        //
+                        // Working hypothesis to kill or confirm: main never reaches
+                        // 0x11e744, because th6 (pinned at 1) never yields, so main
+                        // is starved INSIDE the spin loop and the restore never runs.
+                        // mainpc in [0x11e6f0,0x11e714] confirms it.  Anything else
+                        // -- especially mainpc past 0x11e744 -- kills it, and the
+                        // poison must then come from CriUnlock overriding a restore
+                        // that did happen.
+                        {
+                            const auto snap = eeScheduler().snapshot();
+                            std::cerr << " run=" << snap.runningThreadId;
+                            for (const auto &th : snap.threads)
+                            {
+                                if (th.id != 1 && th.id != 6)
+                                    continue;
+                                std::cerr << " t" << th.id << "[pc=0x" << std::hex
+                                          << th.pc << std::dec
+                                          << " pri=" << th.currentPriority
+                                          << " ini=" << th.initialPriority
+                                          << " st=" << static_cast<int>(th.status)
+                                          << " sus=" << th.suspendCount
+                                          << " wk=" << th.wakeupCount << "]";
+                            }
+                        }
+                    std::cerr << " live=" << live << " busy=" << busy
+                                      << (cbOk ? "" : " MEM-UNREADABLE") << std::endl;
+                        }
                     }
 
                     // Coverage is scanned every tick for the inline cov= fields,
                     // but only written to the structured sink every 10s -- the
                     // summary is what the watchdog line needs, and the sink is
+                    // -----------------------------------------------------------
+                    // [WATCH] 1 Hz structured sampler, PS2X_TRACE_WATCH-driven.
+                    //
+                    // Every wide std::cerr sampler in this file -- [sofdec],
+                    // [pump], [cblist], and the [watchdog] line right below,
+                    // whose own comment admits it orders fields defensively
+                    // because "long lines get clipped somewhere between here and
+                    // the log" -- shares one defect: the data path is a console
+                    // line. On 2026-09-04 that cost a session its headline when a
+                    // pasted [sofdec] line was clipped at terminal width and
+                    // w6tick=13296567 was read as 18.
+                    //
+                    // This block writes the same kind of time series into the
+                    // structured sink instead, where a record cannot be clipped,
+                    // cannot be re-encoded, and cannot be glued to its neighbour
+                    // by a line-oriented parser. Field list comes from the SAME
+                    // PS2X_TRACE_WATCH syntax the [trace] tracer uses
+                    // (Kernel/Diag/trace_calls.cpp), so a field set is defined
+                    // once and read by both. Query with analyze_run.py --onset.
+                    //
+                    // Silent unless PS2X_TRACE_WATCH is set.
+                    // -----------------------------------------------------------
+                    {
+                        struct WatchSpec
+                        {
+                            std::string name;
+                            uint32_t addr;
+                        };
+                        static std::vector<WatchSpec> s_watchSpecs;
+                        static bool s_watchParsed = false;
+                        if (!s_watchParsed)
+                        {
+                            s_watchParsed = true;
+                            const char *raw = std::getenv("PS2X_TRACE_WATCH");
+                            if (raw != nullptr && raw[0] != '\0')
+                            {
+                                std::string cur;
+                                for (const char *p = raw;; ++p)
+                                {
+                                    if (*p == ',' || *p == '\0')
+                                    {
+                                        const std::size_t eq = cur.find('=');
+                                        if (eq != std::string::npos && eq != 0u)
+                                        {
+                                            char *end = nullptr;
+                                            const std::string valText = cur.substr(eq + 1);
+                                            const unsigned long long a =
+                                                std::strtoull(valText.c_str(), &end, 0);
+                                            if (end != valText.c_str() && *end == '\0')
+                                            {
+                                                s_watchSpecs.push_back(
+                                                    WatchSpec{cur.substr(0, eq),
+                                                              static_cast<uint32_t>(a)});
+                                            }
+                                        }
+                                        cur.clear();
+                                        if (*p == '\0')
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    cur.push_back(*p);
+                                }
+                                std::cerr << "[WATCH] armed " << s_watchSpecs.size()
+                                          << " field(s) at 1 Hz -> probe sink"
+                                          << std::endl;
+                            }
+                        }
+
+                        if (!s_watchSpecs.empty())
+                        {
+                            // +2 for t and a readability flag. A sample where the
+                            // guest memory was unreadable must be distinguishable
+                            // from one that legitimately read zero -- otherwise a
+                            // transient failure looks like a field going to 0,
+                            // which is exactly the shape of the event we hunt.
+                            std::vector<const char *> keys;
+                            std::vector<uint64_t> vals;
+                            keys.reserve(s_watchSpecs.size() + 2u);
+                            vals.reserve(s_watchSpecs.size() + 2u);
+
+                            uint32_t unreadable = 0u;
+                            keys.push_back("t");
+                            vals.push_back(static_cast<uint64_t>(t) + 1u);
+                            for (const WatchSpec &w : s_watchSpecs)
+                            {
+                                uint32_t v = 0u;
+                                try
+                                {
+                                    v = m_memory.read32(w.addr);
+                                }
+                                catch (const std::exception &)
+                                {
+                                    ++unreadable;
+                                }
+                                keys.push_back(w.name.c_str());
+                                vals.push_back(v);
+                            }
+                            keys.push_back("unreadable");
+                            vals.push_back(unreadable);
+
+                            ps2x_probe_kv("WATCH", static_cast<int>(keys.size()),
+                                          keys.data(), vals.data());
+                        }
+                    }
+
                     // for analyze_run.py afterwards.
                     const CoverageSummary cov =
                         scanCoverage((static_cast<uint32_t>(t) % 10u) == 9u, 1u, false);
@@ -5411,7 +6009,48 @@ void PS2Runtime::run()
                               << g_syscallInFlightA2.load(std::memory_order_relaxed)
                               << " sysRa=0x"
                               << g_syscallInFlightRa.load(std::memory_order_relaxed)
+                              // Diagnostic-only (2026-08-28): last-call result of
+                              // syscall 0x83 FindAddress, whose 3-register scan
+                              // semantics contradict the project's own
+                              // db-syscalls.md ("a0=id" single-arg signature) --
+                              // see the comment above the extern block near the
+                              // top of this file. faScan names the actual word
+                              // count of the last scan (huge if the "~2GB range"
+                              // hypothesis is right, small/zero if it is not);
+                              // faResult is the guest address it returned (0 =
+                              // not found, every call so far per the AGRESSIVE_LOGS
+                              // -gated detail log being off by default).
+                              << " faResult=0x"
+                              << ps2_syscalls::g_findAddressLastResult.load(std::memory_order_relaxed)
                               << std::dec
+                              << " faScan=" << ps2_syscalls::g_findAddressLastScannedWords.load(std::memory_order_relaxed)
+                              << " faCalls=" << ps2_syscalls::g_findAddressCallCount.load(std::memory_order_relaxed)
+                              << " faAborted=" << ps2_syscalls::g_findAddressLastAborted.load(std::memory_order_relaxed)
+                              // Diagnostic-only (2026-08-28, continued): faCalls
+                              // above stayed 0 for a full 200s run -- these show
+                              // whether dispatchSyscallOverride() is intercepting
+                              // syscall 0x83 before the real FindAddress ever
+                              // runs, which guest handler address it registered,
+                              // and which of that function's branches fires.
+                              << " soCalls=" << ps2_syscalls::g_syscallOverrideCallCount.load(std::memory_order_relaxed)
+                              << " soHandler=0x" << std::hex << ps2_syscalls::g_syscallOverrideLastHandler.load(std::memory_order_relaxed) << std::dec
+                              << " soBranch=" << ps2_syscalls::g_syscallOverrideLastBranch.load(std::memory_order_relaxed)
+                              // Diagnostic-only (2026-08-29): EeScheduler.cpp's
+                              // checkpointDue() has a branch (line ~637) that sets
+                              // m_checkpointPending=true whenever eeCycle >=
+                              // nextEventCycle, and that flag is only ever cleared
+                              // by processPendingEvents() recomputing the SAME
+                              // comparison -- so if nextEventCycle is never
+                              // advanced past a fresh eeCycle after being consumed,
+                              // every checkpointDue() call anywhere (including every
+                              // guest loop's cooperative-preemption check) returns
+                              // true forever, starving all guest progress. These
+                              // two fields, read via the existing public
+                              // EeScheduler::snapshot() (no header change needed),
+                              // show directly whether nextEventCycle is frozen
+                              // while eeCycle keeps climbing.
+                              << " eeCyc=" << eeScheduler().snapshot().eeCycle
+                              << " nextDl=" << eeScheduler().snapshot().nextEventCycle
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
                 }
 
@@ -5736,6 +6375,7 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    ps2_syscalls::stopInterruptWorker();
 
     if (watchdogThread.joinable())
     {

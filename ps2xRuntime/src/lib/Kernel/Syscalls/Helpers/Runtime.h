@@ -184,6 +184,19 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
             samePcCount = 0u;
         }
 
+        if (pc == 0x178a08u)
+        {
+            static std::atomic<uint32_t> s_fillZ18RpcInvokeLogs{0u};
+            const uint32_t n = s_fillZ18RpcInvokeLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 32u)
+            {
+                std::cerr << "[semwatch:fillz18-rpcinvoke] #" << n
+                          << " ra=0x" << std::hex << getRegU32(&tmp, 31)
+                          << " sp=0x" << getRegU32(&tmp, 29)
+                          << " a0=0x" << getRegU32(&tmp, 4)
+                          << std::dec << std::endl;
+            }
+        }
         PS2Runtime::RecompiledFunction func = runtime->lookupFunction(pc);
         func(rdram, &tmp, runtime);
         ++steps;

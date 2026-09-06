@@ -222,6 +222,45 @@ void fn_11ABA0_0x11aba0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     RUNTIME_LOG("[game_overrides] fn_11ABA0_0x11aba0 stub hit at pc=0x" << std::hex << ctx->pc << std::dec);
 }
 
+// Missing-body dispatch hole, same class as above but with a known root
+// cause and a real body instead of a stub. 0x17ee80-0x17eebc sits in the
+// func-map gap between syscall_stub_z_34 (ends 0x17ee48) and
+// syscall_stub_z_35 (starts 0x17eec0); IDA's boundary scan never carved it
+// out because nothing reaches it via a static jal/j -- the guest only
+// reaches it indirectly, by registering it as its own syscall 0x83 handler
+// via SetSyscall (see PS2_PROJECT_STATE.md HANDOFF 2026-08-28 part 10/11).
+// Disassembled by hand (mips_r5900_disassembler.py "ELF/SLUS_214.42"
+// 0x17ee38 40): a compiler-unrolled word-scan loop, semantically
+// `for (a0 = start; a0 < end; a0 += 4) if (*a0 == target) return a0; return 0;`
+// with a0=$a0 (start), a1=$a1 (end, exclusive), a2=$a2 (target word). The
+// two `movz $a0,$zero,$v0` merge points look asymmetric in the disassembly
+// but both only fire when the preceding sltu found the scan already out of
+// range, so they never clobber a genuine match -- a plain loop is a faithful
+// translation, not just an approximation.
+void fn_17EE80_0x17ee80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram;
+    (void)runtime;
+
+    uint32_t addr = GPR_U32(ctx, 4);
+    const uint32_t end = GPR_U32(ctx, 5);
+    const uint32_t target = GPR_U32(ctx, 6);
+
+    uint32_t result = 0u;
+    while (addr < end)
+    {
+        if (READ32(addr) == target)
+        {
+            result = addr;
+            break;
+        }
+        addr += 4u;
+    }
+
+    SET_GPR_U32(ctx, 2, result);
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
 // Stage 5.10 [poolbase] probe: singleton_get_camera_0x199db0 is a generic
 // singleton-pool accessor (name is a stale Ghidra auto-label, not literally
 // "camera"). GameInit calls it once and zero-fills 0xC000 bytes starting at
@@ -367,6 +406,12 @@ namespace
     }
 }
 
+// Defined in Kernel/Diag/trace_calls.cpp. Declared here rather than in a
+// header on purpose: ps2_runtime.h is included by every generated runner TU,
+// so touching it costs a 30+ hour rebuild. Same cross-TU pattern as the
+// [frametrace] symbols above.
+void ps2xTraceCallsInstall(PS2Runtime &runtime);
+
 namespace ps2_game_overrides
 {
     AutoRegister::AutoRegister(const Descriptor &descriptor)
@@ -410,10 +455,9 @@ namespace ps2_game_overrides
             descriptors = descriptorRegistry();
         }
 
-        if (descriptors.empty())
-        {
-            return;
-        }
+        // No early return on an empty registry: the [trace] install at the end
+        // of this function must run whether or not any override matched, and a
+        // loop over an empty vector already does nothing.
 
         const std::string elfName = basenameFromPath(elfPath);
         uint32_t fileCrc32 = 0u;
@@ -471,6 +515,15 @@ namespace ps2_game_overrides
         {
             RUNTIME_LOG("[game_overrides] applied " << appliedCount << " matching override(s).");
         }
+
+        // LAST, deliberately. The [trace] tracer snapshots whatever pointer is
+        // in the dispatch table and tail-calls it, so it must see the table in
+        // its final, post-override state -- otherwise it would either wrap a
+        // generated body that an override later replaced (tracing a function
+        // the guest no longer runs) or be clobbered by that override outright.
+        // No-ops unless PS2X_TRACE_CALLS is set. Defined in
+        // Kernel/Diag/trace_calls.cpp.
+        ps2xTraceCallsInstall(runtime);
     }
 }
 
@@ -1039,6 +1092,82 @@ namespace
     // It is the setter half of a pair: get_global_var_2 at 0x116ce0 is
     // `lui $v1,0x44 / jr $ra / lw $v0,-13428($v1)` -- the same word. $v0 is left
     // holding the lui result, which no caller uses but is cheap to reproduce.
+    // ---- part 68 (09-04): who latches g36, and is the close ever reached? ---
+    //
+    // RETRACTION FIRST.  Part 67's d6n-vs-w6tick ratio test was INVALID.  It
+    // assumed the nested run_class(6) reached through 0x154950 would bump the
+    // per-class counter at 0x45EFC8+cls*4.  It does not.  0x154950 tail-jumps
+    // to 0x13c448, a bare single-slot dispatcher (table 0x54EBA0; load fnp,
+    // jalr, return) that bumps NOTHING; the counter is bumped at 0x13c5b0,
+    // inside the other dispatcher 0x13c4f8.  So d6n ~= w6tick holds whether or
+    // not the bracket is ever entered, and the observed 1:1 tested nothing.
+    //
+    // What IS established, from the part-63 HWWATCH run: the last g36=1 write
+    // has no matching clear for the remainder of the run.  g36 is latched.
+    // Unresolved: which bracket left it open, and why the close never ran.
+    //
+    // 0x1555a0 is the ONLY writer and is 15 instructions:
+    //     s0=a0; s1=a1; v0=f_14e4d0(); if (s0) [s0+92]=s1; [v0+36]=s1
+    // and 0x14e4d0 is a pure constant -- lui/jr/addiu, v0 = 0x45F678, no loads
+    // and no side effects -- so inlining it below is exact, not an estimate.
+    //
+    // ra names the call site uniquely.  Static read finds exactly four:
+    //     0x14e934 = bracket A open   (sub_14E8B0, a0=0,   a1=1)
+    //     0x14e948 = bracket A close  (sub_14E8B0, a0=0,   a1=0)
+    //     0x155650 = bracket C open   (sub_155630, a0=obj, a1=1)
+    //     0x155664 = bracket C close  (sub_155630, a0=obj, a1=0)
+    // Any other ra means a fifth caller the static sweep missed, which would
+    // itself be the answer.
+    //
+    // nest = [0x45F670] (= ctx-8), the counter sub_14E8B0 decrements at
+    // 0x14e8dc; unless it lands exactly on 0 at 0x14e8e4 the entire body --
+    // bracket A included -- is skipped to the early-out at 0x14e9d0.  Printed
+    // signed, because the Stage 5.17 movie gate was blocked by exactly this
+    // shape going negative ([0x45EFC0] = -2).
+    //
+    // prev = g36 as it reads BEFORE this store, so open/close pairs and any
+    // double-open show up as a transition instead of being inferred.
+    void sdbzTraceSetG36_1555A0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+
+        const uint32_t obj = GPR_U32(ctx, 4);
+        const uint32_t val = GPR_U32(ctx, 5);
+        const uint32_t ra = GPR_U32(ctx, 31);
+
+        static uint32_t s_g36Calls = 0;
+        static const uint32_t kG36LogMax = 512u;
+        ++s_g36Calls;
+        if (s_g36Calls <= kG36LogMax)
+        {
+            std::cerr << "[g36set] #" << std::dec << s_g36Calls
+                      << " ra=0x" << std::hex << ra
+                      << " obj=0x" << obj << std::dec
+                      << " val=" << val
+                      << " prev=" << READ32(0x0045F69Cu)
+                      << " nest=" << (int32_t)READ32(0x0045F670u)
+                      << " wbusy=" << READ32(0x00441924u)
+                      << std::endl;
+            if (s_g36Calls == kG36LogMax)
+            {
+                // [capped_probes_false_negatives]: once this fires, a missing
+                // close in the log stops being evidence that none happened.
+                std::cerr << "[cap] tag=g36set saturated at " << kG36LogMax
+                          << std::endl;
+            }
+        }
+
+        if (obj != 0u)
+        {
+            WRITE32(obj + 92u, val);
+        }
+        WRITE32(0x0045F678u + 36u, val);
+
+        ctx->pc = ra;
+    }
+
+
     void sdbzSetGlobalVar116CD0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         SET_GPR_U64(ctx, 2, 0x00440000u);
@@ -1611,11 +1740,12 @@ namespace
         runtime.registerFunction(0x001BFB80u, &sdbzDtorThunk1BFB80);
         runtime.registerFunction(0x00390DF0u, &sdbzCtor390DF0);
         runtime.registerFunction(0x0038D990u, &sdbzCtor38D990);
-        // 0x180d30: generated fn_180D30_0x180d30 exists (runner/fn_180D30_0x180d30.cpp)
-        // but has no g_ps2RecompiledFunctionTable slot in register_functions.cpp --
-        // dispatch-table gap, not a missing translation. Register the generated
-        // body directly instead of regenerating (2026-07-24).
-        runtime.registerFunction(0x00180D30u, &fn_180D30_0x180d30);
+        // 0x180d30: the dispatch-table gap this used to paper over is CLOSED. The
+        // func-map rebuild gave it a real slot -- register_functions.cpp:28832 maps
+        // 0x180d30 -> sub_00180D30_0x180d30 -- so the old registration of the
+        // generated fn_ body for this address was overwriting a current body with
+        // a stale 2026-07-24 one. Removed 2026-08-31; do not re-add without first
+        // checking register_functions.cpp for a slot.
         // 0x1a4500: same dispatch-table-gap class as 0x180d30 above. The generated
         // body (runner/fn_1A4500_0x1a4500.cpp) is a complete, correctly-terminated
         // translation (ends with ctx->pc = GPR_U32(ctx, 31)) -- an older memory note
@@ -1648,6 +1778,8 @@ namespace
         // 0x116cd0: hole instance 5, the setter for the global at 0x0043CB8C.
         // Retires the 0x116d2c spin, which was only its caller's fall-through.
         runtime.registerFunction(0x00116CD0u, &sdbzSetGlobalVar116CD0);
+        // part 68: trace the only g36 writer (see sdbzTraceSetG36_1555A0).
+        runtime.registerFunction(0x001555A0u, &sdbzTraceSetG36_1555A0);
 
         // The 0x460F10 flag-block cluster (Stage 5.14 run 50). 0x14fc88 is the
         // one proven reachable -- it is the target of the thunk at 0x14fab8 that
@@ -1704,18 +1836,25 @@ namespace
             runtime.registerFunction(0x001BB460u, body1BB450);
         }
 
-        // Free wins, found while checking whether the 144 missing-body holes could
-        // just be mass-registered. They cannot -- 136 of them have no generated
-        // file at all -- but eight do, and these six are the ones not already
-        // handled (0x13c4f8 has an override above, 0x180d30 is registered above).
-        // Real generated bodies, named for exactly these addresses; the generator
-        // simply never emitted a table slot for them.
-        runtime.registerFunction(0x001137B0u, &fn_1137B0_0x1137b0);
-        runtime.registerFunction(0x001C9980u, &fn_1C9980_0x1c9980);
-        runtime.registerFunction(0x001C9AB0u, &fn_1C9AB0_0x1c9ab0);
-        runtime.registerFunction(0x00256960u, &fn_256960_0x256960);
-        runtime.registerFunction(0x00341920u, &fn_341920_0x341920);
-        runtime.registerFunction(0x00356CD0u, &fn_356CD0_0x356cd0);
+        // REMOVED 2026-08-31. Six registerFunction calls lived here, added when the
+        // generator "simply never emitted a table slot" for these addresses. That
+        // premise is dead post-func-map-rebuild: every one of them now has a real
+        // slot, and because registerFunction() is an unconditional overwrite
+        // (ps2_runtime.cpp:1699-1702) these lines were actively CLOBBERING current
+        // generated bodies with stale 2026-07-02 ones -- fn_1137B0_0x1137b0.cpp
+        // alone carried 8 `__entryPc` sites, a code shape the generator abandoned.
+        //
+        // Current coverage, verified in register_functions.cpp:
+        //   0x1137b0 -> sub_1137A4_0x1137a4    (interior alias, +0xC)  :1127
+        //   0x1c9980 -> sub_1C997C_0x1c997c    (interior alias, +0x4)  :46117
+        //   0x1c9ab0 -> sub_001C9AB0_0x1c9ab0                          :46125
+        //   0x256960 -> sub_00256960_0x256960                          :140702
+        //   0x341920 -> sub_00341920_0x341920                          :270368
+        //   0x356cd0 -> sub_00356CD0_0x356cd0                          :279460
+        //
+        // The two interior-alias entries are a real behaviour change: those
+        // addresses now enter their owner mid-body rather than running a
+        // standalone stale body. That is what the func map says is correct.
 
         // 0x1bf2e0: same dispatch-table-gap class as 0x180d30/0x1a4500 above. The
         // generated body (runner/fn_1BF2E0_0x1bf2e0.cpp) is a complete leaf
@@ -1756,6 +1895,17 @@ namespace
         }
 
         registerSdbzSyscallThunks(runtime, std::make_index_sequence<kSdbzSyscallThunkCount>{});
+
+        // 0x17ee80: same dispatch-table-gap class as 0x180d30/0x1a4500/0x1bf2e0
+        // above, except reached only through the guest's own SetSyscall(0x83)
+        // registration, never a direct jal/j -- see fn_17EE80_0x17ee80's own
+        // comment for the disassembly/semantics. Forward-declaring it in
+        // fn_forward_decls.h (auto-generated) is NOT enough to make hasFunction()
+        // see it -- that only adds the C++ declaration, not a table slot. Without
+        // this line dispatchSyscallOverride() keeps taking the
+        // !runtime->hasFunction(handler) branch forever (soBranch=3 confirmed for
+        // an entire 200s run at ~9M calls/sec, HANDOFF 2026-08-28 part 11).
+        runtime.registerFunction(0x0017EE80u, &fn_17EE80_0x17ee80);
     }
 
     // --- Loadfile signature-gate seed (2026-07-17e) ---------------------------
@@ -2039,6 +2189,20 @@ namespace
         {0x00171C30u, 0x00171C30u},
         {0x00171D00u, 0x00171C30u},
         {0x00171D0Cu, 0x00171C30u},
+        // 2026-08-31 session 5 part 41 -- sub_17CF50's own $ra slot corruption
+        // (parts 38-40: [semwatch:cf50resume] raAtSpPlus32 reads 0 at the
+        // 0x17cfa4 resume, after 32+ healthy hits earlier in the same run).
+        // Reading fn_17CF50_0x17cf50.cpp directly ruled out "prologue
+        // skipped" -- the real prologue (0x17cf50) does write a valid $ra to
+        // sp+0x20 -- so this wraps every registered slot (true entry plus the
+        // three resume labels) the same way the rpc_call hunt above did, to
+        // arm a live HWWATCH write-trap on that exact RDRAM address instead
+        // of guessing the writer. See the funcStart==0x0017CF50u block in
+        // sdbzFrameTraceWrapper below.
+        {0x0017CF50u, 0x0017CF50u},
+        {0x0017CF68u, 0x0017CF50u},
+        {0x0017CF70u, 0x0017CF50u},
+        {0x0017CFA4u, 0x0017CF50u},
     };
 
     constexpr size_t kSdbzFrameTraceSlotCount =
@@ -2123,6 +2287,10 @@ namespace
     std::atomic<uint64_t> g_hwWatchHost{0};    // host address under watch
     std::atomic<uint32_t> g_hwWatchGuest{0};   // guest address under watch
     std::atomic<bool> g_hwWatchArmerUp{false};
+    std::atomic<bool> g_hwWatchVehUp{false};
+    // Times hwWatchArmSelf actually set DR0 on the calling thread. Published
+    // in HWSTAT as "selfarm" -- see the 2026-08-31 race note on hwWatchArm.
+    std::atomic<uint32_t> g_hwWatchSelfArmed{0};
     // Only stores of this value are recorded. 0xFFFFFFFF = record all.
     std::atomic<uint32_t> g_hwWatchWantVal{1};
     std::atomic<uint64_t> g_hwWatchSkipped{0}; // filtered-out stores, for sanity
@@ -2284,6 +2452,70 @@ namespace
         g_hwWatchThreadsArmed.store(armedCount, std::memory_order_relaxed);
     }
 
+    // 2026-08-31 session 5 part 32 -- closes the arm-to-first-sweep race found
+    // after part 31's hwwatch run came back armed=1/hits=0/seen=0 for the
+    // whole run: the run_probe.jsonl sequence numbers show the FIRST HWSTAT
+    // heartbeat (which only prints after hwWatchArmerMain's SymInitialize +
+    // AddVectoredExceptionHandler complete and the loop reaches its first
+    // hwWatchSweep) already reported the guest's final frozen progress value
+    // -- i.e. by the time DR0 was ever set on the guest thread via the
+    // background armer, the freeze had already happened. Any write to the
+    // watched address during the actual suspension window (the thing part 31
+    // was trying to catch) was invisible by construction, which makes the
+    // "never written" HWSTAT reading unusable for this run
+    // (see feedback_run_window_false_negative / feedback_degenerate_result_convicts_the_probe).
+    //
+    // AddVectoredExceptionHandler is a cheap, synchronous, allocation-free
+    // registration -- it is SymInitialize (symbol/module enumeration) that is
+    // slow and was gating it. Split them: register the VEH here, eagerly, on
+    // the calling (guest) thread, the first time any code asks to arm the
+    // watch. SymInitialize stays in hwWatchArmerMain (only needed later, for
+    // hwWatchSymbolize's backtraces on the eventual dump).
+    void hwWatchEnsureVeh()
+    {
+        bool expected = false;
+        if (g_hwWatchVehUp.compare_exchange_strong(expected, true,
+                                                    std::memory_order_acq_rel))
+        {
+            AddVectoredExceptionHandler(1, hwWatchVeh);
+        }
+    }
+
+    // Arms DR0 on the CALLING thread directly, without suspending it -- you
+    // cannot SuspendThread yourself, but SetThreadContext on your own pseudo
+    // handle (GetCurrentThread()) is well-defined for debug registers and
+    // takes effect on return. This must run AFTER hwWatchEnsureVeh(): arming
+    // DR0 before the VEH is live would turn the very write we want to catch
+    // into an unhandled STATUS_SINGLE_STEP.
+    //
+    // This does not replace the background armer thread's periodic
+    // hwWatchSweep -- that still covers every OTHER thread in the process (in
+    // this project nTh=1 so there normally isn't one, but it's not assumed
+    // here) and re-arms threads created after the fact. This just guarantees
+    // the ONE thread that is actually calling into guest code is armed
+    // synchronously, inline, with no thread-handoff latency at all.
+    void hwWatchArmSelf(uint64_t host)
+    {
+        static thread_local uint64_t s_lastArmed = 0;
+        if (s_lastArmed == host)
+            return;
+        HANDLE self = GetCurrentThread();
+        CONTEXT c = {};
+        c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(self, &c))
+        {
+            c.Dr0 = host;
+            c.Dr6 = 0;
+            c.Dr7 = (c.Dr7 & ~kHwWatchDr7Mask) | kHwWatchDr7Bits;
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (SetThreadContext(self, &c))
+            {
+                s_lastArmed = host;
+                g_hwWatchSelfArmed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
     std::string hwWatchDumpPath()
     {
         const char *probe = std::getenv("PS2X_PROBE_FILE");
@@ -2391,7 +2623,10 @@ namespace
 
         SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
         SymInitialize(GetCurrentProcess(), nullptr, TRUE);
-        AddVectoredExceptionHandler(1, hwWatchVeh);
+        // hwWatchArm() already registers this eagerly on the calling thread
+        // (see hwWatchEnsureVeh) before this thread even starts; guarded so
+        // calling it again here is a harmless no-op, not a double-registration.
+        hwWatchEnsureVeh();
 
         uint64_t armed = 0;
         uint32_t tick = 0;
@@ -2439,10 +2674,16 @@ namespace
                 //                               written.
                 // drop>0 still poisons every absence argument: it means the
                 // records describe the first kHwWatchMaxHits stores only.
-                const char *keys[11] = {"guest", "armed", "skipped", "outwin",
+                // selfarm (2026-08-31, part 32): count of hwWatchArmSelf
+                // successes, i.e. inline calling-thread arms independent of
+                // this background thread's own setup latency. selfarm>0 on
+                // the FIRST heartbeat directly proves DR0 was live before this
+                // thread even finished starting up -- the specific guarantee
+                // part 31's run was missing.
+                const char *keys[12] = {"guest", "armed", "skipped", "outwin",
                                         "hits",  "seen",  "drop",    "vbl",
-                                        "winlo", "winhi", "thr"};
-                const uint64_t vals[11] = {
+                                        "winlo", "winhi", "thr",     "selfarm"};
+                const uint64_t vals[12] = {
                     g_hwWatchGuest.load(std::memory_order_relaxed),
                     g_hwWatchHost.load(std::memory_order_relaxed) != 0ull ? 1ull
                                                                          : 0ull,
@@ -2456,8 +2697,9 @@ namespace
                     ps2x_vblank_ticks(),
                     g_hwWatchVblLo.load(std::memory_order_relaxed),
                     g_hwWatchVblHi.load(std::memory_order_relaxed),
-                    g_hwWatchThreadsArmed.load(std::memory_order_relaxed)};
-                ps2x_probe_kv("HWSTAT", 11, keys, vals);
+                    g_hwWatchThreadsArmed.load(std::memory_order_relaxed),
+                    g_hwWatchSelfArmed.load(std::memory_order_relaxed)};
+                ps2x_probe_kv("HWSTAT", 12, keys, vals);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
@@ -3356,6 +3598,13 @@ namespace
         g_hwWatchGuest.store(masked, std::memory_order_relaxed);
         g_hwWatchHost.store(host, std::memory_order_relaxed);
 
+        // 2026-08-31 part 32: arm synchronously, inline, before handing off to
+        // the background thread -- see the note above hwWatchEnsureVeh/
+        // hwWatchArmSelf for why the old background-only path could lose the
+        // race against a freeze that lands inside the first real second.
+        hwWatchEnsureVeh();
+        hwWatchArmSelf(host);
+
         bool expected = false;
         if (g_hwWatchArmerUp.compare_exchange_strong(expected, true,
                                                      std::memory_order_relaxed))
@@ -3442,6 +3691,57 @@ namespace
             }
         }
 
+        // 2026-08-31 session 5 part 41c -- sub_17CF50's $ra slot. First two
+        // attempts (41/41b) armed entrySp+0x20 and got a clean armed=1/
+        // selfarm=0x987/hits=0/seen=0 result -- a genuine "never written"
+        // negative on the WRONG address. `entrySp` here is captured at the
+        // wrapper's start, BEFORE the real prologue's `addiu $sp,$sp,-0x30`
+        // (fn_17CF50_0x17cf50.cpp:29-37) runs, so `0x20($sp)` in that
+        // prologue's own frame of reference is entrySp-0x30+0x20 = entrySp-
+        // 0x10, not entrySp+0x20. Confirmed by cross-referencing THIS run's
+        // own data, not by re-deriving on paper: [frametrace:cf50wrap] #1
+        // showed entrySp=0x1ffbee0 for the same invocation whose resume-time
+        // sp (post-decrement, read by [semwatch:cf50resume] #1 in
+        // EeScheduler.cpp) was 0x1ffbeb0 -- exactly 0x30 less, confirming the
+        // arithmetic. entryPc==funcStart restricts this to the TRUE entry
+        // slot (kSdbzFrameTraceSlots[I].addr==0x17CF50), never one of the
+        // three resume slots also wrapped above. Re-published every true
+        // entry since sp is not constant across invocations. Deliberately
+        // UNCONDITIONAL on PS2X_HWWATCH_CLIENT -- that var exists to silence
+        // the COMPETING rpc_call arm above, not this one.
+        const bool isCf50TrueEntry =
+            funcStart == 0x0017CF50u &&
+            kSdbzFrameTraceSlots[I].addr == funcStart &&
+            entryPc == funcStart;
+        // 2026-08-31 part 41b -- two prior runs with this arm in place showed
+        // ZERO [HWSTAT]/[HWWATCH] records despite [frametrace] confirming all
+        // 79 slots (this one included) installed cleanly. Rather than guess
+        // why, print unconditionally (no PS2X_HWWATCH dependency) whenever
+        // funcStart==0x17CF50u fires AT ALL, showing entryPc/addr/I and the
+        // isCf50TrueEntry verdict -- settles whether the wrapper never runs
+        // for this slot, or runs but the guard never evaluates true. Capped;
+        // unconditional.
+        if (funcStart == 0x0017CF50u)
+        {
+            static std::atomic<uint32_t> s_cf50WrapperLogs{0u};
+            const uint32_t n = s_cf50WrapperLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 16u)
+            {
+                std::cerr << "[frametrace:cf50wrap] #" << n
+                          << " I=" << I
+                          << " slotAddr=0x" << std::hex << kSdbzFrameTraceSlots[I].addr
+                          << " entryPc=0x" << entryPc
+                          << " entrySp=0x" << entrySp
+                          << std::dec
+                          << " isTrueEntry=" << isCf50TrueEntry
+                          << std::endl;
+            }
+        }
+        if (isCf50TrueEntry)
+        {
+            hwWatchArm(rdram, entrySp - 0x10u);
+        }
+
         // 2026-07-22 SLOTWATCH2 -- fn_178068 is SLOTWATCH's #1 (deepest wrapped
         // callee) and the first frame to see slot=0x1. Arithmetic: its prologue
         // `addiu $sp,-0xA0` + `sd $ra,0x90($sp)` (0x178074) writes to sp-0x10.
@@ -3460,6 +3760,33 @@ namespace
         if (is178068)
         {
             slot178068Before = READ32(g_rpcSlotAddr.load(std::memory_order_relaxed));
+        }
+
+        // 2026-08-29 -- [semwatch] follow-up #3. dispidx (gated on funcStart==
+        // 0x175090) never fired -- the fresh decompile of sub_178068 shows why:
+        // `dword_5616D8` is NOT itself the ready-gate byte. It is a pointer
+        // VARIABLE (at address 0x5616D8) that sub_177B00 initializes ONCE to the
+        // constant 0x20561600. The gate/size byte sub_178068 actually tests is
+        // `*(BYTE*)dword_5616D8`, i.e. the byte AT 0x20561600 -- a different
+        // address entirely. The IMBAL/watchdog data from the dispidx run already
+        // shows sub_178068 exiting at 0x1780c0 (the early `if (!byte) return 0;`
+        // path, per decompiles_SLUS_214_42.txt:94822-94874) -- syscall_stub_z_24
+        // is never reached because the gate reads 0 every time. Log the REAL
+        // gate byte on every entry, unconditional, bounded, to see whether it's
+        // ever nonzero anywhere in a run (race: arrives late) or stays 0 the
+        // whole time (missing producer).
+        if (funcStart == 0x00178068u)
+        {
+            static std::atomic<uint32_t> s_gateByteDumps{0};
+            const uint32_t n = s_gateByteDumps.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if (n <= 64u)
+            {
+                std::cerr << "[semwatch:gatebyte] #" << std::dec << n
+                    << " ptr=0x" << std::hex << READ32(0x005616D8u)
+                    << " gate=0x" << (uint32_t)READ8(0x20561600u)
+                    << " entrySp=0x" << entrySp
+                    << std::endl;
+            }
         }
 
         // 2026-07-23 SLOTWATCH BEFORE-read. Capture the watched slot on the way
@@ -3530,6 +3857,29 @@ namespace
         // Log GS entries unconditionally instead, bounded. entryPc distinguishes
         // real-entry-with-stale-sp from resume-slot aliasing; entrySp is the
         // number that matters (0x1ffbf00 == the overlapping frame).
+        // 2026-08-29 -- [semwatch] follow-up. semwatch proved iSignalSema(4)
+        // never fires this run. 0x178560 is the SIF dispatcher's _request_end
+        // completion-callback handler (see the kSdbzFrameTraceSlots comment
+        // above) -- the only known place a completion callback could trigger
+        // that signal. It's already wrapped (entry-only) but the frametrace
+        // ring only logs on anomaly/VECCTOR/LEAFEXIT conditions, not on plain
+        // entry, so an unreached function and a silently-clean one look
+        // identical in that ring. Log entry unconditionally, bounded, same as
+        // the GSENTRY probe below, to settle it directly instead of inferring
+        // from the (thread-interleaved, ring-limited) trace= history.
+        if (kSdbzFrameTraceSlots[I].funcStart == 0x00178560u)
+        {
+            static std::atomic<uint32_t> s_requestEndEntryDumps{0};
+            const uint32_t n = s_requestEndEntryDumps.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if (n <= 64u)
+            {
+                std::cerr << "[semwatch:reqend] #" << std::dec << n
+                    << " entryPc=0x" << std::hex << entryPc
+                    << " entrySp=0x" << entrySp
+                    << " entryRa=0x" << entryRa
+                    << std::endl;
+            }
+        }
         if (kSdbzFrameTraceSlots[I].funcStart == 0x00102870u)
         {
             static std::atomic<uint32_t> s_gsEntryDumps{0};
@@ -3792,6 +4142,80 @@ namespace
         }
 
         original(rdram, ctx, runtime);
+
+        // 2026-08-29 -- [semwatch] follow-up #2. reqend (0x178560) never fires --
+        // the SIF dispatcher (0x178068) never reaches it. Per the fresh decompile
+        // of fn_178068_0x178068.cpp, dispatch routing is NOT literally "word[2]"
+        // of the packet as earlier hypothesised -- it is the return value of
+        // syscall_stub_z_24 (0x175090, already an entry-only wrapped slot in this
+        // table), used as a signed index into one of two function-pointer tables
+        // ([0x5616E4]/[0x5616E8] for negative, [0x5616EC]/[0x5616F0] for
+        // non-negative), stride 12. A null table slot or an out-of-bound index
+        // both fall straight to LABEL_15 (sync/ei, no handler call) without ever
+        // invoking anything -- that is the exact shape that would leave 0x178560
+        // unreached while 0x178068 itself still runs once. $v0 on return from
+        // 0x175090 IS that index (decompile's local v12). Log it unconditionally,
+        // bounded, to see the real value instead of inferring it.
+        if (funcStart == 0x00175090u)
+        {
+            static std::atomic<uint32_t> s_dispIdxDumps{0};
+            const uint32_t n = s_dispIdxDumps.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if (n <= 64u)
+            {
+                std::cerr << "[semwatch:dispidx] #" << std::dec << n
+                    << " v0=0x" << std::hex << GPR_U32(ctx, 2)
+                    << " v1=0x" << GPR_U32(ctx, 3)
+                    << " entrySp=0x" << entrySp
+                    << " negTbl=0x" << READ32(0x005616E4u)
+                    << " negBound=0x" << READ32(0x005616E8u)
+                    << " posTbl=0x" << READ32(0x005616ECu)
+                    << " posBound=0x" << READ32(0x005616F0u)
+                    << std::endl;
+            }
+        }
+
+        // 2026-08-29 -- [semwatch] follow-up #4. dispidx STILL never fires even
+        // though [semwatch:gatebyte] now shows the gate byte CAN be nonzero
+        // (0x40 seen once). Re-read of the actual runner file
+        // fn_178068_0x178068.cpp (not the IDA decompile) shows exitPc=0x1780c0
+        // is NOT a return at all -- it is the copy-loop body address
+        // (`lq $v0,0x0($a2)`); the only way to leave the function with pc
+        // parked there is the cooperative-preemption check on the loop's
+        // backward branch (`if (runtime->shouldPreemptGuestExecution())
+        // return;`). So sub_178068 DOES take the true branch and DOES start
+        // the packet copy -- it got yielded out mid-loop, confirmed by
+        // matching gatebyte's entrySp=0x1ff3db0/gate=0x40 sample against the
+        // IMBAL exitPc=0x1780c0 line at that same entrySp. My prior part-21
+        // "early return, gate reads zero" conclusion was WRONG -- correcting
+        // it here. Separately: per [[feedback_registerfunction_bypass]],
+        // sub_178068 reaches syscall_stub_z_24 via
+        // `runtime->lookupFunction(0x175090)` called DIRECTLY from inside its
+        // own translated body (fn_178068_0x178068.cpp:277-288) -- a direct
+        // C++ call, not a dispatch-loop call -- so it never passes through
+        // whatever wraps funcStart==0x175090 at the top level. dispidx's
+        // silence is an instrumentation gap, not proof the dispatch never
+        // runs. Watch THIS wrapper's own funcStart==0x178068 invocation
+        // instead: after original() returns, log where ctx->pc actually
+        // landed (0x1780c0 again == preempted again; 0x1781b0/other == the
+        // call actually finished) plus the real dispatch input at [sp+8]
+        // (decompile's v12 / the asm's post-call $v1 reload at 0x1780e4).
+        if (funcStart == 0x00178068u)
+        {
+            static std::atomic<uint32_t> s_dispExitDumps{0};
+            const uint32_t n = s_dispExitDumps.fetch_add(1, std::memory_order_relaxed) + 1u;
+            if (n <= 64u)
+            {
+                std::cerr << "[semwatch:dispexit] #" << std::dec << n
+                    << " exitPc=0x" << std::hex << ctx->pc
+                    << " exitSp=0x" << GPR_U32(ctx, 29)
+                    << " v1@sp8=0x" << READ32(ADD32(GPR_U32(ctx, 29), 8))
+                    << " negTbl=0x" << READ32(0x005616E4u)
+                    << " negBound=0x" << READ32(0x005616E8u)
+                    << " posTbl=0x" << READ32(0x005616ECu)
+                    << " posBound=0x" << READ32(0x005616F0u)
+                    << std::endl;
+            }
+        }
 
         if (isIntrEnable)
         {
@@ -7642,4 +8066,32 @@ extern "C" void ps2x_srd_stat_tick()
     // launcher ends runs with TerminateProcess, so anything driven from the
     // guest side would print nothing on exactly the run that matters.
     sregStatTick();
+}
+
+// ---------------------------------------------------------------------------
+// Exposed for EeScheduler's eeResolveOwnerEntry().
+//
+// The frametrace wrappers give every slot -- including interior resume labels --
+// its own distinct sdbzFrameTraceWrapper<I> instantiation, so two addresses in
+// the SAME guest function end up holding DIFFERENT function pointers in the
+// dispatch table. That defeats a pointer-identity walk back through the table:
+// the walk sees fn != self at the first wrapped probe and stops, reporting the
+// resume label as its own entry.
+//
+// Measured 2026-08-31: 0x17CFA4 (a known resume label inside sub_17CF50, parts
+// 38/39) was reported as owner==itself for exactly this reason, while the
+// unwrapped 0x178AC4 resolved correctly to 0x178A08. This table is the
+// authoritative address -> owner map for the wrapped addresses.
+// ---------------------------------------------------------------------------
+bool sdbzLookupFrameTraceOwner(uint32_t address, uint32_t &funcStart)
+{
+    for (size_t i = 0; i < kSdbzFrameTraceSlotCount; ++i)
+    {
+        if (kSdbzFrameTraceSlots[i].addr == address)
+        {
+            funcStart = kSdbzFrameTraceSlots[i].funcStart;
+            return true;
+        }
+    }
+    return false;
 }

@@ -480,6 +480,21 @@ namespace ps2_syscalls
         return true;
     }
 
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28,
+    // continued): a fresh watchdog run showed g_findAddressCallCount pinned at
+    // 0 for the full 200s and [FindAddress:hit]/[miss] never printed once,
+    // even though sysNum sampled 0x83 repeatedly and the guest's progress
+    // counter climbed by 30M+ -- the real FindAddress() below is never
+    // reached. dispatchSyscallOverride() runs BEFORE the switch in
+    // dispatchNumericSyscall and can short-circuit case 0x83 entirely if the
+    // guest registered its own handler via SetSyscall (0x74). These atomics
+    // identify which of this function's exit branches is actually taken for
+    // syscall 0x83, and what handler address the guest registered, without
+    // guessing.
+    std::atomic<uint32_t> g_syscallOverrideCallCount{0u};
+    std::atomic<uint32_t> g_syscallOverrideLastHandler{0u};
+    std::atomic<uint32_t> g_syscallOverrideLastBranch{0u};
+
     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t handler = 0u;
@@ -488,6 +503,12 @@ namespace ps2_syscalls
             handler == 0u)
         {
             return false;
+        }
+
+        if (syscallNumber == 0x83u)
+        {
+            g_syscallOverrideCallCount.fetch_add(1u, std::memory_order_relaxed);
+            g_syscallOverrideLastHandler.store(handler, std::memory_order_relaxed);
         }
 
         // Handlers copied into kernel RAM have no recompiled function; if the
@@ -509,6 +530,10 @@ namespace ps2_syscalls
                               << " result=0x" << hleV0
                               << std::dec << std::endl;
                 }
+                if (syscallNumber == 0x83u)
+                {
+                    g_syscallOverrideLastBranch.store(1u, std::memory_order_relaxed);
+                }
                 setReturnU32(ctx, hleV0);
                 return true;
             }
@@ -518,13 +543,26 @@ namespace ps2_syscalls
         scheduler.bindMainContextForSyscall(*ctx, rdram);
         if (scheduler.hasInvocation(GuestInvocationKind::SyscallOverride, syscallNumber))
         {
+            if (syscallNumber == 0x83u)
+            {
+                g_syscallOverrideLastBranch.store(2u, std::memory_order_relaxed);
+            }
             return false;
         }
 
         if (!runtime->hasFunction(handler))
         {
+            if (syscallNumber == 0x83u)
+            {
+                g_syscallOverrideLastBranch.store(3u, std::memory_order_relaxed);
+            }
             setReturnS32(ctx, KE_ERROR);
             return true;
+        }
+
+        if (syscallNumber == 0x83u)
+        {
+            g_syscallOverrideLastBranch.store(4u, std::memory_order_relaxed);
         }
 
         GuestInvocation invocation{};
@@ -845,11 +883,28 @@ namespace ps2_syscalls
 #endif
     }
 
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28):
+    // the project's own syscall reference (db-syscalls.md) documents the real
+    // BIOS FindAddress as a single-argument call ("a0=id" -> "$v0=addr"), which
+    // contradicts the 3-register (start,end,target) scan below. A live run
+    // showed a0=0x3 (id-shaped, not pointer-shaped) with a1/a2 holding what
+    // looks like leftover register content, driving a scan toward end=0x80080000.
+    // These externally-linked atomics (no header touched; extern'd from
+    // ps2_runtime.cpp same as ps2x_srd_stat_tick() above) capture what the scan
+    // actually does on each call, so the next watchdog line can confirm or kill
+    // the "this is a multi-hundred-million-word scan, not a quick id lookup"
+    // hypothesis without guessing.
+    std::atomic<uint32_t> g_findAddressCallCount{0u};
+    std::atomic<uint32_t> g_findAddressLastScannedWords{0u};
+    std::atomic<uint32_t> g_findAddressLastResult{0u};
+    std::atomic<uint32_t> g_findAddressLastAborted{0u};
+
     // 0x83 FindAddress:
     // - a0: table start (inclusive)
     // - a1: table end (exclusive)
     // - a2: target address to locate inside the table (word entries)
     // Returns the guest address of the matching word entry, or 0 if not found.
+    // ⚠️ UNVERIFIED against real hardware -- see the diagnostic comment above.
     void FindAddress(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)runtime;
@@ -891,6 +946,10 @@ namespace ps2_syscalls
                                       0u,
                                       nullptr,
                                       0u);
+            g_findAddressCallCount.fetch_add(1u, std::memory_order_relaxed);
+            g_findAddressLastScannedWords.store(0u, std::memory_order_relaxed);
+            g_findAddressLastResult.store(0u, std::memory_order_relaxed);
+            g_findAddressLastAborted.store(0u, std::memory_order_relaxed);
             setReturnU32(ctx, 0u);
             return;
         }
@@ -971,6 +1030,11 @@ namespace ps2_syscalls
                                   nonZeroWordCount,
                                   matches,
                                   matchCount);
+
+        g_findAddressCallCount.fetch_add(1u, std::memory_order_relaxed);
+        g_findAddressLastScannedWords.store(scannedWords, std::memory_order_relaxed);
+        g_findAddressLastResult.store(resultAddr, std::memory_order_relaxed);
+        g_findAddressLastAborted.store(aborted ? 1u : 0u, std::memory_order_relaxed);
 
         setReturnU32(ctx, resultAddr);
     }

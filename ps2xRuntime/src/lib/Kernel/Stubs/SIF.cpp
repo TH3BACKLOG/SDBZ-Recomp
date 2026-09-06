@@ -1077,14 +1077,57 @@ namespace ps2_stubs
 
             ++s_deliverDepth;
             uint32_t resumes = 0u;
+            PS2Runtime::RecompiledFunction step = dispatcher;
             for (;;)
             {
-                dispatcher(rdram, ctx, runtime);
+                step(rdram, ctx, runtime);
 
-                // Outside the function body => it ran to its `jr $ra` (or derailed). Done.
-                if (!ctx || ctx->pc < kSifDispatcherFn || ctx->pc >= kSifDispatcherEnd)
+                // ctx->pc landed on the sentinel this function injected as $ra before the
+                // first call => the dispatcher's own `jr $ra` fired. Genuinely done.
+                if (!ctx || ctx->pc == savedPc)
                 {
                     break;
+                }
+
+                if (ctx->pc >= kSifDispatcherFn && ctx->pc < kSifDispatcherEnd)
+                {
+                    // Still inside the dispatcher's own body -- it's a resumable coroutine
+                    // that re-enters through its own entry switch on ctx->pc (e.g. after a
+                    // shouldPreemptGuestExecution() yield). Resume it directly.
+                    step = dispatcher;
+                }
+                else
+                {
+                    // 2026-08-29 -- a direct `jal` to a statically-known callee (e.g.
+                    // fn_175090 / sceSifSetDChain) compiles to a trampoline: set ctx->pc to
+                    // the callee's entry and return, relying on the *real* dispatch loop to
+                    // look the callee up, invoke it, and resume the caller via $ra. We stand
+                    // in for that dispatch loop here; the old range check treated any pc
+                    // outside 0x178068's own narrow span as "returned", which silently
+                    // swallowed this hop (and everything after it, incl. the fn_178560
+                    // SignalSema path) every single time -- see [semwatch:reqendgate],
+                    // PS2_PROJECT_STATE.md part 27/28. Follow it instead.
+                    if (ctx->pc == 0x178a08u)
+                    {
+                        static std::atomic<uint32_t> s_fillZ18SifResumeLogs{0u};
+                        const uint32_t n = s_fillZ18SifResumeLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (n <= 32u)
+                        {
+                            std::cerr << "[semwatch:fillz18-sifresume] #" << n
+                                      << " ra=0x" << std::hex << getRegU32(ctx, 31)
+                                      << " sp=0x" << getRegU32(ctx, 29)
+                                      << " a0=0x" << getRegU32(ctx, 4)
+                                      << std::dec << std::endl;
+                        }
+                    }
+                    PS2Runtime::RecompiledFunction next = runtime->lookupFunction(ctx->pc);
+                    if (!next)
+                    {
+                        // Can't resolve -- a genuine derail. Stop; the derail detector below
+                        // still fires on this ctx->pc.
+                        break;
+                    }
+                    step = next;
                 }
 
                 if (++resumes >= kSifDispatcherMaxResume)
@@ -1111,6 +1154,50 @@ namespace ps2_stubs
                 {
                     std::cerr << "[SIF_DIAG:DERAIL] pc=0x" << std::hex << pc
                               << " cid=0x" << req.cid << std::dec << std::endl;
+                }
+            }
+
+            // 2026-08-29 [semwatch:reqendgate] -- static trace of fn_178068/fn_178560
+            // (the actual runner .cpp, not the IDA decompile) shows the dispatcher's
+            // `jalr $a2` at 0x178180 is a direct inline lookupFunction() call from
+            // INSIDE fn_178068's own translated body -- same wrapper-bypass shape as
+            // the already-documented 0x175090 call (feedback_registerfunction_bypass),
+            // so the existing [semwatch:reqend] entry probe (wraps funcStart==0x178560
+            // at the top-level dispatch wrapper) cannot see this invocation either way.
+            // Two things settle it directly instead: whether the dispatcher's OWN `jr
+            // $ra` fired (ctx->pc lands back on the savedPc sentinel this function
+            // injected as $ra before the first call -- see savedPc above) proving the
+            // full body including the jalr ran; and the actual value fn_178560 reads
+            // as its SignalSema gate, client_block[8] i.e. *(pkt[7] + 0x8), where
+            // pkt[7] is the client control block pointer echoed from the guest's own
+            // packet. Unconditional, bounded -- no field is written, this only reads.
+            if (ctx)
+            {
+                static std::atomic<uint32_t> s_reqEndGateLogs{0u};
+                const uint32_t n = s_reqEndGateLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (n <= 64u)
+                {
+                    const bool dispatcherRanToOwnReturn = (ctx->pc == savedPc);
+                    const uint32_t clientPtr = req.words[7];
+                    bool gateRead = false;
+                    uint32_t gateValue = 0u;
+                    if (clientPtr != 0u)
+                    {
+                        if (const uint8_t *gp = getConstMemPtr(rdram, clientPtr + 0x8u))
+                        {
+                            std::memcpy(&gateValue, gp, sizeof(gateValue));
+                            gateRead = true;
+                        }
+                    }
+                    std::cerr << "[semwatch:reqendgate] #" << std::dec << n
+                              << " cid=0x" << std::hex << req.cid
+                              << " ranToOwnReturn=" << std::dec << dispatcherRanToOwnReturn
+                              << " clientPtr=0x" << std::hex << clientPtr
+                              << " gateRead=" << std::dec << gateRead
+                              << " gateValue=0x" << std::hex << gateValue
+                              << " gateNegative=" << std::dec
+                              << (gateRead && (static_cast<int32_t>(gateValue) < 0))
+                              << std::endl;
                 }
             }
 
