@@ -51,6 +51,19 @@ namespace
     uint64_t g_dispatchOther = 0;
     uint64_t g_sleepBlocked = 0;
     uint64_t g_sleepFast = 0;
+    // 2026-09-06 part 87 -- the wakeupCount fast path is the last unmeasured
+    // link in the SofDec stall. main's 0x11E690 spin calls WakeupThread once
+    // per iteration (0x11E6F0 -> 0x11ED28); every call that lands on an
+    // already-Ready thread takes wakeupThread's else branch below and bumps
+    // wakeupCount with no ceiling. If th6 then reaches SleepThread it consumes
+    // exactly ONE and returns immediately, so it never parks and main (pri 24)
+    // never runs again. These ride the 1 Hz WATCH sampler, which is the only
+    // probe that provably keeps emitting through the stall -- DISPATCH is
+    // driven from sleepCurrent and goes silent exactly when we need it.
+    uint64_t g_wakeAcc[kDispatchMaxId] = {};    // ++wakeupCount events per tid
+    uint64_t g_wakeReady[kDispatchMaxId] = {};  // makeReady events per tid
+    uint32_t g_wakeCountLast[kDispatchMaxId] = {}; // last seen wakeupCount
+    uint32_t g_sleepCountLast[kDispatchMaxId] = {}; // wakeupCount at SleepThread
     unsigned g_dispatchSinceClock = 0;
     bool g_dispatchClockSet = false;
     std::chrono::steady_clock::time_point g_dispatchLastEmit{};
@@ -2089,11 +2102,43 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
     return KE_OK;
 }
 
+// 2026-09-06 part 87 -- read by the 1 Hz WATCH sampler in ps2_runtime.cpp.
+// Host-side scheduler state has no guest address, so it cannot ride
+// PS2X_TRACE_WATCH's address list; this is the seam. Order is fixed and the
+// caller passes its own capacity, so adding a field later cannot corrupt a
+// stale caller.
+extern "C" void ps2x_sched_diag(uint64_t *out, int n)
+{
+    if (out == nullptr || n <= 0)
+    {
+        return;
+    }
+    const uint64_t v[] = {
+        g_sleepFast,
+        g_sleepBlocked,
+        g_wakeAcc[6],
+        g_wakeReady[6],
+        static_cast<uint64_t>(g_wakeCountLast[6]),
+        static_cast<uint64_t>(g_sleepCountLast[6]),
+        g_wakeAcc[1],
+        g_wakeReady[1],
+    };
+    const int have = static_cast<int>(sizeof(v) / sizeof(v[0]));
+    for (int i = 0; i < n; ++i)
+    {
+        out[i] = (i < have) ? v[i] : 0u;
+    }
+}
+
 void EeScheduler::sleepCurrent()
 {
     assertExecutor();
     GuestThread *self = currentThread();
     assert(self != nullptr);
+    if (m_currentThreadId > 0 && m_currentThreadId < kDispatchMaxId)
+    {
+        g_sleepCountLast[m_currentThreadId] = static_cast<uint32_t>(self->wakeupCount);
+    }
     if (self->wakeupCount != 0u)
     {
         --self->wakeupCount;
@@ -2127,10 +2172,19 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
         target->wait.reason == EeWaitReason::Sleep)
     {
         makeReady(*target, KE_OK, interruptSafe);
+        if (id > 0 && id < kDispatchMaxId)
+        {
+            ++g_wakeReady[id];
+        }
     }
     else
     {
         ++target->wakeupCount;
+        if (id > 0 && id < kDispatchMaxId)
+        {
+            ++g_wakeAcc[id];
+            g_wakeCountLast[id] = static_cast<uint32_t>(target->wakeupCount);
+        }
     }
     publishSnapshot();
     return KE_OK;

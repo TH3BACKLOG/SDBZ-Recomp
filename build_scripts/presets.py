@@ -137,6 +137,21 @@ PRESETS = {
         ("g36", 0x45F69C, 32),      # guard-3 gate; 0->1 marks the stall window
         ("done", 0x460F04, 32),     # SofDec done flag (get_data_ptr()+6284)
         ("cur", 0x460F58, 32),      # last handle sif_is_bound saw
+        # --- part 84 (09-06): the h44 PUMP PATH, decoded on PCSX2 in-phase.
+        # 0x155210 body -> for i in 0..7: 0x155320(obj_i) where
+        # obj_i = 0x45F6E4 + i*0x304 (only obj0 is live; obj1..7 are all-zero).
+        # 0x155320 gates, in order, then tail-jumps 0x1553D8 -> 0x165250 -> 0x165300:
+        #   0x155358  g674  == 1        (watched above)
+        #   0x155384  [obj+0x00] == 1   -> o0st
+        #   0x155394  [obj+0x60] != 1   -> o0bsy  (re-entrancy; set 1 for the
+        #                                  duration of 0x1553D8 via 0x155518)
+        #   0x1553a4  g36 != 1          <- THE g36 BAIL, found at last
+        #   0x165250  0x15B560([obj+0x3C]) == 0 -> o0slt must be a live slot
+        # then 0x165338 does `sw zero,0x44(s1)` -- the ONLY h44 clear.
+        # Oracle in-phase: o0st=1, o0bsy=0 (1 only while servicing), o0slt=0x1B12CC0.
+        ("o0st", 0x45F6E4, 32),
+        ("o0bsy", 0x45F744, 32),
+        ("o0slt", 0x45F720, 32),
         ("gamemode", 0x5E6B3C, 8),  # 0x00 = MainMenu; width unverified
     ],
 }

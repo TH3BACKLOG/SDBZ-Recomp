@@ -1,3 +1,1173 @@
+## HANDOFF part 92 (2026-09-07) -- THE STARVED EDGE IS NAMED: THE GATE PASSES, NOTHING CALLS 0x14f428.
+
+First PCSX2 oracle session in-phase with breakpoints ACTUALLY FIRING. Everything
+part 91 could only infer is now measured on hardware.
+
+### 1. The hardware chain, read off four live backtraces
+
+    ??? -> 0x14f428                 ra=0x14f450 observed at the 0x155630 hit
+             gate: beqzl s1,0x14F4F0  ; s1 = lw [s0+0x3C], s0 = 0x45F6E4
+           -> 0x155630              THE DRAIN BARRIER -- runs constantly on hardware
+             -> 0x154950  [tail j -- ELIDED from the stack walk]
+               -> 0x13c448          class dispatch, a0=6
+                 -> 0x11e690        wake worker: a0=0x0E (id 14), a1=0x19 (pri 25)
+
+s1 = 0x01B12CC0 (the SofDec handle) is held live across every frame.
+0x154950 is invisible to the walker because it is entered by `j`, not `jal`.
+
+### 2. The gate is a DATA gate, one level ABOVE the driver
+
+Part 91 was right that there is no gate INSIDE the driver. It sits at 0x14f428,
+and it tests a POSTED POINTER, not a flag:
+
+    0x14f440  beqzl s1, 0x14F4F0    ; s1 = [0x45F720] -> skip the drain if null
+    0x14f448  jal   0x00155630      ; the drain barrier
+    0x14f450  sw    zero, 0x4(s0)   ; consume
+    0x14f454  sw    zero, 0x3C(s0)  ; clear the posted request
+
+0x45F678 is get_data_ptr() -- its ONLY static ref is get_data_ptr+0x8 -- which
+pins the offsets: obj0 = +0x6C = 0x45F6E4, posted slot = +0xA8 = 0x45F720,
+g36 = +0x24, done = +0x188C. Matches build_scripts/presets.py exactly.
+
+### 3. *** The gate is SATISFIED on our side, so the gate is NOT the bug
+
+Run E, 597 in-phase samples, vs. hardware read live at the same phase:
+
+    field           ours          hardware
+    o0st  (+0x00)   1             1           OK
+    o0bsy (+0x60)   0             0           OK
+    o0slt (+0x3C)   0x1b12cc0     0x1b12cc0   OK
+
+o0slt was already watched by part 84; its recorded oracle expectation is now
+CONFIRMED against real hardware rather than inherited.
+
+So the posted request is correct, the gate would pass, and the barrier plus
+everything below it are correct. Part 91 measured 0x14f428 entered 2x in 200 s;
+hardware enters it many times per second. NOTHING CALLS IT.
+
+The wall is exactly one edge wide: the callers of 0x14f428.
+
+### 4. The five callers -- all slot=yes, all traceable
+
+    0x14c8c8  sub_14C8C8           5 static callers   (Run E: 0 hits)
+    0x14f140  sub_14F140           2                  (Run E: 1 hit, ra 0x14f220)
+    0x14f278  sub_14F278           0  <- runtime slot  (Run E: 0 hits)
+    0x14f378  obj_set_fields_k_2   3                  (Run E: 0 hits)
+    0x14f500  sub_14F500           1                  (Run E: 1 hit, ra 0x14f558)
+
+0x14f278 has callers=0, i.e. reachable ONLY through a runtime table -- the same
+construction that hid the per-frame driver from eeref all along. Prime suspect
+for the per-frame path hardware uses and we never take.
+
+One level up (both slot=yes, both reached by jal, so counts will be trustworthy):
+0x14f140 <- 0x113aa0 obj_set_fields___30_0 (3 callers);
+0x14f500 <- 0x113c60 wrap_wrap_obj_set_flags_clone_01 (3 callers).
+
+### 5. Next run -- NO REBUILD, env-var only
+
+    $env:PS2X_TRACE_CALLS = "0x14f428:4096,0x14c8c8:4096,0x14f140:4096,0x14f278:4096,0x14f378:4096,0x14f500:4096,0x113aa0:4096,0x113c60:4096"
+    $env:PS2X_TRACE_WATCH = (python "F:\SDBZ Recomp\build_scripts\presets.py" sofdec)
+    & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+
+WARNING: a zero on any of these is only evidence if that function is entered by
+`jal`; a tail `j` bypasses the function-table hook and reads zero while running.
+
+### 6. RETRACTED from the part-91 session -- all three were dead-probe artifacts
+
+The emulator was paused at PCSX2's OWN UI level while the DebugServer happily
+answered. pcsx2_continue reported "Resumed" and did NOT restart the frame loop.
+Every negative taken in that window is void:
+
+  - "0x14f428 never fires on hardware"   -- it fires; its ra is how we found the caller.
+  - "0x155630 is not driven per-frame"   -- it is, constantly.
+  - "0x11e690 never fires on hardware"   -- it fires 26 cycles later.
+
+Caught by a POSITIVE CONTROL: 0x13c448 (the class dispatcher, which must run
+constantly) also failed to fire. Tells that the machine is frozen rather than
+quiet: EE PC pinned at 0x00081fc0 (a nop-slide ending in `b 0x81fc0`, the kernel
+idle thread), memory identical across two reads of a toggling field,
+get_backtrace returning "No stack frames" right after a successful pause, and a
+non-monotonic cycle counter. ALWAYS arm a positive control before trusting a
+negative from this debugger.
+
+SURVIVES INDEPENDENTLY (a disassembly reading, not an emulator measurement):
+w6tick/d6n are bumped inside th6's OWN loop at 0x11eb30/0x11eb3c, so the 15-68/s
+rate measures th6 looping, not the barrier. Part 90's headline stands corrected;
+the barrier's hardware rate is still unmeasured in absolute terms, but it is now
+OBSERVED RUNNING in-phase.
+
+### 7. Session end state
+
+PCSX2 ran past the movie: sl0 = 0 and all of obj0 reads zero, so the phase is
+gone. Re-catching hardware's CALLER of 0x14f428 needs a reload to the Atari logo.
+
+---
+
+## HANDOFF part 91 -- NO GATE INSIDE THE DRIVER. THE WHOLE SofDec CLUSTER IS ENTERED TWICE IN 200 s.
+
+### 1. Run E result
+
+PS2X_TRACE_CALLS=0x155630:2048,0x14f428:2048,0x14f580:2048,0x11ed78:2048
+525 TRACE records, no cap.
+
+    ('0x11ed78','0x11e994') 258    thread 4 loop
+    ('0x11ed78','0x11ea88') 258    thread 5 loop
+    ('0x11ed78','0x11ebbc')   2    th6 completion sleep
+    ('0x11ed78','0x11eb60')   2    th6 wbusy-ack sleep
+    ('0x155630','0x14f450')   2    <- the barrier; site 0x14f448 in sub_14F428
+    ('0x14f428','0x14f220')   1    <- from sub_14F140+0xd8
+    ('0x14f428','0x14f558')   1    <- from sub_14F500+0x50
+    ('0x14f580','0x14f0dc')   1    <- from sub_14F000+0xd4
+
+Only ONE of the three 0x155630 call sites is live: 0x14f448. The two sites in
+sub_14F580 (0x14f614, 0x14f628) never fire.
+
+### 2. The gate is NOT inside sub_14F428
+
+sub_14F428 ran twice and called the barrier twice. 1:1. It is faithful.
+Every level of the tree runs once or twice:
+
+    0x155630 x2   <-  0x14f428 x2   <-  {sub_14F140 x1, sub_14F500 x1}
+    0x14f580 x1   <-  sub_14F000 x1
+
+Hardware drives the barrier 15-68 times per SECOND (part 90 sec.3).
+=> The starvation is ABOVE everything traced so far. The whole SofDec/CRI
+   driver cluster is simply not being ticked.
+
+All call sites involved are `jal` with no tail jumps (eeref: call=5 ptr=0 for
+0x14f428, call=3 ptr=0 for 0x14f580), so these counts are trustworthy and the
+tracer is NOT structurally blind here.
+
+### 3. Why the next step must be PCSX2, not more static work
+
+0x13c448 dispatches through a table at 0x54EBA0 that is BUILT AT RUNTIME.
+eeref sees the static image only, so it cannot enumerate whoever installs or
+invokes those slots. The per-frame driver of this cluster is therefore not
+recoverable statically -- it must be observed.
+
+DECIDED EXPERIMENT (one breakpoint, one backtrace):
+  - PCSX2 at the Atari-logo movie phase; confirm phase by sl0 == 0x1B12CC0
+  - breakpoint at 0x14f428
+  - read the BACKTRACE (NOT the hit count -- PCSX2 BP/WP counters read 0 even
+    when firing, see reference_pcsx2_debugger_quirks)
+  - hardware hits this 15-68x/s so it fires immediately
+
+That names the per-frame driver on hardware. Then check whether that driver
+exists and runs in our runtime.
+
+FALLBACK if PCSX2 is unavailable: another trace run one level up --
+sub_14F140 (0x14f140), sub_14F500 (0x14f500), sub_14F000 (0x14f000) and their
+callers. Costs several runs of guessing versus one backtrace.
+
+### 4. Ruled out this run
+
+"Run with no timer" will NOT help. The freeze is total, not slow: d5n froze at
+257 for the final 72 s and the deadlock is mutual and self-sustaining. The 200 s
+window already contains the entire ~12 s active window. More wall-clock only
+buys more spin at ~195k ticks/s.
+
+
+## HANDOFF part 90 -- THE DEADLOCK IS A SYMPTOM. THE REAL BUG IS UPSTREAM: CLASS 6 IS NEVER DRIVEN, SO A PENDING COMMAND (h4c=3) SITS UNCONSUMED UNTIL main's BARRIER SLAMS THE GATE ON IT.
+
+### 1. Run D: the g36 bracket is named, first-hand
+
+PS2X_TRACE_CALLS=0x1555a0:4096,0x11ed78:4096 + sofdec WATCH. 523 TRACE records, no cap.
+
+    ('0x11ed78','0x11e994') 258     thread 4 loop
+    ('0x11ed78','0x11ea88') 258     thread 5 loop
+    ('0x11ed78','0x11ebbc')   2     th6 completion sleep
+    ('0x11ed78','0x11eb60')   2     th6 wbusy-ack sleep
+    ('0x1555a0','0x155650')   2     g36 = 1   <- SET
+    ('0x1555a0','0x155664')   1     g36 = 0   <- CLEAR
+
+Two sets, one clear -- the same 2:1 as CHGPRI, now bound to an instruction.
+The other two 0x1555a0 caller pairs (0x14e92c/0x14e940, 0x154a1c/0x154a30)
+NEVER FIRE AT ALL. Only sub_155630 is live.
+
+    1698  ra=0x155650 a1=1  savetid=1 savepri=0x18  h4c=1  d5n=1    done=1   bracket 1 OPEN
+    1708  ra=0x155664 a1=0                          h4c=1  d5n=1    done=1   bracket 1 CLOSED
+    5949  ra=0x155650 a1=1  savetid=1 savepri=0x18  h4c=3  d5n=257  done=0   bracket 2 OPEN, never closes
+
+Same site, same thread, same h44/h48. Differences at entry: h4c 1 -> 3, done 1 -> 0.
+
+### 2. sub_155630 is a DRAIN BARRIER, and it is straight-line
+
+    0x15563c  jal 0x14ff40                 ; enter
+    0x155648  jal 0x1555a0(s0, 1)          ; g36 = 1        OPEN
+    0x155650  jal 0x154950                 ; <<< the body
+    0x15565c  jal 0x1555a0(s0, 0)          ; g36 = 0        CLOSE
+    0x155664  jal 0x14ff58                 ; leave
+    0x155678  j   0x1549c0                 ; tail
+
+NO branches, NO conditional escape. Exactly one call sits between open and close.
+
+    0x154950:  a0 = 6 ; j 0x13c448
+    0x13c448:  table = 0x54EBA0 ; fn = [table + class*8] ; arg = [table + class*8 + 4]
+               if (fn == 0) return ; else jalr fn(arg)
+    slot 6 fn = 0x11e778   (matches the c6fn WATCH field exactly)
+    0x11e778:  a0 = [0x44198c] ; a1 = [0x441908] ; j 0x11e690     <- TAIL JUMP, tracer-blind
+    0x11e690:  wbusy = 1 ; boost th6 25 -> 1 ; spin until wbusy == 0
+
+So main deliberately blocks waiting for th6 to drain, WHILE HOLDING the exact flag
+(g36) that stops th6 from ever draining. The bracket cannot be escaped early.
+
+### 3. ORACLE: hardware runs this same bracket per-frame, in microseconds
+
+All three PCSX2 captures, 1803 samples, same slot pointer sl0 = 0x1B12CC0 (phase-matched):
+
+    g36    = 0 in ALL 1803 samples
+    wbusy  = 0 in ALL 1803 samples
+    done   = 0 in ALL 1803 samples
+    h44    toggles 0/1 freely (366/235, 394/207, 279/254)
+    h48    in {0,2,4,6}; h48 == 1 in exactly 1 of 1803 samples
+    w6tick == d6n EXACTLY, in all three captures
+
+w6tick/d6n rate on hardware: 15.7, 53.8, 67.9 per second -- FRAME-RATE SHAPED.
+
+This RETIRES the standing "no oracle capture ever reaches g36=1" debt. It is not
+that hardware avoids the bracket; hardware runs it 15-68 times a SECOND and each
+pass lasts microseconds, so a 1 Hz sampler can never catch g36=1. wbusy=0 always,
+for the same reason. The oracle is CONSISTENT with our code path, not divergent on it.
+
+### 4. The real divergence, with the window computed correctly
+
+WARNING -- an earlier rate comparison this session was WRONG because it divided by
+the whole 200 s run. The first 115 seconds are DEAD: sl0=0, w6tick=0, d6n=0, d5n=0,
+h44=0, h48=0. The active window is only ~12 s (t~115 -> t~127).
+
+Recomputed over the correct window:
+
+                  ours        hardware
+    d5n (class 5) ~21/s       2.1 - 14.5/s     <- ours is FASTER than hardware
+    d6n (class 6) 0.17/s      15.7 - 67.9/s    <- ours is 100-400x UNDER
+
+main is not slow. Class 5 is healthy. CLASS 6 ALONE IS STARVED.
+
+### 5. h4c=3 is pending from the slot's BIRTH
+
+presets.py line 132-134: h4c is the COMMAND word read by the state-1 handler
+0x165458; state 1 advances to 2 only when h4c is in {2,3,4,6}.
+
+Our h4c = 3 in the VERY FIRST WATCH sample in which the slot exists (index 120),
+with g36 still 0. So a VALID pending advance-command existed for ~12 seconds
+before main ever set g36. The command was never consumed because th6 never ran
+the pump. Then main opened bracket 2 and gated the pump permanently.
+
+Ordering, from the sleep census: th6 ticked TWICE at the very start of the window
+(d5n = 0, 1), slept via ra=0x11eb60, and stayed asleep for the whole 12 s while
+main ran 256 class-5 iterations. 256 class-5 iterations, ZERO barrier entries.
+
+### 6. Who wakes th6 -- the search is closed
+
+eeref refs 0x11ed28 (the WakeupThread helper) = 4 call sites:
+    0x11e6f0  jal   in 0x11e690        <- main's drain barrier
+    0x11eb90  jal   in 0x11eac8        <- th6 itself, wakes the OTHER worker [0x441990]
+    0x11fbe0  jal   in 0x11fbb8
+    0x11fc24  j     in 0x11fbb8
+
+0x11fbb8 is NOT a general per-frame ticker. Decoded 0x11ed90:
+    returns the tid ONLY if status is 8 (SUSPEND) or 0xc (WAIT|SUSPEND)
+    returns 0 otherwise
+and 0x11fbb8 gates its wake on `bne v0, v1` against the same tid. So 0x11fbb8
+wakes a worker only when that worker was SUSPENDED. A plainly sleeping th6 is
+deliberately NOT woken there.
+
+=> The ONLY routine waker of a sleeping th6 is main's drain barrier at 0x11e6f0.
+=> Therefore hardware MUST enter sub_155630 per-frame. We entered it TWICE in 200 s.
+
+CORRECTION to a statement made earlier this session: s1 in th6's loop is the
+constant 1 (addiu s1,zero,1), NOT a tid. The wake at 0x11eb90 targets [0x441990],
+the second worker -- not main.
+
+### 7. THE QUESTION FOR THE NEXT RUN
+
+Why does main not enter sub_155630 per-frame?
+
+eeref refs 0x155630 = 3 call sites, all jal:
+    0x14f448  in sub_14F428+0x20
+    0x14f614  in sub_14F580+0x94
+    0x14f628  in sub_14F580+0xa8
+
+All four proposed targets verified slot=yes (func-map entries, safe to trace):
+    0x155630 slot=yes   0x14f428 slot=yes   0x14f580 slot=yes   0x11ed78 slot=yes
+
+    PS2X_TRACE_CALLS=0x155630:2048,0x14f428:2048,0x14f580:2048,0x11ed78:2048
+
+Reads:
+  - 0x14f428 / 0x14f580 firing at ~21/s but 0x155630 at 0.17/s
+        => the gate is INSIDE those two functions; disassemble the guard.
+  - 0x14f428 / 0x14f580 also at ~0.17/s
+        => the starvation is further up; walk the tree from part 90 section 7.
+  - ra on 0x155630 names which of the 3 sites is the per-frame one.
+
+### 8. COVERAGE CAVEATS
+
+  - "the only routine waker" rests on eeref, which sees the STATIC image only.
+    A runtime-installed dispatch slot calling WakeupThread would be invisible.
+    0x13c448's table at 0x54EBA0 is exactly such a runtime table.
+  - 0x11e778 reaches 0x11e690 by TAIL JUMP, so the tracer is structurally blind
+    to 0x11e690 itself. Do not read a zero there as "never ran".
+  - The oracle captures are phase-matched by sl0 = 0x1B12CC0 and by w6tick==d6n,
+    not by an explicit scene marker.
+
+
+## HANDOFF part 89 -- THE DEADLOCK IS CLOSED AND FULLY DECODED. main HOLDS g36 WHILE WAITING FOR th6, AND th6 CANNOT FINISH WHILE g36 IS HELD.
+
+### 1. Run C: the first COMPLETE sleep census
+`PS2X_TRACE_CALLS=0x11ed78:4096` -> **520 records, no `[cap]`**. Every
+SleepThread through that slot, for the whole 200 s run.
+
+```
+('0x11ed78','0x11e994') 258   thread 4 loop
+('0x11ed78','0x11ea88') 258   thread 5 loop
+('0x11ed78','0x11ebbc')   2   th6, completion sleep  (0x11ebb4, s0==0 path)
+('0x11ed78','0x11eb60')   2   th6, wbusy-ack sleep   (0x11eb58, clears wbusy)
+```
+**th6 slept exactly 4 times in 200 seconds.** wk6rdy=4 -> 4 sleeps, 4 wakes,
+ends awake. Fully consistent, no lost events.
+
+### 2. New progress meter: d5n
+`d5n` (0x45EFDC, run_class(5)) ran ~28/s until t=125 and then **FROZE at 257
+for the remaining 72 s** while d6n/w6tick ran to 13.7 M. main makes literally
+zero forward progress after the bifurcation. Use d5n, not w6tick, to ask
+"is main alive".
+
+### 3. Two brackets, one exit -- reproducible for the 3rd run running
+Whole-run CHGPRI: `0x11e6e8` (boost) **x2**, `0x13c478` (restore) **x1**.
+After the last th6 sleep, `cur` is 0x6 for **3846** consecutive records and
+nothing else ever runs.
+
+```
+5942  CHGPRI ra=0x11e6e8 cur=0x1 thid=0x6 prio=0x1 old=0x19  <- main boosts th6 25->1
+5943  TRACE  ra=0x11ebbc  wbusy=1  w6tick=2                  <- th6 completion-sleeps, wbusy NOT cleared
+5946  TRACE  ra=0x11eb60  wbusy=0  w6tick=3                  <- th6 clears wbusy, sleeps
+5947+ CHGPRI ra=0x11e5dc cur=0x6 ... old=0x1  forever         <- th6 awake at pri 1, never restored
+```
+th6's own critsec pair reads `prio=0x1 old=0x1` -- a **no-op**, because main
+already boosted it to 1. Thread 4's pair two lines earlier is a real
+`0x1 / 0x10` raise+restore. Good contrast for spotting the boosted state.
+
+### 4. main's spin and th6's loop, both decoded
+```
+main 0x11e690:                       th6 0x11eac8 loop @0x11eb30:
+  0x11e6d4 sw 1 -> wbusy               0x11eb38 w6tick++
+  0x11e6e0 jal ChangeThreadPriority    0x11eb3c jal 0x13c6e8 = run_class(6); s0 = ret
+  loop:                                0x11eb4c if (wbusy == 1)
+    0x11e6f0 jal 0x11ed28                0x11eb58 jal SLEEP ; delay slot: wbusy = 0
+    0x11e6f8 jal 0x11ed90              0x11eb60 bne s0, zero -> 0x11ebbc   (SKIP the sleep)
+    0x11e704 lw wbusy                  0x11eb68..0x11eb90 (s0==0 path only)
+    0x11e708 beq 0 -> exit+restore     0x11ebb4 jal SLEEP
+    0x11e710 loop (max 199,999,999)    0x11ebbc loop tail
+```
+`0x11ed28(tid)` = ReferThreadStatus; if status 4 (WAIT) or 0xc -> **WakeupThread**.
+`0x11ed90(tid)` = ReferThreadStatus; if status 8 (SUSPEND) or 0xc -> ResumeThread
+                  -- a **no-op** on a plainly sleeping thread.
+
+⚠ **CORRECTS part 88's warning.** I said "do NOT arm 0x11ed28, th6 calls it
+196k/s". That was inferred, not measured, and it is WRONG: 0x11eb90 sits on the
+`s0==0` fall-through, which the spin never takes. **The spin path calls ONLY
+run_class(6).** Arming 0x11ed28/0x11ed90 is safe.
+
+### 5. THE CLOSED LOOP -- every link disassembled first-hand this session
+```
+0x1651d8  sweep of 8 slot pointers at 0x461164 (== the preset's sl0..sl7):
+            for i in 0..7:  p = slots[i]
+              if 0x15b560(p) != 0: continue          ; excused
+              if 0x1651b0(p) == 0: return 0          ; INCOMPLETE
+            return 1
+0x15b560  p==NULL -> -1 (excused);  p->h48==0 -> -1 (excused);  else 0
+0x1651b0  (unsigned)(p->h48 - 1) >= 4 -> 1 (complete);  else return (p->h44 == 0)
+```
+Our sl0=0x1b12cc0 has **h48=1, h44=1**; sl1..sl7 are NULL and excused. So the
+whole sweep reduces to one bit: **h44**.
+
+```
+h44 is cleared in exactly ONE place:
+  0x165300(slot):  if ((unsigned)(h48-1) >= 4) return
+                   if (slot->h44 == 0) return
+                   slot->h44 = 0            <<< the write
+  reachable only:  0x165300 <- 0x165250 <- 0x155320 <- 0x155210 <- 0x154fa8
+                   (0x1652a8, the other caller, is UNREACHABLE dead code)
+0x155320(slot):    if (g674 != 1)         return 0
+                   if (slot == NULL)      return 0
+                   if (slot->[0] != 1)    return 0
+                   if (slot->[96] == 1)   return 0
+                   if (ctx->g36 == 1)     return 0     <-- 0x1553a4, THE BAIL
+                   ... -> 0x165250 -> 0x165300
+ctx = 0x14e4d0() = 0x45F678 ;  g36 = ctx+36 = 0x45F69C  (matches presets)
+```
+
+**The deadlock, stated exactly:**
+1. main sets g36=1, sets wbusy=1, boosts th6 25->1, spins on wbusy.
+2. th6 runs run_class(6) -> slot 0 -> 0x155320 -> **bails because g36==1**.
+3. h44 stays 1 -> 0x1651d8 = INCOMPLETE -> slot 0 returns 1 -> run_class(6) != 0.
+4. `bne s0, zero` at 0x11eb60 skips th6's sleep -> th6 spins at pri 1.
+5. main (pri 24) never runs again -> never reads wbusy==0 at 0x11e704 ->
+   never closes the g36 bracket -> back to (2).
+Each side is blocked by the other. Self-sustaining.
+
+⚠ COVERAGE: the "exactly ONE place" and "dead code" claims rest on `eeref`,
+which sees the **static image only**. A dispatch slot installed at runtime that
+reaches 0x165300 would be invisible to it. 0x154fa8 itself is such a slot, and
+eeref did resolve it -- but that is not proof there is no other.
+
+### 6. NEXT RUN -- name the bracket that latched g36 (no rebuild)
+g36 is written by **0x1555a0(slot, val)**: `slot->[92] = val` if non-null, and
+**always** `ctx->g36 = val`. It has three caller PAIRS -- three set/clear
+brackets:
+```
+0x14e92c / 0x14e940   in sub_14E8B0
+0x154a1c / 0x154a30   in sub_1549C0
+0x155648 / 0x15565c   in sub_155630     (memory already flags 0x154950 here)
+```
+TRACE records carry a0..a3, so tracing 0x1555a0 gives **both** the site (`ra`)
+and the value (`a1`). The last `a1=1` with no matching `a1=0` names the bracket
+that never closed.
+```
+PS2X_TRACE_CALLS=0x1555a0:4096,0x11ed78:4096
+expected ra: 0x14e930 0x14e944 0x154a20 0x154a34 0x15564c 0x155660
+```
+
+### 7. The oracle debt is now the decisive question
+No PCSX2 capture has EVER reached g36=1 (g36=0 in all 1,803 samples of all
+three captures). If hardware never enters this bracket in this phase, then
+**entering it at all is the divergence** and the deadlock inside it is a
+downstream consequence, not the bug. Get an in-phase capture.
+
+---
+
+## HANDOFF part 88 -- HYPOTHESIS REFUTED: THE EE SCHEDULER IS EXONERATED. th6 NEVER SLEEPS BECAUSE THE GUEST CODE SAYS NOT TO.
+
+### 1. The part-87 patch worked, and it killed the part-87 hypothesis
+`slpfast slpblk wk6acc wk6rdy wk6cnt wk6slp wk1acc wk1rdy` emitted in all 198
+WATCH samples. Bifurcation reproduced at **t=135** (t=139, t=131 in prior runs).
+
+```
+slpfast = 0     for the ENTIRE run -- sleepCurrent's wakeupCount fast path
+                was NEVER taken, not once
+wk6acc  = 0     for the ENTIRE run -- main's spin never bumped th6's
+                wakeupCount; every WakeupThread landed on a WAITING th6
+wk6cnt  = 0     wk6slp = 0        wk1acc = 0
+wk6rdy  = 4     main made th6 Ready exactly 4 times in 200 s
+slpblk  climbs to 777 and FREEZES at t=135
+```
+
+**The unbounded-`++wakeupCount` theory is dead.** `EeScheduler` is behaving
+correctly: no accumulation, no fast-path returns, no lost wakeups. This was
+branch 4 of part 87's decision table, not the predicted branch 1.
+
+### 2. What the timeline actually shows
+```
+t     w6tick    g36  wbusy wk6rdy slpblk savepri savetid h44 h48
+119-125    0    0    0     0      0      0x0     0x0     0   0
+126        2    0    0     1      52     0x18    0x1     1   1   <- slot 0 born, th6 parks
+127-134    2    0    0     1      722    0x18    0x1     1   1   <- NINE SECONDS asleep
+135      122    1    0     4      777    0x1     0x6     1   1   <- bracket 2 opens
+136+  196728+   1    0     4      777    0x1     0x6     1   1   <- 196k/s forever
+```
+`slpblk` freezing means **no thread in the system calls SleepThread after
+t=135**, not just th6. DISPATCH's last record is the same second.
+
+### 3. main is the spinner -- confirmed, with its normal priority
+```
+CHGPRI ra=0x11e6e8  cur=0x1  thid=0x6  prio=0x1  old=0x19   x2   <- the BOOST
+CHGPRI ra=0x13c478                                          x1   <- the RESTORE
+```
+`cur=0x1` -> main (tid 1) is the thread inside `0x11e690`. `old=0x19` -> th6
+normally runs at **priority 25, LOWER than main's 24**. So th6 cannot starve
+main on its own; the starvation exists **only** because main deliberately
+boosts it to 1 and then busy-waits. Two entries, one exit: pass 1 completed,
+pass 2 never returned. (Same 2:1 as part 87.)
+
+### 4. The reframe: this is not a scheduler bug at all
+th6's loop is doing exactly what the guest instructs. `run_class(6)` returns
+nonzero because class-6 slot 0 reports **INCOMPLETE** (`0x1651d8() == 0` while
+`h48 in 1..4 && h44 != 0`), so `bne s0, zero, 0x11ebbc` at `0x11eb60` takes the
+no-sleep branch on every pass. A worker with outstanding work is *supposed* to
+keep working. Everything downstream of that is a correct consequence.
+
+⚠ So parts 86 and 87 both framed this as "th6 fails to sleep". It does not
+fail -- it is told not to. The defect is upstream of the sleep decision.
+
+### 5. The two questions that are actually open
+**(a) The nine-second park, t=126..134.** Slot 0 was already INCOMPLETE and
+work was outstanding, yet th6 sat parked with `wk6rdy` stuck at 1 and nothing
+woke it. On hardware `w6tick` moves in bursts, so *something* pumps th6
+periodically. Identify that waker and check whether it runs here. This window
+is the cleaner failure -- g36 was 0 the whole time, so the gate was open and
+nothing was blocked.
+
+**(b) The single second t=135.** main opened bracket 2, woke th6 three times
+(`wk6rdy` 1 -> 4, every one landing on a Waiting thread), and never got control
+back. Sub-second ordering is required; 1 Hz cannot resolve it.
+
+### 6. The cap problem that blocked parts 86 and 87 is GONE
+**Total sleeps for the whole 200 s run = 777** (`slpblk` final, `slpfast` 0).
+So `0x11ed78:4096` now captures **every SleepThread call in the entire run**
+without saturating -- the chronological-cap trap
+([[feedback_tracer_blind_to_tail_jumps]] corollary) does not apply at this
+volume. Its `ra` separates th6's two sleep sites (`0x11eb60` = the wbusy path,
+`0x11ebbc` = the s0==0 path), and every record now carries the sched counters.
+
+**Do NOT arm `0x11ed28`** -- th6's own loop calls it at `0x11eb90`, 196k/s.
+
+**Decision table:**
+```
+th6 sleeps repeatedly through t=126..134           -> it IS being pumped; the park
+                                                      is not a park, re-read (a)
+th6 has NO record between t=126 and t=135          -> confirms the 9 s park; find
+                                                      the missing periodic waker
+at t=135, ra=0x11eb60 fires then w6tick climbs     -> th6 cleared wbusy and main
+  with no further record                              still failed to see 0 -- main's
+                                                      0x11e704 read is the target
+at t=135, ra=0x11ebbc fires 3x then stops          -> th6 slept on s0==0 without
+                                                      clearing wbusy; main's spin
+                                                      is waiting on a flag th6 only
+                                                      clears on the other branch
+```
+
+### 7. Unchanged, still owed
+An oracle capture that actually reaches `g36=1`. All three captures have g36=0
+in every one of their 1,803 samples, so `h48=1` still has no in-phase hardware
+comparison and remains a symptom, not a proven cause.
+
+---
+
+## HANDOFF part 87 -- THE LOOP IS CLOSED: run_class(6) REPORTS "INCOMPLETE" FOREVER, SO th6 NEVER REACHES EITHER SLEEP
+
+### 1. What the run answered
+Armed `0x11ed78:64,0x11e690:16` + full sofdec watch set. 200 s, RelWithDebInfo.
+Bifurcation reproduced at **t=139** (was t=131 last run).
+
+- `0x11ed78` saturated (`[cap] tag=trace addr=0x11ed78 saturated at 64`) at
+  probe line 4160, i.e. **between t=130 and t=131 -- BEFORE the explosion.**
+  Every conclusion from the TRACE list is therefore about the QUIET window only.
+- `0x11e690` traced **ZERO** -- and that zero is **structural, not evidence**.
+  `0x11e778` ends in `j 0x11e690`, and the generated body emits that tail jump as
+  a DIRECT C++ call (`noop_sub_e690_0x11e690(rdram, ctx, runtime); return;`),
+  bypassing the function table the tracer hooks. See [[feedback_tracer_blind_to_tail_jumps]].
+
+### 2. The 64 TRACE records (quiet window)
+| ra | who | n | meaning |
+|----|-----|---|---------|
+| `0x11eb60` | th6 | **1** | the `wbusy==1` sleep, at w6tick 1->2, with g36=1 |
+| `0x11ebbc` | th6 | 1 | the `s0==0` sleep, earlier, g36=0 |
+| `0x11e994` | th4 | 31 | normal work/sleep cycle |
+| `0x11ea88` | th5 | 31 | normal work/sleep cycle |
+
+**Pass 1 of the handshake COMPLETES CORRECTLY.** main opened the bracket at
+t~129, th6 woke, ran one pass, saw `wbusy==1`, cleared it in the `0x11eb5c`
+delay slot, slept and blocked; main's spin then read `wbusy==0`, exited, and
+restored priority (savepri/savetid `0x19/6` -> `0x18/1`). g36 back to 0 by t=130.
+
+### 3. run_class(6) decoded -- `0x13c4f8`
+```
+s1 = 0x45EFE8 + idx*4        ; idx=6 -> 0x45F000  == d6in   (verified)
+s0 = 0x54E960 + idx*72       ; idx=6 -> 0x54EB10  <- class-6 handler table
+s2 = 5                       ; 6 slots, 12 bytes each {fn, arg, _}
+  sw 1,(s1) ; jalr fn(arg) ; sw 0,(s1) ; s3 |= v0
+[0x45EFC8 + idx*4] += 1      ; idx=6 -> 0x45EFE0  == d6n    (verified)
+return s3                    ; OR of every handler's return
+```
+presets' legacy field name `d5fn` (0x54EB10) is **class 6 slot 0**, as its own
+comment already says. Its value is `0x154fa8`, arg `0x4bd7d0`.
+
+### 4. Why run_class(6) never returns 0 -- the last link
+```
+0x154fa8(a0):  if (0x154ff0(a0) == 1) return 0;  return 0x155210(a0);
+0x155210 -> 0x155228:
+    if (g674 != 1) return 0
+    s1obj = 0x14e4d0();  if (0x1548a0(s1obj+0x58) != 1) return 0
+    if (0x1556f8() != 1) { for (8 slots @ s1obj+0x6c step 0x304) 0x155320(slot) }
+    0x1554d0()
+    s1 = (0x1556f8() != 1) && (0x1651d8() == 0)
+    if (s1 == 1) return 1        <-- "work outstanding"
+    ...
+    return 0
+```
+`0x1651d8` is the completion predicate presets already records: it returns 0
+(**INCOMPLETE**) while `h48 in 1..4 && h44 != 0`. Our slot 0 sits at
+**`h44=1 h48=1` from birth to the end of the run**. So `0x155210` returns **1**
+forever, `run_class(6)` ORs it into a nonzero result forever, and th6's
+`bne s0, zero, 0x11ebbc` at `0x11eb60` takes the **no-sleep** path every pass.
+
+### 5. CORRECTS part 86's "two distinct blocks back to back"
+It is **ONE** block. `0x155320` -- and therefore `0x165250` -- is reachable
+**only** from th6's slot walk at `0x155298`. So:
+
+- **t=130..138:** g36 == 0, gate wide open, but **th6 was asleep** (w6tick
+  pinned at 2) so nobody walked the slots. `0x165250` zero.
+- **t>=139:** th6 runs at 200k/s, but g36 == 1 so every slot bails at
+  `0x1553a4`. `0x165250` still zero.
+
+The completer only ever runs on the one thread that is either parked or
+starving the thread that holds the gate. That is the whole deadlock.
+
+### 6. main entered the spin twice and escaped once -- exact
+CHGPRI `ra` histogram over the whole run:
+```
+0x11e5dc 2489   0x11e670 2489    <- th6's own CriLock/CriUnlock ceiling pair
+0x11e6e8    2                    <- jal 0x174b30 at 0x11e6e0 = the BOOST, entry to 0x11e690
+0x13c478    1                    <- j 0x174b30 at 0x11e744 = the RESTORE (tail jump
+                                    carries the CALLER's ra), i.e. the only exit
+0x175b48 2  0x11f3bc 2  0x11eeec/0x11f030/0x11f0b8/0x11f140 1 each
+```
+Two entries, one exit. **Pass 2 never left the spin.** `s0 = s3 = 0x441924` in
+`0x11e690` (re-verified), so main provably executed `sw 1 -> wbusy` on pass 2.
+
+Note `savepri/savetid = (1,6)` at t=139 is **th6's own CriLock**, not main's
+boost -- 0x11e5dc/0x11e670 write those too. Do not read it as main's.
+
+### 7. What the stall state actually is
+Diff of all watch fields t=138 -> t=139 -> t=198:
+```
+changed:   d6n 2 -> 0x10811 -> 0xb16732     w6tick identical to d6n
+           d6in 0 -> 1 -> 1                 (stuck: th6 is inside a jalr ~100% of the time)
+           g36 0 -> 1 -> 1                  wdisp 0 -> 1 -> 1
+unchanged: h44=1 h48=1 h4c=3 sl0=0x1b12cc0 o0st=1 o0bsy=0 wbusy=0 wexit=0
+           boost=1 c6fn=0x11e778 done=0 g674=1 svmnest=1
+```
+THLIFE after t=139 is **only** `me=6` resume(0x52)/suspend(0x55) of thid=3 via
+`0x11edd8`/`0x11ee3c`. Before t=139 threads 1, 4 and 5 do the identical thing.
+So th6 poking th3 is **normal handler behaviour**, not the fault -- part 86
+over-weighted it. The fault is only that th6 does it without ever yielding.
+
+### 8. The one link still unmeasured
+`wbusy` reads **0 in all 60 post-stall samples**, and the only writer of 0 is
+th6's `0x11eb5c` delay slot, which is paired with `jal 0x11ed78`. So th6 called
+SleepThread once at t=139 and **did not park**:
+
+- `DISPATCH` is emitted **from `sleepCurrent`** (64-event batch, 1 s gate).
+  It stops at t~138 while w6tick climbs unbroken => th6 calls SleepThread
+  fewer than 64 times/s afterwards. It is not sleeping in a loop.
+- If it had *blocked*, main would have been scheduled and read `wbusy==0`
+  and exited. It did not (only one restore, section 6).
+
+Measured `fast=0`, `blocked` 126 -> 766 across all 8 DISPATCH records -- but
+**all 8 are pre-explosion**, so that is NOT evidence about t>=139.
+See [[feedback_capped_probes_false_negatives]].
+
+**Hypothesis, now instrumented:** `EeScheduler::wakeupThread`'s else branch does
+`++target->wakeupCount` with **no ceiling**, and main's spin calls WakeupThread
+once per iteration (`0x11e6f0` -> `0x11ed28`). Every call landing on an
+already-Ready th6 bumps the count. th6's single SleepThread then consumes ONE
+via `sleepCurrent`'s fast path and returns immediately. EeScheduler.cpp's own
+header comment predicted exactly this: *"blocked==0 with fast climbing
+identifies the wakeupCount fast path as the reason thread 6 never parks."*
+
+### 9. Patch written (needs a rebuild)
+Host-side scheduler state has no guest address, so it cannot ride
+`PS2X_TRACE_WATCH`. And the tracer's cap is consumed chronologically with no
+time or caller gate, so arming `0x11ed28` cannot reach t=139 either. The 1 Hz
+**WATCH sampler is the only probe that provably kept emitting through the
+stall** (198/198 samples), so the counters were routed there.
+
+- `src/lib/Kernel/EeScheduler.cpp` -- `g_wakeAcc[]`, `g_wakeReady[]`,
+  `g_wakeCountLast[]`, `g_sleepCountLast[]`; new `extern "C" ps2x_sched_diag()`.
+- `src/lib/ps2_runtime.cpp` -- WATCH now also emits
+  `slpfast slpblk wk6acc wk6rdy wk6cnt wk6slp wk1acc wk1rdy`.
+
+Neither is a runner file; both are runtime lib.
+
+**Decision table for the next run:**
+```
+slpfast climbs after t=139, slpblk flat     -> fast path CONFIRMED; fix is a wakeup ceiling
+wk6acc large (>>1) at the stall             -> main's spin is the accumulator, as predicted
+wk6acc ~0 but slpfast climbs                -> the count came from somewhere else; find that writer
+slpfast AND slpblk both flat after t=139    -> th6 truly stops calling SleepThread;
+                                               the question moves to 0x11eb50's wbusy read
+```
+
+### 10. Also still owed
+An oracle capture that actually reaches `g36=1`. All three existing captures
+have g36=0 in every one of their 1,803 samples, so `h48=1` still has **no
+in-phase hardware comparison**. h48=1 is a legal state in the 1..5 jump table
+and remains a SYMPTOM of the un-ticked pump, not a proven cause.
+
+---
+
+## HANDOFF part 86 -- THE BISECT LANDED: A PRIORITY-1 WORKER THAT NEVER SLEEPS STARVES MAIN, AND THE PUMP HAS NEVER TICKED ONCE
+
+Run: 200 s, `PS2X_TRACE_CALLS=0x165250:512,0x1555a0:512`. 198 WATCH samples, 78 live.
+
+### 1. The bisect: `0x1553a4` IS a real bail (0x165250 = ZERO calls)
+
+`0x165250` armed (`orig` non-null, no `[cap]`, single `jal` caller) -> **0 records**.
+Decoded `0x155320` confirms why:
+
+```
+0x155358  bne a1,v1,ret0     ; g674 != 1        ours=1 PASS
+0x155384  bne s0,a1,ret0     ; [obj+0x00] != 1  ours=1 PASS
+0x155394  beql v0,s0,ret0    ; [obj+0x60] == 1  ours=0 PASS
+0x15539c  jal 0x1555e8       ; v0 = g36
+0x1553a4  beq v0,s0,0x155374 ; g36 == 1 -> return 0     <-- BAIL
+          fallthrough -> j 0x1553d8 -> 0x15542c jal 0x165250
+```
+
+### 2. g36 is a RE-ENTRANCY BRACKET, not a state flag
+
+`0x1555a0` fired **3 times in 200 s**, all from one function:
+
+| n | ra | a1 | meaning |
+|---|----|----|---------|
+| 1 | 0x155650 | 1 | open |
+| 2 | 0x155664 | 0 | close |
+| 3 | 0x155650 | 1 | open -- NEVER CLOSED |
+
+```
+0x155630(obj):  jal 0x14ff40 ; jal 0x1555a0(obj,1) ; jal 0x154950
+                jal 0x1555a0(obj,0) ; jal 0x14ff58 ; j 0x1549c0
+```
+
+### 3. The unclosed bracket, all the way down
+
+`0x154950` -> `0x13c448(6)` -> callback table `0x54EBA0[6]` -> `jalr` **`0x11E778`** -> `0x11E690`.
+`[0x54EBD0]=0x11E778, [0x54EBD4]=0` is already our `c6fn`/`c6arg` -- registered by
+`0x13c3f0(6, 0x11E778, 0)` at ADX_Init+0x160. Both generated bodies
+(`sub_0013C448_0x13c448.cpp`, `noop_wrapper____0x154950.cpp`) are COMPLETE; the `jalr`
+goes through `dispatchGuestBranch(IndirectCall)` and there is **no** missing-target line
+in the log. A failed dispatch would `return` and g36 WOULD still be cleared -- it wasn't.
+
+`0x11E690(tid6, origpri)` = boost worker to `boost`(=1), then **busy-wait** up to
+199,999,999 iterations for `wbusy`(=`[0x441924]`) to clear, then restore priority.
+
+### 4. t=131: the system bifurcates
+
+| t | w6tick | rate | d5n | wdisp | g36 | savepri/tid |
+|---|--------|------|-----|-------|-----|-------------|
+| 121-130 | **2** | **0/s** | climbing | 0 | 0 | 0x18 / tid1 |
+| 131 | 140,141 | **+198,000/s** | frozen 257 | 1 | **1** | 0x1 / tid6 |
+| 197 | 13,101,828 | +198,000/s | 257 | 1 | 1 | 0x1 / tid6 |
+
+Probe activity, before vs after t=131:
+
+```
+BEFORE: THLIFE CHGPRI VSYNCREG PSEUDOTID SLOTENTRY GSENTRY WATCH RASLOT STACKOOB DISPATCH ...
+AFTER : CHGPRI(3264) THLIFE(1608) WATCH(67)          <-- everything else STOPS
+```
+
+Main gets zero cycles. Thread 6 called `ChangeThreadPriority(6,1)` **26,196,244** times
+(`ra` alternating 0x11e5dc / 0x11e670 = CriLock/CriUnlock, `old=1`, `cur=6`).
+`old=1` is CORRECT -- THCREATE shows th6 was created at prio 1. **Not a priority-save bug.**
+
+### 5. The circle -- every link measured
+
+```
+main sets g36=1, sets wbusy=1, boosts th6 to pri 1, busy-spins
+ -> th6 (pri 1) runs; slot0 incomplete -> never sleeps -> 198k/s
+   -> main (pri 24) never rescheduled
+     -> g36 never cleared
+       -> 0x1553a4 bails -> 0x165300 never runs -> h44 never cleared
+         -> slot0 stays incomplete (0x1651b0: incomplete iff h48 in 1..4 AND h44 != 0)
+```
+
+Syscalls decoded from the stub block at 0x174b30 (16-byte stubs):
+`0x174b30`=0x29 ChangeThreadPriority, `0x174ba0`=0x30 ReferThreadStatus,
+**`0x11ed78` -> `0x174bc0` = 0x32 SleepThread**, `0x174bd0`=0x33 WakeupThread,
+`0x174c10`=0x37 SuspendThread, `0x174c30`=0x39 ResumeThread.
+
+### 6. !! THE PUMP HAS NEVER TICKED -- this narrows the target, and corrects part 85
+
+```
+t=  1  sl0=0x0        h44=0 h48=0 h4c=0
+t=121  sl0=0x1b12cc0  h44=1 h48=1 h4c=3     <- born
+t=197  sl0=0x1b12cc0  h44=1 h48=1 h4c=3     <- IDENTICAL
+```
+
+Slot 0 never changes in its entire life. And for **t=121-130 g36 was 0** -- the gate was
+OPEN -- and `0x165250` STILL recorded zero calls, because th6 was ASLEEP (w6tick pinned
+at 2) so `0x155320` was never called at all. **Two different blocks back to back:**
+
+- t=121-130: gate open, worker asleep -> pump never invoked
+- t=131+:    worker running 198k/s -> pump invoked constantly -> g36=1 bails it
+
+The worker only runs while main holds the bracket that blocks it.
+
+### 7. Thread 6 should have slept on its FIRST pass
+
+```
+0x11eb30  w6tick++ ; wdisp=1 ; s0 = run_class(6) ; wdisp=0
+0x11eb4c  lw v0,[0x441924]
+0x11eb50  bne v0,1 -> 0x11eb60
+0x11eb58  jal 0x11ed78          ; SleepThread
+0x11eb5c  sw zero,[0x441924]    ; delay slot -> wbusy=0
+0x11eb60  bne s0,zero -> loop   ; NO sleep on this path
+0x11ebb4  jal 0x11ed78          ; SleepThread (only on s0==0)
+```
+
+main sets `wbusy=1` BEFORE waking th6, so th6's first pass MUST take the 0x11eb58 branch
+and block. It did 13 million passes instead. **SleepThread did not block.**
+
+Th6 spends those iterations resuming+suspending **thread 3**: THLIFE `op 0x52`
+(st 0x8->0x2, ra=0x11edd8, ResumeThread) alternating `op 0x55` (st 0x2->0x8, ra=0x11ee3c,
+SuspendThread), `me=6 mypri=1 tpri=8`, n=26,196,244. Th3 never gets a slice.
+
+### 8. Oracle status -- NO in-phase comparison exists yet
+
+All three captures (`sofdec_oracle*.csv`, 1,803 samples) have **g36=0 throughout**, so they
+cannot answer "what is h48 when g36=1". What they DO establish:
+
+| field | hardware | ours |
+|-------|----------|------|
+| h48 | 0, 2, 4, 6 -- **never 1** | 1, frozen |
+| h44 | alternates 0/1 constantly | 1, frozen |
+| w6tick | bursts then holds (~22/s avg) | +198,000/s |
+| sl0 | 0x1B12CC0 (same handle) | 0x1B12CC0 |
+
+So on hardware **the pump runs freely with g36=0 and the worker mostly asleep**. Ours never
+ran even during its own g36=0 window. h48=1 is a legal state (jump table has 1..5) that
+hardware passes through too fast to sample -- it is a SYMPTOM of the un-ticked pump, and
+must not be called the cause.
+
+### 9. Next run -- discriminates why th6 does not sleep
+
+Small caps ON PURPOSE: we want the FIRST records (t~131), and the `[cap]` line itself
+proves saturation. Both addresses are func-map ENTRIES.
+
+```
+$env:PS2X_TRACE_CALLS = "0x11ed78:64,0x11e690:16"
+$env:PS2X_TRACE_WATCH = (python "F:\SDBZ Recomp\build_scripts\presets.py" sofdec)
+```
+
+| result | reading |
+|--------|---------|
+| `0x11ed78` ra=0x11eb60 once at t~131 then stops | th6 slept once; the wake/sleep handshake broke after |
+| `0x11ed78` ra=0x11eb60 NEVER | th6 never saw wbusy==1 -- main's store vs the wake is misordered |
+| `0x11ed78` ra=0x11ebbc saturates | th6 IS calling SleepThread every pass; syscall 0x32 is not blocking |
+| `0x11e690` fires 3x | confirms the bracket count matches the three g36 writes |
+
+Also owed, independent of the above: an oracle capture that actually reaches g36=1.
+
+
+## HANDOFF part 85 -- THREE GATES CLEARED, 0x165300 CONFIRMED UNREACHED, AND A
+## CORRECTED DECODE OF THE LAST GATE
+
+Run 09-06 01:10, 200 s, `PS2X_TRACE_CALLS=0x165300:512` + the extended `sofdec`
+watch preset. 197 WATCH samples, 77 of them live (`sl0 != 0`), t=121..197.
+
+### 1. The three unmeasured gates are CLEAN and match hardware exactly
+
+    field   ours (all 77 live samples)   hardware in-phase   gate
+    o0st    0x1  (77/77)                 1                   0x155384  PASS
+    o0bsy   0x0  (77/77)                 0 except servicing  0x155394  PASS
+    o0slt   0x01b12cc0 (77/77)           0x01b12cc0          0x165250  live ptr
+
+Also frozen across all 77: `h44=1`, `h48=1`, `h4c=3`, `done=0`, `g674=1`,
+`svmnest=1`, `wbusy=0`. `tsflag` toggles 40/37 between 0 and 1, so `0x155210`
+IS being entered and IS acquiring its lock -- the pump loop is reached.
+
+Three of the four unknowns from part 84 are therefore eliminated. `0x155320`
+gets past `0x155358`, `0x155384` and `0x155394` on obj0.
+
+### 2. `0x165300` was never called -- and the probe is sound
+
+    [trace] armed 0x165300 orig=0x7ff652dfb970 cap=512 slot=0
+    probe=TRACE records in run_probe.jsonl: 0
+    no [cap] line
+
+`slot=0` is the TRACER's own array index (`const std::size_t index =
+g_slotCount++`, trace_calls.cpp:337), NOT "no dispatch slot". `orig` is a real
+non-null body and `replaceFunction` returned true, so the thunk was installed.
+`eeref refs 0x165300` = 2 callers, both `jal`, slot=yes. Zero is real evidence.
+
+Combined with part 84: `0x165300`'s own two gates PASS on our frozen h44=1 /
+h48=1, so if it ever ran it would clear h44. It never runs. The bail is
+upstream of it.
+
+### 3. g36 is the only diverging gate -- but not cleanly
+
+    g36 = 0x1 in 68/77 live samples, stable at 1 since t=130
+    g36 = 0x0 in  9/77 live samples, t=121..129
+
+`h44` is stuck at 1 through the g36=0 window too. At 1 Hz the sampler cannot
+rule out g36 toggling faster than it samples, so this neither confirms nor
+refutes the `0x1553a4` bail. It stays a CONTRIBUTOR, not a proven sole gate
+(consistent with the -092702 caution).
+
+### 4. CORRECTION to part 84: `0x15B560` is not a SIF call
+
+`sif_is_bound` / `sif_bind_rpc` are misleading auto-labels. Decoded:
+
+    0x15b560(slot):                      ; "sif_is_bound" -- SLOT VALIDITY
+       if (slot == 0)        return -1
+       if ([slot+0x48] == 0) return -1   ; [slot+0x48] IS h48
+       [0x460F58] = slot                 ; <-- writes `cur`
+       return 0
+
+    0x165250(slot):
+       if (slot_invalid(slot) != 0) tail j 0x15B340(0, 0xFF000138)   ; error report
+       else                         jal  0x165300(slot)              ; service
+
+`0x15B340` has 156 callers, nearly all tail `j`, and is invoked here with
+`(0, 0xFF000138)` -- an assert/panic id, not an RPC bind. Our `h48=1` and
+`o0slt` nonzero mean this gate would PASS.
+
+`cur` == `o0slt` == 0x01b12cc0 for the whole live phase, and `0x15b578` is a
+writer of `cur`. That LOOKS like proof `0x165250` ran -- but `eeref refs
+0x460f58` returns "UNREACHABLE", failing to see the `lui 0x46` + `sw 3928`
+pair, so its writer list is incomplete and no such claim can be made.
+(Known eeref lui+lo coverage gap; see [[project_eeref_static_xref]].)
+
+### 5. The g36 setter, found
+
+    0x1555a0(obj, val):                  ; wrap_get_data_ptr_p, slot=yes
+       base = 0x14e4d0()                 ; = 0x45F678
+       if (obj != 0) [obj+0x5C] = val
+       [base+0x24] = val                 ; g36 = val   ALWAYS
+
+So `g36` mirrors `[obj+0x5C]`. Six callers, all `jal`:
+`0x14e92c`, `0x14e940` (in `sub_14E8B0`), `0x154a1c`, `0x154a30` (in
+`sub_1549C0`), `0x155648`, `0x15565c` (in `noop_seq_noop_wrapper___414`).
+Getters: `0x1555e0` = `[a0+0x5C]`, `0x1555e8` = `g36`.
+
+### 6. Next run -- bisect the bail, and attribute g36
+
+TRACE records carry `ra` + `a0..a3` (trace_calls.cpp:212-227), so the setter
+probe is fully attributable; no count-based conviction is needed.
+
+    trace 0x165250  -- 1 caller (0x15542c, jal, slot=yes). Did we clear g36's gate?
+    trace 0x1555a0  -- who writes g36, to what value (a1), from where (ra)?
+
+    0x165250 count == 0                -> the 0x1553a4 g36 bail IS the story;
+                                          fix = whoever should have set g36=0
+    0x165250 fires, 0x165300 still 0   -> slot_invalid() diverting; re-read h48
+    0x1555a0 a1 always 1               -> nothing ever clears g36; find hw's clearer
+    0x1555a0 never fires in-phase      -> g36=1 is stale from before the phase
+
+## HANDOFF part 84 -- THE h44 PUMP PATH, FULLY DECODED ON THE ORACLE
+
+Phase re-validated first: all 8 of part 80's fingerprint fields matched exactly
+(d5fn=0x154fa8, d5arg=0x4bd7d0, sl0=0x1b12cc0, cur=0x1b12cc0, h40=0x4000,
+h48=0x4, c6fn=0x11e778, boost=1). PCSX2 paused on the Atari logo movie.
+
+### 1. Both h44 writers caught on hardware, by write watchpoint on 0x1B12D04
+
+    SETTER   0x169F40   sw v0,0x44(s1)     v0=1     in sub_169DE8
+    CLEARER  0x165338   sw zero,0x44(s1)            in sub_165300
+
+h44 is a "tick me" request flag: 0x169DE8 raises it, 0x165300 consumes it.
+
+### 2. The clear happens INSIDE 0x155210 -- the very function whose return diverges
+
+Hardware backtrace at the clearing store:
+
+    #0 0x165300  pc=0x165338   sw zero,0x44(s1)      <- the clear
+    #1 0x165250  pc=0x165290
+    #2 0x1553D8  pc=0x155434
+    #3 0x155228  pc=0x1552a0   [= 0x155210's framed body]
+    #4 0x154FA8  pc=0x154fd4   [= d5fn, the SofDec worker]
+    #5 0x13C4FC  pc=0x13c568
+    #6 0x11EAC8  pc=0x11eb44
+
+So the pump and the completeness test live in the SAME call, pump first.
+On hardware 0x155210 clears h44, then 0x1651D8 sees h44==0 => complete =>
+s1=0 => return 0 => the worker sleeps. That is the whole pacing mechanism.
+
+### 3. 0x155210 decoded end to end (single exit at 0x155308 -> 0x155318 jr ra)
+
+    s2 = g674 [0x45F674]
+    if (s2 != 1) return 0
+    base = 0x14E4D0() = CONSTANT 0x45F678
+    s0 = 0x1548A0(base+0x58) -> 0x13C880(0x45F6D0)     ; TEST-AND-SET on tsflag
+    if (s0 != 1) return 0                              ; lock busy
+    0x155148()
+    if (0x1556F8() != 1)                               ; 0x1556F8() == [0x460F04] == `done`
+        for i in 0..7: 0x155320(0x45F6E4 + i*0x304)    ; <-- THE PUMP LOOP
+    0x1554D0(0); s1 = 0
+    if (0x1556F8() != 1)
+        s1 = (0x1651D8() == 0)                         ; 1 => some slot INCOMPLETE
+    0x155178()                                          ; releases the lock
+    if (s1 == 1) return 1                               ; caller keeps spinning
+    0x1555E8(); if (== 1) return 0
+    0x1551E0(); return 0
+
+0x13C880 is an atomic test-and-set: reads [p], writes 1, returns (old == 0).
+Hook ptr at 0x54EBF8 (`tshook`) is 0 on BOTH sides, so both take this path.
+
+### 4. The pump's gate chain -- five gates, in order
+
+obj_i = 0x45F6E4 + i*0x304. Hardware: obj0 is the ONLY live one
+([obj0+0]=1, [obj0+0x3C]=0x1B12CC0); obj1 and obj2 read all-zero.
+
+    0x155358   g674 == 1                       ours 1   hw 1   OK
+    0x155384   [obj+0x00] == 1                 ours ?   hw 1   <- UNMEASURED
+    0x155394   [obj+0x60] != 1                 ours ?   hw 0*  <- UNMEASURED
+    0x1553a4   0x1555E8() != 1                 ours 1   hw 0   <- g36 BAIL
+    0x165250   0x15B560([obj+0x3C]) == 0       ours ?   hw ok  <- UNMEASURED
+    0x165320   ([slot+0x48]-1) <u 4            ours 1   hw 4   passes both
+    0x165330   [slot+0x44] != 0                ours 1   hw 1   passes both
+    0x165338   sw zero,0x44(s1)                             THE CLEAR
+
+    * [obj+0x60] is a re-entrancy flag set to 1 by 0x155518 for the duration
+      of 0x1553D8 and cleared after; it read 1 only because we were paused
+      inside that window.
+
+Gates 6 and 7 PASS with our own frozen values (h48=1 is inside 1..4, h44=1
+is nonzero). So if 0x165300 ever ran on our side it WOULD clear h44.
+h44 stuck at 1 therefore proves 0x165300 is never reached -- corroborated
+independently by h48 frozen at 1, since 0x165300 is also what advances the
+state via the jump table at 0x4BF4F0.
+
+### 5. 0x1553a4 is the g36 bail that part 66 could not find
+
+0x1555E8() == [0x45F678+0x24] == [0x45F69C] == `g36`, already in the preset
+since part 63. Its consuming branch was never located; it is 0x1553a4, and
+it sits directly on the pump path. Closes [[feedback_bind_every_probe_to_an_instruction]].
+
+g36 across our archived live-phase samples:
+
+    -010017  13x0 / 39x1      -030734  15x0 / 51x1
+    -021414  13x0 / 51x1      -031719  12x0 / 63x1
+    -023602  14x0 / 42x1      -032623  11x0 / 107x1
+    -091815  11x0 / 8251x1    -092702  4456x0 / 76x1   <-- g36=0 yet h44 STILL 1
+
+Hardware in-phase: g36 = 0.
+
+CAUTION: run -092702 clears the g36 gate 4,456 times and h44 is stuck anyway,
+so g36 is a CONTRIBUTOR, not the sole gate. Do not headline it.
+
+### 6. Ruled OUT this session (measured on both sides, they agree)
+
+    done  [0x460F04]  = 0  both   -> the pump loop IS entered
+    g674  [0x45F674]  = 1  both
+    tshook[0x54EBF8]  = 0  both   -> same TAS path
+    h40               = 0x4000 both
+
+Also: the `noop_` prefix on noop_sub_5210 / noop_sub_c880 / noop_wrapper___
+is a decompiler AUTO-LABEL, not behavior. 2,579 such names exist in the func
+map and NO override is registered on any of these addresses. Not stubs.
+
+### 7. NEXT -- one watch-only run, no rebuild, no cap risk
+
+presets.py `sofdec` now emits three new fields (added this session):
+
+    o0st  = 0x45F6E4   [obj0+0x00]   must be 1
+    o0bsy = 0x45F744   [obj0+0x60]   must be 0 except while servicing
+    o0slt = 0x45F720   [obj0+0x3C]   must be a live slot ptr (hw 0x1B12CC0)
+
+Trace only 0x165300. Both its callers (0x165288, 0x1652d8) use `jal` and it
+owns a dispatch slot, so a ZERO count is real evidence
+([[feedback_tail_jump_hides_the_caller]] satisfied). Do NOT trace 0x155228 or
+0x1553D8 -- check_trace_addrs reports both FOLDED
+([[feedback_trace_only_funcmap_entries]]).
+
+Decision table for the run:
+
+    o0st  != 1              -> bail at 0x155384; find who writes 0x45F6E4
+    o0bsy == 1 persistently -> 0x1553D8 never returned; a lock leak
+    o0slt == 0 or its +0x48 == 0 -> 0x165250 diverts to 0x15B340
+    all clean and g36 == 1  -> the 0x1553a4 g36 bail is the whole story
+    all clean and g36 == 0  -> re-open; the pump ran and something re-set h44
+
+PCSX2 is paused in-phase with the watchpoint removed, so more oracle reads
+are cheap while it stays there.
+
+## HANDOFF part 83 -- ROOT CAUSE, ORACLE-REPRODUCED: h44 is stuck at 1
+
+  Source: live PCSX2 (SLUS-21442) session of 2026-09-06, DebugServer, plus a
+  re-read of three archived runs.  CLOSES part 82's section 7 caveat: the oracle
+  has now been read, and it does NOT do what we do.
+
+### 1. PHASE VALIDATED FIRST
+
+  All 8 of part 80's fingerprint fields matched at the moment of measurement:
+    d5fn=0x154fa8  d5arg=0x4bd7d0  sl0=0x1b12cc0  cur=0x1b12cc0
+    h40=0x4000     h48=0x4         c6fn=0x11e778  boost=1
+  (PCSX2 later ran the movie to completion and tore the session down --
+   sl0..sl7 and d5fn all went to 0, and 0x1B12CC0 was reallocated as float
+   data.  Every reading below predates that.  Re-enter the movie before
+   reusing this connection.)
+
+### 2. 0x155210 HAS ONE EXIT, AND HARDWARE RETURNS BOTH VALUES
+
+  Native disasm confirms part 82 section 5 instruction-for-instruction, and all
+  five paths converge on 0x155308 -> `0x155318 jr ra`.  ONE breakpoint reads it.
+
+    sample 1  v0 = 1   ra = 0x154fd4
+    sample 2  v0 = 0   ra = 0x154fd4
+    sample 3  v0 = 0   ra = 0x154fd4
+
+  ra=0x154fd4 is the `jal` at 0x154fcc -- slot 0's call site, as predicted.
+  REFINES part 82 section 4: hardware does not return 0 *every* iteration, it
+  returns 0 *often enough* to pace at 53.87/s.  Ours returns non-zero ~always.
+  (3 samples -- enough to prove "both values occur", NOT enough for a ratio.)
+
+### 3. THE GATE, FULLY DECODED (two tiny leaf functions)
+
+  0x1651B0(slot) -- the per-slot completion test:
+      v1 = [slot+0x48]                 ; h48
+      if ((v1 - 1) >=u 4) return 1     ; h48 outside 1..4 => COMPLETE
+      return ([slot+0x44] == 0)        ; else complete IFF h44 == 0
+
+  0x15B560(slot) -- the validity test:
+      if (slot == 0)      return -1    ; null    => slot SKIPPED
+      if ([slot+0x48]==0) return -1    ; state 0 => slot SKIPPED
+      [0x460F58] = slot                ; <-- this is what writes `cur`
+      return 0                         ; valid => run the completion test
+
+  0x1651D8 -- the 8-slot scan @0x461164 (confirms the presets.py comment):
+      for i in 0..7: s = slots[i]
+        if (0x15B560(s) != 0) continue
+        if (0x1651B0(s) == 0) return 0     ; any incomplete slot => EARLY OUT
+      return 1                              ; all 8 complete => worker SLEEPS
+
+### 4. THE DIVERGENCE -- ONE FIELD
+
+  Ours, 211 live samples (sl0!=0) across three independent runs
+  20260905-032623 / -091815 / -092702:
+
+    h44   = 0x1  ONE distinct value, frozen, 62 + 76 + 73 samples
+    h48   = 0x1  ONE distinct value, frozen
+    h40   = 0x4000                     (matches hardware)
+    w6tick  meanwhile races to millions
+
+  Hardware at a sleeping sample:  h48 = 4,  h44 = 0.
+
+  Feed each through 0x1651B0 -- both sides take the SAME branch, because 1 and 4
+  are both inside 1..4, so h48 is NOT what decides.  h44 is:
+
+    ours      h48=1 in range -> return (h44==0) = (1==0) = 0  -> INCOMPLETE
+              -> 0x1651D8 = 0 -> s1 = 1 -> 0x155210 returns 1 -> NEVER SLEEPS
+    hardware  h48=4 in range -> return (h44==0) = (0==0) = 1  -> COMPLETE
+              -> 0x1651D8 = 1 -> s1 = 0 -> 0x155210 returns 0 -> SLEEPS
+
+  This predicts EXACTLY part 82 section 3's measurement: fewer than 64
+  SleepThread calls against 11.75M loop iterations.  Chain closed.
+
+  ==> ROOT CAUSE: [handle+0x44] ("h44") is stuck NON-ZERO in our runtime.
+      Secondary, unexplained: h48 is stuck at 1 where hardware reaches 4.
+
+### 5. WHAT IS NOT YET KNOWN -- who clears h44
+
+  `eeref field 0x44` is NON-SELECTIVE: +0x44 is a generic struct offset, 397
+  functions touch both +0x44 and +0x48 image-wide (vectors/matrices dominate).
+  Do not fish there again.
+
+  The SELECTIVE handle is the slot array address itself.  `eeref refs 0x461164`
+  returns exactly NINE functions -- the entire slot subsystem:
+
+    0x15B268  0x1651D8(known)  0x1652A8  0x1661D0  0x166290
+    0x166390  0x166850         0x1688B0  0x169DE8
+
+  0x1556F8 is NOT one of them -- it is `return [0x14E4D0()+0x188C]`, a global
+  flag read, so part 82 section 8's "which of 0x1556F8 / 0x1651D8" framing is
+  answered: 0x1651D8 is the one that matters.
+
+### 6. NEXT -- one PCSX2 watchpoint, no rebuild, no 200 s run
+
+  Get PCSX2 back into the movie phase (fingerprint in section 1 must match),
+  then catch the writer on hardware:
+
+    watchpoint  write  0x1B12D04..0x1B12D08   (h44)
+    watchpoint  write  0x1B12D08..0x1B12D0C   (h48, for the 1->4 transition)
+
+  Read the breaking PC and its `ra`; bucket by `ra`, never by count
+  (feedback_never_convict_by_count_with_two_callers).  Then compare that writer's
+  path against ours -- our side is the one that never runs it.
+
+  NOTE: the object is only at 0x1B12CC0 for a given movie session; re-read sl0
+  after re-entering the phase rather than assuming the address.
+
 ## HANDOFF part 82 -- CONFIRMED at 0x11eb60, and the culprit is now ONE function
 
   Source: the 198 s run of 2026-09-05 10:18 (run_probe.jsonl, 11,342 records).

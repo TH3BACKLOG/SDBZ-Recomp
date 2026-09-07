@@ -459,6 +459,10 @@ namespace
     extern "C" void ps2x_probe_kv(const char *name, int n,
                                   const char *const *keys, const uint64_t *vals);
 
+    // 2026-09-06 part 87 -- host-side EE scheduler counters, defined in
+    // Kernel/EeScheduler.cpp. Same extern-between-.cpp rule as above.
+    extern "C" void ps2x_sched_diag(uint64_t *out, int n);
+
     // Periodic SRD histogram dump, also defined in game_overrides.cpp. The
     // watchdog is the only thing in the process guaranteed to keep ticking when
     // the guest stalls, so it -- not the SRD call sites -- is where a dump has
@@ -5934,6 +5938,30 @@ void PS2Runtime::run()
                             }
                             keys.push_back("unreadable");
                             vals.push_back(unreadable);
+
+                            // 2026-09-06 part 87 -- host-side scheduler state.
+                            // The SofDec stall kills every event-driven probe
+                            // (DISPATCH emits from sleepCurrent, so it goes
+                            // silent exactly when th6 stops sleeping) while
+                            // this wall-clock sampler keeps going. slpfast
+                            // climbing with slpblk flat means SleepThread is
+                            // returning without parking; wk6acc is how many
+                            // unbounded ++wakeupCount bumps main's 0x11E690
+                            // spin landed on th6 to make that possible.
+                            {
+                                static const char *const schedKeys[] = {
+                                    "slpfast", "slpblk", "wk6acc", "wk6rdy",
+                                    "wk6cnt", "wk6slp", "wk1acc", "wk1rdy"};
+                                constexpr int kSchedN =
+                                    static_cast<int>(sizeof(schedKeys) / sizeof(schedKeys[0]));
+                                uint64_t schedVals[kSchedN] = {};
+                                ps2x_sched_diag(schedVals, kSchedN);
+                                for (int i = 0; i < kSchedN; ++i)
+                                {
+                                    keys.push_back(schedKeys[i]);
+                                    vals.push_back(schedVals[i]);
+                                }
+                            }
 
                             ps2x_probe_kv("WATCH", static_cast<int>(keys.size()),
                                           keys.data(), vals.data());
