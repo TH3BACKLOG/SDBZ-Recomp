@@ -1,3 +1,88 @@
+## HANDOFF part 93 (2026-09-07) -- THE TWO CALLERS WE DO TAKE ARE ONE-SHOT SETUP. THE PER-FRAME CALLER IS STILL UNTAKEN.
+
+Part 92 named the starved edge and listed five candidate callers of 0x14f428.
+This run armed all five plus the two grandparents and answers which fire.
+
+Run: PS2X_TRACE_CALLS over 8 addresses + the 40-field sofdec WATCH preset,
+-Determinism 1, 200 s, RelWithDebInfo. run_log.txt / run_probe.jsonl of
+2026-09-07 19:08. Arming confirmed in the log: "[trace] 8 address(es) armed,
+40 watch field(s)".
+
+### 1. *** 0x14f428 was entered exactly TWICE, and both are phase-open setup
+
+    #  chain                                                ra
+    1  0x420f48 -> 0x113aa0 -> 0x14f140 -> 0x14f428        0x14f220
+    2  0x4210d0 -> 0x113c60 -> 0x14f500 -> 0x14f428        0x14f558
+
+This reproduces part 91's "2 entries in 200 s" and now names both chains end
+to end. Both fire at the instant the phase opens and never again:
+
+    phase span (WATCH, 1 Hz)   progress 15,042,625 .. 21,214,875
+    78 contiguous in-phase samples  => ~78 s in-phase
+    0x14f428 entry #1          progress 15,041,918
+    0x14f428 entry #2          progress 15,049,871
+
+Both land in the first ~0.1% of the phase. That is SEVENTY-EIGHT SECONDS
+in-phase with zero further entries, while hardware runs the drain barrier
+continuously (part 92, section 1). These two callers are setup/teardown, not
+the per-frame path.
+
+### 2. The three that never fired
+
+    addr        static callers   Run F hits
+    0x14c8c8    5                0
+    0x14f378    3                0
+    0x14f278    0  <- runtime    0
+
+0x14f278 was part 92's prime suspect and it read ZERO.
+
+### 3. Weighting those zeros -- only ONE of them is real evidence
+
+Per feedback_tracer_blind_to_tail_jumps: the T1 tracer hooks function-TABLE
+slots, so a guest tail `j` bypasses the hook and reads zero while running.
+That caveat applies UNEVENLY here:
+
+  - 0x14f278 -- zero is MEANINGFUL. It has no static callers at all, so it is
+    reachable only through the runtime table at 0x54EBA0, and a table dispatch
+    goes THROUGH the slot the tracer hooks. This is inference from the call
+    mechanism, not a second measurement; label it as such.
+  - 0x14c8c8, 0x14f378 -- zero is WEAK. Either could be entered by tail `j`
+    from one of its static callers and read zero while provably running.
+
+### 4. The gate match re-confirmed on a fresh run
+
+All 78 in-phase WATCH samples, without exception:
+
+    o0st=1   o0bsy=0   o0slt=0x1b12cc0   h44=1   h48=1
+
+Identical to the hardware values read live in part 92. The beqzl at 0x14f440
+would PASS. The posted request is correct. Nothing is calling the function
+that contains the gate. The wall remains exactly one edge wide.
+
+### 5. Next step -- ONE PCSX2 measurement closes this
+
+We know hardware sits INSIDE 0x14f428 (the ra=0x14f450 seen at the 0x155630
+hit in part 92). We have never seen who CALLS it. With PCSX2 reloaded to the
+Atari logo:
+
+    1. arm 0x13c448 as the POSITIVE CONTROL and require it to fire first
+    2. break at 0x14f428
+    3. read ra
+
+That ra names the missing edge directly. Do not skip step 1: a UI-paused
+PCSX2 answers every probe with a confident false negative (see
+reference_pcsx2_debugger_quirks.md). The movie phase is gone from the current
+PCSX2 session -- sl0 reads 0 and all of obj0 reads zero -- so a reload to the
+Atari logo is required before any of this.
+
+### 6. Measurement note
+
+The first pass at this run reported zero hits on all eight addresses. That was
+a bad query filter keying on `tag`/`fn` fields the TRACE records do not carry;
+the records were present throughout. TRACE records land in run_probe.jsonl as
+probe=TRACE, NOT in run_log.txt, despite the log line describing the sink.
+Query them by probe type, never by guessing at key names.
+
 ## HANDOFF part 92 (2026-09-07) -- THE STARVED EDGE IS NAMED: THE GATE PASSES, NOTHING CALLS 0x14f428.
 
 First PCSX2 oracle session in-phase with breakpoints ACTUALLY FIRING. Everything
