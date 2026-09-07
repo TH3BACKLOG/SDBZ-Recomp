@@ -1,3 +1,122 @@
+## Part 94 (2026-09-07) -- SofDec: the missing edge is NAMED AND MEASURED on hardware
+
+*** 0x113c60 calls 0x14c8c8 on hardware. Our runtime enters 0x113c60 and never does.
+
+Measured on PCSX2, in the movie phase, with the positive control armed FIRST:
+0x13c448 was set, fired twice (cycles 2085720156 and 3349179081), and only then was
+anything concluded. This is not a UI-paused false negative.
+
+Three hits, each with registers and a stack walk:
+
+  hit 1  PC=0x14f428  ra=0x14F220  a0=0x45F6E4 a1=0x4DCD80 a2=0 a3=0xFFFFFFFF
+         stack: 0x54bb18 -> 0x14f1e0 (jal at 0x14f220) -> 0x14f428
+         This is OUR OWN chain 1, argument for argument, identical to TRACE
+         seq=0x6a4. Where we do run, we match.
+
+  hit 2  PC=0x14f428  ra=0x14C904  (conditional BP: ra != 0x14f220 && ra != 0x14f558)
+         stack: 0x14c8e0 (jal at 0x14c8fc) -> 0x14f428
+         A THIRD caller, one we never take.
+
+  hit 3  PC=0x14c8c8  ra=0x113CD8
+         stack: 0x54bb18 -> 0x113c60 (jal at 0x113cd0) -> 0x14c8c8
+         The caller of that third caller is 0x113c60 -- a function our runtime
+         demonstrably enters (TRACE seq=0x153d).
+
+### Why the zero on 0x14c8c8 is real evidence, not a tail-jump blind spot
+
+  eeref refs 0x14c8c8  -> slot=yes, call=5, ALL jal:
+      0x113bd4  in 0x113aa0 + 0x134
+      0x113cd0  in 0x113c60 + 0x70
+      0x14c660  in 0x14C328 + 0x338
+      0x14e910  in 0x14E8B0 + 0x60
+      0x15237c  in 0x152338 + 0x44
+  eeref refs 0x14c8e0  -> call=1, the j at 0x14c8d4 only, "inside sub_14C8C8
+                          (folded body)"
+
+0x14c8c8 is a thunk: addiu sp,-0x10 / sd ra / ld ra / j 0x14C8E0 / addiu sp,0x10.
+The body at 0x14c8e0 has exactly ONE reference in the whole image, so the thunk is
+the only door in. The thunk has a dispatch slot and every static caller reaches it
+by jal, so feedback_tracer_blind_to_tail_jumps does NOT apply: our tracer armed
+0x14c8c8 and read zero, and that zero means the call never happened.
+
+Two of the five callers, 0x113aa0 and 0x113c60, are the two functions at the head of
+OUR chains 1 and 2. We enter both. We take neither jal.
+
+### Where the divergence has to be -- two guards, both now watchable
+
+  0x113c94  jal  0x14F500          <- we DO take this (our ra=0x113c9c proves it)
+  0x113c9c  lw   v0, 0x30(s0)      s0 = 0x54BD60, so this reads [0x54BD90]
+  0x113ca0  beqz v0, ->0x113CF0    GUARD 1 -- skips the call site entirely
+  0x113ca8  lw   s1, 0xCC(s0)      reads [0x54BE2C]
+  0x113cac  lw   a0, (s1)
+  0x113cb0  bnez a0, ->0x113D08    GUARD 2 -- skips the call site entirely
+  0x113cb8  lw   a0, 4(s1)
+  0x113cbc  beqz a0, ->0x113CCC
+  0x113cc4  jal  0x10E6C0
+  0x113ccc  lw   a0, 0x30(s0)
+  0x113cd0  jal  0x14C8C8          <- THE MISSING EDGE
+
+Reaching 0x113cd0 FORCES *(s1) == 0 by branch semantics -- that one is not inference.
+s1 == 0x500730 IS inference: it is what s1 held at the 0x14c8c8 entry with nothing
+writing s1 in between. Post-hoc reads disagree with the branch-time values --
+[0x54BE2C] read 0 and [0x500730] read 0x3b AFTER the call -- so both cells are
+volatile and must be sampled in-phase. 0x10E6C0 at 0x113cc4 is the likely writer.
+
+0x14f500 is also a thunk (j 0x14F518). Its body calls 0x1505D0, requires v0==1, then
+jal 0x14F428 at 0x14f550 -- ra 0x14f558, matching our TRACE seq=0x153f exactly. It
+does NOT write s0->0x30; it writes 0x74(s0) on a DIFFERENT object. So whatever clears
+guard 1 is downstream: 0x153768, or the tail j 0x134530.
+
+### What this session could NOT answer -- stated so it is not mis-read later
+
+By the time the 0x14c8c8 chain was captured, PCSX2 had run on past the movie. With
+unconditional breakpoints armed, neither 0x14f428 nor 0x113c60 fired again across
+several seconds of emulated time. That is a RUN-WINDOW result and proves NOTHING
+about per-frame behaviour -- the phase was already over. Do not read it as
+"hardware does not call 0x14f428 per-frame".
+
+Evidence the phase turned over rather than stalled: 0x14c8e0 does sw zero,(s0) with
+s0 = 0x45F6E4, which zeroes o0st -- yet o0st reads 1 again afterwards, and [0x45F6E8]
+moved 0 -> 2. A new stream opened. GameMode [0x5E6B3C] reads 0x00, but 0x00 is also
+the zero default, so on its own that is weak.
+
+The gate data itself matched hardware exactly at hit 1: o0st=1, o0bsy=0,
+o0slt=0x1B12CC0 -- the same values part 92 read live and the same values all 78
+in-phase WATCH samples of the part-93 run carried.
+
+### The probe is already written
+
+build_scripts/presets.py, preset sofdec, gains four fields (44 of the 48-field cap):
+
+  m30   0x54BD90   s0->0x30, guard 1; oracle in-phase 0x45F6E4
+  mcc   0x54BE2C   s0->0xCC, guard 2 base; inferred 0x500730
+  p730  0x500730   *(s0->0xCC); must be 0 to reach the call
+  p734  0x500734   [s1+4]; gates the 0x10E6C0 call at 0x113cc4
+
+Suggested TRACE_CALLS set for the next run -- all four are func-map entries:
+  0x113c60, 0x14c8c8, 0x14f500, 0x14f428
+Set PS2X_TRACE_WATCH as well, or the WATCH columns are stripped off the TRACE
+records too (feedback_trace_watch_required_with_trace_calls).
+
+The run answers one question: at the sample where we are in-phase, is m30 zero
+(guard 1 fails) or is p730 nonzero (guard 2 fails)? Those are different bugs.
+
+### Corrections to parts 92 and 93
+
+Part 92's "nothing CALLS 0x14f428" stands, but it was the symptom, not the level to
+work at: 0x14f428 has callers we DO take. What we never take is 0x14c8c8, one level
+up, and the reason is a guard inside 0x113c60.
+
+Part 93 listed 0x14c8c8 among "the three that never fired" and weighted its zero as
+WEAK on the grounds that a tail j could hide it. That weighting was wrong -- eeref
+now shows slot=yes with five jal callers and no j into it. It was the strongest of
+the three zeros, not the weakest. 0x14f378 and 0x14f278 are untouched by this.
+
+Tool note: eeref refs 0x54bd90 returned "UNREACHABLE in the static image". That is a
+COVERAGE GAP, not evidence -- the access is lui v0,0x55 plus lw v0,-0x4270(v0), a
+negative lo16 its lui+lo matcher does not pair. Third time a zero from this tool has
+been a missing coverage entry.
+
 ## HANDOFF part 93 (2026-09-07) -- THE TWO CALLERS WE DO TAKE ARE ONE-SHOT SETUP. THE PER-FRAME CALLER IS STILL UNTAKEN.
 
 Part 92 named the starved edge and listed five candidate callers of 0x14f428.

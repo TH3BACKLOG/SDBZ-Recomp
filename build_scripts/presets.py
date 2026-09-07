@@ -152,6 +152,27 @@ PRESETS = {
         ("o0st", 0x45F6E4, 32),
         ("o0bsy", 0x45F744, 32),
         ("o0slt", 0x45F720, 32),
+        # --- part 94 (09-07): THE MISSING EDGE, measured on PCSX2 with a
+        # positive control (0x13c448) that fired first, so this is not a
+        # UI-paused false negative.  Hardware calls 0x14c8c8 from 0x113cd0
+        # (ra=0x113cd8) inside 0x113c60 -- the SAME 0x113c60 our runtime
+        # enters and leaves without ever making that call.  0x14c8c8 has
+        # slot=yes and all five static callers use jal, so the tracer's zero
+        # on it is real evidence; the tail-jump blind spot does not apply.
+        # 0x14c8e0 (the thunk's tail-j target) has exactly ONE static ref --
+        # the j at 0x14c8d4 -- so 0x14c8c8 is the only door in.
+        # The two guards between our last confirmed point (0x113c9c, proven
+        # by the ra of our own 0x14f500 call) and that call site:
+        #   0x113ca0  beqz [0x54BD90]    -> guard 1, skips to 0x113CF0
+        #   0x113cb0  bnez *[0x54BE2C]   -> guard 2, skips to 0x113D08
+        # Reaching 0x113cd0 FORCES *(s1)==0 by branch semantics.  s1==0x500730
+        # is inference: it is what s1 held at the 0x14c8c8 entry with nothing
+        # writing s1 in between, but 0x54BE2C read 0 post-hoc and 0x500730 read
+        # 0x3b post-hoc, so BOTH are volatile -- sample them in-phase only.
+        ("m30", 0x54BD90, 32),      # s0->0x30, guard 1; oracle in-phase 0x45F6E4
+        ("mcc", 0x54BE2C, 32),      # s0->0xCC, guard 2 base; inferred 0x500730
+        ("p730", 0x500730, 32),     # *(s0->0xCC); ==0 is required to reach the call
+        ("p734", 0x500734, 32),     # [s1+4]; gates the 0x10E6C0 call at 0x113cc4
         ("gamemode", 0x5E6B3C, 8),  # 0x00 = MainMenu; width unverified
     ],
 }
