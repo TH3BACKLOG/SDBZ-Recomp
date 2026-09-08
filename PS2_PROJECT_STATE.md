@@ -1,3 +1,119 @@
+## Part 96 (2026-09-07) -- SofDec: BOTH GUARDS PASS. We stop INSIDE the chain, and 0x113c60 is TEARDOWN
+
+*** Parts 94 and 95 both framed this as "which guard blocks us". Neither guard blocks us.
+*** We enter 0x113c60 with guard 1 already satisfied, and past guard 1 reaching 0x14c8c8
+*** is UNCONDITIONAL. The failure is a call that never returns, not a branch not taken.
+
+--- 1. WHO WRITES [0x54BE2C] -- answered, exactly two writers
+
+Seven functions materialize the base 0x54BD60 (`eeref refs 0x54bd60`). Disassembling all
+seven and filtering for stores at +0xCC gives exactly two:
+
+    0x00113bc4  sw  $v0,   204($s0)    in obj_set_fields___30_0 (0x113aa0)   <- ARM
+    0x00113cd4  sw  $zero, 204($s0)    in 0x113c60                           <- DISARM
+
+The arming write is the DELAY SLOT of `bne $v0, $zero, 0x113c30` at 0x113bc0, so it
+stores either way. $v0 is the return of `jal 0x114a50` at 0x113bb8, which returns
+`$gp + 0xffffd6c0` = 0x500730 on success and 0 on failure.
+
+Note `eeref refs 0x54be2c` says UNREACHABLE. That is the known negative-lo16 coverage
+gap (same as 0x54BD90 in part 94), NOT evidence. The base-then-offset route above is the
+way to ask this question for any field in this struct.
+
+--- 2. OUR RUNTIME ARMS THE LATCH CORRECTLY -- part 95's question 1 answered YES
+
+200 s run, 198 samples. Every one of the four new watch cells is BIT-IDENTICAL to the
+hardware reading, and all four turn on together at t=117 and stay on to the end of the run:
+
+    field   t=1..116     t=117..198    hardware (part 95)
+    mcc     0x0          0x500730      0x500730
+    m30     0x0          0x45f6e4      0x45f6e4
+    p730    0x0          0x3b          0x3b
+    p734    0x0          0x3c          0x3c
+    o0st    0x0          0x1           0x1
+
+So the latch IS armed, the object pointer IS present, and the run ended still in-phase
+(82 in-phase samples, no teardown). Part 95's "is mcc ever nonzero" is answered: yes.
+
+--- 3. PART 95'S QUESTION 3 WAS MALFORMED -- p730 is a HANDLE, not a counter
+
+`sub_114A50` is an INITIALIZER, not a per-frame updater:
+
+    0x114a70  jal 0x10e7a0            ; allocate
+    0x114a7c  sw  $v0, -10560($gp)    ; [0x500730] = handle #1   (0x3b)
+    0x114a90  jal 0x10e7a0            ; allocate
+    0x114a9c  sw  $v0, -10556($gp)    ; [0x500734] = handle #2   (0x3c)
+
+Two consecutive allocator returns, 59 and 60. Part 95 speculated "frame counters,
+UNVERIFIED"; they are handles, and "does p730 drain to 0" was the wrong question.
+
+--- 4. THE REAL SHAPE: 0x113d08 IS A RELEASE-AND-LOOP-BACK, NOT A SKIP
+
+Part 94 read `bnez a0 -> 0x113D08` as "skips the call site". It does not:
+
+    0x113cb0  bnez $a0, 0x113D08      ; handle #1 live -> go release it
+    ...
+    0x113d08  jal  0x10e6c0           ; RELEASE handle #1
+    0x113d10  b    0x113cbc           ; loop BACK into the teardown
+    0x113d14  lw   $a0, 4($s1)        ; delay slot: handle #2
+    0x113cbc  beqz $a0, 0x113CCC
+    0x113cc4  jal  0x10e6c0           ; release handle #2
+    0x113ccc  lw   $a0, 48($s0)
+    0x113cd0  jal  0x14C8C8           ; DESTROY -- reached either way
+
+Once guard 1 passes, `0x14c8c8` is UNAVOIDABLE. Guard 2 only chooses the order in which
+the two handles are released. There is no waiting and nothing to drain.
+
+Consequence: 0x113c60 is the stream CLOSE/TEARDOWN routine, not a per-frame routine.
+0x14c8e0 fits -- lock, call the gate, `sw zero,(s0)` on the stream object, unlock. And
+our TRACE shows `0x113c60 n=1`: entered exactly once in 200 s.
+
+--- 5. WHERE WE ACTUALLY STOP
+
+Three TRACE records, one instant (progress=14869440, tid=0x1709), then silence:
+
+    seq=5423  addr=0x113c60  ra=0x4210d0  m30=0x45f6e4 mcc=0x500730 p730=0x3b
+    seq=5424  addr=0x14f500  ra=0x113c9c   <- the jal at 0x113c94, correct place
+    seq=5425  addr=0x14f428  ra=0x14f558   <- inside 0x14f500's body, at 0x14f550
+
+m30 is NONZERO in the entry record, so guard 1 passes for us too. 0x14c8c8 was in
+PS2X_TRACE_CALLS for this run and has ZERO records, and part 94 established it has
+slot=yes with 5 jal callers and no j -- the zero is real.
+
+The chain after the 0x14f428 at 0x14f550:
+
+    0x14f558  daddu $a0, $s0
+    0x14f55c  jal   0x153768          ; <- NEXT CALL, never observed
+    0x14f564  sw    $zero, 116($s0)
+    0x14f568  lw    $a0, 72($s0)
+    0x14f574  j     0x134530          ; tail jump; 0x134530's return lands at 0x113c9c
+
+So we stop somewhere in {inside 0x14f428, inside 0x153768, inside the 0x134530 subtree,
+inside 0x10e6c0}. We never get back to 0x113c9c.
+
+--- 6. THE NEXT RUN -- a clean 3-way, no rebuild
+
+    PS2X_TRACE_CALLS = 0x113c60,0x14f428,0x153768,0x10e6c0,0x14c8c8
+
+All five are func-map entries with slot=yes. Caller shapes checked with eeref:
+
+  0x153768  3 callers; ours (0x14f55c) is a jal -> visible.
+  0x10e6c0  3 jal callers, TWO of them are the sites we care about (0x113cc4, 0x113d08).
+  0x14c8c8  5 jal callers, no j (part 94).
+
+Read it as:
+
+  - 0x153768 ZERO      -> we never return from 0x14f428. The gate itself is the wall.
+  - 0x153768 fires,
+    0x10e6c0 ZERO      -> we die in 0x153768 or in the 0x134530 subtree.
+  - 0x10e6c0 fires,
+    0x14c8c8 ZERO      -> contradicts section 4; re-derive, do not theorise.
+
+DELIBERATELY EXCLUDED: 0x134530. Our edge into it is the `j` at 0x14f574, which bypasses
+the function table, so a zero on it would be structurally meaningless
+([[feedback_tracer_blind_to_tail_jumps]]). It also has 6 unrelated jal callers that would
+muddy a nonzero. Do not add it.
+
 ## Part 95 (2026-09-07) -- SofDec: the mcc latch is a SELF-DISARMING ONE-SHOT; guard 1 passes on hardware
 
 *** [0x54BE2C] is armed by someone else and cleared by the call itself. The question
