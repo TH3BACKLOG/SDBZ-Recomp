@@ -63,7 +63,7 @@ node_modules/
 package.json
 package-lock.json
 third_party/
-tools/
+/tools/
 output/
 run_logs/
 graphify-out/
