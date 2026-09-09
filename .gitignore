@@ -74,6 +74,7 @@ ELF/
 *.txt
 !README*.txt
 !CHANGELOG*.txt
+!CMakeLists.txt
 desktop.ini
 *.7z
 ghidra_*/
