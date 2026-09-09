@@ -21,6 +21,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build libgl-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev pkg-config libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev
 
+      - name: Recomp output check
+        run: |
+          if [ ! -f ps2xRuntime/include/fn_forward_decls.h ]; then
+            echo "::warning::SKIPPED: ps2xRuntime + ps2xTest (no recomp output in CI — generated headers and runner sources are deliberately untracked). Green does NOT mean the runtime compiles."
+          fi
+
       - name: Configure
         run: |
           if [ "${{ matrix.compiler }}" = "gcc" ]; then
@@ -36,7 +42,40 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Tests
-        run: ./build/ps2xTest/ps2x_tests
+        run: |
+          if [ -x build/ps2xTest/ps2x_tests ]; then
+            ./build/ps2xTest/ps2x_tests
+          else
+            echo "::warning::SKIPPED: ps2x_tests (runtime not built — no recomp output)"
+          fi
+
+      - name: Script hygiene + IRX pack verify
+        if: matrix.compiler == 'gcc'
+        shell: pwsh
+        run: |
+          # Syntax-check every Python script under build_scripts/
+          python3 -m compileall -q build_scripts
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # Parse-check every PowerShell script under build_scripts/
+          $bad = @()
+          Get-ChildItem build_scripts -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null; $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errs) | Out-Null
+            if ($errs) { $bad += "$($_.FullName): $($errs[0].Message)" }
+          }
+          if ($bad) { $bad | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          # Adjudication-gate regression test: every committed reply CSV must
+          # pass make_irx_pack.py verify with zero PROBLEM lines. Missing rows
+          # are allowed (batches land incrementally); malformed rows are not.
+          $failed = $false
+          Get-ChildItem build_scripts/copilot_packs -Filter reply_*.csv | ForEach-Object {
+            $module = ($_.BaseName -split '_')[1]
+            Write-Host "verify $module <- $($_.Name)"
+            $out = python3 build_scripts/make_irx_pack.py verify $module --csv $_.FullName 2>&1
+            $out | Write-Host
+            if ($out -match 'PROBLEM:') { $failed = $true }
+          }
+          if ($failed) { exit 1 }
 
   windows-msvc:
     strategy:
@@ -60,6 +99,13 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
 
+      - name: Recomp output check
+        shell: pwsh
+        run: |
+          if (-not (Test-Path ps2xRuntime/include/fn_forward_decls.h)) {
+            Write-Host "::warning::SKIPPED: ps2xRuntime + ps2xTest (no recomp output in CI - generated headers and runner sources are deliberately untracked). Green does NOT mean the runtime compiles."
+          }
+
       - name: Build
         shell: cmd
         run: |
@@ -67,9 +113,14 @@ jobs:
           cmake --build build --config Release
 
       - name: Tests
-        shell: cmd
+        shell: pwsh
         run: |
-          .\build\ps2xTest\Release\ps2x_tests.exe
+          if (Test-Path build\ps2xTest\Release\ps2x_tests.exe) {
+            .\build\ps2xTest\Release\ps2x_tests.exe
+            exit $LASTEXITCODE
+          } else {
+            Write-Host "::warning::SKIPPED: ps2x_tests (runtime not built - no recomp output)"
+          }
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:

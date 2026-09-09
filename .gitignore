@@ -54,6 +54,11 @@ config.toml
 build_scripts/*
 !build_scripts/recomp_mcp_server.py
 !build_scripts/funcmap/
+!build_scripts/make_irx_pack.py
+!build_scripts/copilot_packs/
+build_scripts/copilot_packs/*
+!build_scripts/copilot_packs/manifest_*.csv
+!build_scripts/copilot_packs/reply_*.csv
 STUDIO_BUG_LOG.md
 
 # Local tooling, dumps, and workspace clutter (not part of the recomp source tree)

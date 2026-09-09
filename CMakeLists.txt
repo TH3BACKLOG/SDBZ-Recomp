@@ -104,7 +104,16 @@ if(PS2X_BUILD_RUNTIME)
     # interpreter (ps2_iop_cpu.cpp) still owns the IOP path. This exists so
     # cri_dtx/sdrdrv/tsnddrv can be ported across module by module.
     add_subdirectory("ps2xIOP")
-    add_subdirectory("ps2xRuntime")
+    # ps2_runtime cannot compile without the recomp output (generated headers
+    # + src/runner/), which is deliberately untracked (no game code in git).
+    # Skip LOUDLY rather than fail so CI still builds everything else. Green
+    # CI does NOT mean the runtime compiles.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ps2xRuntime/include/fn_forward_decls.h"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ps2xRuntime/include/ps2_recompiled_functions.h")
+        add_subdirectory("ps2xRuntime")
+    else()
+        message(WARNING "SKIPPED: ps2xRuntime (no recomp output — generated headers/runner sources absent; run ps2_recomp + build.ps1 locally)")
+    endif()
 endif()
 
 if(PS2X_BUILD_ANALYZER)
@@ -112,7 +121,11 @@ if(PS2X_BUILD_ANALYZER)
 endif()
 
 if(PS2X_BUILD_TEST)
-    add_subdirectory("ps2xTest")
+    if(TARGET ps2_runtime)
+        add_subdirectory("ps2xTest")
+    else()
+        message(WARNING "SKIPPED: ps2xTest (requires ps2_runtime, which was skipped)")
+    endif()
 endif()
 
 if(PS2X_BUILD_STUDIO)
