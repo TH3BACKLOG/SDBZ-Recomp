@@ -129,10 +129,15 @@ target_link_libraries(ps2xStudio PRIVATE
     imgui_filedialog_lib
     ps2_recomp_lib
     ps2_analyzer_lib
-    ps2_test_lib
     SDL2::SDL2
     OpenGL::GL
 )
+
+# ps2_test_lib is absent when ps2xTest is skipped (no recomp output in CI);
+# no Studio source references its symbols, so linking it is optional.
+if(TARGET ps2_test_lib)
+    target_link_libraries(ps2xStudio PRIVATE ps2_test_lib)
+endif()
 
 if(WIN32)
     target_link_libraries(ps2xStudio PRIVATE SDL2::SDL2main)
