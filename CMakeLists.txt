@@ -129,5 +129,11 @@ if(PS2X_BUILD_TEST)
 endif()
 
 if(PS2X_BUILD_STUDIO)
-    add_subdirectory("ps2xStudio")
+    # StudioState::RunDiagnostics() calls test-registration functions from
+    # ps2_test_lib, so Studio cannot link when ps2xTest was skipped.
+    if(TARGET ps2_test_lib)
+        add_subdirectory("ps2xStudio")
+    else()
+        message(WARNING "SKIPPED: ps2xStudio (requires ps2_test_lib, which was skipped)")
+    endif()
 endif()
