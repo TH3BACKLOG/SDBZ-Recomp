@@ -528,12 +528,16 @@ def recomp_list_breakpoints() -> dict:
         bad = _bad_version(h)
         if bad:
             return bad
+        # A slot that was never armed is all-zeroes from Init()'s ZeroMemory,
+        # so cond_reg reads 0 — i.e. "r0", not kDbgNoCondReg. Reporting that as
+        # a live condition made every untouched slot look conditional on $zero.
+        # Only a slot that is actually enabled can have a meaningful condition.
         slots = [{
             "slot": i,
             "addr": hex(b["addr"]),
             "enabled": b["enabled"],
-            "condition": None if b["cond_reg"] == NO_COND_REG
-                         else f"r{b['cond_reg']} == {hex(b['cond_value'])}",
+            "condition": (None if (not b["enabled"] or b["cond_reg"] == NO_COND_REG)
+                          else f"r{b['cond_reg']} == {hex(b['cond_value'])}"),
             "reserved_for_pause": i == PAUSE_SLOT,
         } for i, b in enumerate(h["bp_slots"])]
         return {
