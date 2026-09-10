@@ -13,11 +13,34 @@ pc/gpr slot to a per-thread table (thread_states[kDbgMaxTrackedThreads]),
 version 6 -> 7. This script's struct format was updated to match; see
 DbgThreadState in recomp_debug_ipc.h for the authoritative layout.
 
-Hard limits inherited from the protocol (not this script):
-  - read_memory only succeeds for addresses inside the ~2KB ram_window
-    centred on the current PC. There is no general-purpose memory bus.
-  - There is no free-run "pause anytime" — pause() arms a breakpoint at the
-    current PC and waits for the recompiler to reach it again.
+Protocol facts re-verified against the C++ writer on 2026-09-09 by reading
+recomp_debug_writer.cpp and recomp_debug_ipc.h directly. Older comments in
+this file were stale; trust these:
+  - There IS a general-purpose memory bus. mem_req/mem_resp and mem_write_*
+    reach any RDRAM address, 4096 bytes per request, and are serviced both
+    while running AND while halted (CheckBreakpoint()'s spin calls
+    ServiceMemRequests() every 1ms). recomp_read_memory() is the legacy
+    ram_window-only path — prefer recomp_read_memory_general().
+  - Breakpoints: 8 slots, each optionally CONDITIONAL on
+    gpr[cond_reg] == cond_value, honoured by CheckBreakpoint().
+  - Stepping is per-tid via step_requested_tid (BUG-021).
+  - There is still no true async pause — recomp_pause() arms a breakpoint at
+    the current PC and waits for the recompiler to reach it again.
+
+*** BREAKPOINT GRANULARITY — READ BEFORE BELIEVING A NEGATIVE ***
+CheckBreakpoint() is called from EeScheduler.cpp:947 once per scheduler
+DISPATCH ITERATION, with context.pc = the PC the thread is about to dispatch
+from. It is NOT a per-instruction hook. An address interior to a recompiled
+function body never appears as a dispatch PC, so a breakpoint armed there
+never fires even though the code provably runs. Arm on function-map ENTRY
+addresses / resume labels only. Same failure mode as the T1 tracer.
+
+NOT WIRED — present in the struct but dead, so no tool exposes them:
+  - pad_override[]: RecompDbg::GetPadOverride() has no caller. ps2_runtime.cpp
+    deliberately dropped the consumer because setPadOverrideState() is
+    single-port. Writing pad_override[] does nothing.
+  - iop_pc / iop_gpr[]: RecompDbg::UpdateIop() has no caller, so they stay 0.
+Both would need a C++ change (rebuild) before a tool would mean anything.
 """
 import mmap
 import struct
@@ -84,6 +107,7 @@ BP_SLOT_SIZE = struct.calcsize("<" + _BP_SLOT_FMT)
 _TAIL_OFFSET = BP_SLOTS_OFFSET + BP_SLOT_SIZE * NUM_BP_SLOTS  # bp_hit_addr
 BP_HIT_TID_OFFSET = _TAIL_OFFSET + struct.calcsize("<I")
 BP_HIT_OFFSET = BP_HIT_TID_OFFSET + struct.calcsize("<i")
+STEP_REQUESTED_TID_OFFSET = BP_HIT_OFFSET + struct.calcsize("<B")
 
 # --- mem_write_* handshake offsets (post-header fields, not covered by HEADER_FMT) ---
 # Layout order in recomp_debug_ipc.h after ram_window[2048]:
@@ -124,7 +148,25 @@ REG_WRITE_IDX_OFFSET = MEM_WRITE_DATA_OFFSET + _MEM_REQ_MAX_SIZE
 REG_WRITE_VALUE_OFFSET = REG_WRITE_IDX_OFFSET + 4
 REG_WRITE_SEQ_OFFSET = REG_WRITE_VALUE_OFFSET + 4
 REG_WRITE_DONE_SEQ_OFFSET = REG_WRITE_SEQ_OFFSET + 4
-FULL_SHM_SIZE = REG_WRITE_DONE_SEQ_OFFSET + 4
+# --- guest scheduler snapshot: threads[64] (version 9) -------------------
+# Populated by RecompDbg::UpdateThreads(), called once per video frame from
+# ps2_runtime.cpp:6394. DbgThreadInfo is declared *before* the pack(1) block
+# but is 8x int32, so natural alignment adds no padding: 32 bytes.
+THREAD_COUNT_OFFSET = REG_WRITE_DONE_SEQ_OFFSET + 4
+THREADS_OFFSET = THREAD_COUNT_OFFSET + 4
+_THREAD_INFO_FMT = "<iIIIiiii"  # tid, entry, currentPc, stack, status, waitType, waitId, priority
+THREAD_INFO_SIZE = struct.calcsize(_THREAD_INFO_FMT)  # 32
+NUM_SCHED_THREADS = 64  # kDbgMaxThreads
+
+# pad_override[2] (declared inside pack(1), so 1+3+2+4 = 10 bytes each) plus
+# uint8 _reserved[4] close the struct.
+PAD_OVERRIDE_OFFSET = THREADS_OFFSET + THREAD_INFO_SIZE * NUM_SCHED_THREADS
+FULL_SHM_SIZE = PAD_OVERRIDE_OFFSET + 10 * 2 + 4  # == sizeof(RecompDebugState)
+
+# THS_* / TSW_* decode tables for DbgThreadInfo.status / .waitType
+_THS = {0x01: "RUN", 0x02: "READY", 0x04: "WAIT", 0x08: "SUSPEND",
+        0x0C: "WAITSUSPEND", 0x10: "DORMANT"}
+_TSW = {0: "NONE", 1: "SLEEP", 2: "SEMA", 3: "EVENT"}
 
 mcp = FastMCP("recomp")
 
@@ -230,10 +272,46 @@ def _select_thread_index(shm: mmap.mmap, header: dict, tid: int | None = None):
     return None
 
 
-def _write_bp_slot(shm: mmap.mmap, slot: int, addr: int, enabled: int):
+def _write_bp_slot(shm: mmap.mmap, slot: int, addr: int, enabled: int,
+                   cond_reg: int = NO_COND_REG, cond_value: int = 0):
+    """Write one DbgBreakpoint slot. cond_reg == NO_COND_REG (0xFF) is
+    unconditional; otherwise CheckBreakpoint() only fires the slot when
+    gpr[cond_reg] == cond_value."""
     offset = BP_SLOTS_OFFSET + BP_SLOT_SIZE * slot
-    chunk = struct.pack("<IBBxxI", addr, enabled, NO_COND_REG, 0)
+    chunk = struct.pack("<IBBxxI", addr & 0x1FFFFFFF, enabled,
+                        cond_reg & 0xFF, cond_value & 0xFFFFFFFF)
     shm[offset:offset + len(chunk)] = chunk
+
+
+def _bad_version(h: dict):
+    """Returns an error dict if the layout version is not the one this file
+    was written against, else None. Every tool that trusts an offset past the
+    header must call this first."""
+    if h["version"] != 10:
+        return {"error": f"unexpected RecompDebugState version {h['version']} "
+                         f"(expected 10) — struct layout mismatch, trust no field"}
+    return None
+
+
+def _read_thread_table(shm: mmap.mmap):
+    count = struct.unpack("<I", shm[THREAD_COUNT_OFFSET:THREAD_COUNT_OFFSET + 4])[0]
+    count = min(count, NUM_SCHED_THREADS)
+    rows = []
+    for i in range(count):
+        off = THREADS_OFFSET + THREAD_INFO_SIZE * i
+        tid, entry, pc, stack, status, wt, wid, prio = struct.unpack(
+            _THREAD_INFO_FMT, shm[off:off + THREAD_INFO_SIZE])
+        rows.append({
+            "tid": tid,
+            "entry": hex(entry),
+            "currentPc": hex(pc),
+            "stack": hex(stack),
+            "status": _THS.get(status, hex(status)),
+            "waitType": _TSW.get(wt, str(wt)),
+            "waitId": wid,
+            "priority": prio,
+        })
+    return count, rows
 
 
 def _clear_bp_hit(shm: mmap.mmap):
@@ -300,10 +378,15 @@ def recomp_list_threads() -> dict:
 
 @mcp.tool()
 def recomp_read_memory(address: str, size: int) -> dict:
-    """Read up to `size` bytes at physical EE address `address` (hex string,
-    e.g. "0x4418D0"). Only succeeds if the address falls inside the live
-    ~2KB ram_window centred on the current PC — this protocol has no
-    general-purpose memory bus, so most heap/data addresses will fail."""
+    """LEGACY / narrow. Read up to `size` bytes at physical EE address
+    `address` (hex string, e.g. "0x4418D0"), but only if it falls inside the
+    live ~2KB ram_window centred on the current PC.
+
+    ⚠ Prefer recomp_read_memory_general() — it reaches ANY RDRAM address via
+    the mem_req/mem_resp bus. This tool exists only because it needs no
+    handshake round-trip, so it still works when the dispatch loop is not
+    servicing requests. A failure here does NOT mean the address is
+    unreachable."""
     addr = int(address, 16)
     shm = _open()
     try:
@@ -390,17 +473,198 @@ def recomp_write_memory(address: str, data_hex: str, timeout_seconds: float = 1.
 
 
 @mcp.tool()
-def recomp_set_breakpoint(address: str) -> dict:
-    """Arm a breakpoint at physical EE address `address` (hex string) on the
-    reserved pause/breakpoint slot (bp_slots[0]). Any tracked thread that
-    reaches this PC sets bp_hit=1 and bp_hit_tid to its tid, blocking until
-    the debugger clears bp_hit via recomp_resume()."""
+def recomp_set_breakpoint(address: str, slot: int = PAUSE_SLOT,
+                          cond_reg: int = -1, cond_value: str = "0") -> dict:
+    """Arm a breakpoint at physical EE address `address` (hex string).
+
+    `slot` picks one of the 8 bp_slots (0..7). Slot 0 is shared with
+    recomp_pause()/recomp_resume(), so use 1..7 for breakpoints that should
+    survive a resume.
+
+    `cond_reg` (0..31) makes it CONDITIONAL: CheckBreakpoint() halts only
+    when gpr[cond_reg] == cond_value. -1 (default) = unconditional.
+    `cond_value` is a hex string ("0x1234") or a decimal string.
+
+    The condition is one 32-bit compare inside the scheduler's existing
+    per-dispatch loop — NOT a per-instruction interpreter hook. So unlike
+    PCSX2, a conditional breakpoint on a hot address does not throttle the
+    runtime.
+
+    ⚠ Only addresses that appear as a dispatch PC (function-map entries and
+    resume labels) can ever fire — see the module docstring."""
     addr = int(address, 16)
+    if slot < 0 or slot >= NUM_BP_SLOTS:
+        return {"ok": False, "error": f"slot must be 0..{NUM_BP_SLOTS - 1}"}
+    if cond_reg != -1 and not (0 <= cond_reg < 32):
+        return {"ok": False, "error": "cond_reg must be 0..31, or -1 for unconditional"}
+    cv = str(cond_value)
+    val = int(cv, 16) if cv.lower().startswith("0x") else int(cv)
+    creg = NO_COND_REG if cond_reg == -1 else cond_reg
     shm = _open()
     try:
-        _write_bp_slot(shm, PAUSE_SLOT, addr, 1)
+        h = _read_header(shm)
+        bad = _bad_version(h)
+        if bad:
+            return bad
+        _write_bp_slot(shm, slot, addr, 1, creg, val)
         _clear_bp_hit(shm)
-        return {"ok": True, "armed_at": hex(addr)}
+        return {
+            "ok": True,
+            "slot": slot,
+            "armed_at": hex(addr & 0x1FFFFFFF),
+            "condition": None if creg == NO_COND_REG else f"r{creg} == {hex(val)}",
+        }
+    finally:
+        shm.close()
+
+
+@mcp.tool()
+def recomp_list_breakpoints() -> dict:
+    """List all 8 bp_slots (address, enabled, condition) plus the current
+    bp_hit / step_requested_tid state."""
+    shm = _open()
+    try:
+        h = _read_header(shm)
+        bad = _bad_version(h)
+        if bad:
+            return bad
+        slots = [{
+            "slot": i,
+            "addr": hex(b["addr"]),
+            "enabled": b["enabled"],
+            "condition": None if b["cond_reg"] == NO_COND_REG
+                         else f"r{b['cond_reg']} == {hex(b['cond_value'])}",
+            "reserved_for_pause": i == PAUSE_SLOT,
+        } for i, b in enumerate(h["bp_slots"])]
+        return {
+            "slots": slots,
+            "bp_hit": h["bp_hit"],
+            "bp_hit_addr": hex(h["bp_hit_addr"]),
+            "bp_hit_tid": h["bp_hit_tid"],
+            "step_requested_tid": h["step_requested_tid"],
+        }
+    finally:
+        shm.close()
+
+
+@mcp.tool()
+def recomp_clear_breakpoint(slot: int) -> dict:
+    """Disable one bp_slot (0..7) without touching bp_hit or the other slots."""
+    if slot < 0 or slot >= NUM_BP_SLOTS:
+        return {"ok": False, "error": f"slot must be 0..{NUM_BP_SLOTS - 1}"}
+    shm = _open()
+    try:
+        _write_bp_slot(shm, slot, 0, 0)
+        return {"ok": True, "slot": slot}
+    finally:
+        shm.close()
+
+
+@mcp.tool()
+def recomp_clear_all_breakpoints() -> dict:
+    """Disable all 8 bp_slots and clear bp_hit + step_requested_tid, so a
+    halted thread resumes and nothing re-arms behind it."""
+    shm = _open()
+    try:
+        for i in range(NUM_BP_SLOTS):
+            _write_bp_slot(shm, i, 0, 0)
+        shm[STEP_REQUESTED_TID_OFFSET:STEP_REQUESTED_TID_OFFSET + 4] = struct.pack("<i", -1)
+        _clear_bp_hit(shm)
+        return {"ok": True, "cleared_slots": NUM_BP_SLOTS}
+    finally:
+        shm.close()
+
+
+@mcp.tool()
+def recomp_step(tid: int = -1, timeout_seconds: float = 5.0) -> dict:
+    """Single-step one PS2 thread via step_requested_tid, then wait for it to
+    halt. tid=-1 steps whichever thread last hit a breakpoint, falling back to
+    the first tracked thread.
+
+    Per BUG-021 this is per-tid — other threads keep running unaffected.
+    Granularity is one SCHEDULER DISPATCH of that thread, not one MIPS
+    instruction (CheckBreakpoint runs once per dispatch iteration).
+
+    If the target is already halted, bp_hit is cleared first so it can
+    advance. Returns with the thread halted again; release it with
+    recomp_continue()."""
+    shm = _open()
+    try:
+        h = _read_header(shm)
+        bad = _bad_version(h)
+        if bad:
+            return bad
+        target = tid
+        if target == -1:
+            idx = _select_thread_index(shm, h)
+            if idx is None:
+                return {"ok": False, "error": "no tracked threads"}
+            st = _read_thread_slot(shm, idx)
+            if not st:
+                return {"ok": False, "error": "seqlock read failed"}
+            target = st["tid"]
+
+        shm[STEP_REQUESTED_TID_OFFSET:STEP_REQUESTED_TID_OFFSET + 4] = struct.pack("<i", target)
+        # If the thread is parked in CheckBreakpoint()'s spin it must be
+        # released before it can reach the step check on its next dispatch.
+        if h["bp_hit"]:
+            _clear_bp_hit(shm)
+
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            h2 = _read_header(shm)
+            if h2["bp_hit"] and h2["bp_hit_tid"] == target:
+                idx = _select_thread_index(shm, h2, target)
+                st = _read_thread_slot(shm, idx) if idx is not None else None
+                return {
+                    "ok": True,
+                    "tid": target,
+                    "pc": hex(st["pc"]) if st else hex(h2["bp_hit_addr"]),
+                    "cycle_count": st["cycle_count"] if st else None,
+                    "gpr": {f"r{i}": hex(v) for i, v in enumerate(st["gpr"])} if st else None,
+                }
+            if not h2["recomp_running"]:
+                return {"ok": False, "error": "recomp_running went to 0 (process exited)"}
+            time.sleep(0.01)
+        return {"ok": False, "tid": target,
+                "error": "timeout waiting for the step to land — is that tid still being "
+                         "dispatched? A blocked/dormant thread never reaches CheckBreakpoint."}
+    finally:
+        shm.close()
+
+
+@mcp.tool()
+def recomp_continue() -> dict:
+    """Release a halted thread by clearing bp_hit ONLY, leaving every armed
+    bp_slot in place. Use this instead of recomp_resume() when the breakpoint
+    should be able to fire again, and after recomp_step()."""
+    shm = _open()
+    try:
+        h = _read_header(shm)
+        was_hit = h["bp_hit"]
+        _clear_bp_hit(shm)
+        return {"ok": True, "was_halted": was_hit}
+    finally:
+        shm.close()
+
+
+@mcp.tool()
+def recomp_thread_table() -> dict:
+    """Read the full guest scheduler snapshot: up to 64 PS2 threads with tid,
+    entry point, current PC, stack, THS_* status, TSW_* wait type, waitId and
+    priority. Written once per video frame by RecompDbg::UpdateThreads().
+
+    This is the scheduler's own view — much broader than
+    recomp_list_threads(), which only shows the 8 hot per-dispatch debug
+    slots. Use it to see DORMANT/WAIT threads that never appear there."""
+    shm = _open()
+    try:
+        h = _read_header(shm)
+        bad = _bad_version(h)
+        if bad:
+            return bad
+        count, rows = _read_thread_table(shm)
+        return {"thread_count": count, "threads": rows}
     finally:
         shm.close()
 
@@ -435,8 +699,11 @@ def recomp_wait_for_break(timeout_seconds: float = 30.0, poll_interval: float = 
 
 @mcp.tool()
 def recomp_resume() -> dict:
-    """Clear the pause/breakpoint slot and bp_hit so the recompiler's
-    Sleep(1) wait loop exits and execution continues."""
+    """Clear the pause/breakpoint slot (bp_slots[0]) AND bp_hit, so the
+    recompiler's Sleep(1) wait loop exits and execution continues.
+
+    ⚠ This disarms slot 0. If you armed a breakpoint you want to fire again,
+    use recomp_continue() instead — it clears only bp_hit."""
     shm = _open()
     try:
         _write_bp_slot(shm, PAUSE_SLOT, 0, 0)
