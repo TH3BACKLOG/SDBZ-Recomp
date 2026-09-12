@@ -1,3 +1,822 @@
+# PS2 Project State -- SDBZ Recomp
+
+**Game:** Super Dragon Ball Z (NTSC-U), `SLUS_214.42`.
+**What this is:** a **static recompilation**, not an emulator. The EE binary was translated
+ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
+(`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
+loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
+**Where we are:** the milestone ladder is the unit of progress. Rung 4.7 is the current
+wall. Parts below are **newest first** -- Part 109 is the top of the file.
+
+---
+
+## STOP -- read this before touching anything
+
+These are not style preferences. Each one has cost this project real sessions.
+
+**Build and runner**
+
+1. **NEVER clean the build.** No `--clean-first`, no `--target clean`, no deleting `build/`
+   or `.obj` files. A full MSVC rebuild is **30+ hours**. Incremental is seconds.
+2. **NEVER edit `ps2xRuntime/src/runner/*.cpp`.** Machine output. The recompiler overwrites it.
+   Fixes go in `ps2xRuntime/src/lib/game_overrides.cpp` -- nowhere else.
+3. **NEVER edit a `.h` header.** Headers reach all ~4,520 runner TUs => 30+ hour rebuild.
+   Use file-scope `static` in a `.cpp`, or `extern` between two `.cpp` files. If a header
+   change is genuinely unavoidable: STOP, state the cost, get approval.
+4. **NEVER run the recompiler against the live `config.toml`.** It writes into `output/`,
+   which `build.ps1:106-112` syncs into `ps2xRuntime/src/runner/`, which rewrites
+   `fn_forward_decls.h` => 30+ hour rebuild. Copy to a scratch config, regenerate there, diff first.
+   `fn_forward_decls.h` is auto-generated: never hand-edit it.
+5. **NEVER list or scan inside `ps2xRuntime/src/runner/`.** 30,000+ files; it crashes the context.
+   Safe: `Test-Path`, a `-Filter *.cpp | Select -First 1`, or opening one known path.
+6. **The user runs every build and every run.** Hand over the command; do not invoke
+   `build.ps1`, `launch_recomp.ps1`, `run_game_agent.bat`, x64dbg, or the deepseek
+   scripts. Delegation was granted once and **revoked 2026-09-01**.
+7. **`cl /Zs` syntax-checks a runtime TU in seconds** without emitting an `.obj`, writing
+   into `build/`, or spending a build cycle. Do this before handing over any build.
+   It never links, so `extern "C"` signature mismatches must still be diffed by hand.
+8. **Never fake the IOP.** Run the real `.IRX` in the R3000 interpreter.
+9. **Never create files in the project root.** Temp work goes to the scratchpad.
+
+**Measurement**
+
+10. **Absence is not evidence.** A capped probe, a short run window, an anomaly-only
+    probe, or a tracer blind to tail jumps all read zero while the code provably runs.
+    Establish the log string exists before treating its absence as a result.
+11. **`vbl/s` is a guest-progress constant, not a host frame rate.** It is arithmetic over
+    `PS2X_DET_VBLANK_QUANTUM`. Never infer what drew on screen from it.
+12. **Bind every probe to an instruction.** An untraced field is decoration.
+13. **Label hypothesis vs. verified, always.** Ask the binary (static disasm) before the
+    runtime; reproduce on the PCSX2 oracle before naming a root cause.
+14. **Never `open(path, 'w')` on a real file.** Write to `path + ".tmp"`, then
+    `os.replace`. This exact mistake truncated *this file* to 0 bytes on 2026-09-10.
+
+**Environment**
+
+15. `run_log.txt` is **UTF-16LE**. Read it with `analyze_run.py`, not a hand-rolled grep,
+    and never with a `[^\n]*X[^\n]*` regex -- records run to tens of KB with no newline
+    and the pattern backtracks catastrophically.
+16. The user launches from **Windows PowerShell 5.1**; the agent shell is **pwsh 7**.
+    Test PowerShell edits under 5.1. Never wrap a handover command in
+    `powershell -NoProfile -Command "..."` -- the outer shell eats every `$var`.
+17. Visual Studio on this machine is **18 (2026)**, not 2022.
+
+---
+
+## Canonical paths
+
+Read [[command_log]] in memory before quoting any path; never reconstruct one.
+
+| What | Path |
+|---|---|
+| Project root | `F:\SDBZ Recomp` |
+| ELF | `F:\SDBZ Recomp\ELF\SLUS_214.42` |
+| Runtime source (editable) | `F:\SDBZ Recomp\ps2xRuntime\src\lib\` |
+| Game fixes go here, only here | `...\src\lib\game_overrides.cpp` |
+| Generated runner (NEVER edit/scan) | `F:\SDBZ Recomp\ps2xRuntime\src\runner\` |
+| Build tree | `F:\SDBZ Recomp\build` |
+| Run log (UTF-16LE) | `F:\SDBZ Recomp\run_log.txt` |
+| Build log (the only place real compile errors appear) | `F:\SDBZ Recomp\build_log.txt` |
+| Archived runs | `F:\SDBZ Recomp\logs\archive\` |
+| Game data root (`MOVIE\`, etc.) | `F:\SDBZ Recomp\Super Dragon Ball Z ISO\Arcade Version\SDBZ ISO 2\` |
+| vcvars64 | `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat` |
+
+## Active Runner Command
+
+Both are **user-run**. Hand them over; do not execute them.
+
+```powershell
+# Build -- the config argument is MANDATORY. A bare call builds only Debug.
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+
+```powershell
+# Run -- -Exe is MANDATORY (the launcher defaults to a stale Debug exe).
+# Never -Determinism 0 on Stage 5.15+: det=0 loses the .SFD open outright.
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+```powershell
+# Play the opening movies on the host instead of skipping them (Part 108).
+$env:PS2X_FMV = "host"
+```
+
+Confirm you ran what you edited: diff the log's `[runmeta] exeWritten=` line against the
+source file's mtime. Read results with `analyze_run.py` (`--runs`, `--tag`, `--onset`,
+`--watch`, `--probe`), never by hand-grepping the console.
+
+---
+
+> **Recovery note (2026-09-10).** This file was truncated to 0 bytes by an agent edit script
+> (`open(path,'w')` opened for write, then a `UnicodeEncodeError` aborted before anything was
+> written). The body was restored from `git show HEAD:PS2_PROJECT_STATE.md` (commit
+> `a1ab10dd`, Part 96 and older) and the milestone ladder from the agent's context.
+> The header above is a **rewrite, not the original** -- the original (approx. lines 1-47)
+> is gone, and so is the prose of **Part 104** and **Part 105**. Their substance survives in
+> memory: `project_cappwarning_four_second_timer.md`, `project_sofdec_idle_loop_wall.md`,
+> `project_fmv_skip_and_title_screen.md`. Rule 14 above exists because of this.
+
+## Milestone ladder
+
+Replaces "which probe fired" as the unit of progress. Each rung needs an assertable signature.
+
+| # | Milestone | Signature | State |
+|---|---|---|---|
+| 1 | Boot to EE entry | dispatch table populated, no `dispatch-miss` | DONE |
+| 2 | IOP modules + SIF RPC up | ARKD_DVD.IRX loaded, RPC bound | DONE |
+| 3 | Atari loading screen | reached and rendered | DONE |
+| 4 | Past the opening logos | `[skipfmv] ACTIVE installed=4/4`, no `savepri=1 savetid=6` latch | **DONE 09-08** -- and since 09-10 the logos can be PLAYED, not just skipped: `PS2X_FMV=host`. Part 108 |
+| 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **DONE 09-10** -- acc hit 4.0 at t=119, `[warn:stat]` froze t=128. Part 106 |
+| 4.6 | Past `CAppLogoMain` (3-pass logo loop) | `[st4:stat] ret1=1` | **DONE 09-10** -- fired t=322 on the 420 s run. Part 107 |
+| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **BLOCKED** -- narrowed 09-11 to ONE word. `RenderDispatch` (`0x1712d0`, called per frame by `SyncFrame`) only resumes the SofDec workers when `[0x500728] == 1`; th6 sits WAIT+SUSPEND from t=342 and `w6tick` never leaves 2. See **Part 111** |
+| 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]` | NEXT |
+| 6 | Main menu navigable | pad input reaches the menu state machine | later |
+| 7 | Character select | -- | later |
+| 8 | In-game | -- | later |
+
+Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
+reached only because the earlier rungs now hold.
+
+## Part 112 (2026-09-11) -- separate diagnostic thread, root cause traced: `loadscreen_tick`'s own phase byte never reaches 5 because a global fade-animation byte parks at "2" forever
+
+Runs a **parallel** thread to Part 111 (`[0x500728]`/`RenderDispatch` worker-resume chain) --
+not yet reconciled with it. This one tracks `loadscreen_tick`'s (`0x3E0E60`) own phase byte
+(`a1+9`), which needs its slot-`+0x40` vtable call (`sub_420260`) to return 1 to advance
+phase 4->5. Higher-cap trace run (`0x420260:0x4000,0x2c1bb0:0x4000,0x2c1830:0x200`) gave full
+coverage of the parked `st=0xA` window for the first time (743/659/15 hits).
+
+**Traced, not inferred**: `camera_fade_is_active` (`0x2C1BB0`) takes no args, reads global
+byte `[0x500E50]`, returns "active" unconditionally when it equals `2`. At the exact call
+site inside `sub_420260` case 10, 60/61 stall samples show that byte pinned at `2`. The
+writer, `camera_fade_set` (`0x2C1830`), was called only 15 times in the whole run -- the
+last one (from `st4b` = `sub_3E2FF0`) sets the byte to "animating" (2) via a private
+accumulator only `camera_fade_set` itself ever touches (`get_xrefs_to` confirmed) -- so the
+animation can only complete if `camera_fade_set` is called again for that channel, and
+nothing ever does. `st4b` is a second victim of the same stuck global, not an independent bug.
+
+**Next, no build needed**: 4 candidate per-frame re-driver wrappers
+(`wrap_state_byte_transition_j` @0x3F9D68 and 3 clones @0x3FF5DC/0x41AC78/0x421408) were
+never reached with channel=2 during the stall -- decompile + `get_xrefs_to` each to find why.
+Full detail: `memory/project_sofdec_init_never_runs_5618b4.md`, section "cont. 5".
+
+## Part 111 (2026-09-11) -- the class-6 kick chain, end to end, CONFIRMED ON PCSX2. The SofDec workers are resumed ONCE PER FRAME by `RenderDispatch`, and that resume is gated on ONE word: `[0x500728]`
+
+No run, no build spent. Static only: `eeref.py` + `mips_r5900_disassembler.py`, plus a raw
+re-read of Part 109's own 417 s `run_log.txt`. This answers Part 110 open item 1 ("who posts
+the work request / wakes th6, and why does it stop after two ticks").
+
+### Two callback tables, not one -- these had been conflated
+
+| fn | role | table base | entry | index |
+|----|------|------------|-------|-------|
+| `0x13c3f0` register, `0x13c448` dispatch | **hook** -- exactly ONE `fn`+`arg` per class | `0x54EBA0` | 8 B | `class*8` |
+| `0x13c4f8` = `run_class` | **callback list** -- up to 6 entries per class | `0x54E960` | 12 B | `class*72` |
+
+`run_class` also bumps `[0x45EFC8 + class*4]` (class 6 -> `0x45EFE0` = `d6n`) and brackets each
+callback with `[0x45EFE8 + class*4]` (-> `0x45F000` = `d6in`). Both probe constants re-derive
+exactly from the decode, and `tshook = [0x54EBF8]` re-derives as hook class 11 -- so the
+`0x54EBA0` base is confirmed by an independently written probe
+([[feedback_verify_translations_by_decoding]]).
+
+The `[cblist]` table the probes read is the **list**, holding `0x154fa8`. The class-6 **hook**
+is a different slot and holds `sub_11E778`. Different mechanisms; no self-kick loop.
+
+Class wrappers, confirmed by decode: `0x13c670`=1, `0x13c688`=2, `0x13c6a0`=3, `0x13c6b8`=4,
+`0x13c6d0`=5, `0x13c6e8`=6, `0x13c700`=7 -- all `j 0x13c4f8`.
+
+### The worker model -- workers are created SUSPENDED, by design
+
+`ADX_Init` (and `sub_11FE90`, the two-worker variant) build it:
+
+```
+sub_11EE58  CreateThread(entry=sub_11E7E0, stk 0x441A10, 0x800)  -> tid [0x441978]
+            StartThread ; SuspendThread ; ChangeThreadPriority([0x441974])
+sub_11EFB8  CreateThread(entry=sub_11E8D0, stk 0x443210, 0x1000) -> tid [0x441980]
+            StartThread ; ChangeThreadPriority([0x44197C])          <- NOT suspended
+sub_11F0C8  CreateThread(entry=sub_11EAC8, stk 0x445210, 0x2000) -> tid [0x44198C]  worker A
+            StartThread ; ChangeThreadPriority([0x441908]) ; SuspendThread
+sub_11F160  ... same shape, entry sub_11EC00                     -> tid [0x441990]  worker B
+0x13c3f0(6, sub_11E778, 0)   install class-6 HOOK
+0x13c3f0(7, sub_11E7A0, 0)   install class-7 HOOK
+```
+
+### Who suspends -- every frame
+
+`sub_11E8D0` is a thread body (the one `sub_11EFB8` creates unsuspended). Its loop:
+
+```
+[0x441950]++
+SuspendThread-if-not-already([0x44198C])                      <- worker A
+if ([0x441A08]) sub_1201F0() ; [0x441A08]=0
+if ([0x4418E8]==1) SuspendThread-if-not-already([0x441990])   <- worker B
+sub_11FC40()          ; WakeupThread on a THIRD tid [0x441988], gated on [0x44193C]==1
+[0x441928]=1 ; run_class(2) ; [0x441928]=0
+SleepThread()
+while ([0x4419B8]==0)
+```
+
+It suspends and never resumes. The resume comes from elsewhere.
+
+### Who resumes -- also every frame, and this is the answer
+
+```
+SyncFrame 0x104c00
+  -> RenderDispatch 0x1712d0
+       if (lw -10568($gp) == 1)          ; $gp=0x503070  =>  [0x500728]
+            sub_14FF28 -> sub_11FCE8 -> sub_11FBB8
+                 ResumeThread-if-suspended([0x44198C])       <- worker A
+                 WakeupThread-if-waiting([0x44198C])
+                 if ([0x4418E8]==1) same pair for [0x441990] <- worker B
+            sub_11FBA0()
+       else
+            sub_1721E0()                                     <- workers NEVER resumed
+```
+
+`SyncFrame` calls `RenderDispatch` on **both** of its paths (`0x104c6c` inside the spin,
+`0x104cb8` on the early-out), so the call itself is unconditional per frame.
+**The whole thing hangs on `[0x500728]`.**
+
+`[0x500728]` has exactly two writers, both `sw -10568($gp)`:
+`singleton_lazy_init_e_0_clone_01+0x48` (`0x113f28`) and `sub_113F40+0x98` (`0x113fd8`). The
+same lazy-init calls `sub_11F448` at `0x113f1c`, so this word is the SofDec subsystem's
+"initialised" latch, and `sub_113F40` is the only thing that can clear it.
+
+### The class-6 hook is a flush barrier, NOT the pump driver
+
+```
+sub_154950 = call_hook(6) -> [0x54EBD0] = sub_11E778
+sub_11E778 -> sub_11E690([0x44198C], [0x441908])
+sub_11E690 -> [0x441924]=1 ; ChangeThreadPriority(worker, boost)
+              loop { WakeupThread-if-4/0xc ; ResumeThread-if-8/0xc }
+              until [0x441924]==0  (cap 199,999,999) ; restore priority on exit
+```
+
+All three callers of `call_hook(6)` are **stop / pause / close / retire** paths:
+
+| caller | what it is |
+|---|---|
+| `sub_14E8B0+0x84` | SofDec finalizer -- refcount `[0x45F670]` reaches 0, stops all 8 slots, tears down |
+| `sub_1543F8+0x3c` | retire one request: kick, `[obj+0]=0`, virtual destroy, `[obj+28]=0` |
+| `sub_155630+0x20` | reached from `sub_14F428` (close a stream) and `sub_14F580` (pause/resume, ends `sb a1,114(obj)`) |
+
+So it means "let the worker drain one pass and ACK before I tear this down". `sub_155630` even
+tails into `sub_1549C0` -> `sub_11FCE8`, the same resume-all -- a stop path leaves the workers
+*running*. Only `RenderDispatch` starts them.
+
+### What the t=342 wall actually is
+
+The thread table at the wall. **`analyze_run.py --tag thsync` had been silently dropping it** --
+see the tooling note below. Read raw from `run_log.txt`; identical t=342 through t=417:
+
+| tid | st | meaning | wt | pri | pc |
+|---|----|---------|----|-----|----|
+| 1 | 1 | RUN | -- | 24 | `0x174b30` -> `0x102994` |
+| 2 | 4 | WAIT | SEMA id3 | 0 | `0x174ce0` |
+| **3** | **8** | **SUSPEND** | -- | 8 | `0x11e7e0` |
+| 4 | 4 | WAIT | SLEEP | 16 | `0x174bc8` |
+| 5 | 4 | WAIT | SLEEP | 18 | `0x174bc8` |
+| **6** | **12** | **WAIT+SUSPEND** | SLEEP | 25 | `0x174bc8` |
+
+`st` is the guest `THS_` encoding (`rawThreadStatus`, `Thread.cpp:280`): 1 RUN, 2 READY, 4 WAIT,
+8 SUSPEND, 0xc WAITSUSPEND, 0x10 DORMANT. `pc=0x174bc8` is the instruction after `syscall` in
+the SleepThread stub at `0x174bc0`.
+
+- **th6 is worker A.** `st=0xc` = it slept (its own `sub_11ED78` -> SleepThread) and was then
+  suspended by `sub_11E8D0`. That is the designed sequence. It is stuck there only because
+  `RenderDispatch` never resumed it again.
+- **th3 never ran at all.** It is the `sub_11EE58` thread, still parked at its entry PC
+  `0x11e7e0` at t=417 -- suspended at creation, never resumed across the whole 417 s. Its body
+  spins on `[0x441998]` (writers `sub_11F3F8`, `sub_11F950`).
+- `w6tick=2`, `d6n=2`: worker A serviced exactly two passes ever, so `0x154fa8` (the SofDec
+  drain) ran twice in 417 s.
+- `req=[0x441924]=0` at every sample and `gate=[0x4419D8]=0` all run: the acker is **not
+  gated**; it is **not resumed**.
+
+### Correction to Part 110
+
+"th6 slept correctly and is never rewoken" is half right. It slept **and was suspended**, and
+the suspend is the guest's own per-frame design, not a runtime fault. The actionable statement
+is: **`RenderDispatch`'s resume branch is not being taken.**
+
+### Rung 4.7 target, restated
+
+Not "wake th6". **Find why `[0x500728] != 1` from t=342 on** -- or, if it is 1, why the resume
+branch still does not land.
+
+### PCSX2 ORACLE, 2026-09-11 -- `[0x500728] == 1` CONFIRMED, plus two more discriminators
+
+Live read against **real PCSX2 + original ISO** (`UUID de2df62d`, `PCSX2 d75a0ad`,
+SLUS-21442, Status Running) -- target verified per
+[[feedback_verify_pcsx2_target]]. Liveness verified by the two-read rule in
+[[reference_pcsx2_debugger_quirks]]: `[0x441960]` moved `0x7eb` -> `0x26d7`
+between samples. Polling only; no breakpoints, no watchpoints.
+
+The oracle was caught in the **same SofDec phase** as the stall: handle table slot 0
+`[0x461164] = 0x01b12cc0`, byte-identical to the handle our runner freezes on.
+
+| field | PCSX2 (SofDec live) | runner t=342..417 |
+|---|---|---|
+| **`[0x500728]` RenderDispatch gate** | **1** | **not yet measured -- this is the probe** |
+| `[0x54EBD0]` class-6 hook slot | **`0x0011e778`** | (decode confirmed; every other class slot is 0) |
+| `[0x44198C]` worker A tid | 14 | th6 |
+| **worker A thread status** | **`st=4` WAIT/SLEEP** | **`st=0xc` WAIT+SUSPEND** |
+| `[0x441908]` worker A priority | 25 | 25 (matches) |
+| `[0x4418F0]` boost priority | 1 | 1 (matches) |
+| **`[0x441960]` w6tick** | 2027 -> 9943 in one sample gap | **2, frozen 75 s** |
+| **`[0x45EFE0]` d6n** | 2090 | **2, frozen** |
+| `[0x4418E8]` worker-B-exists | 0 | -- |
+| `[0x441990]` worker B tid | 0 -- **never created; `ADX_Init` single-worker path** | -- |
+| **handle `0x1b12cc0` `+72`/`+68`** | **`st=4 pd=0`** (idle, request COMPLETED) | **`st=1 pd=1`** frozen |
+| `[0x45F670]` SofDec refcount | 1 | -- |
+| `[0x45F674]` / `[0x45F688]` | 1 / 0 | 1 / 0 (match) |
+| `[0x441924]` req / `[0x4419D8]` gate | 0 / 0 | 0 / 0 (match) |
+| `[0x441940]` tid-11 spin counter | 492,373 -- **running** | th3 never ran; pc still at entry `0x11e7e0` |
+| **main thread (tid 1)** | **`st=4` SLEEP at `0x174bc8`** | **`st=1` RUN at `0x102994`** |
+
+PCSX2 thread table at that moment: `0` idle, `1` SLEEP, `2` SEMA, **`11` SUSPEND at
+`0x11e810`** (inside its spin loop, not at its entry), `12` SLEEP, `13` SLEEP,
+**`14` SLEEP**.
+
+### What this settles
+
+1. **The gate is real and it is the right word.** `[0x500728]` reads 1 for the whole
+   time SofDec is live, and dropped to 0 (together with `[0x500724]` and `[0x50072C]`)
+   the moment the oracle tore SofDec down and deleted tids 11-14. It is precisely the
+   "SofDec subsystem initialised" latch that `RenderDispatch` branches on.
+2. **The hook-table decode is confirmed against live memory.** `[0x54EBD0]` holds
+   `0x11e778` and every other class slot is zero -- so class 7 / worker B are genuinely
+   unused, which also explains why `0x120180` is statically unreachable (Part 111 open
+   item 3: **closed, benign**).
+3. **Worker A on the oracle is `st=4`, never `st=0xc` at any sample.** `sub_11E8D0`
+   suspends it every frame on hardware too; `RenderDispatch` wins the race every frame.
+   Our runner loses it permanently.
+4. **The oracle completes the request our runner never starts.** `st=4 pd=0` on the
+   handle is the finished state; `st=1 pd=1` is one pending read that never returns.
+
+### New discriminator, not previously noted
+
+**On the oracle the main thread SLEEPS; on our runner it spins.** `sub_11FC40` (called
+by the frame thread `sub_11E8D0` every pass) does `WakeupThread([0x441988])` gated on
+`[0x44193C]==1` -- and on the oracle `[0x441988] = 1` and `[0x44193C] = 1`, i.e. **the
+frame thread wakes the MAIN thread once per frame**, and main is parked at SleepThread
+between frames. Our runner's th1 is `st=1` RUN at `0x102994` and never sleeps. Worth
+carrying into the next probe alongside `[0x500728]`.
+
+⚠ One caveat, stated rather than smoothed over: the oracle is running unattended and
+advanced between samples -- the final `get_threads` shows only tids 0/1/2, SofDec torn
+down. Every row above was read while tids 11-14 were present and `w6tick` was climbing,
+but they are single samples from a moving target, not a time series. Also observed after
+teardown: `d6n` kept climbing (to 11,813) with the workers gone, so **`d6n` has a second
+driver besides the acker** -- do not use `d6n` alone as a pump-liveness proxy; use
+`w6tick`.
+
+### Open
+
+1. **Read `[0x500728]` across the run.** One word, one instruction (`lw -10568($gp)` at
+   `0x1712dc`), [[feedback_bind_every_probe_to_an_instruction]]. If it is 0 or never written,
+   the next question is why `singleton_lazy_init_e_0_clone_01` did not latch it;
+   `sub_113F40+0x98` is the only other writer.
+2. ~~Cross-check on PCSX2~~ **DONE 2026-09-11 -- it reads 1.** See the oracle table
+   above ([[feedback_reproduce_on_oracle_before_root_cause]] satisfied).
+3. ~~The class-7 kick wrapper `0x120180` is statically UNREACHABLE.~~ **CLOSED, BENIGN.**
+   The oracle shows `[0x54EBD8]`(class 7)`= 0` and worker B tid `[0x441990] = 0` -- the
+   single-worker `ADX_Init` path is the one in use, so class 7 is genuinely dead.
+4. NEW from the oracle: our th1 spins at `0x102994` where hardware's main thread SLEEPS
+   at `0x174bc8`, woken once per frame by `sub_11FC40`. Probe `[0x44193C]`/`[0x441988]`
+   alongside `[0x500728]`.
+
+### Tooling defect found on the way -- NOT yet fixed
+
+`analyze_run.py --tag thsync` prints each record **truncated at `nTh=N`** and drops every
+`[tid:st=,wt=,wid=,pri=,pc=]` field after it. The data is present in `run_log.txt`. Part 110's
+thread-state reading was made from the truncated form. Same class as
+[[feedback_truncated_console_column]]: re-read raw before concluding anything about thread state.
+
+### eeref caveat, stated because it bit once here
+
+`refs 0x11e780` returned "UNREACHABLE -- nothing links to this address" because the func map
+folds the row; the real entry is `0x11e778`, which has two IMM refs. Every "unreachable" claim
+above was re-checked at the true row start before being believed
+([[project_eeref_static_xref]], [[project_ghidra_func_map_rebuilt]]).
+
+## Part 110 (2026-09-11) -- CORRECTION. Part 109's pairing is COMMON CAUSE, not causation. The wall is a stream handle stuck at `st=1 pd=1`
+
+No run, no build spent. Everything below is a static re-read of Part 109's own 417 s log
+(`run_log.txt`, 22:27) plus `mips_r5900_disassembler.py`. This is a
+[[feedback_remeasure_the_premise]] result: the premise was wrong, not the measurement.
+
+### The asked check came back clean
+
+Part 109 open item 1 asked whether the runtime pushes a return invocation before calling the
+guest fn. **It does.** `EeScheduler.cpp` pushes on four paths (`PushPending`,
+`PushDispatcher`, `PushInvoke`, `PushSequence`), and the `pc==0` path pops one *first* --
+it only falls through to `makeDormant()` when the invocation stack is genuinely empty.
+
+### Three facts that kill the `0x154fa8` theory
+
+1. **Every dormant is `tid=-1`.** 2,086 EXPECTED events, `tid=-1 entry=0x0` on all of them.
+   **Zero on tid=1. Zero SUSPECT** -- the single "SUSPECT" string in the 2,701-line dump is
+   the suppression notice, not an event. So this is neither "tid1 dies" nor a lost frame.
+   `tid < 0` is the pseudo-thread `acquireInvocationThread()` mints to host a pending
+   invocation; `EeScheduler.cpp` part 46 already marks its `pc==0` recycle as **designed**.
+
+2. **The hosted invocation is `0x104b30`, not `0x154fa8`.** Disassembled, it is the EE
+   **Timer-0 interrupt handler**:
+
+   ```
+   0x104b84  sw   $v0(0x83), 16($v1=0x10000000)   ; T0_MODE  = 0x83
+   0x104b8c  sw   $zero, 0($v1)                   ; T0_COUNT = 0
+   0x104bbc  jalr $ra, $v0                        ; hook [0x503230]
+   0x104bc4  jal  0x171320
+   0x104bdc  jr   $ra
+   ```
+
+   `[watchdog] trace=` confirms the entry path: `0x17ed60 -> 0x17edb0 -> 0x104b30`, i.e. the
+   INTC dispatcher. At t=345 the watchdog catches the EE at exactly `pc=0x104b30 ra=0x0`.
+
+3. **The pairing is common cause: one per vblank.** Per-second `d5n` delta == `vbl/s` ==
+   dormants/s, **second by second across all 76 samples**, including the truncated final
+   second (10 / 10 / 10). Both counters are 0 for the first 341 s and both start at t=342.
+
+   | t | d5n | d(d5n) | vbl/s | dormants that sec |
+   |---|---|---|---|---|
+   | 342 | 23 | 23 | 23 | 20 |
+   | 343 | 51 | 28 | 29 | 28 |
+   | 380 | 1077 | 28 | 28 | 28 |
+   | 416 | 2080 | 28 | 28 | 28 |
+   | 417 | 2090 | 10 | 10 | 10 |
+
+   Part 109 sampled both at 1 Hz and read the equality as a chain. It is two clocks ticking
+   off the same interrupt. [[feedback_never_convict_by_count_with_two_callers]].
+
+**The dormants are evidence the interrupt path is ALIVE during the quiesce.** They are not
+the failure; they are the one subsystem still working.
+
+### What the t=342 wall actually is -- frozen, not spinning
+
+The entire `[sofdec]` record is **identical from t=342 to t=417**. 76 samples, not one field
+transition:
+
+| field | value | reading |
+|---|---|---|
+| `h0=0x1b12cc0 st0=1 pd0=1*` | BUSY | one pending request, **never cleared**. PCSX2 idle = `st=4 pd=0` -- we never complete the FIRST read |
+| `w6tick=2  d6n=2` | frozen | th6 (`sub_11EAC8`) ran two ticks and stopped |
+| `[thsync] req=0 inWork=0 dTick=0` | 75 s | **nobody ever posts a work request** |
+| `savepri=24 savetid=1 nest=0` | healthy | **no priority latch**; matches PCSX2's `0x18`. The old `savetid=6 savepri=1` latch is absent |
+| `g36=0 g688=0 g674=1 tsflag=0` | open | every pump gate passes -- this is **not** the g36 wall |
+| `gif/s=28 dma/s=168 vblSrc=0/28/0` | moving | GIF and DMA still run; the vblank source moved from slot 0 to slot 1 at t=342 |
+
+**Deadlock, not spin.** `[h+68]` is cleared only by `sub_165300`, which is reachable only
+through the class-6 dispatch -- and that is not running, because th6 slept correctly (which
+is the *right* behaviour, [[project_resume_no_preemption]]) and is never woken again. Part
+61b already proved `sub_165300`'s own two guards both PASS at `st=1 pd=1`, so the servicer
+is simply never called. Nothing is broken at the servicer; the caller never arrives.
+
+### Correction to the rung-4.7 signature
+
+The ladder's exit test for 4.7 was "EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`". Both
+halves are wrong: tid1 never goes dormant in this run, and `[ee:zero-pc-dormant]` fires
+~28/s as normal timer behaviour. Replaced in the ladder above with a signature that
+discriminates: **`pd0` reaches 0**, or **`w6tick` advances past 2**.
+
+### Open
+
+1. **Who posts the work request / wakes th6, and why does it stop after two ticks?**
+   Find the word `[thsync] req` reads, then `eeref` its writers. Static, no run needed.
+2. Part 109 items 2 and 3 are unchanged.
+
+Memory: `project_zero_pc_dormant_pump_pairing` (rewritten as the falsification).
+
+## Part 109 (2026-09-10) -- ⛔ SUPERSEDED BY PART 110 -- 417 s run. ~~EVERY call to the SofDec drain callback `sub_154FA8` ends in a zero-PC dormant -- 1:1, five samples~~ (the pairing is real; the causal reading is FALSIFIED)
+
+`-Determinism 1 -RunSeconds 420 -NoDebugger -Exe ...RelWithDebInfo\ps2EntryRunner.exe`.
+Run ended t=417 s. This is the longer run Part 108 open item 3 asked for.
+
+### The finding: `d5n` == `dormant#`, exactly, at every sample
+
+`[sofdec] d5n` counts calls to the class-5 drain fn `0x154fa8`.
+`[ee:zero-pc-dormant] EXPECTED #N` counts guest PCs reaching 0 with no invocation to pop.
+Different subsystems, different tags, same number:
+
+| t | `d5n` | `dormant#` |
+|---|---|---|
+| 350 | 241 | 241 |
+| 360 | 521 | 521 |
+| 370 | 797 | 797 |
+| 380 | 1077 | 1077 |
+| 390 | 1358 | 1358 |
+| 417 | 2090 | 2090 |
+
+**Measured fact:** the pairing is exact, 1:1, across five independent samples at five
+different values. **Hypothesis (strong, not proven):** the runtime invokes `0x154fa8`
+without a proper invocation frame, so the callback returns into pc=0 and the EE goes
+dormant instead of resuming the interrupted thread. That is exactly Part 107's
+"EE tid1 goes DORMANT with pc=0" wall, now **bound to an instruction**
+(`feedback_bind_every_probe_to_an_instruction`) instead of floating.
+
+⚠ The dormants are tagged **EXPECTED** by the runtime, so they do **not** contradict the
+`project_irq_handler_stack_overlap` fix (which closed a different, unexpected class 234->0).
+An EXPECTED label is a runtime opinion, not a verdict -- 2,090 of them in 75 s is a number
+worth distrusting.
+
+### Part 107's wall REPRODUCED, with the host FMV player active
+
+| t | what |
+|---|---|
+| ~4 s | ATARI plays (host) |
+| ~40 s | OKR plays (host) |
+| 40-342 | app chain runs; `progress` ~100k/s, `vbl/s` 4-6, `pc` alternates `0x104c74`/`0x422660` |
+| **342** | **4 threads spawn (3,4,5,6) and a real SofDec stream OPENS** -- `h0=0x1b12cc0`, `o0st=1`, `cb6=0x11e778`, `d5fn=0x154fa8` |
+| 342-417 | quiesce: all 6 threads WAIT/SUSPEND, EE on the idle loop `0x104c74`, `progress` collapses ~100k/s -> ~900/s, `vbl/s` rises 4-6 -> 28 |
+
+t=342 here is Part 107's t=322 app `0x4fae50` -- the SofDec-class app **after** `CAppLogoMain`.
+**Now measured, not predicted: `PS2X_FMV=host` does NOT cover it.** The host player owns only
+the four logo phase fns; this app opens the stream itself and hangs.
+
+### The g36 wall did NOT reproduce
+
+`g36=0` for the whole run. `g688=0`, `g674=1`. `d5n` = 2,090 over 75 s = **~27/s**, not the
+183k/s acker spin of `project_sofdec_pump_never_idle`. So the park at `0x4fae50` in this run
+is a **quiesce, not a spin** -- a different failure shape from the parked SofDec wall, and the
+two should not be assumed to be the same bug.
+
+### Host FMV player, second run -- numbers hold
+
+```
+ATARI 256x448 mpeg1video 29.97fps 4.05408s audio=adpcm_adx 48000x2 -> ...\MOVIE\ATARI.SFD
+ATARI: finished after 4.14116s (91 presented, 122 decoded)  retired after 4.27363s
+OKR:   finished after 5.14241s (119 presented, 152 decoded)  retired after 5.21227s
+```
+
+Player span within +2.1% / +1.7% of the movie's own duration -- real-time, same as the 200 s
+run. Presented/decoded 75% and 78% (was 75% / 74%). The ~25% drop is stable and still
+untuned.
+
+### Open
+
+1. ~~**The `0x154fa8` -> zero-PC-dormant pairing.**~~ **CLOSED 2026-09-11 -- the
+   hypothesis was FALSIFIED. See Part 110.** The dispatch does push a return invocation;
+   the dormants are the Timer-0 IRQ recycling on the pseudo-thread, one per vblank.
+2. **`OP.SFD` phase addresses still not derivable.** Unchanged from Part 108 item 2.
+   ⚠ The `0x4fae50` app opening a stream at t=342 is *probably* that movie -- but
+   `[moviegate:stat]` shows `dvci130ef0.calls=0` and `open12cc20.calls=0`, so the two
+   movie-open probes never fired. Either the probes are mis-sited or the app opens by a
+   third path. **Hypothesis, with counter-evidence on the record.**
+3. The guest's SofDec filename is runtime-assembled: `[movie] objFile=0x4597b0` reads as
+   96 zero bytes in the static ELF, so the file cannot be named without a live read.
+
+Memory: `project_zero_pc_dormant_pump_pairing` (the finding), `project_fmv_host_player`,
+`project_sofdec_pump_never_idle`, `project_irq_handler_stack_overlap`.
+
+## Part 108 (2026-09-10) -- THE OPENING MOVIES PLAY. Host-side FFmpeg player, detached from upstream
+
+First feature in a long time that worked on the first run. Original ask: *"modify the
+program so it runs the FMV — something we can detach so it doesn't mess with the
+recomp upstream."* Both halves delivered.
+
+### What was built
+
+The guest's own SofDec path stays parked (the `g36` class-6 wall is untouched). Instead
+the four logo phase-machine slots are intercepted, the real `.SFD` is decoded on the
+**host** with the FFmpeg already linked into `ps2_runtime`, presented over raylib, and
+only then does the stub report "phase complete".
+
+| File | Lines | Contains |
+|---|---|---|
+| `src/lib/Kernel/Fmv/FmvHost.h` | 136 | module-internal interface; leaks neither FFmpeg nor raylib types |
+| `src/lib/Kernel/Fmv/FmvHost.cpp` | 708 | anchor TU: 4 hooks, state machine, player thread, movie table, 3 exports |
+| `src/lib/Kernel/Fmv/FmvDecoder.cpp` | 465 | FFmpeg only; `#if PS2X_HAS_FFMPEG` with an `#else` stub so the symbols always link |
+| `src/lib/Kernel/Fmv/FmvPresent.cpp` | 224 | raylib only; Texture2D + AudioStream |
+
+**Detachment is literal.** `game_overrides.cpp`: untouched. `CMakeLists.txt`: untouched
+(the existing `GLOB_RECURSE ... CONFIGURE_DEPENDS` over `src/lib/Kernel/*.cpp` picks the
+new directory up for free). `ps2_runtime.cpp` takes 4 small edits, ~24 lines total: three
+`extern "C"` decls, `ps2x_fmv_host_install(this)`, `ps2x_fmv_host_draw()`,
+`ps2x_fmv_host_shutdown()`.
+
+Installing from `PS2Runtime::run()` rather than a self-registering descriptor beats two
+hazards at once: cross-TU static-init order is unspecified, and `ps2_runtime` is a STATIC
+lib with no `/WHOLEARCHIVE`, so a TU reachable only via static-init self-registration is
+silently dead-stripped at link time.
+
+### The run -- `PS2X_FMV=host`, det=1, 200 s, 2026-09-10 21:00
+
+```
+[skipfmv] ACTIVE ... installed=4/4
+[fmvhost] ACTIVE -- host FFmpeg player owns 0x420e70/0x420fc0/0x4216e0/0x421830,
+          OVERRIDING [skipfmv]'s stubs. installed=4/4
+[fmvhost] first tick: ATARI open 0x420e70                                  (t~125s)
+[fmvhost] ATARI 256x448 mpeg1video 29.97fps 4.05408s audio=adpcm_adx 48000x2
+          size=737280   -> ...\SDBZ ISO 2\MOVIE\ATARI.SFD                (t~125s)
+[fmvhost] OKR   256x448 mpeg1video 29.97fps 5.05609s audio=adpcm_adx 48000x2
+          size=2424832  -> ...\SDBZ ISO 2\MOVIE\OKR.SFD                  (t~162s)
+[fmvhost] abort requested: shutdown                                        (t=199s)
+[run] exiting loop
+```
+
+No `watchdog at`, no `outer watchdog`, no `decode error`, no `open failed`, no
+`LoadAudioStream failed`.
+
+**Confirmed on screen by the user.** The log cannot show that a picture appeared and
+`vbl/s` must never be used to infer it -- this rung rests on direct observation, which is
+the correct evidence for "did a picture appear". Audio audibility was **not** separately
+confirmed; the ADX stream opened cleanly but nobody has said they heard it.
+
+### The polling contract is PROVEN -- and the probe built for it was never needed
+
+The entire design rested on one unverified assumption: that the guest **re-polls** the
+logo phase slot, so a stub can answer `$v0 = 0` ("still working") for many ticks and
+`$v0 = 1` once. The 10-slot logo vtable is a different table from the `+0x38..+0x44` CApp
+driver verified in part 106, so it could not be inherited.
+
+`PS2X_FMV_PROBE=N` was written specifically to settle it. It never had to run. **OKR
+opening after ATARI is the proof**: the ATARI phase can only be retired by the stub
+answering 1, and that answer only ever happens on a *later* tick than the one that
+started playback. The natural sequence discriminated for free.
+
+Generalised into memory as `feedback_natural_sequence_beats_a_probe`: if B cannot happen
+without A, observing B proves A -- check for that before building a counter. One-
+directional only; B *absent* still proves nothing.
+
+### Pre-build syntax checking, new capability
+
+`cl /Zs` syntax-checks any runtime TU in seconds without emitting an `.obj`, writing into
+`build/`, or spending one of the user's build cycles. All four new TUs plus the `#else`
+no-FFmpeg branch and the edited `ps2_runtime.cpp` came back EXIT=0 before the build was
+ever handed over -- which is why this landed first try. Recipe in
+`project_syntax_check_without_building`. `/Zs` never links, so `extern "C"` signatures
+still have to be diffed by hand.
+
+### Container facts, now measured three ways
+
+`reference_iso_layout.md` said "MPEG-2 video + ADX audio". Raw byte parse, then `ffprobe`,
+then the runtime's own libavformat open all agree:
+
+| File | Video | Audio | Duration |
+|---|---|---|---|
+| ATARI.SFD | `mpeg1video` 256x448 @ 30000/1001 | `adpcm_adx` 48 kHz stereo | 4.054 s |
+| OKR.SFD | `mpeg1video` 256x448 | `adpcm_adx` 48 kHz stereo | 5.056 s |
+| OP.SFD | `mpeg1video` 512x448 | `adpcm_adx` 48 kHz stereo | 40.358 s |
+
+So the video half was wrong (MPEG-**1**, pack header nibble `0b0010`) and the ADX half was
+right. Note the trap: the audio PES id **is** `0xC0`, the standard MPEG-audio slot, but the
+payload is ADX. A stream-ID parse reads the slot, not the codec.
+
+### Open
+
+1. **MEASURED 2026-09-10 21:49 — the player is NOT the 37 s.** 37 s elapsed between
+   ATARI's first tick and OKR's, for a 4.05 s movie. Since it looked right on screen the
+   ~33 s is *probably* guest work between the two logo apps -- still an inference. Two
+   lines added 2026-09-10 and RUN:
+
+   ```
+   [fmvhost] ATARI: finished after 4.14021s (92 frames presented, 122 decoded)  movie=4.05408s  sinceFirstTick=4.16827s
+   [fmvhost] ATARI: retired after 4.23264s since first tick
+   [fmvhost] OKR:   finished after 5.14232s (113 frames presented, 152 decoded)  movie=5.05609s  sinceFirstTick=5.18063s
+   [fmvhost] OKR:   retired after 5.26421s since first tick
+   ```
+
+   They split the gap into three spans with different owners: first tick -> finished is the
+   **player**; finished -> retired is the **guest** taking one more tick to accept
+   `$v0 = 1`; retired -> the next movie's first tick is **guest work between the logo apps**.
+   `presented` counts the `UpdateTexture` in `FmvPresent.cpp`, `decoded` counts
+   `publishFrame` -- they differ because the present loop takes only the newest frame, so
+   never quote `decoded` as evidence a frame was drawn.
+
+   **Result.** Player span = **4.14 s** for a 4.054 s movie (+2.1%) and **5.14 s**
+   for a 5.056 s movie (+1.7%) — real-time. Guest retirement latency = **0.09 s**
+   and **0.12 s**. So of the 37 s, the player owns ~4.2 s; the remaining **~33 s is
+   guest work between the two logo apps**, which was the standing inference and is
+   now measured. The FMV player is closed as a performance suspect.
+
+   **New open number: 25% of decoded frames never reach the GPU.** ATARI presented
+   92 of 122 (75%), OKR 113 of 152 (74%) — ~22 fps against a 29.97 fps source. The
+   present loop takes only the newest frame, so this is the frame-pacing gap, not a
+   decode failure. Not yet a visible complaint; log it before tuning.
+
+   Audio decodes as **`adpcm_adx` 48000x2**, confirming ADX — the plan's
+   "MPEG audio on PES 0xC0" reading was wrong.
+2. **`OP.SFD` is BLOCKED, not merely unwired — its phase addresses are not derivable
+   statically (checked 2026-09-10).** Three independent attempts, all negative:
+
+   - **Structural twin match works for the logos and only the logos.** ATARI and OKR are
+     identical shapes in the func map — `Ctor` 0x4c → `obj_set_fields___` 0x40 →
+     **open** 0x140 → `return_const_1` 0x8 → **close** 0x170, at `0x420DE0` and
+     `0x421650`. That twinning is *why* their four addresses were known.
+     `CAppDemoMovie_Ctor` (`0x3E3290`), the only other plausible movie app, has none of
+     those neighbours — it is not a third clone.
+   - **String xref is blind here.** `eeref refs` on all three `movie/*.sfd` VAs
+     (`0x4D7A50` `op_usa`, `0x4DCD80` `atari`, `0x4DCDC8` `okr`) reports
+     **UNREACHABLE** — including `atari`, which PCSX2 proved is used. The filenames are
+     assembled at runtime, so absence here is not evidence
+     ([[feedback_capped_probes_false_negatives]]).
+   - **The stream-open has no static callers.** `eeref up 0x130EF0` finds zero `jal`
+     sites; it is reached only through a **data word at `0x44E728`** (a vtable slot).
+
+   ⚠️ **The ELF contains `movie/op_usa.sfd`, never `movie/op.sfd`** — only
+   `0FLIST.DIR` names the latter. A third table entry should probably target
+   `OP_USA.SFD` (46.4 MB), not `OP.SFD`.
+
+   **How to unblock (cheap, but needs the oracle):** attract mode plays *after* the title
+   screen, which no run has reached (rung 4.7 is still the wall) — so there is nothing to
+   verify a guess against either. Settle it on PCSX2: break on `0x130EF0`, let the title
+   screen idle into attract mode, and the **third** hit names the app; the caller's return
+   address gives the phase machine. Until that exists, adding a table entry would be a
+   guess ([[feedback_no_guessing]]).
+3. ~~**The run did not reach the title in 200 s.**~~ **CLOSED by Part 109** -- the 417 s
+   run was executed. It does not reach the title either, but it is no longer "needs more
+   seconds": at t=342 it reaches the SofDec-class app `0x4fae50` and quiesces there. Rung 4.7
+   is still the wall; the wall now has a bound instruction (`0x154fa8`).
+
+Memory: `project_fmv_host_player` (full detail), `project_syntax_check_without_building`,
+`feedback_natural_sequence_beats_a_probe`, `reference_iso_layout`.
+
+## Part 107 (2026-09-10) -- `CAppLogoMain` COMPLETES at t=322. The new wall is the app AFTER it: EE tid1 goes DORMANT with pc=0
+
+`-Determinism 1 -RunSeconds 420 -NoDebugger`.
+
+### Rung 4.6 closed
+
+`[st4:stat]` (hook `0x420260`, obj `0x632df0`) reached the modelled exit exactly:
+
+| t | subChanged | b161 | b162 | subAfter | note |
+|---|---|---|---|---|---|
+| 273 | 14 | 2 | 0 | 1 | pass 3 begins (`b161` loads 2) |
+| 307 | 17 | 2 | 0 | **0xa** | `sub=3` sets state **10** -- the exit state |
+| **322** | 17 | 2 | 0 | 0xa | **`ret1=1`** -- app complete |
+
+The three-pass model from part 104 is now **re-verified on a second run**, not inherited.
+
+### The app chain, off `[lstick:stat] vt=`
+
+| t | vt | app |
+|---|---|---|
+| 24 | `0x4fa400` | `CAppWarning` -- done |
+| 128 | `0x4f99a0` | brief |
+| 133 | `0x4faf10` | unlabeled, ctor `0x42122c` |
+| 163 | `0x4f99a0` | brief again |
+| 168 | `0x4fadf0` | `CAppLogoMain` -- done at t=322 |
+| **322** | **`0x4fae50`** | **NEW. SofDec-class. This is where we die.** |
+
+### What `0x4fae50` is (read statically out of the ELF)
+
+| slot | addr | name from `output/` |
+|---|---|---|
+| +0x08 | `0x420dc0` | `gp_field_get_z_410` -- `jr $ra; lw $v0, -10756($gp)` |
+| +0x14 | `0x3e1280` | `loadscreen_reset` |
+| +0x1c | `0x3e12f0` | `loadscreen_cancel` |
+| +0x34 | `0x420720` | `obj_set_fields_z_252` |
+| **+0x38** | **`0x420780`** | **`CAppCRISofdec_Tick_clone_02`** |
+| +0x3c | `0x4208b0` | `wrap_camera_set_mode_b` |
+| +0x40 | `0x4208f0` | `CAppRankingBase_Tick_clone_02` (inherited label, NOT re-verified) |
+| +0x44 | `0x3e0c20` | `return_const_1_z_127` |
+
+`vt+0x38` being a `CAppCRISofdec` tick is what makes this a **movie app**.
+
+### ⚠ The FMV skip does NOT cover it
+
+`kSkipFmvFns` replaces exactly four functions -- `CAppLogoAtari` open/close (`0x420E70`,
+`0x420FC0`) and `CAppLogoOkrtron` open/close (`0x4216E0`, `0x421830`). `0x4fae50` is a
+different app class and runs **for real**. `[skipfmv] ACTIVE installed=4/4` in this run.
+
+### The death
+
+| t | event |
+|---|---|
+| 322 | app switches to `0x4fae50` |
+| **326** | a **single** `[ee:zero-pc-dormant] SUSPECT` (tid=1, entry=`0x100008`) |
+| **327** | `[thsync]` tid1 `st=1` -> **`st=16` (THS_DORMANT)**, `pc=0x0` |
+| 327-417 | idle: `busy%=0`, `gif/s=0`, `dma/s=0`, `progress` frozen, `stuckSecs` climbing to 90 |
+
+⚠ The 909 `[ee:zero-pc-dormant]` lines are **one** multi-line dispatch-ring dump, not 909
+events. Exactly one SUSPECT fired, at t=326 ([[feedback_capped_probes_false_negatives]] shape
+inverted -- do not read the line count as an event count).
+
+### What is NOT the cause -- ruled out by reading the generated code
+
+`GameMain` = `0x422630`, `GameUpdate` = `0x421ea0`, `GameInit` = `0x421b70`,
+`GameShutdown` = `0x421a80`. `$gp = 0x503070` (from `.reginfo`).
+
+`GameMain`'s loop is:
+```
+0x422658  jal   GameUpdate(0x421ea0)
+0x422660  lui   $v0, 0x64            <- MID-RESUME lands here
+0x422668  lw    $v0, -0x20C($v0)     ; [0x63FDF4] = current app ptr
+0x422670  bne   $v0, $v1, 0x422658   ; $v1 = $gp-0x281C = 0x500854 (sentinel)
+```
+`output/GameMain_0x422630.cpp` is **complete and correct** -- every path sets `ctx->pc`, and
+the file is not truncated. So this is **not** the truncated-function class.
+
+It is also **not** a clean shutdown: the dispatch ring's newest entry is still `0x422660`
+(the loop resume). `GameShutdown` (`0x421A80`) never dispatched. An earlier reading of this
+run as "the game exited normally" was **wrong and is retracted**.
+
+### Open
+
+The exact instruction that produced `pc=0` is **not yet established**. Candidate worth
+checking first: `GameUpdate`'s opening indirect call
+`lw $a0,-3572($gp)` (= `[0x50227C]`) -> `lw $t9,0($a0)` -> `lw $t9,20($t9)` -> `jalr $t9`.
+
 ## Part 96 (2026-09-07) -- SofDec: BOTH GUARDS PASS. We stop INSIDE the chain, and 0x113c60 is TEARDOWN
 
 *** Parts 94 and 95 both framed this as "which guard blocks us". Neither guard blocks us.
@@ -18647,6 +19466,12 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - rpc=0x001 WARNING gone
 
 ## Learned Patterns
+
+### 2026-09-10
+- **★★★ Two counters from unrelated subsystems that agree EXACTLY across five samples are one event counted twice — that is a lead, not a coincidence.** `[sofdec] d5n` (calls to the class-5 drain fn `0x154fa8`) and `[ee:zero-pc-dormant] EXPECTED #N` read 241/241, 521/521, 797/797, 1077/1077, 1358/1358, 2090/2090. Neither tag knows the other exists. The pairing localized Part 107's free-floating "tid1 goes DORMANT with pc=0" wall onto a single guest function in one grep, after the previous run had left it as a whole-app mystery. **When two independent probes track each other to the unit, stop treating them as two facts and go find the one instruction underneath.**
+- **★★ A runtime tag that labels its own event "EXPECTED" is an opinion, not a verdict.** 2,090 `[ee:zero-pc-dormant] EXPECTED` lines went unexamined because the word EXPECTED reads as "already understood". They were the wall. **Grep the EXPECTED/benign-tagged lines too when the rate is absurd** — 2,090 in 75 s is not a background hum.
+- **★★ `vbl/s` RISING while `progress` collapses is the signature of a guest quiesce, not of speedup.** At t=342 `progress` fell ~100k/s -> ~900/s while `vbl/s` went 4-6 -> 28. Under det=1 the vblank pacer is driven by guest progress, so a "faster" frame rate here means the guest stopped asking for work. **Read the two together or the frame rate lies** — [[reference_det_vblank_quantum]].
+- **★ A guest pointer field can read as zeros in the static ELF because the string is assembled at runtime.** `[movie] objFile=0x4597b0` dumps 96 zero bytes at file offset `0x359830`. That is not a bad address or a bad delta — it is `.bss`. **A zero dump at a valid VA means "runtime-filled", so stop and get a live read** rather than concluding the field is unused.
 
 ### 2026-08-29
 - **★★ A recurring `LNK1136: invalid or corrupt file` on one unity `.obj` can clear via a targeted single-file delete + recompile, without a clean build.** Three straight bare-retry link attempts on `unity_4186_cxx.obj` all failed identically; deleting just that `.obj` (not the whole build tree) and rebuilding let it recompile fresh, and the following link succeeded first try. `dumpbin /headers` confirmed the previously-failing object was structurally valid (not corrupt, not a `/bigobj` relocation overflow) — so whatever triggered LNK1136 was environmental/transient, not a real defect in the object. **Cheaper recovery than chasing a Defender-exclusion fix (needs admin rights) or a full rebuild (30h): delete the one implicated unity `.obj` and let it recompile.**
