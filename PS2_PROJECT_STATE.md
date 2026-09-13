@@ -910,6 +910,250 @@ The exact instruction that produced `pc=0` is **not yet established**. Candidate
 checking first: `GameUpdate`'s opening indirect call
 `lw $a0,-3572($gp)` (= `[0x50227C]`) -> `lw $t9,0($a0)` -> `lw $t9,20($t9)` -> `jalr $t9`.
 
+## RESTORED 2026-09-13 -- the original file header (as of 2026-09-09) and Parts 105 and 104
+
+> Recovered from the unreachable git blob `bb633a6b02568b68d587d21e79ff41509beb5069` while checking a `git prune` on 2026-09-13.
+> This text was destroyed on 2026-09-10, when this file was truncated to 0 bytes by an
+> `open(path, 'w')` (see STOP rule 14), and it had never been committed -- the blob was the only copy.
+> A raw copy is kept at `_backup_recovered_2026-08-31/prune_rescue_2026-09-13/`.
+>
+> **The header below is HISTORICAL.** Its "ACTIVE STAGE" banner and its milestone ladder are
+> superseded by the header and ladder at the top of this file; its headings are demoted one level
+> so they do not read as current sections. **Parts 105 and 104 are verbatim**, placed newest-first
+> (the snapshot held them in the order 104, 105). Part 106, cited by the ladder, was not in the
+> blob and remains lost.
+
+### [historical header] ACTIVE STAGE (2026-09-08): Stage 6 -- TITLE SCREEN. The FMV is no longer the goal.
+
+> **Read this before anything else. The objective changed on 2026-09-08.**
+> "Make the opening FMV play" is **retired** as the active stage. It was a boot blocker,
+> which coupled 100% of project progress to the single hardest subsystem in the game
+> (CRI SofDec + ADX + IPU + CDVD streaming + a two-thread handshake), at roughly one bit
+> of information per build+run cycle, for months.
+> The opening logo movies are now **SKIPPED by default** (`PS2X_SKIPFMV`, default ON) and
+> the FMV is a feature to be finished later, not a gate. The root-cause work is **parked
+> with its resume point named**, not abandoned -- see part 103.
+
+#### Why this is not giving up
+
+- The method was sound. The measurement discipline caught **8** wrong headlines before any
+  of them became load-bearing. What was wrong was the **objective's shape**, not the work.
+- The title screen is **provably reachable**: `path_holes.py` closure from a live PCSX2
+  title-screen backtrace found **zero** remaining direct-branch holes between the Atari
+  screen and the title screen (validated, run 47).
+- The SofDec question is in better shape than it has ever been, and it is **one function
+  wide**: class 6 has exactly one registered handler (`0x154FA8`), `[0x45F688]` is 0 in
+  every sample so that handler always takes `return 0x155210()`, and `0x155210` returns
+  nonzero for us where hardware returns 0. That is the resume point.
+
+#### The skip switch
+
+`PS2X_SKIPFMV` -- **default ON**. `PS2X_SKIPFMV=0` restores the real movie path exactly
+(the override becomes fully inert and replaces nothing).
+
+Implemented in `ps2xRuntime/src/lib/game_overrides.cpp` as `applySdbzSkipFmv`, registered
+**last** on purpose because `applySdbzSregProbe` also replaces `0x420E70`. It stubs four
+vtable phase-machine slots to their own documented done-path (`[obj+48]=0; return 1`):
+
+| app | vtable | open (+0x08) | close (+0x10) |
+|---|---|---|---|
+| CAppLogoAtari | `0x4FAEE0` | `0x420E70` | `0x420FC0` <- the hang |
+| CAppLogoOkrtron | `0x4FAFA0` | `0x4216E0` | `0x421830` |
+
+Not stubbed: the third app of the same vtable shape (`0x3E2E80`/`0x3E2FF0`, vt `0x4F9AA0`).
+Its `+0x0C` is `wrap_effect_mgr_set_flag` rather than a return-1 stub, so it is a different
+app class, not an opening logo.
+
+Every run prints `[skipfmv] ACTIVE ... installed=N/4` or `[skipfmv] disabled`. **A run whose
+log has neither line did not pick up the override.** `installed` below 4 is a broken install,
+not a quiet guest.
+
+#### MILESTONE LADDER -- progress is measured in how far the game gets
+
+Replaces "which probe fired" as the unit of progress. Each rung needs an assertable signature.
+
+| # | Milestone | Signature | State |
+|---|---|---|---|
+| 1 | Boot to EE entry | dispatch table populated, no `dispatch-miss` | DONE |
+| 2 | IOP modules + SIF RPC up | ARKD_DVD.IRX loaded, RPC bound | DONE |
+| 3 | Atari loading screen | reached and rendered | DONE |
+| 4 | Past the opening logos | `[skipfmv] ACTIVE installed=4/4`, no `savepri=1 savetid=6` latch | ✅ **DONE 09-08** |
+| 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **IN PROGRESS** -- needs `-RunSeconds 240`, see part 104 |
+| 5 | **Title screen** | ⚠️ `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]` | NEXT |
+| 6 | Main menu navigable | pad input reaches the menu state machine | later |
+| 7 | Character select | -- | later |
+| 8 | In-game | -- | later |
+
+Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
+independent of each other and individually far smaller than the SofDec stack. Re-run
+`path_holes.py` from a fresh PCSX2 backtrace whenever a new screen is reached -- that method
+already converted an open-ended 144-item grind into a bounded 5-item batch, and it was right.
+
+
+---
+
+## Part 105 (2026-09-09) -- SofDec: the g36 chain RE-DERIVED INDEPENDENTLY (already in part 90), plus three genuinely new links -- and PCSX2 was killed by a hot-loop breakpoint
+
+### 0. READ THIS FIRST -- most of this session was a duplicate
+
+Parts 89 and 90 (2026-09-07) already established, first-hand, everything I "found" today:
+the `0x155630` bracket and its straight-line shape, `0x154950: a0 = 6`, table `0x54EBA0`
+slot 6 = `0x11e778`, the tail jump into `0x11e690`, the wbusy handshake, the 2:1
+open/close ratio, **and the oracle capture** (1803 PCSX2 samples: hardware runs the
+bracket 15-68x/second, microseconds per pass, `g36 = 0` in every sample).
+
+I re-derived it from scratch via `eeref` because I did not grep this file for `g36`
+first. **This file is 1.5 MB / 18,000+ lines: it is a SEARCH target, not a read target.**
+The one upside is that part 90's chain is now independently confirmed by a second method.
+
+### 1. What IS new -- three links parts 89/90 did not have
+
+**(a) `sub_165300` @ 0x165300 is the SOLE drainer of the stream handle.** `eeref field
+68:79` over the whole image, plus the decompile. Its body holds the only clear of
+`h[68]` and the only advance of `h[72]` that exists anywhere:
+
+    v2 = h[72];
+    if ((unsigned)(v2 - 1) < 4) {
+        if (h[68]) { h[68] = 0; ...dispatch on state...; h[72] = new; }
+    }
+
+Its only live caller chain (`eeref up`; the other caller `sub_1652A8` has zero callers):
+`0x155210 -> 0x155320 -> 0x165250 -> 0x165300`.
+
+**(b) g36's READER is now bound to an instruction -- `0x1553a4`.** Part 90 bound g36's
+*writer* (`0x1555a0`). The consumer was still unbound, which is exactly what
+[[feedback_bind_every_probe_to_an_instruction]] warns about. `sub_155320` has five gates,
+and four of them are already printed by the live `[sofdec]` line -- all four PASS:
+
+| # | instruction | test | run-4 field | verdict |
+|---|---|---|---|---|
+| 1 | 0x155358 | `*(0x45F674) == 1` | unprobed; PCSX2 read = 1 | pass |
+| 2 | 0x155360 | `obj != 0` | `o0h=0x1b12cc0` | pass |
+| 3 | 0x155384 | `obj[0] == 1` | `o0st=1` | pass |
+| 4 | 0x155394 | `obj[96] != obj[0]` | `o0lock=0` | pass |
+| 5 | **0x1553a4** | **`g36 != obj[0]`** | **`g36=1`** | **FAIL** |
+
+So the class-6 starvation part 90 measured (d6n 0.17/s vs hardware 15.7-67.9/s) now has
+its mechanism named: gate 5 switches the pump off.
+
+**(c) The g36 timeline across a full run, correlated with watchdog progress.** Part 90 had
+the 2:1 bracket ratio from a TRACE run; this is the 885 s picture from run 4:
+
+    t=1..158    g36=0  (157 [sofdec] samples)
+    t=159..885  g36=1  (727 samples)
+    exactly ONE transition, never returns
+
+    t=157 progress=15,108,853   +417/s
+    t=158 progress=15,109,270        <- last d5n increment
+          prog=15,109,279            <- CHGPRI th6 25 -> 1
+    t=159 progress=15,174,025   +64,755/s  (155x)  <- g36 latches
+
+`run=` after that: `run=6` x727, `run=1` x157. Threads 1/4/5 sit READY for 726 s.
+
+### 2. Correction to my own earlier framing (not to part 90)
+
+`ra=0x11e6e8` and `ra=0x13c478` are **not** a boost/restore pair, and their 2x-vs-1x
+CHGPRI count mismatch is not on its own a smoking gun:
+
+* `0x11e6e8` = return from `jal 0x174b30` in `0x11e690`'s **prologue**.
+* `0x13c478` = return from the **`jalr`** inside the generic dispatcher `0x13c448` --
+  a different call site in a different subsystem.
+
+### 3. UNVERIFIED hypothesis -- do not act on it
+
+Threads 1 and 6 are both at priority 1 after the boost, and our scheduler may never
+round-robin thread 1 back in, so it cannot observe the wbusy flag that thread 6 **does**
+clear every iteration (`0x11eb5c`, ungated; `d6n = 111,969,810` iterations prove the loop
+runs). This is a guess. It contradicts nothing measured, but nothing measured requires it
+either. Part 90's framing -- class 6 starved upstream -- remains better supported.
+[[feedback_reproduce_on_oracle_before_root_cause]]
+
+### 4. PCSX2 was killed, by me
+
+Arming the test crashed the emulator (PID gone, both ports ECONNREFUSED). Cause: a
+**conditional breakpoint at `0x11e704`** -- the head of a 200,000,000-iteration spin loop,
+so the condition is evaluated on every execution -- followed by a **`write` watchpoint on
+`0x441960`**, a counter incremented every loop iteration. `ECONNRESET` on that second
+call. Full write-up in [[reference_pcsx2_debugger_quirks]].
+
+Also established there: the emulator had been UI-halted the whole time (cycles frozen at
+`1731361776` across four `pcsx2_status` calls, **before** anything was armed), and
+`pcsx2_continue` **genuinely resumed it** -- `PC 0x81fc0 -> 0x13bb2c`, `Cycles +581 M`,
+`*(0x441960)` +299. The older "continue lies" note is too strong; try it first.
+
+### 5. Resume point
+
+Part 90's question is still the open one: **why is class 6 starved upstream.** If the g36
+path is revisited, do it by POLLING `pcsx2_read_memory` on `0x45F69C`, `0x441924` and
+`0x441960` -- no breakpoints, no watchpoints, no crash risk, and it sidesteps the
+"hit counts stay 0 even when fired" quirk.
+
+---
+
+## Part 104 (2026-09-08) -- ***THE GAME BOOTS.*** THE SKIP WORKS, WE REACH GameMain, AND THE NEXT SCREEN IS A TIMER, NOT A STALL
+
+**Two runs. Rung 4 is DONE.** `[skipfmv] ACTIVE ... installed=4/4`, and from **t=1s** the PC is
+in the game's real main loop, sustained for the whole run.
+
+Clean in both runs: **0** `dispatch-miss`, **0** `[guest-branch:missing-target]`,
+`savepri=0 savetid=0` (the SofDec priority latch **never engages**), `nTh=2` with no spinning
+thread, every SofDec probe zero, `stuckSecs=0`, `gif/s` 5-8. The entire th6 deadlock class went
+away with the movie. Months of wall, gone the moment it stopped being a boot blocker.
+
+### The engine top level, measured
+
+```
+GameMain   0x422630 : 0x171AE0(); GameInit(0); if(v0&0x80000000) bail;
+                      do { GameUpdate(); } while ([0x63FDF4] != $gp-0x281C);
+                      GameShutdown();
+GameUpdate 0x421EA0 : a0=[$gp-3572]; (a0->vtable[+0x14])(a0, -1);   <- the app tick
+                      then EngineUpdate 0x199840, CFileLoadMng_Update 0x1AEDB0,
+                      GameState_ReadInput 0x327F90, GameState_Update 0x3280C0,
+                      GameState_Draw 0x328160
+```
+
+`GameMain` looping `GameUpdate` forever is **correct** -- the compare is a quit flag. A watchdog
+`pc=0x422660` or `pc=0x421Exx` is the game **running**.
+
+### `0x3E0E60` is the GENERIC CApp phase machine, not "loadscreen_tick"
+
+The func-map name and the `[lstick:stat]` tag are both misleading. It drives **every** CApp:
+`[obj+9]` is the state byte, states 2/3/4/5 call vtable `+0x38`/`+0x3C`/`+0x40`/`+0x44`, and each
+arm advances only when its handler returns nonzero. Any probe reading fields off its `a0` must
+gate on the object's class or it blends unrelated apps together.
+
+### The screen after the logos is `CAppWarning` (vt `0x4FA400`, obj `0x6330D0`)
+
+The health/legal warning -- the plain white Atari screen. `CAppWarning_Update 0x3FC0C0` is itself
+a 5-state machine on `[obj+48]`: alloc -> wait for asset `0x4076A0` -> `camera_fade_set` and wait
+for the fade -> **a 4.0-second timer** -> fade out and return 1.
+
+### It is NOT stalled. The run window was ~0.2 s too short.
+
+```
+[warn:stat] subHist=0:4, 1:198, 2:61, 3:235     <- advanced 0 -> 1 -> 2 -> 3 cleanly
+            dt=0.0166667                         <- exactly 1/60, frame delta is correct
+            fadeMode=0x0 fadeState=0x0           <- fade IDLE; fadeBusy=75 only while in sub 2
+            acc: 0.4 -> 0.92 -> 1.43 -> 1.93 -> 2.45 -> 2.97 -> 3.48 -> 3.9
+```
+
+Threshold is **4.0**. The run ended at **t=119s with acc=3.9**. `acc` climbs ~0.5/s wall
+(~30 ticks/s, half real-time under the `PS2X_DET_VBLANK_QUANTUM` throttle), so a 4-second warning
+screen costs ~8 wall-seconds and the run died a fifth of a second before it would have returned 1.
+
+**NEXT ACTION: rerun with `-RunSeconds 240`.** Nothing to fix.
+
+### Two side results
+
+- ✅ **The `0x2C1830` skip risk is CLEARED.** The stub bypasses `camera_fade_set` in the logo
+  close paths, and a black/silent next screen was the named first suspect. Measured: `CAppWarning`
+  calls `camera_fade_set` itself at `0x3FC190` and both fade bytes return to 0. Fine.
+- ⚠️ **The skip created one blind spot.** It replaces `0x420E70`/`0x4216E0`, which the sreg probe
+  also wraps, so `[sreg]` now always prints `AtariLogo{calls=0} OkrtronLogo{calls=0}`. That is the
+  override winning, **not** a silent guest. Add a counter inside the stub before reading those.
+
+---
+
 ## Part 96 (2026-09-07) -- SofDec: BOTH GUARDS PASS. We stop INSIDE the chain, and 0x113c60 is TEARDOWN
 
 *** Parts 94 and 95 both framed this as "which guard blocks us". Neither guard blocks us.
