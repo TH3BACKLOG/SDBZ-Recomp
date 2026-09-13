@@ -6,7 +6,7 @@ ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
 **Where we are:** the milestone ladder is the unit of progress. Rung 4.7 is the current
-wall (SofDec half lifted 09-12, Part 113). Parts below are **newest first** -- Part 113 is the top of the file.
+wall -- the SofDec wall is LIFTED on the played-movie path (09-13, Part 114). Parts below are **newest first** -- Part 114 is the top of the file.
 
 ---
 
@@ -128,7 +128,7 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 | 4 | Past the opening logos | `[skipfmv] ACTIVE installed=4/4`, no `savepri=1 savetid=6` latch | **DONE 09-08** -- and since 09-10 the logos can be PLAYED, not just skipped: `PS2X_FMV=host`. Part 108 |
 | 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **DONE 09-10** -- acc hit 4.0 at t=119, `[warn:stat]` froze t=128. Part 106 |
 | 4.6 | Past `CAppLogoMain` (3-pass logo loop) | `[st4:stat] ret1=1` | **DONE 09-10** -- fired t=322 on the 420 s run. Part 107 |
-| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **PARTIAL 09-12** -- root cause found: `[0x449210]` savepri poisoned by a nested boost pins the worker at pri 1. Fix B lifts it: `o0st`->0, slots all-zero (oracle signature), g36->0. Then a NEW stall: `[warn:stat] acc` frozen at 4.0167, no thread RUNNING (t1+t6 READY at `0x174B30`). Part 111's `[0x500728]` is NOT the gate (`rgate=1` with the wall up). See **Part 113** |
+| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **SOFDEC WALL LIFTED 09-13** -- real root cause: `sdbzSyscallThunk` re-issued thread-switching syscalls (CHGPRI ping-pong livelock). Fixed; with `PS2X_SKIPFMV=0` both movies play and tear down, vt reaches CAppLogoMain `0x4fadf0` at t=192. vt `0x4fae50` itself NOT yet reached (needs >=450 s). Part 113's savepri/Fix B reading is likely a symptom. See **Part 114** |
 | 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]` | NEXT |
 | 6 | Main menu navigable | pad input reaches the menu state machine | later |
 | 7 | Character select | -- | later |
@@ -136,6 +136,94 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 114 (2026-09-13) -- ROOT CAUSE OF THE SOFDEC WALL: the syscall thunk RE-ISSUED every thread-switching syscall. One-line fix; both opening movies now play through guest SofDec and the game reaches `CAppLogoMain`.
+
+### The defect
+
+`registerSdbzSyscallThunks` (`game_overrides.cpp` ~1897) replaces all 120 EE syscall stubs
+(`0x174880 + i*16`) with `sdbzSyscallThunk`. The thunk called `handleSyscall` with `ctx->pc`
+still equal to its OWN entry (`dispatchGuestBranch` sets `pc = target` before the call).
+
+A syscall that switches threads -- `ChangeThreadPriority` via `transferIfRequested`, and any
+other path that throws `EeDispatcherTransfer` -- unwinds out of `handleSyscall`. `EeScheduler`
+later resumes the thread at whatever `ctx->pc` held: the thunk entry. The resume re-enters the
+thunk and **issues the same syscall again, with the same a0/a1**.
+
+Regression: the thunk landed 07-17 (`f52e7eb4`); the throwing `EeScheduler` landed 08-26
+(`a45fe142`, Phase 3b). Under the old scheduler a stale pc was harmless.
+
+Tail-`j` callers were immune -- the generated code calls the generated stub directly
+(`syscall_stub_u_0x174b30(...)`), which sets `pc = syscall+4` before `handleSyscall`. That is
+why SleepThread waiters always sat at stub+8 (`0x174bc8`) while the `jal` callers sat at the
+stub ENTRY.
+
+### How Part 113's stall was really this (read from the 09-12 12:52 run, no new probe)
+
+- CHGPRI records with consecutive `n` strictly alternate ~4.8M times:
+  main `ChangeThreadPriority(6,1)` @`ra=0x11e6e8` <-> th6 `ChangeThreadPriority(6,25)` @`ra=0x11e670`.
+- Static disasm: `noop_sub_e690` issues that boost ONCE, at `0x11e6e0`, BEFORE its loop. Millions
+  of calls with no intervening restore is only possible if the syscall is re-issued.
+- th6 logs CRI **exit** records with no matching **enter** -- same signature.
+- Watchdog `sysPc=0x174b30` (the thunk entry; the generated stub would store `0x174b38`).
+- "No thread RUNNING, t1+t6 READY at `0x174B30`" is the snapshot `transferIfRequested` publishes
+  after clearing the running id -- a hand-off mid-ping-pong, not an idle kernel.
+
+**Part 113's "Next target: scheduler side" is WITHDRAWN.** The scheduler did exactly what it is
+coded to do. The equal-priority time-slice rotation in `checkpointDue` is upstream's and was
+NOT shown to matter here.
+
+### The fix
+
+```cpp
+SET_GPR_S64(ctx, 3, static_cast<int64_t>(kSdbzSyscallThunkNums[I]));
+ctx->pc = GPR_U32(ctx, 31);   // NEW: resume after the call, not back into the thunk
+runtime->handleSyscall(rdram, ctx);
+ctx->pc = GPR_U32(ctx, 31);
+```
+
+`$ra` is where the stub's `jr $ra` lands, and every jal/jalr return site is a resume entry.
+Non-transferring syscalls behave exactly as before. Side effect: the watchdog's `sysPc` now
+shows the return address. `cl /Zs` clean; exe `2026-09-13 04:26:14`.
+
+### Verification -- A/B against Part 113, identical env
+
+Run `2026-09-13 04:42`, 300 s, `PS2X_SKIPFMV=0` + Part 113's `PS2X_TRACE_CALLS`/`PS2X_TRACE_WATCH`.
+
+| | Part 113 (09-12 12:52) | Part 114 (09-13 04:42) |
+|---|---|---|
+| CHGPRI total `n` | 6,700,767 | **26,615** |
+| `ra=0x11e6e8` (one-shot boost) | millions | **4** (2 per movie) |
+| two-thread strict alternation | ~4.8M | **0** |
+| SofDec threads | 3-6 created t=120, wall forever | **3-6 t~133 -> torn down t~143; 7-10 t~177 -> torn down t~190** |
+| teardown traces (`0x14f428` stop / `0x14c8c8` dtor / `0x14e8b0` sweep) | never completes | **stop x6, dtor x2, sweep x2 at t~143 and t~190** |
+| app vt | parked at `0x4faeb0` | **`0x4faeb0` t133 -> `0x4faf10` t143 -> `0x4faf70` t178 -> `0x4fadf0` CAppLogoMain t192** |
+| `[savepri:fix]` (Fix B) | fired t=130 | **never fired** |
+| missing functions / missing targets / exceptions | 0 | 0 |
+
+`[ee:cold-resume]` is byte-identical between the runs (24 lines, same pcs) -- pre-existing, not
+the fix. `[ee:zero-pc-dormant]` 1,297 (vs 860): the known Timer-0 IRQ recycles; the runs took
+different paths, so no credit or blame is assigned.
+
+A skip-FMV run on the same exe (`04:32`, no TRACE env) also progressed normally: warn screen done
+t~118, CAppLogoMain t~163, third logo pass at t=297. **It did not exercise the fix** -- SofDec never
+initialised -- and must not be cited as verification.
+
+### Corrections carried forward
+
+- `[warn:stat] acc` stopping at 4.0167 with `sub=4` is the warning screen **FINISHING** (rung 4.5's
+  own signature), not a stall. Part 113 misread it.
+- Fix B is probably a symptom-patch of this bug. Unproven until the `PS2X_FIX_SAVEPRI=0` run.
+- `sdbzSyscallStub` (~line 1564) is dead code: line 1897 overwrites its three slots.
+
+### Open
+
+1. **>= 450 s run, `PS2X_SKIPFMV=0`, `PS2X_FIX_SAVEPRI=0`.** Pass = `[st4:stat] ret1=1` AND `nTh`
+   still returns to 2 after each movie. 300 s ended at CAppLogoMain pass ~1 (`accMax=3.03`, `ret1=0`).
+2. Rung 4.7 **as defined** (vt `0x4fae50`, the app AFTER CAppLogoMain) is **not yet reached** on
+   either path.
+3. CHGPRI shows 4 CRI-exit restores to prio 1 by thread 6 in the fixed run -- likely a legitimate
+   nested boost, not yet checked.
 
 ## Part 113 (2026-09-12) -- ROOT CAUSE FOUND AND FIXED: the loadscreen wall is a priority-inversion livelock seeded by a single-global priority save. The SofDec teardown now completes and matches PCSX2.
 
