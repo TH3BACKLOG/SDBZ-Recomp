@@ -5,8 +5,8 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are:** the milestone ladder is the unit of progress. Rung 4.7 is DONE and rung 5 (title
-screen) is next -- the game reaches CAppDemoMovie (09-13, Part 115). Parts below are **newest first** -- Part 115 is the top of the file.
+**Where we are:** the milestone ladder is the unit of progress. Rung 5 (title screen) is REACHED
+-- `CAppTitleMain` is live (09-13, Part 116); rung 6 is next. Parts below are **newest first** -- Part 116 is the top of the file.
 
 ---
 
@@ -129,13 +129,66 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 | 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **DONE 09-10** -- acc hit 4.0 at t=119, `[warn:stat]` froze t=128. Part 106 |
 | 4.6 | Past `CAppLogoMain` (3-pass logo loop) | `[st4:stat] ret1=1` | **DONE 09-10** -- fired t=322 on the 420 s run. Part 107 |
 | 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **DONE 09-13** -- root cause: `sdbzSyscallThunk` re-issued thread-switching syscalls (Part 114). 450 s, `PS2X_SKIPFMV=0`, Fix B OFF: CAppLogoMain `ret1=1` t~335 -> `0x4fae50` CAppCopyRight t~340 -> `0x4f9a70` CAppDemoMovie t~374, demo movie playing at run end. See **Part 115** |
-| 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]`. Candidate: the app after CAppDemoMovie's 83 s attract timeout (~t=570 det=1) -- needs a >=650 s run (Part 115) | NEXT |
-| 6 | Main menu navigable | pad input reaches the menu state machine | later |
+| 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]`. | **REACHED 09-13** -- after CAppDemoMovie's 83 s attract timeout, vt `0x4fa210` = `CAppTitleMain` from t~580 (binary-verified: vtable slot 2 returns `aCapptitlemain`). Visual check vs PCSX2 still pending. See **Part 116** |
+| 6 | Main menu navigable | pad input reaches the menu state machine; `CAppTitleMain` Tick state 2 waits on button mask `0x10` | **NEXT** |
 | 7 | Character select | -- | later |
 | 8 | In-game | -- | later |
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 116 (2026-09-13) -- THE GAME REACHES THE TITLE SCREEN: CAppDemoMovie's attract timeout expires and `CAppTitleMain` takes over
+
+Run `2026-09-13 06:12`, 650 s, det=1, exe `2026-09-13 04:26:14` (Part 114 fix), `PS2X_SKIPFMV=0`,
+`PS2X_FIX_SAVEPRI=0`, Part 113's `PS2X_TRACE_CALLS`/`PS2X_TRACE_WATCH`, `-Elf` passed explicitly.
+
+### Timeline
+
+| t (s) | event | evidence |
+|---|---|---|
+| 142 -> 152 | movie 1 plays, tears down | THCREATE 3-6; stop/dtor/sweep t~152; `nTh` 6 -> 2 |
+| 187 -> 201 | movie 2 plays, tears down | THCREATE 7-10; stop/dtor/sweep t~201 |
+| 202 | CAppLogoMain | vt `0x4fadf0` |
+| 354 | CAppLogoMain completes -> CAppCopyRight | `[st4:stat] ret1=1`; vt `0x4fae50` |
+| 392 -> 578 | CAppDemoMovie plays for the full attract window | THCREATE 11-14; vt `0x4f9a70`; `vbl/s` ~27 throughout |
+| **~580** | **attract timeout fires** | `[st4b:stat] ret1=1 accUp=4980 accLastF=83.0033`, substates 1..4 each run |
+| 578 | demo movie torn down | `0x14f428` stop x2, `0x14c8c8` dtor, `0x14e8b0` sweep; `nTh` -> 2 at t~577 |
+| **~580 -> 640** | **`CAppTitleMain`** | vt `0x4fa210`, `[lstick:stat]` gains `st=5` |
+
+Everything ran ~10 s later than the Part 115 run despite det=1; the 83 s expiry landed at t~580
+against a predicted ~570. Compare **order and tick counts**, not wall seconds, across runs.
+
+### `0x4fa210` is CAppTitleMain -- verified from the binary, not from IDA names
+
+- ELF vtable at `0x4fa210`: slot 2 = `0x3f9b50`, whose whole body is `return aCapptitlemain;`.
+  Identical layout to the known CAppDemoMovie: vt `0x4f9a70` slot 2 = `0x3e3280` -> `aCappdemomovie`.
+  Slots 4-9 (`0x3e0e00 .. 0x3e1430`) are the shared app base methods, same as CAppDemoMovie's.
+- `0x3f8830` (IDA `CAppTitleMain_Ctor`) stores `dword_4FA210` at `a1+0` and `dword_4FA238` at `a1+4`.
+- Secondary vtable `0x4fa238` holds `0x3f8a00` (Tick) and `0x3f8d80` (Update).
+- Tick, state 2 (`a1+52`): `if (!input_device_get_button_map_clone_01(0x10)) ...; else ++state` --
+  **the title screen waits for a button press.** No input was given; zero pad log lines after t=575,
+  as expected. The pad read path itself was fixed 2026-08-10 (Stage 5.12.2).
+
+**What is NOT verified:** that the title screen is correctly *drawn*. `gif/s` held 4-5 with
+`[gs:frame-change]` activity after t=580, but nobody has looked at the window or compared a
+capture against PCSX2. Rung 5's own row asks for that positive visual signature.
+
+### Health
+
+- No CHGPRI ping-pong: total `n` = 216,404 over 650 s, zero two-thread alternation. Fix B stays
+  off-able on the full path through the title screen.
+- `[guest-branch:missing-target]` 0, `dispatch-miss` 0, missing functions 0, exceptions 0.
+- `[ee:cold-resume]` the same 24 lines as every run.
+- `[ee:zero-pc-dormant]` 6,293 -- Timer-0 IRQ recycles, grows with run length. Not investigated.
+- **New:** one `[schedwatch:skip] #1` at t=481 (tid=12, pc=`0x178068`, `checkpointPending=1`,
+  `reschedReq=0`) during CAppDemoMovie. A single hit of a capped probe that previously read zero;
+  playback continued normally. Noted, not investigated.
+
+### Next -- rung 6
+
+Interactive run (`-RunSeconds 900`). Watch the window: at the title (~t=580) confirm the title is
+drawn, then press Start. If the press does nothing, the first place to look is whether
+`scePadRead` is reached and what `input_device_get_button_map_clone_01(0x10)` reads.
 
 ## Part 115 (2026-09-13) -- Fix B is NOT needed, and the game gets further than ever: CAppLogoMain completes, then CAppCopyRight, then CAppDemoMovie plays
 
