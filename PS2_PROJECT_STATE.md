@@ -180,9 +180,10 @@ capture against PCSX2. Rung 5's own row asks for that positive visual signature.
 - `[guest-branch:missing-target]` 0, `dispatch-miss` 0, missing functions 0, exceptions 0.
 - `[ee:cold-resume]` the same 24 lines as every run.
 - `[ee:zero-pc-dormant]` 6,293 -- Timer-0 IRQ recycles, grows with run length. Not investigated.
-- **New:** one `[schedwatch:skip] #1` at t=481 (tid=12, pc=`0x178068`, `checkpointPending=1`,
-  `reschedReq=0`) during CAppDemoMovie. A single hit of a capped probe that previously read zero;
-  playback continued normally. Noted, not investigated.
+- **New:** `[schedwatch:skip]` fired **3 times** (corrected -- first written as one): t~481 pc=`0x178068`,
+  t~484 pc=`0x11e994`, t~529 pc=`0x174bc8`; all tid=12 (a SofDec worker), `checkpointPending=1`,
+  `reschedReq=0`, during CAppDemoMovie. The 450 s run (Part 115) had 1; the 04:42 and 09-12 runs had 0.
+  Capped probe (40), so the count is real. Playback continued normally. Noted, not investigated.
 
 ### Next -- rung 6
 
