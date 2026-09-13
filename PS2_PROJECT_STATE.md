@@ -6,7 +6,7 @@ ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
 **Where we are:** the milestone ladder is the unit of progress. Rung 4.7 is the current
-wall. Parts below are **newest first** -- Part 109 is the top of the file.
+wall (SofDec half lifted 09-12, Part 113). Parts below are **newest first** -- Part 113 is the top of the file.
 
 ---
 
@@ -128,7 +128,7 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 | 4 | Past the opening logos | `[skipfmv] ACTIVE installed=4/4`, no `savepri=1 savetid=6` latch | **DONE 09-08** -- and since 09-10 the logos can be PLAYED, not just skipped: `PS2X_FMV=host`. Part 108 |
 | 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **DONE 09-10** -- acc hit 4.0 at t=119, `[warn:stat]` froze t=128. Part 106 |
 | 4.6 | Past `CAppLogoMain` (3-pass logo loop) | `[st4:stat] ret1=1` | **DONE 09-10** -- fired t=322 on the 420 s run. Part 107 |
-| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **BLOCKED** -- narrowed 09-11 to ONE word. `RenderDispatch` (`0x1712d0`, called per frame by `SyncFrame`) only resumes the SofDec workers when `[0x500728] == 1`; th6 sits WAIT+SUSPEND from t=342 and `w6tick` never leaves 2. See **Part 111** |
+| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **PARTIAL 09-12** -- root cause found: `[0x449210]` savepri poisoned by a nested boost pins the worker at pri 1. Fix B lifts it: `o0st`->0, slots all-zero (oracle signature), g36->0. Then a NEW stall: `[warn:stat] acc` frozen at 4.0167, no thread RUNNING (t1+t6 READY at `0x174B30`). Part 111's `[0x500728]` is NOT the gate (`rgate=1` with the wall up). See **Part 113** |
 | 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]` | NEXT |
 | 6 | Main menu navigable | pad input reaches the menu state machine | later |
 | 7 | Character select | -- | later |
@@ -136,6 +136,99 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 113 (2026-09-12) -- ROOT CAUSE FOUND AND FIXED: the loadscreen wall is a priority-inversion livelock seeded by a single-global priority save. The SofDec teardown now completes and matches PCSX2.
+
+### The defect
+
+`sub_11E598` (CRI enter) / `sub_11E620` (CRI exit) boost the **current** thread to
+`[0x4418F0]` (=1) and stash its old priority in **one global**, `[0x449210]`, gated by the
+nest counter `[0x441920]`:
+
+```c
+// sub_11E598 @0x11E598   CHGPRI ra=0x11e5dc
+if (!nest) { me = GetThreadId();
+             [0x449210] = ChangeThreadPriority(me, [0x4418F0]);   // savepri = OLD prio
+             [0x449214] = me; }
+nest++;
+// sub_11E620 @0x11E620   CHGPRI ra=0x11e670
+if (!--nest) { ChangeThreadPriority(GetThreadId(), [0x449210]); }
+```
+
+That is only correct if nobody changes the thread's priority from outside the bracket.
+`noop_sub_e690` @0x11E690 -- the SofDec join-wait -- does exactly that, boosting its target
+from the caller at `CHGPRI ra=0x11e6e8`. `syscall 0x29` @0x174B30 = **ChangeThreadPriority**.
+
+### The measured poisoning (300 s trace run, seq-exact)
+
+| seq | CHGPRI ra | cur | thid | prio | old | meaning |
+|---|---|---|---|---|---|---|
+| 0x5a4 | 0x11f140 | 1 | 6 | 0x19 | 0x1 | th6 initialised to 25 |
+| 0x5fa/0x5fd | 0x11e5dc/0x11e670 | 6 | 6 | 0x1/0x19 | 0x19/0x1 | healthy enter/exit, saves+restores 25 |
+| **0x69e** | **0x11e6e8** | **1** | 6 | 0x1 | 0x19 | **main boosts th6 25->1 for the join** |
+| **0x6a0** | 0x11e5dc | 6 | 6 | 0x1 | **0x1** | **th6 enters CRI WHILE BOOSTED -> saves 1** |
+| 0x6a3+ | 0x11e670 | 6 | 6 | 0x1 | 0x1 | restores 1 -- 4,025 more times |
+
+Aggregate proof it is specific to the worker: thid 1/4/5 restore 0x18/0x10/0x12 correctly;
+**thid 6 restores 0x1**. `ra=0x11e6e8` fires only twice in a whole run.
+
+### Why that was THE wall (self-sustaining livelock)
+
+1. main is inside `sub_155630` after `0x155648 jal 0x1555A0(entry,1)` -> **g36=1**.
+2. g36=1 fires **BAIL C** (`0x1553a4`), so the SofDec idle proc returns NONZERO.
+3. th6's loop `sub_11EAC8` ORs that -> `bnez` at `0x11eb60` **skips SleepThread**.
+4. th6 pinned at pri 1 starves main (pri 24).
+5. main never reaches `0x15565c` to clear g36. Goto 2.
+
+So `a1[15]=0` in `sub_14F428` (the stop -- it holds `aE2003Mwsfdstop`) and `*slot=0` in
+`sub_14C8C8` (the destructor) never ran, and `[mvgate] nLive` stayed 1 forever.
+
+### Fix B -- landed, confirmed, and NOT sufficient
+
+`ps2xRuntime/src/lib/ps2_runtime.cpp`, inside the 1 Hz `[thsync]` sampler (~line 5360):
+writes `[0x449210] = [0x441908]` only when `savePri==boost && saveTid==wAtid && trueA` is
+sane. `[0x441908]` is the game's OWN original (the a1 that `0x11E778` hands
+`noop_sub_e690`); oracle reads 0x19 there. **`PS2X_FIX_SAVEPRI=0` disables it.**
+
+Fired **once** -- `[savepri:fix] t=130s n=1 tid=6 was=1 now=25 boost=1` -- and:
+
+| | before | after |
+|---|---|---|
+| `[mvgate]` final | g36=1 nLive=1 (latched t=135..690) | **g36=0 nLive=0** (nLive=0 @t=201, g36=0 @t=270) |
+| `w6tick` | 107,296,443 climbing 188k/s | **72,613 frozen** |
+| `[sofdec]` slots | `sl=[0x1b12cc0,0,...]` o0st=1 | **`sl=[0,0,0,0,0,0,0,0]` o0st=0** |
+| th6 priority | 1 (pinned) | **25** for t=140..275 |
+
+`sl=` all-zero + g36=0 is **exactly the PCSX2 loadscreen signature**. First time we match.
+
+### Limits -- the next gate, and a warning
+
+`[warn:stat]` advanced (`acc` 0.333->4.017, `samples` 304->566, `sub` 3->4) then **FROZE**:
+last change t~123, unchanged for the remaining 172 s. The freeze coincides with SofDec
+**init** (t=120), i.e. BEFORE the teardown completed -- so the teardown fixing itself does not
+restart it. **DO NOT "just run longer"**; a 2,000 s run re-measures 4.0167. (An earlier
+first-vs-last read called this "still climbing" and nearly cost that run -- compute rates
+over the ACTIVE window.)
+
+End-state: host `progress` collapses ~107,000/s -> **~1,600/s** after t=274, and the thread
+table shows **no thread in st=1 RUNNING** -- t1 and t6 both st=2 READY parked at `0x174B30`
+(ChangeThreadPriority), t2/t4/t5 WAIT, t3 SUSPEND. th6 is also re-boosted to pri=1 at t=296
+with `savepri=24 savetid=1` -- same single-global bug, thread 1 as the new victim, which the
+current guard cannot catch (it requires `saveTid == wAtid`).
+
+### Next target
+
+**Scheduler side.** Why does our runtime leave two READY threads parked inside
+ChangeThreadPriority, and why does it open the boost window hardware seemingly does not?
+Files: `ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp`, `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp`
+(both already locally modified -- diff before assuming current behaviour is upstream's).
+
+**Part 88's "THE EE SCHEDULER IS EXONERATED" is hereby qualified.** The guest code does say
+"don't sleep", but the reason it says so is a priority window we create. Re-open that lane.
+
+Also closed this part: `PS2X_SKIPFMV` is **EXONERATED** (the player leaks whether or not the
+FMV plays). `[thsync]`'s `VERDICT=WORKER-GATED` / `GATE-OPEN-BUT-DEAD` strings were written
+for the pre-fix livelock and are now **stale** -- they still print; re-derive before acting.
 
 ## Part 112 (2026-09-11) -- separate diagnostic thread, root cause traced: `loadscreen_tick`'s own phase byte never reaches 5 because a global fade-animation byte parks at "2" forever
 
@@ -19466,6 +19559,16 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - rpc=0x001 WARNING gone
 
 ## Learned Patterns
+
+### 2026-09-12
+- **★★★ A save/restore through ONE global is only correct if nothing changes the value outside the bracket.** `sub_11E598` saves the caller's priority into `[0x449210]`; `noop_sub_e690` boosts the same thread from outside, so the save captured the boost and every restore re-pinned it. Look for this whenever a "restore" leaves something stuck: find the saver, then find every OTHER writer of the saved quantity.
+- **★★★ Aggregate a restore by victim before reading sequences.** One `Counter((thid, prio, ra))` over 9,789 CHGPRI records showed thid 1/4/5 restoring 0x18/0x10/0x12 and thid 6 restoring 0x1 -- the whole bug in one table. Seq-by-seq reading had missed it for weeks.
+- **★★★ An earlier success of the same path in the same run is a positive control -- use it.** The first teardown fired both `set(1)` and `clear(0)` at the same call sites; so the second teardown's missing `clear(0)` was real evidence, not a tracer blind spot. Look for a control before declaring an absence.
+- **★★★ Read the records already on disk before theorising.** Two of my hypotheses (join-wait spin, stuck in destructor) were killed by `[thsync] req=0` and `[sofdec] done=0x0` -- fields that were already being logged. Check existing probe columns first; a new run is the last resort.
+- **★★ First-vs-last is not a rate.** `acc` 0 -> 4.0167 read as "climbing"; it had been frozen for the last 172 s. Computing over the active window caught it before a ~2,000 s run was handed over for nothing. Find the LAST CHANGE, not the endpoints.
+- **★★ IDA drops arguments, not just `&`.** `noop_sub_e690` decompiles as one arg; the disassembly moves `a1` into `s5` and restores the priority from it. The caller `0x11E778` loads `a1=[0x441908]`. Disassemble before trusting arity.
+- **★ A signature can be named long before its mechanism.** Rung 4's ladder signature has said "no `savepri=1 savetid=6` latch" since 09-08. The symptom was on the ladder for four days before anyone asked what wrote it. Treat every ladder signature as an open question about its writer.
+- **★ Func-map CSV lookups must match field 2.** `grep ,0x0014c8c8,` also matches the END column; five of sixteen lookups were wrong. `awk -F, '$2=="0x..."'`.
 
 ### 2026-09-10
 - **★★★ Two counters from unrelated subsystems that agree EXACTLY across five samples are one event counted twice — that is a lead, not a coincidence.** `[sofdec] d5n` (calls to the class-5 drain fn `0x154fa8`) and `[ee:zero-pc-dormant] EXPECTED #N` read 241/241, 521/521, 797/797, 1077/1077, 1358/1358, 2090/2090. Neither tag knows the other exists. The pairing localized Part 107's free-floating "tid1 goes DORMANT with pc=0" wall onto a single guest function in one grep, after the previous run had left it as a whole-app mystery. **When two independent probes track each other to the unit, stop treating them as two facts and go find the one instruction underneath.**

@@ -1,33 +1,58 @@
-# Handoff note -- 2026-09-11 session end
+# Handoff note -- 2026-09-12 session end
 
-## What happened this session
-Resumed the SofDec/loadscreen `st=0xA` stall investigation. Corrected a prior session's
-"case 10 is a dead end" conclusion, then the user ran the higher-cap trace that was queued
-up (`0x420260:0x4000,0x2c1bb0:0x4000,0x2c1830:0x200`) and it gave full coverage of the stall
-for the first time. Root cause is now traced end-to-end, not inferred:
+## Headline
+**The loadscreen wall is root-caused and experimentally fixed. The SofDec teardown now
+completes and matches PCSX2. The game then stalls again one step later -- almost certainly
+the same defect class, scheduler-side.**
 
-- `camera_fade_is_active` (0x2C1BB0) reads global byte `[0x500E50]`; returns "active"
-  unconditionally when it's `2`.
-- That byte is pinned at `2` for 60/61 samples at the exact blocking call site, for the
-  whole stall.
-- The writer (`camera_fade_set`, 0x2C1830) was called only 15 times in the entire run. The
-  last call (from `st4b`) sets the byte to "animating" (2) and nothing ever calls it again
-  for that channel to finish the animation -- so it never clears.
-- `st4b` is a second victim of the exact same stuck global, not a separate bug.
+Full detail: `PS2_PROJECT_STATE.md` **Part 113** and
+`memory/project_savepri_poisoned_by_nested_boost.md` (cont.1, cont.2, Next action).
 
-Full detail: `memory/project_sofdec_init_never_runs_5618b4.md` (section "cont. 5"), also
-folded into `PS2_PROJECT_STATE.md` as **Part 112**.
+## Root cause (verified: TRACE + CHGPRI probes + oracle A/B)
+- `sub_11E598` / `sub_11E620` (CRI enter/exit) boost the CURRENT thread to `[0x4418F0]`=1
+  and save its old priority in ONE global, `[0x449210]`.
+- `noop_sub_e690` @0x11E690 boosts the SofDec worker from OUTSIDE that bracket
+  (`CHGPRI ra=0x11e6e8`). The worker then enters the CRI section already boosted, saves
+  **1** as its "original", and every later restore re-pins it at priority 1.
+- Worker at pri 1 never sleeps (BAIL C, g36=1) and starves main (pri 24), which holds g36
+  inside `sub_155630` and so never clears it. Self-sustaining livelock.
+- Oracle `[0x449210]` = 0x19 (25). Ours = 0x1.
 
-**Note**: this is a *separate* diagnostic thread from Part 111's `[0x500728]`/`RenderDispatch`
-worker-resume finding -- both are tracked, not yet reconciled into one story.
+## Fix B (in place, keep it)
+- `ps2xRuntime/src/lib/ps2_runtime.cpp`, inside the 1 Hz `[thsync]` sampler (~line 5360):
+  guarded write `[0x449210] = [0x441908]` (the game's own original).
+- `PS2X_FIX_SAVEPRI=0` disables it -- the A/B switch.
+- Result: fired once (`was=1 now=25`); nLive 1->0, g36 1->0, slots all-zero (oracle
+  signature), w6tick 107 M -> frozen, worker at pri 25.
+- Built into `RelWithDebInfo` exe 2026-09-12 12:45. **Not committed.**
 
-## Next step (no build required)
-Four candidate per-frame "re-tick" wrapper functions were never reached with channel=2
-during the stall: `wrap_state_byte_transition_j` (0x3F9D68) and clones `_b` (0x3FF5DC),
-`_c` (0x41AC78), `_d` (0x421408). Decompile each and `get_xrefs_to` each to find their
-callers -- one of them should be the missing per-frame driver, either never reached at all
-or reached but gated on something false during the stall.
+## Where it stops now
+- `[warn:stat] acc` froze at **4.0167** at t~123 (SofDec init), BEFORE teardown finished.
+- Host `progress` collapses ~65x after t=274; **no thread RUNNING** -- t1 and t6 both READY,
+  parked at `0x174B30` (ChangeThreadPriority).
+- t=296: worker re-boosted to pri 1, `savepri=24 savetid=1` -- same bug, thread 1 as victim.
+  Fix B's guard cannot catch it (requires `saveTid == wAtid`).
+
+## Next step
+Scheduler side: **why do two READY threads sit parked inside ChangeThreadPriority with none
+running?** Start in `ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp` and
+`ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` -- both locally modified, diff them first.
+Read-only work; no build needed to start. Part 88's "EE scheduler exonerated" is now only
+half true.
+
+## Do NOT
+- **Do not run long to "wait out" the 83-s timer.** It is frozen, not slow.
+- Do not patch BAIL C -- it is a correct re-entrancy guard.
+- Do not chase `0x14C8C8` / `0x14E8B0` -- they fired n=0; the hang was upstream in the stop.
+- Do not trust `[thsync]` VERDICT strings -- written for the old livelock, now stale.
+
+## Superseded this session
+- Part 111's `[0x500728]` gate: NOT the wall -- `rgate=1` measured with the wall still up.
+- Previous handoff's stuck fade byte `[0x500E50]` (Part 112): **not re-checked this session.**
+  It may be a downstream symptom of this livelock, or it may be the new stall. Unverified --
+  worth one read of `[0x500E50]` in the next run's logs before assuming either.
+- `PS2X_SKIPFMV`: EXONERATED -- the player leaked with movies played for real.
 
 ## Standing rules unchanged
-User runs all builds/launches. No runner-file edits. Fixes go in `game_overrides.cpp` only.
-See `PS2_PROJECT_STATE.md` "STOP" section for the full list.
+User runs all builds/launches. No runner-file or `.h` edits. See the STOP section of
+`PS2_PROJECT_STATE.md`.
