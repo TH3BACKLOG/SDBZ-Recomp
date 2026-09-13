@@ -43,6 +43,13 @@
 extern "C" void ps2x_probe_kv(const char *name, int n,
                               const char *const *keys, const uint64_t *vals);
 
+// Defined in Syscalls/Thread.cpp. Declared here rather than in a header for the
+// same reason as every other ps2x_* free function in this file: ee_scheduler.h
+// is pulled in by ~4,520 generated TUs, so touching it is a 30h rebuild.
+// Registering tid 1 here is the whole point -- see eeMainStackSpan() and the
+// bootstrap block in EeScheduler::reset().
+extern "C" void ps2x_stack_register(int tid, uint32_t lo, uint32_t hi);
+
 namespace
 {
     constexpr int kDispatchMaxId = 10;
@@ -51,15 +58,38 @@ namespace
     uint64_t g_dispatchOther = 0;
     uint64_t g_sleepBlocked = 0;
     uint64_t g_sleepFast = 0;
-    // 2026-09-06 part 87 -- the wakeupCount fast path is the last unmeasured
-    // link in the SofDec stall. main's 0x11E690 spin calls WakeupThread once
-    // per iteration (0x11E6F0 -> 0x11ED28); every call that lands on an
-    // already-Ready thread takes wakeupThread's else branch below and bumps
-    // wakeupCount with no ceiling. If th6 then reaches SleepThread it consumes
-    // exactly ONE and returns immediately, so it never parks and main (pri 24)
-    // never runs again. These ride the 1 Hz WATCH sampler, which is the only
-    // probe that provably keeps emitting through the stall -- DISPATCH is
-    // driven from sleepCurrent and goes silent exactly when we need it.
+    // 2026-09-08 part 102 -- these counters were added by part 87 to test a
+    // wakeupCount-runaway theory. THAT THEORY IS FALSIFIED; they are kept
+    // because they are what falsified it. Do not re-derive it.
+    //
+    // Part 87 predicted: main's 0x11E690 spin calls WakeupThread once per
+    // iteration (0x11E6F0 -> 0x11ED28), each call lands on an already-Ready
+    // th6, takes wakeupThread's unbounded else branch below, and pumps
+    // wakeupCount; th6 then consumes exactly ONE per SleepThread, never parks,
+    // and main (pri 24) never runs again.
+    //
+    // Measured instead, over a full stalled run:
+    //   g_sleepFast    == 0 in EVERY DISPATCH record -- the fast path below has
+    //                     never once been taken, so no wakeupCount was ever
+    //                     consumed, let alone accumulated.
+    //   g_sleepBlocked  climbs 126 -> 766 -- SleepThread parks correctly every
+    //                     time it is actually called.
+    //   dispatches(th6) == 2 -- th6 was scheduled twice all run; the second
+    //                     dispatch simply never ends.
+    // The arithmetic agreed in advance: our spin ran 2 iterations, so at most 2
+    // wakeups, which cannot explain 51M unparked iterations. The guest guards
+    // the call anyway -- 0x11ED28 only wakes when ReferThreadStatus reports
+    // WAIT, so the unbounded else branch is not even reachable from there.
+    //
+    // th6 does not "sleep and return fast" -- IT NEVER CALLS SleepThread. Class
+    // 6 has exactly one registered handler (0x154FA8), [0x45F688] is 0 in every
+    // sample so that handler always takes `return 0x155210()`, and 0x155210
+    // returns nonzero for us where hardware returns 0. The divergence is in the
+    // guest handler, not in this scheduler. See project_sofdec_idle_loop_wall.
+    //
+    // Caveat worth keeping: DISPATCH emission is driven from sleepCurrent, so it
+    // goes silent exactly when th6 stops sleeping. That silence is a signal, not
+    // a broken probe. The 1 Hz WATCH sampler keeps emitting through the stall.
     uint64_t g_wakeAcc[kDispatchMaxId] = {};    // ++wakeupCount events per tid
     uint64_t g_wakeReady[kDispatchMaxId] = {};  // makeReady events per tid
     uint32_t g_wakeCountLast[kDispatchMaxId] = {}; // last seen wakeupCount
@@ -693,6 +723,44 @@ namespace
 
     uint64_t g_eeOwnStackForced = 0u;
 
+    // 2026-09-10 -- arm the EXISTING STACKOOB guard on the main thread.
+    //
+    // ps2x_stack_register() was only ever called from StartThread()
+    // (Syscalls/Thread.cpp), and tid 1 is bootstrapped directly below rather
+    // than started through that syscall. So ps2x_stack_check() hit
+    // `g_stackRanges.find(tid) == end() -> return 0` on EVERY main-thread call
+    // and the guard has never once looked at the thread that actually dies with
+    // pc=0 (sub_00398D40 reloading `ld $ra,0x20($sp)` as zero, frame 0x1ffbde0,
+    // clobbered word 0x1ffbe00).
+    //
+    // This adds no new instrument and nothing on the hot path -- it only stops
+    // an existing check from short-circuiting.
+    //
+    // Span, and why it is this wide rather than tight:
+    // deliverSifRpcReply (Stubs/SIF.cpp:1064) legitimately parks the nested RPC
+    // dispatcher at `savedSp - 0x8000 - depth*0x2000`, with depth capped at 8,
+    // i.e. up to 0x18000 (96 KB) BELOW the live main $sp. A range tighter than
+    // that would flood STACKOOB with known-good SIF scratch frames and the real
+    // signal would be lost to the cap (default 16, see PS2X_STACKOOB_MAX and
+    // the [cap] line in ps2x_stack_check). 0x40000 clears that band with room
+    // to spare while still flagging a wild $sp (zero, garbage, or a borrowed
+    // callback stack -- those live down at 0xfc000..0x100000).
+    uint32_t eeMainStackSpan()
+    {
+        static const uint32_t kSpan = []() -> uint32_t {
+            if (const char *e = std::getenv("PS2X_MAIN_STACK_SPAN"))
+            {
+                const unsigned long parsed = std::strtoul(e, nullptr, 0);
+                if (parsed >= 0x1000ul && parsed <= 0x00400000ul)
+                {
+                    return static_cast<uint32_t>(parsed);
+                }
+            }
+            return 0x40000u;
+        }();
+        return kSpan;
+    }
+
     void eeRecordInv(EeInvKind kind, int tid, uint32_t pc, uint32_t sp,
                      size_t depthAfter, uint64_t eeCycle, uint8_t gkind)
     {
@@ -810,6 +878,41 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
+
+    // Arm STACKOOB for tid 1. See eeMainStackSpan() for why the band is wide.
+    //
+    // NOTE on the +0x10: `main.stack` above is the initial $sp, i.e. the stack
+    // TOP -- unlike every other GuestThread, where `stack` is the BASE and the
+    // top is `stack + stackSize`. That inconsistency is pre-existing and is NOT
+    // changed here (startThread() guards `id <= kMainThreadId`, so nothing else
+    // reads it), but it is why the range is derived from the sp directly. hi is
+    // exclusive in ps2x_stack_check, so it must sit one slot ABOVE the initial
+    // sp or the very first frame would read as out of range.
+    {
+        const uint32_t mainSp = getRegU32(&mainContext, 29);
+        if (mainSp != 0u)
+        {
+            const uint32_t span = eeMainStackSpan();
+            const uint32_t lo = (mainSp > span) ? (mainSp - span) : 0u;
+            const uint32_t hi = mainSp + 0x10u;
+            ps2x_stack_register(kMainThreadId, lo, hi);
+            // One line, at boot, so the band that every later STACKOOB record is
+            // judged against is permanently on the log rather than inferred.
+            std::cerr << "[main-stack] tid=" << kMainThreadId
+                      << " sp0=0x" << std::hex << mainSp
+                      << " range=[0x" << lo << ", 0x" << hi << ")"
+                      << " span=0x" << span << std::dec << std::endl;
+        }
+        else
+        {
+            // hi=0 disables the check rather than inventing a range -- same
+            // contract StartThread uses when target->stack is 0.
+            ps2x_stack_register(kMainThreadId, 0u, 0u);
+            std::cerr << "[main-stack] tid=" << kMainThreadId
+                      << " initial $sp is 0 -- STACKOOB left DISABLED for the "
+                         "main thread" << std::endl;
+        }
+    }
     // SDBZ: do NOT self-seed the wall-clock vblank timer here. Upstream drives
     // vblank purely off kVBlankPeriodCycles/kVBlankPeriod real time, with no
     // awareness of PS2X_DETERMINISM's guest-progress-quantum pacing (Stage
@@ -1269,6 +1372,21 @@ void EeScheduler::run()
                     }
                 }
                 std::cerr << std::endl;
+            }
+
+            // 2026-09-10 -- the ring above only records SCHEDULER-LOOP dispatches,
+            // so on a SUSPECT it names the last checkpoint resume (0x422660 in
+            // GameMain, say) rather than the frame that actually returned to
+            // $ra == 0. The real culprit unwound through
+            // PS2Runtime::dispatchGuestBranch's `ctx->pc == 0u` early-out, which
+            // keeps its own ring. Print it here, where the event is terminal and
+            // spam is not a concern. Declared extern locally on purpose: the
+            // definition lives in ps2_runtime.cpp and putting it in a header
+            // would drag ~4,520 generated TUs into a rebuild.
+            if (!zeroPcExpected)
+            {
+                extern void ps2x_dump_zero_pc_unwind();
+                ps2x_dump_zero_pc_unwind();
             }
 
             if (!zeroPcExpected && eeFatalOnZeroPcDormant())

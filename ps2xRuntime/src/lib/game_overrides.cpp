@@ -2203,6 +2203,34 @@ namespace
         {0x0017CF68u, 0x0017CF50u},
         {0x0017CF70u, 0x0017CF50u},
         {0x0017CFA4u, 0x0017CF50u},
+        // 2026-09-10 -- sub_00398D40, the frame that actually kills tid 1.
+        //
+        // Measured, not suspected: the zero-pc unwind ring in
+        // dispatchGuestBranch named it as the frame that returned with
+        // ctx->pc == 0. Its prologue is `addiu $sp,-0x30; sd $ra,0x20($sp)`,
+        // its epilogue `ld $ra,0x20($sp); jr $ra`, and 24 instructions later
+        // that load reads ZERO. Entry $ra is provably 0x1C2EDC -- the only
+        // caller is the vtable+0x20 `jalr $t9` at 0x1C2ED4, whose generated
+        // code does SET_GPR_U32(ctx,31,0x1C2EDCu) BEFORE dispatching -- so the
+        // value going in was right and the stack slot is CLOBBERED in between.
+        // Frame base 0x1ffbde0, clobbered word 0x1ffbe00.
+        //
+        // Why this slot set is worth its cost when the dispatchGuestBranch
+        // probe was not: that probe sat on EVERY inter-function transfer and
+        // measured 19% slower, so the run never reached the failure. This one
+        // is paid only by calls to a single small function.
+        //
+        // The wrapper's existing exitSp != entrySp IMBAL dump is the point --
+        // it prints the registers and the count source on any frame imbalance,
+        // which splits "the stack slot was overwritten" from "$sp itself was
+        // wrong when the epilogue ran" without adding a new instrument.
+        //
+        // Entry plus both registered resume labels, same as the rpc_call and
+        // 0x17CF50 hunts above: a mid-function resume must not be misread as a
+        // fresh prologue execution.
+        {0x00398D40u, 0x00398D40u},
+        {0x00398D70u, 0x00398D40u},
+        {0x00398D90u, 0x00398D40u},
     };
 
     constexpr size_t kSdbzFrameTraceSlotCount =
@@ -2211,6 +2239,31 @@ namespace
     // Captured before replaceFunction() overwrites the slot, so the wrapper can
     // still reach the real body.
     PS2Runtime::RecompiledFunction g_sdbzFrameTraceOriginals[kSdbzFrameTraceSlotCount] = {};
+
+    // 2026-09-10 -- per-slot CALL COUNTER. Answers "did this slot ever run?",
+    // which nothing in this file could answer before.
+    //
+    // Every existing frametrace family (SLOTENTRY, GSENTRY, LEAFENTRY, LEAFEXIT,
+    // IMBAL, RABAD, CTORTGT, RAOUT) prints only on an anomaly, and most are
+    // additionally gated -- SLOTENTRY needs `slotWatchAddrPre != 0` AND caps at
+    // 40. So a slot that is called a million times cleanly, and a slot that is
+    // never called at all, produce byte-identical output: nothing.
+    //
+    // That cost the 1785 s run of 2026-09-10. `0x398D40` -- the frame this whole
+    // instrument was extended to watch -- appeared ZERO times in a 26 MB log, and
+    // the log could not distinguish "ran clean" from "never reached". Both
+    // readings imply completely different next steps, so the run answered
+    // nothing. Same structural-blindness class as
+    // [[feedback_trace_only_funcmap_entries]] and
+    // [[feedback_capped_probes_false_negatives]]: absence is only evidence when
+    // presence was possible.
+    //
+    // Cost: one relaxed atomic increment per traced call, on ~83 functions --
+    // NOT on the dispatchGuestBranch hot path that measured 19% in
+    // [[feedback_hot_path_probe_costs_runtime]]. Read out by the watchdog via
+    // ps2x_dump_frametrace_calls() below, so the FIRST second each slot becomes
+    // non-zero is on the record, not just a final total.
+    std::atomic<uint64_t> g_sdbzFrameTraceCalls[kSdbzFrameTraceSlotCount];
 
     // 2026-07-22 SLOTWATCH -- fork B is confirmed: rpc_call (0x178be8) is handed a
     // valid $ra (0x1bb0b0), saves it at newsp+0xB0 (== entrySp-0x10 == 0x1ffbeb0),
@@ -3623,6 +3676,12 @@ namespace
         {
             return;
         }
+
+        // 2026-09-10 -- unconditional per-slot call counter. Must be the first
+        // statement after the null check: every early-out below it would
+        // otherwise reintroduce the "silence means two different things"
+        // ambiguity this counter exists to remove. See the array's declaration.
+        g_sdbzFrameTraceCalls[I].fetch_add(1u, std::memory_order_relaxed);
 
         const uint32_t entryPc = ctx->pc;
         const uint32_t entrySp = GPR_U32(ctx, 29);
@@ -6113,6 +6172,26 @@ namespace
     std::atomic<uint32_t> g_lstickVt38{0u};
     std::atomic<uint32_t> g_lstickVt40{0u};
     std::atomic<uint32_t> g_lstickVt44{0u};
+
+    // --- CAppWarning_Update (0x3FC0C0) sub-state -------------------------
+    // The generic CApp phase machine 0x3E0E60 parks at [obj+9]==4, whose arm
+    // is a virtual call to vtable+0x40. For the object we actually tick, that
+    // slot resolves to 0x3FC0C0 = CAppWarning_Update, which is ITSELF a
+    // 5-state machine on [obj+48] returning 0 until it clears. Every field
+    // below names the instruction that consumes it, so a value that never
+    // moves convicts a specific branch rather than the app in general.
+    std::atomic<uint32_t> g_warnObj{0u};                // a0; == the lstick a0
+    std::atomic<uint32_t> g_warnSub{0xFFFFFFFFu};       // [obj+48], switch 0x3FC0D0
+    std::atomic<uint64_t> g_warnSubHist[8];
+    std::atomic<uint64_t> g_warnSubOther{0u};
+    std::atomic<uint32_t> g_warnH160{0xFFFFFFFFu};      // [obj+160], arg  0x3FC148
+    std::atomic<uint32_t> g_warnAccBits{0u};            // [obj+44],  cmp  0x3FC1DC
+    std::atomic<uint32_t> g_warnDtBits{0u};             // [[obj+40]+4], add 0x3FC1DC
+    std::atomic<uint32_t> g_warnP40{0u};                // [obj+40],  load 0x3FC1C8
+    std::atomic<uint32_t> g_warnFadeMode{0xFFFFFFFFu};  // [gp-8736], read 0x2C1BB0
+    std::atomic<uint32_t> g_warnFadeState{0xFFFFFFFFu}; // [gp-8735], read 0x2C1BCC
+    std::atomic<uint64_t> g_warnFadeBusy{0u};   // samples where fade_is_active()!=0
+    std::atomic<uint64_t> g_warnSamples{0u};
     std::atomic<uint32_t> g_nullcbSlotAddr{0u};
     std::atomic<uint32_t> g_nullcbSlot{0xFFFFFFFFu};
     std::atomic<uint32_t> g_nullcbA0C0{0xFFFFFFFFu};
@@ -6462,6 +6541,50 @@ namespace
             g_lstickVt38.store(sofdecRead32(rdram, vt + 0x38u), std::memory_order_relaxed);
             g_lstickVt40.store(sofdecRead32(rdram, vt + 0x40u), std::memory_order_relaxed);
             g_lstickVt44.store(sofdecRead32(rdram, vt + 0x44u), std::memory_order_relaxed);
+
+            // Gate on the SHAPE of the state-4 arm, not on an object address:
+            // 0x3E0E60 is the phase machine for EVERY CApp, so an ungated read
+            // of [a0+48] would blend CAppWarning's sub-state with whatever
+            // another class happens to keep at that offset. vt40 is already
+            // measured just above, so a run where this block never fires shows
+            // up as samples=0 sitting next to a nonzero vt40 -- the probe
+            // reports its own miss instead of printing a confident zero.
+            const uint32_t vt40 = sofdecRead32(rdram, vt + 0x40u);
+            if (vt40 == 0x003FC0C0u)
+            {
+                g_warnSamples.fetch_add(1u, std::memory_order_relaxed);
+                g_warnObj.store(a0, std::memory_order_relaxed);
+
+                const uint32_t sub = sofdecRead32(rdram, a0 + 48u);
+                g_warnSub.store(sub, std::memory_order_relaxed);
+                if (sub < 8u)
+                    g_warnSubHist[sub].fetch_add(1u, std::memory_order_relaxed);
+                else
+                    g_warnSubOther.fetch_add(1u, std::memory_order_relaxed);
+
+                g_warnH160.store(sofdecRead32(rdram, a0 + 160u), std::memory_order_relaxed);
+                g_warnAccBits.store(sofdecRead32(rdram, a0 + 44u), std::memory_order_relaxed);
+
+                const uint32_t p40 = sofdecRead32(rdram, a0 + 40u);
+                g_warnP40.store(p40, std::memory_order_relaxed);
+                // Sub-state 3 needs [obj+44] += [[obj+40]+4] to reach 4.0f. A
+                // null p40 means the dt SOURCE is missing, which reads very
+                // differently from a dt that is present but zero.
+                if (p40 != 0u)
+                    g_warnDtBits.store(sofdecRead32(rdram, p40 + 4u), std::memory_order_relaxed);
+
+                // camera_fade_is_active (0x2C1BB0) is the wait for sub-states 2
+                // AND 4. Recompute its verdict from the same two gp-relative
+                // bytes it reads rather than calling it, so the probe cannot
+                // perturb the fade it is measuring.
+                const uint32_t gp = GPR_U32(ctx, 28);
+                const uint32_t fmode = sofdecRead8(rdram, gp - 8736u);
+                const uint32_t fstate = sofdecRead8(rdram, gp - 8735u);
+                g_warnFadeMode.store(fmode, std::memory_order_relaxed);
+                g_warnFadeState.store(fstate, std::memory_order_relaxed);
+                if (fmode == 1u || fmode == 2u || fstate == 3u || fstate == 4u)
+                    g_warnFadeBusy.fetch_add(1u, std::memory_order_relaxed);
+            }
             return;
         }
 
@@ -6726,6 +6849,46 @@ namespace
         }
         oss << "other:" << g_lstickStateOther.load(std::memory_order_relaxed)
             << "\n";
+
+        // [warn:stat] answers "which of CAppWarning_Update's four waits are we
+        // parked in". sub is the switch value read at 0x3FC0D0:
+        //   1 -> blocked on 0x4076A0(h160) returning 0
+        //   2 -> blocked on camera_fade_is_active() != 0
+        //   3 -> blocked on acc(+44) + dt reaching 4.0f
+        //   4 -> blocked on camera_fade_is_active() != 0, then returns 1
+        {
+            const uint32_t accB = g_warnAccBits.load(std::memory_order_relaxed);
+            const uint32_t dtB = g_warnDtBits.load(std::memory_order_relaxed);
+            float accF = 0.0f;
+            float dtF = 0.0f;
+            std::memcpy(&accF, &accB, sizeof(accF));
+            std::memcpy(&dtF, &dtB, sizeof(dtF));
+            oss << "[warn:stat] why=" << why
+                << std::dec
+                << " samples=" << g_warnSamples.load(std::memory_order_relaxed)
+                << std::hex
+                << " obj=0x" << g_warnObj.load(std::memory_order_relaxed)
+                << " h160=0x" << g_warnH160.load(std::memory_order_relaxed)
+                << " p40=0x" << g_warnP40.load(std::memory_order_relaxed)
+                << " accBits=0x" << accB
+                << " dtBits=0x" << dtB
+                << " fadeMode=0x" << g_warnFadeMode.load(std::memory_order_relaxed)
+                << " fadeState=0x" << g_warnFadeState.load(std::memory_order_relaxed)
+                << std::dec
+                << " acc=" << accF
+                << " dt=" << dtF
+                << " fadeBusy=" << g_warnFadeBusy.load(std::memory_order_relaxed)
+                << " sub=" << static_cast<int32_t>(g_warnSub.load(std::memory_order_relaxed))
+                << " subHist=";
+            for (size_t i = 0; i < 8u; ++i)
+            {
+                const uint64_t n = g_warnSubHist[i].load(std::memory_order_relaxed);
+                if (n != 0u)
+                    oss << i << ":" << n << ",";
+            }
+            oss << "other:" << g_warnSubOther.load(std::memory_order_relaxed)
+                << "\n";
+        }
 
         // Third line, separate tag again: [st4:stat] answers "and why does the
         // state-4 arm keep saying no".
@@ -8043,6 +8206,99 @@ namespace
                        [] { sregStatLine("install"); std::atexit([] { sregStatLine("shutdown"); }); });
     }
 
+    // ================= SDBZ opening-logo FMV skip =========================
+    // 2026-09-08 -- the opening Atari and Okrtron logo movies are a BOOT
+    // BLOCKER. CAppLogoAtari's close phase hangs forever inside the SofDec
+    // teardown (0x420FC0 -> 0x113C60 -> ... -> the 0x11E690 thread-poke spin),
+    // so nothing downstream of the logos has ever run -- title screen, menus,
+    // GS and pad work are all provably reachable but untouched. The root-cause
+    // work is PARKED, not abandoned: project_sofdec_idle_loop_wall part 103
+    // names the single remaining divergence (0x155210).
+    //
+    // Both logo apps expose the same 10-slot vtable, and two of its slots are
+    // phase machines driven off [obj+48], each returning 0 = "still working"
+    // and 1 = "phase complete":
+    //
+    //                                    +0x08 open/play   +0x10 close
+    //   CAppLogoAtari   (vtable 0x4FAEE0)   0x420E70          0x420FC0  <- hangs
+    //   CAppLogoOkrtron (vtable 0x4FAFA0)   0x4216E0          0x421830
+    //
+    // All four end their own success path with exactly `sw $zero, 48($s0)` +
+    // `addiu $v0, $zero, 1`, and the ADJACENT vtable slot +0x0C (0x420FB0 /
+    // 0x421820) ships as literally `jr $ra; addiu $v0, $zero, 1`. So "reset the
+    // phase counter and report complete on the first tick" is the game's own
+    // idiom for these slots, not a fabricated return value.
+    //
+    // Stubbing the OPEN phase as well as the close phase is deliberate: the
+    // open phase is what mounts the stream (0x110C50 with the filename, then
+    // 0x113ED0 / 0x113D30, and on Okrtron 0x113AA0, which is the routine that
+    // arms the mcc latch -- part 96). Stubbing only the close phase would leave
+    // a stream open with nothing left to close it.
+    //
+    // NOT stubbed: the third app sharing this vtable shape (0x3E2E80 open /
+    // 0x3E2FF0 close, vtable 0x4F9AA0). Its +0x0C is wrap_effect_mgr_set_flag
+    // rather than a return-1 stub, so it is a different app class and not an
+    // opening logo. Do not add it without re-deriving that.
+    constexpr uint32_t kSkipFmvFns[4] = {
+        0x00420E70u, // CAppLogoAtari   open
+        0x00420FC0u, // CAppLogoAtari   close  <- where we hang today
+        0x004216E0u, // CAppLogoOkrtron open
+        0x00421830u, // CAppLogoOkrtron close
+    };
+
+    bool skipFmvEnabled()
+    {
+        static const bool on = []() {
+            // DEFAULT ON. PS2X_SKIPFMV=0 restores the real movie path exactly,
+            // which is the baseline the parked investigation resumes from.
+            const char *e = std::getenv("PS2X_SKIPFMV");
+            return e == nullptr || (e[0] != 0 && e[0] != '0');
+        }();
+        return on;
+    }
+
+    void skipFmvPhaseDone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t obj = GPR_U32(ctx, 4); // $a0 = the CApp object
+        WRITE32(obj + 48u, 0u);               // [obj+48] = 0, as the real done paths do
+        SET_GPR_U64(ctx, 2, 1u);              // $v0 = 1 -> "phase complete"
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    void applySdbzSkipFmv(PS2Runtime &runtime)
+    {
+        if (!skipFmvEnabled())
+        {
+            // Fully inert when off: nothing is replaced, so applySdbzSregProbe
+            // keeps its own wrapper on 0x420E70 and the baseline run is
+            // byte-for-byte the behaviour we had before this override existed.
+            std::cerr << "[skipfmv] disabled (PS2X_SKIPFMV=0) -- opening movies"
+                         " run for real and WILL stall; this is the baseline path"
+                      << std::endl;
+            return;
+        }
+
+        // Registered LAST on purpose. applySdbzSregProbe also replaces 0x420E70
+        // (kSregStateAtariFn); applying after it means this wrapper wins rather
+        // than being silently clobbered by whichever ran later.
+        unsigned installed = 0u;
+        for (uint32_t fn : kSkipFmvFns)
+        {
+            if (runtime.lookupFunction(fn) != nullptr && runtime.replaceFunction(fn, &skipFmvPhaseDone))
+                ++installed;
+        }
+
+        // Loud on purpose. With the skip defaulting ON, a future session must
+        // never mistake a skipped movie for a working one, and a partial install
+        // must not read as a success
+        // ([[feedback_stubbed_hardware_has_no_error_path]]).
+        std::cerr << "[skipfmv] ACTIVE -- opening Atari/Okrtron logo movies are"
+                     " SKIPPED, not played. installed=" << installed << "/4"
+                  << (installed == 4u ? "" : "  <-- INCOMPLETE, expected 4")
+                  << " (PS2X_SKIPFMV=0 plays them for real)" << std::endl;
+    }
+
     PS2_REGISTER_GAME_OVERRIDE("RECVX sound-driver compat", "slus_201.84", 0u, 0u, &applyRecvxSoundDriverCompat);
     PS2_REGISTER_GAME_OVERRIDE("RECVX DTX compat", "slus_201.84", 0u, 0u, &applyRecvxDtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("LotR sound RPC compat", "SLUS_205.78", 0u, 0u, &applyLotrSoundRpcCompat);
@@ -8054,6 +8310,9 @@ namespace
     PS2_REGISTER_GAME_OVERRIDE("SDBZ Sofdec per-frame driver probe", "SLUS_214.42", 0u, 0u, &applySdbzSofdecProbe);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ SRD completion probe", "SLUS_214.42", 0u, 0u, &applySdbzSrdProbe);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ SIF sreg + logo-step probe", "SLUS_214.42", 0u, 0u, &applySdbzSregProbe);
+    // Must stay LAST: it replaces 0x420E70, which the sreg probe above also
+    // replaces, and the later apply wins.
+    PS2_REGISTER_GAME_OVERRIDE("SDBZ opening-logo FMV skip", "SLUS_214.42", 0u, 0u, &applySdbzSkipFmv);
 }
 
 // File scope on purpose -- see srdStatTick() above. Mirrors the placement of
@@ -8094,4 +8353,46 @@ bool sdbzLookupFrameTraceOwner(uint32_t address, uint32_t &funcStart)
         }
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-10 -- frametrace call-counter readout.
+//
+// Called once per watchdog second from ps2_runtime.cpp. Prints ONLY slots whose
+// count changed since the last call, so a steady-state run costs one short line
+// per second and a fully idle run costs nothing at all.
+//
+// The point is the TRANSITION, not the total: the first second a slot goes
+// non-zero tells us when the guest first reached it. `0x398D40` never appearing
+// here at all is then a real negative -- the frame is never entered -- instead
+// of the un-decidable silence the 1785 s run produced.
+//
+// extern "C" and declared at the ps2_runtime.cpp call site rather than in a
+// header: ee_scheduler.h / ps2_runtime.h reach ~4,520 generated TUs and a header
+// edit is a 30h rebuild. Same rule as every other ps2x_* free function here.
+// ---------------------------------------------------------------------------
+extern "C" void ps2x_dump_frametrace_calls()
+{
+    static uint64_t s_last[kSdbzFrameTraceSlotCount] = {};
+    std::ostringstream oss;
+    size_t changed = 0;
+    for (size_t i = 0; i < kSdbzFrameTraceSlotCount; ++i)
+    {
+        const uint64_t now = g_sdbzFrameTraceCalls[i].load(std::memory_order_relaxed);
+        if (now == s_last[i])
+        {
+            continue;
+        }
+        // First sighting is the interesting event, so mark it. `addr` not
+        // `funcStart`: two slots can share a funcStart (entry + resume labels)
+        // and collapsing them would hide which half of the function ran.
+        oss << ' ' << std::hex << kSdbzFrameTraceSlots[i].addr
+            << (s_last[i] == 0u ? "=NEW:" : "=") << std::dec << now;
+        s_last[i] = now;
+        ++changed;
+    }
+    if (changed != 0u)
+    {
+        std::cerr << "[frametrace:calls]" << oss.str() << std::endl;
+    }
 }

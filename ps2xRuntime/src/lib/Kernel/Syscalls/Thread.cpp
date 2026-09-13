@@ -154,6 +154,36 @@ extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
     if (ps2x_on_irq_handler_stack() != 0u)
         return 0;
 
+    // ...except the guard above is DEAD CODE and has been since it was written.
+    // `tls_on_irq_handler_stack` is only ever incremented by Interrupt.cpp's
+    // `IrqHandlerStackScope`, and that type is declared and never instantiated
+    // -- grep it: five hits, all inside its own definition. So the counter is
+    // permanently 0 and the early-out never fires.
+    //
+    // Measured cost, run of 2026-09-10 (first run with tid 1 registered):
+    // 32,768+ STACKOOB violations, cap [cap] line at 16, and all 16 surviving
+    // records identical -- pc=0x178068, sp=0xffff0, blamed on thid=0x1.
+    // 0xffff0 is the async callback pool's stackTop, exactly as printed by the
+    // one `[async-stack] reserved [0xfc000, 0x100000) stackTop=0xffff0` line of
+    // that boot. Every one of those 32,768 is the false positive the dead guard
+    // was supposed to suppress, and they drowned the probe before it could say
+    // anything about the frame this instrument was added to watch.
+    //
+    // Fixed by address band rather than by arming the scope. Arming it means
+    // touching all four invocation dispatch sites in EeScheduler.cpp, and the
+    // band test is exact: ps2_runtime.cpp:318-336 documents the pool invariant
+    // as "guest thread stacks are game-chosen addresses >= 0x00100000
+    // [and the pool] is disjoint from ALL guest memory by construction". A $sp
+    // below that ceiling is kernel-reserved by definition and can never be a
+    // guest thread's own stack, so this cannot mask a real violation.
+    //
+    // Not a header include: ps2_runtime.h is pulled in by ~4,520 generated TUs
+    // and Thread.cpp does not currently include it. Mirrored constant, with the
+    // definition site named so the two stay findable together.
+    constexpr uint32_t kKernelReservedStackCeiling = 0x00100000u; // == kAsyncCallbackStackTop, ps2xRuntime/include/ps2_runtime.h:432
+    if (sp < kKernelReservedStackCeiling)
+        return 0;
+
     const int tid = ps2x_guest_current_thread_id();
     GuestStackRange r;
     {

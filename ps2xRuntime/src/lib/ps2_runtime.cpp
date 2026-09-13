@@ -47,11 +47,35 @@ namespace ps2_stubs
 extern "C" void ps2x_host_sampler_start(void);
 extern "C" void ps2x_host_sampler_stop(void);
 
+// Detached host-side FMV player (src/lib/Kernel/Fmv/FmvHost.cpp). Declared here
+// for the same header-cost reason as above. Fully inert unless PS2X_FMV=host.
+//
+// _install is called from run() rather than through PS2_REGISTER_GAME_OVERRIDE on
+// purpose, and it does two jobs at once:
+//   1. applyMatching runs inside loadELF, which main.cpp calls BEFORE run(), so a
+//      replaceFunction issued here deterministically wins over game_overrides.cpp
+//      (whose skipfmv override owns the same four addresses). Cross-TU static-init
+//      order is unspecified, so the macro would have been a coin flip.
+//   2. ps2_runtime is a STATIC lib with no /WHOLEARCHIVE, so a TU reachable only
+//      via static-initializer self-registration is silently dropped at link time.
+//      These references are the anchor that keeps it.
+extern "C" void ps2x_fmv_host_install(PS2Runtime *runtime);
+extern "C" void ps2x_fmv_host_draw(void);
+extern "C" void ps2x_fmv_host_shutdown(void);
+
 // Stage 5.12: emulates padman's per-vsync IOP->EE pad-state push straight into
 // the guest libpad buffer. Defined in ps2_pad.cpp; declared here for the same
 // header-cost reason as above. Must be called on the thread that polls raylib
 // input, i.e. right after EndDrawing().
 extern "C" void ps2x_pad_push_frame(uint8_t *rdram);
+
+// Defined in game_overrides.cpp. Emits [frametrace:calls] for any traced slot
+// whose call count moved since the previous watchdog second -- the first time a
+// slot goes non-zero is the event worth having. Declared here rather than in a
+// header: ps2_runtime.h reaches ~4,520 generated TUs and a header edit is a 30h
+// rebuild. A linkage-specification is only valid at namespace scope, so it lives
+// here and not at the watchdog call site.
+extern "C" void ps2x_dump_frametrace_calls();
 
 namespace
 {
@@ -2127,6 +2151,87 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 // that sees real function entries can feed the cold-resume witness table.
 extern "C" void ps2x_witness_true_entry(uint32_t entryPc, uint32_t sp);
 
+// 2026-09-10 -- zero-pc UNWIND ring.
+//
+// dispatchGuestBranch() returns false the instant a callee leaves ctx->pc == 0
+// (see the `isStopRequested() || ctx->pc == 0u` check at the bottom of this
+// function). That false then propagates up through EVERY enclosing generated
+// frame -- each one does `if (!runtime->dispatchGuestBranch(...)) { return; }`
+// -- so by the time EeScheduler prints [ee:zero-pc-dormant] the frame that
+// actually returned to $ra == 0 has already unwound. Its own g_eeDispatchRing
+// cannot help: that ring only records SCHEDULER-LOOP dispatches, and an
+// intra-function `jal` reached through this path never round-trips back to the
+// scheduler. That is why parts 37-46 could never name the culprit address.
+//
+// Record the unwind here instead. Within one unwind the pushes run
+// innermost-first, so the FIRST entry of the final burst names the guest
+// function that returned to zero; every later entry in that burst is just the
+// propagation walking outwards.
+//
+// Unconditional, no I/O and no allocation on the hot path -- the same contract
+// as the scheduler's g_eeDispatchRing. Printed only from the terminal SUSPECT
+// branch in EeScheduler.cpp, which calls ps2x_dump_zero_pc_unwind() below.
+namespace
+{
+    struct Ps2xZeroPcRec
+    {
+        uint32_t targetPc;
+        uint32_t sourcePc;
+        uint32_t ra;        // $ra AFTER the callee returned (== 0 on the unwind)
+        uint32_t sp;        // $sp AFTER the callee returned
+        // raAtEntry/spAtEntry were removed 2026-09-10 -- capturing them cost a
+        // measured 19% on the dispatch hot path and the question they answered
+        // is now settled statically. See the note in dispatchGuestBranch.
+        uint32_t kind;
+    };
+
+    constexpr uint32_t kPs2xZeroPcRingSize = 64u;
+    Ps2xZeroPcRec g_ps2xZeroPcRing[kPs2xZeroPcRingSize] = {};
+    std::atomic<uint32_t> g_ps2xZeroPcRingPos{0u};
+    std::atomic<uint64_t> g_ps2xZeroPcTotal{0u};
+}
+
+// Declared extern (not in a header -- headers are included by ~4,520 generated
+// TUs and touching one costs a full rebuild) at its single call site in
+// EeScheduler.cpp.
+void ps2x_dump_zero_pc_unwind()
+{
+    const uint64_t total = g_ps2xZeroPcTotal.load(std::memory_order_relaxed);
+    const uint32_t pos = g_ps2xZeroPcRingPos.load(std::memory_order_relaxed);
+    const uint32_t have = (total < kPs2xZeroPcRingSize)
+                              ? static_cast<uint32_t>(total)
+                              : kPs2xZeroPcRingSize;
+
+    std::cerr << "[ee:zero-pc-unwind]   dispatchGuestBranch unwind ring ("
+              << std::dec << have << " of " << total
+              << " total, OLDEST FIRST -- the first line of the LAST burst is the"
+                 " function that returned to $ra==0):"
+              << std::endl;
+
+    if (have == 0u)
+    {
+        std::cerr << "[ee:zero-pc-unwind]     <empty -- pc never reached 0 inside "
+                     "dispatchGuestBranch, so the zero was produced by a top-level "
+                     "scheduler dispatch, not by an unwind>"
+                  << std::endl;
+        return;
+    }
+
+    for (uint32_t n = 0; n < have; ++n)
+    {
+        const uint32_t idx = (pos + kPs2xZeroPcRingSize - have + n) % kPs2xZeroPcRingSize;
+        const Ps2xZeroPcRec &r = g_ps2xZeroPcRing[idx];
+        std::cerr << "[ee:zero-pc-unwind]     #" << std::dec << n
+                  << " target=0x" << std::hex << r.targetPc
+                  << " from=0x" << r.sourcePc
+                  << " kind=" << describeGuestBranchKind(
+                         static_cast<PS2Runtime::GuestBranchKind>(r.kind))
+                  << " raAfter=0x" << r.ra
+                  << " spAfter=0x" << r.sp
+                  << std::dec << std::endl;
+    }
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -2221,10 +2326,41 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
+    // 2026-09-10 -- the entry snapshot that used to live here (two unconditional
+    // GPR reads feeding raAtEntry/spAtEntry in the ring below) is GONE, and must
+    // not come back. It was written off as "nearly free"; measured, it cost 19%
+    // of guest throughput (progress/s 105k -> 85k, CAppLogoMain t=168 -> t=198)
+    // and the run then timed out ~8 game ticks short of the failure it existed
+    // to observe. This function is on every inter-function transfer.
+    //
+    // It is also no longer needed. It was there to split "the callee was ENTERED
+    // with $ra == 0" from "the saved slot was clobbered", and static reading of
+    // the call site settled that: 0x1C2ED4's generated code does
+    // SET_GPR_U32(ctx, 31, 0x1C2EDCu) before dispatching, so sub_00398D40 was
+    // entered with a correct $ra and the slot is overwritten in between. The
+    // frame-trace slots added for 0x398D40 in game_overrides.cpp carry the
+    // entry/exit comparison now, paid only by that one function.
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
     {
+        // 2026-09-10 -- see the Ps2xZeroPcRec block above this function. This is
+        // the ONLY place a zero pc turns into a silent unwind, so it is the only
+        // place that can still see which function produced it. targetPc is that
+        // function: it was just called, and it returned leaving ctx->pc == 0.
+        if (ctx->pc == 0u)
+        {
+            const uint32_t slot =
+                g_ps2xZeroPcRingPos.fetch_add(1u, std::memory_order_relaxed) %
+                kPs2xZeroPcRingSize;
+            Ps2xZeroPcRec &r = g_ps2xZeroPcRing[slot];
+            r.targetPc = targetPc;
+            r.sourcePc = sourcePc;
+            r.ra = GPR_U32(ctx, 31);
+            r.sp = GPR_U32(ctx, 29);
+            r.kind = static_cast<uint32_t>(kind);
+            g_ps2xZeroPcTotal.fetch_add(1u, std::memory_order_relaxed);
+        }
         return false;
     }
 
@@ -3237,6 +3373,10 @@ void PS2Runtime::run()
     // Started here so the profile window covers the whole guest run, including
     // the 4.4s stall at t=2-6s that the watchdog sees but cannot explain.
     ps2x_host_sampler_start();
+
+    // Must be before gameThread is spawned below, and is after loadELF's
+    // applyMatching by construction (main.cpp loads the ELF before calling run()).
+    ps2x_fmv_host_install(this);
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -5155,6 +5295,8 @@ void PS2Runtime::run()
                     {
                         uint32_t req = 0u, inWork = 0u, gateLo = 0u, gateHi = 0u;
                         uint32_t tickLo = 0u, tickHi = 0u, boost = 0u;
+                        uint32_t rgate = 0xDEADBEEFu, rg724 = 0u, rg72C = 0u;
+                        uint32_t mreq = 0u, mtid = 0u, wAtid = 0u, wBex = 0u, wBtid = 0u;
                         bool memOk = true;
                         try
                         {
@@ -5165,10 +5307,103 @@ void PS2Runtime::run()
                             tickLo = m_memory.read32(0x00441960u); // 64-bit worker tick counter
                             tickHi = m_memory.read32(0x00441964u);
                             boost  = m_memory.read32(0x004418F0u); // priority handed to the boost
+
+                            // Part 111 / PCSX2 oracle 2026-09-11. rgate is THE
+                            // word: RenderDispatch 0x1712d0 loads it at 0x1712dc
+                            // (lw $v1,-10568($gp); $gp=0x503070 => 0x500728) and
+                            // only takes the branch that resumes the SofDec
+                            // workers when it equals 1. On real PCSX2 it reads 1
+                            // for the whole time SofDec is live and drops to 0,
+                            // together with 0x500724 and 0x50072C, the instant
+                            // SofDec is torn down -- so it is the subsystem's
+                            // initialised latch, written by exactly two sites
+                            // (0x113f28 and 0x113fd8, both sw -10568($gp)).
+                            // 0xDEADBEEF on the line means the read threw, not 0.
+                            rgate  = m_memory.read32(0x00500728u); // RenderDispatch gate
+                            rg724  = m_memory.read32(0x00500724u); // moves with it on the oracle
+                            rg72C  = m_memory.read32(0x0050072Cu);
+
+                            // sub_11FC40, called every pass by the frame thread
+                            // sub_11E8D0: lw [0x44193C] (0x11fc50), and if it is 1
+                            // it Refers then WakeupThreads tid [0x441988]. The
+                            // oracle has [0x441988]=1 -- the MAIN thread -- and
+                            // main sits asleep at 0x174bc8 between frames, while
+                            // our th1 spins at 0x102994 and never sleeps.
+                            // NB mreq is a ONE-SHOT: 0x11fca4 does sw $zero,0($s1)
+                            // in a beql delay slot once the wake lands, so 0 is the
+                            // normal steady-state reading and only mtid is stable.
+                            mreq   = m_memory.read32(0x0044193Cu); // main-wake request latch
+                            mtid   = m_memory.read32(0x00441988u); // tid it wakes (oracle: 1)
+
+                            // Worker identity, so the thread table below can be
+                            // read without guessing which row is worker A.
+                            wAtid  = m_memory.read32(0x0044198Cu); // worker A tid (oracle: 14)
+                            wBex   = m_memory.read32(0x004418E8u); // worker B exists (oracle: 0)
+                            wBtid  = m_memory.read32(0x00441990u); // worker B tid  (oracle: 0)
                         }
                         catch (const std::exception &)
                         {
                             memOk = false;
+                        }
+
+                        // ---- FIX B: un-poison savepri (2026-09-12) --------------------
+                        // ROOT CAUSE (TRACE + CHGPRI probes, oracle A/B):
+                        //   sub_11E598 (CRI enter, CHGPRI ra=0x11e5dc) saves the CURRENT
+                        //   priority of the calling thread into the SINGLE global
+                        //   [0x449210], guarded by the nest count [0x441920]:
+                        //       if (!nest) { me = GetThreadId();
+                        //                    [0x449210] = ChangeThreadPriority(me, [0x4418F0]);
+                        //                    [0x449214] = me; }
+                        //   sub_11E620 (CRI exit, ra=0x11e670) restores [0x449210].
+                        //   noop_sub_e690 @0x11E690 boosts worker A from OUTSIDE that
+                        //   bracket (ChangeThreadPriority(tid, [0x4418F0]), CHGPRI
+                        //   ra=0x11e6e8 -- fires only twice in a 300 s run). If the worker
+                        //   enters the CRI section during that window it reads old==1 and
+                        //   saves the BOOST value as its "original"; every later exit then
+                        //   restores 1 and the worker is pinned at priority 1 forever.
+                        //   Measured: thid 1/4/5 restore 0x18/0x10/0x12 correctly,
+                        //   thid 6 restores 0x1 4,025 times.
+                        //   That starves main (pri 24), which is still inside sub_155630
+                        //   holding g36=1 after `0x155648 jal 0x1555A0(entry,1)`, so the
+                        //   clear at 0x15565c never runs -> BAIL C forever -> the worker
+                        //   never SleepThreads -> main never runs. Self-sustaining livelock.
+                        // ORACLE: [0x449210]=0x19(25) and [0x441908]=0x19. OURS: 0x1.
+                        // [0x441908] is the game's OWN authoritative original for worker A
+                        // -- it is the value 0x11E778 passes to noop_sub_e690 as a1, the
+                        // priority the join itself restores. So this writes back the
+                        // game's number, not one we invented.
+                        // Fires ONLY in the exact poisoned state. Set PS2X_FIX_SAVEPRI=0
+                        // to disable and reproduce the wall (this is the A/B switch).
+                        static const bool s_savepriFixOn = [] {
+                            const char *e = std::getenv("PS2X_FIX_SAVEPRI");
+                            return !(e && *e == '0');
+                        }();
+                        static uint32_t s_savepriFixes = 0u;
+                        if (s_savepriFixOn && memOk)
+                        {
+                            try
+                            {
+                                const uint32_t savePri = m_memory.read32(0x00449210u);
+                                const uint32_t saveTid = m_memory.read32(0x00449214u);
+                                const uint32_t trueA = m_memory.read32(0x00441908u);
+                                if (boost != 0u && savePri == boost &&
+                                    wAtid != 0u && saveTid == wAtid &&
+                                    trueA != 0u && trueA != boost)
+                                {
+                                    m_memory.write32(0x00449210u, trueA);
+                                    ++s_savepriFixes;
+                                    std::cerr << "[savepri:fix] t=" << std::dec << (t + 1)
+                                              << "s n=" << s_savepriFixes
+                                              << " tid=" << saveTid
+                                              << " was=" << savePri
+                                              << " now=" << trueA
+                                              << " boost=" << boost
+                                              << std::endl;
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
                         }
 
                         const uint64_t tick =
@@ -5186,6 +5421,9 @@ void PS2Runtime::run()
                             std::cerr << "[thsync] armed req@0x441924 inWork@0x441934"
                                          " gate@0x4419D8 tick@0x441960 boost@0x4418F0"
                                          " spinner=sub_11E690 acker=sub_11EAC8"
+                                         " rgate@0x500728(bound to lw at 0x1712dc)"
+                                         " mreq@0x44193C mtid@0x441988(sub_11FC40)"
+                                         " wA@0x44198C wBex@0x4418E8 wB@0x441990"
                                       << std::endl;
                         }
 
@@ -5200,6 +5438,14 @@ void PS2Runtime::run()
                                   << " tick=" << tick
                                   << " dTick=" << dTick
                                   << " boost=" << boost
+                                  << " rgate=" << rgate
+                                  << " g724=" << rg724
+                                  << " g72C=" << rg72C
+                                  << " mreq=" << mreq
+                                  << " mtid=" << mtid
+                                  << " wA=" << wAtid
+                                  << " wBex=" << wBex
+                                  << " wB=" << wBtid
                                   << " idle=" << ps2x_guest_idle();
 
                         if (s_havePrev && req != s_prevReq)
@@ -5229,6 +5475,32 @@ void PS2Runtime::run()
                                 std::cerr << " VERDICT=WORKER-NOT-RUNNING"
                                              "(request up, worker never ticked;"
                                              " read the thread table below)";
+                            }
+                        }
+
+                        // Pre-committed, written before the run so a later reading
+                        // cannot be fitted to it. The workers are created SUSPENDED
+                        // by design (sub_11F0C8) and re-suspended on every pass by
+                        // sub_11E8D0, so the per-frame resume inside RenderDispatch
+                        // is not an optimisation -- it is the only thing that ever
+                        // runs them. rgate != 1 therefore means the workers can
+                        // never run again, whatever the thread table says.
+                        if (memOk)
+                        {
+                            if (rgate != 1u)
+                            {
+                                std::cerr << " VERDICT=RENDER-GATE-CLOSED"
+                                             "(rgate!=1 so RenderDispatch 0x1712d0 takes"
+                                             " the sub_1721E0 branch and NEVER resumes the"
+                                             " SofDec workers; PCSX2 reads 1 here --"
+                                             " fix 0x113f28/0x113fd8, not the scheduler)";
+                            }
+                            else if (dTick == 0ull && s_havePrev)
+                            {
+                                std::cerr << " VERDICT=GATE-OPEN-BUT-DEAD"
+                                             "(rgate==1 yet the worker did not tick;"
+                                             " the resume is reaching ResumeThread and"
+                                             " failing -- next lane is Thread.cpp)";
                             }
                         }
 
@@ -5985,6 +6257,14 @@ void PS2Runtime::run()
                     // feeds VIF1 by DMA, so both read 0 by design and neither ever
                     // discriminated anything; gifTot is just the running sum of
                     // gif/s.
+                    // 2026-09-10 -- frametrace call counters, emitted just
+                    // BEFORE the watchdog line so the `t=` immediately after it
+                    // timestamps the transition. Defined in game_overrides.cpp;
+                    // declared here rather than in a header because ps2_runtime.h
+                    // is included by ~4,520 generated TUs (30h rebuild).
+                    // Self-silencing: prints nothing on a second where no traced
+                    // slot's count moved.
+                    ps2x_dump_frametrace_calls();
                     std::cerr << "[watchdog] t=" << (++t) << "s"
                               // cov=<distinct>/<game band>. A game-band count
                               // that never rises is the Stage 5.7 answer.
@@ -6328,6 +6608,12 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+
+        // After the guest blit so the movie covers it, before the debug panel so
+        // the panel still draws on top. No-op unless PS2X_FMV=host and a movie is
+        // actually playing.
+        ps2x_fmv_host_draw();
+
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
@@ -6424,6 +6710,12 @@ void PS2Runtime::run()
     // Backstop only: the sampler normally reports itself on its own timer, since
     // launch_recomp.ps1's auto-stop can Kill() before this point is reached.
     ps2x_host_sampler_stop();
+
+    // Before UnloadTexture/CloseWindow below, and before ~PS2Runtime's
+    // CloseAudioDevice(): a player thread still touching the AudioStream or the
+    // GL texture after either of those is a use-after-free. WindowShouldClose()
+    // can break the present loop mid-movie, so this must be safe from Playing.
+    ps2x_fmv_host_shutdown();
 
     RecompDbg::Shutdown();
     UnloadTexture(frameTex);
