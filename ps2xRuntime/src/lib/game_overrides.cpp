@@ -623,10 +623,24 @@ namespace
     constexpr size_t kSdbzSyscallThunkCount =
         sizeof(kSdbzSyscallThunkNums) / sizeof(kSdbzSyscallThunkNums[0]);
 
+    // 2026-09-13 part 114 -- pc is parked on $ra BEFORE handleSyscall. A syscall
+    // that switches threads (29h ChangeThreadPriority, WakeupThread, ...) throws
+    // EeDispatcherTransfer out of handleSyscall, and EeScheduler later resumes
+    // the thread at whatever ctx->pc held. It used to hold this thunk's own
+    // entry (dispatchGuestBranch sets pc = target), so the resume re-entered the
+    // thunk and RE-ISSUED the syscall with the same a0/a1. Measured in the
+    // 09-12 run: main's one-shot boost ChangeThreadPriority(6,1) @ra=0x11e6e8
+    // and th6's CRI-exit ChangeThreadPriority(6,25) @ra=0x11e670 strictly
+    // alternating ~4.8M times, neither thread ever passing its syscall.
+    // $ra is where `jr $ra` lands, and every jal/jalr return site is a resume
+    // entry. Tail-`j` callers bypass this thunk (direct C++ call into the
+    // generated stub, which already sets pc = syscall+4). Non-transferring
+    // syscalls are unaffected: pc is forced to $ra afterwards exactly as before.
     template <size_t I>
     void sdbzSyscallThunk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         SET_GPR_S64(ctx, 3, static_cast<int64_t>(kSdbzSyscallThunkNums[I]));
+        ctx->pc = GPR_U32(ctx, 31);
         runtime->handleSyscall(rdram, ctx);
         ctx->pc = GPR_U32(ctx, 31);
     }
