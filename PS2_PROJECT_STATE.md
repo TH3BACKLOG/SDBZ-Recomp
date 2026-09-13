@@ -5,8 +5,8 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are:** the milestone ladder is the unit of progress. Rung 4.7 is the current
-wall -- the SofDec wall is LIFTED on the played-movie path (09-13, Part 114). Parts below are **newest first** -- Part 114 is the top of the file.
+**Where we are:** the milestone ladder is the unit of progress. Rung 4.7 is DONE and rung 5 (title
+screen) is next -- the game reaches CAppDemoMovie (09-13, Part 115). Parts below are **newest first** -- Part 115 is the top of the file.
 
 ---
 
@@ -128,14 +128,83 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 | 4 | Past the opening logos | `[skipfmv] ACTIVE installed=4/4`, no `savepri=1 savetid=6` latch | **DONE 09-08** -- and since 09-10 the logos can be PLAYED, not just skipped: `PS2X_FMV=host`. Part 108 |
 | 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **DONE 09-10** -- acc hit 4.0 at t=119, `[warn:stat]` froze t=128. Part 106 |
 | 4.6 | Past `CAppLogoMain` (3-pass logo loop) | `[st4:stat] ret1=1` | **DONE 09-10** -- fired t=322 on the 420 s run. Part 107 |
-| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **SOFDEC WALL LIFTED 09-13** -- real root cause: `sdbzSyscallThunk` re-issued thread-switching syscalls (CHGPRI ping-pong livelock). Fixed; with `PS2X_SKIPFMV=0` both movies play and tear down, vt reaches CAppLogoMain `0x4fadf0` at t=192. vt `0x4fae50` itself NOT yet reached (needs >=450 s). Part 113's savepri/Fix B reading is likely a symptom. See **Part 114** |
-| 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]` | NEXT |
+| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **DONE 09-13** -- root cause: `sdbzSyscallThunk` re-issued thread-switching syscalls (Part 114). 450 s, `PS2X_SKIPFMV=0`, Fix B OFF: CAppLogoMain `ret1=1` t~335 -> `0x4fae50` CAppCopyRight t~340 -> `0x4f9a70` CAppDemoMovie t~374, demo movie playing at run end. See **Part 115** |
+| 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]`. Candidate: the app after CAppDemoMovie's 83 s attract timeout (~t=570 det=1) -- needs a >=650 s run (Part 115) | NEXT |
 | 6 | Main menu navigable | pad input reaches the menu state machine | later |
 | 7 | Character select | -- | later |
 | 8 | In-game | -- | later |
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 115 (2026-09-13) -- Fix B is NOT needed, and the game gets further than ever: CAppLogoMain completes, then CAppCopyRight, then CAppDemoMovie plays
+
+Run `2026-09-13 05:51`, 450 s, det=1, exe `2026-09-13 04:26:14` (Part 114 fix), `PS2X_SKIPFMV=0`,
+**`PS2X_FIX_SAVEPRI=0`**, Part 113's `PS2X_TRACE_CALLS`/`PS2X_TRACE_WATCH`.
+
+### Timeline
+
+| t (s) | event | evidence |
+|---|---|---|
+| 119 | warning screen done | `[warn:stat] sub=4` |
+| 132 -> 142 | movie 1 plays, tears down | THCREATE 3-6; `0x14f428` stop / `0x14c8c8` dtor / `0x14e8b0` sweep at t~142; `nTh` 6 -> 2 |
+| 175 -> 188 | movie 2 plays, tears down | THCREATE 7-10; stop/dtor/sweep at t~188; `nTh` 6 -> 2 |
+| 192 | CAppLogoMain | vt `0x4fadf0` |
+| **335** | **CAppLogoMain completes** | `[st4:stat] ret1=1` |
+| **340** | **CAppCopyRight** | vt `0x4fae50` |
+| **374** | **CAppDemoMovie**, third SofDec movie | vt `0x4f9a70`; THCREATE 11-14 at t~373 |
+| 443 | run ends, demo movie still playing | see below |
+
+App names are from `project_cappwarning_four_second_timer.md` (ctor-verified), not re-derived.
+
+### Fix B A/B -- verdict
+
+With Fix B **off**: zero two-thread strict alternation in CHGPRI, total `n` = 98,300 over 450 s,
+final `savepri=24 savetid=1` (main's real priority). The 4 CRI-exit restores to prio 1 by
+thread 6 appear identically with Fix B on (04:42 run) and off -- not a poisoning signature.
+**Part 113's poisoned priority save was a symptom of the Part 114 thunk bug.** Fix B stays in the
+tree for now by decision; it is a no-op on this path. `PS2X_FIX_SAVEPRI=0` remains the switch.
+
+### The demo movie is PLAYING, not walled
+
+t=373..442: `vbl/s` 27, `gif/s` 27, `[movie] stat=1 objSt=1`, `[mvgate] nLive=1 live=0`,
+`[sofdec] d5n` +27/s (48 -> 1,889), `w6tick` flat at 12.
+
+- `[sofdec] st0=1 pd0=1*` with `d5n` climbing and `w6tick` flat is **the normal playback signature**:
+  the 04:42 run shows exactly that for movies 1 and 2 (t=132-141, t=176-188), and both completed.
+  It is NOT Part 110's "stream handle stuck at st=1 pd=1" wall on its own -- that needs `d5n` frozen.
+- Host `progress` falling to ~830/s during a movie is normal: movies 1/2 did the same
+  (04:42 run, wd t=135 -> t=140: 15,823,308 -> 15,827,460).
+- `[st4b:stat]` (`sub_3E2FF0`, the **83.0 s attract-mode timeout**): `accUp=1767`, `accLastF=29.45`,
+  climbing ~25 ticks/s. Expiry needs `accUp` ~4,980 => **~t=570** at this rate. A 450 s run cannot
+  see what follows ([[feedback_long_guest_timer_reads_as_stall]]).
+
+### Health
+
+`[guest-branch:missing-target]` 0, `dispatch-miss` 0, missing functions 0, exceptions 0.
+`[ee:cold-resume]` the same 24 lines as every prior run. `[ee:zero-pc-dormant]` 3,185 -- the known
+Timer-0 IRQ recycles, scaling with run length and movie time (vbl-driven); not investigated.
+
+### Part 114's Open list, closed
+
+1. >= 450 s with Fix B off -- **done**: `ret1=1` at t~335, `nTh` returns to 2 after both movies.
+2. Rung 4.7 as defined (vt `0x4fae50`) -- **reached at t~340 and survived** (next app at t~374).
+3. The 4 CRI-exit restores to prio 1 by th6 -- present with Fix B on AND off; benign.
+
+### Launcher trap found on the way
+
+A run at 04:59 died in under a second: `[runmeta] elf=.` then `Failed to open ELF file: .`.
+A stray `.` after the pasted command bound to `-Elf`, the launcher's FIRST positional parameter,
+and `launch_recomp.ps1:207`'s `Test-Path` accepts `.` because it is a directory. Handover commands
+now pass `-Elf "F:\SDBZ Recomp\ELF\SLUS_214.42"` explicitly. Hardening the check to
+`Test-Path -PathType Leaf` is offered, not done.
+
+### Next
+
+**>= 650 s run**, same env (Fix B may stay off). Pass = `[st4b:stat]` reaches 83 (or the movie ends
+first), the demo movie tears down (stop/dtor/sweep, `nTh` -> 2), and `[lstick:stat]` shows a new vt.
+Whatever follows CAppDemoMovie is the rung-5 (title screen) candidate; confirm against the PCSX2
+title capture before claiming it.
 
 ## Part 114 (2026-09-13) -- ROOT CAUSE OF THE SOFDEC WALL: the syscall thunk RE-ISSUED every thread-switching syscall. One-line fix; both opening movies now play through guest SofDec and the game reaches `CAppLogoMain`.
 
