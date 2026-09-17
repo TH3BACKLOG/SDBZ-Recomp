@@ -5,8 +5,10 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are:** the milestone ladder is the unit of progress. Rung 5 (title screen) is REACHED
--- `CAppTitleMain` is live (09-13, Part 116); rung 6 is next. Parts below are **newest first** -- Part 116 is the top of the file.
+**Where we are:** the milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
+-- 09-15 run, Goku's select model on screen (Part 117). Warped 3D: our VIF1 + VU1 match PCSX2 bit-exact
+on a replayed capture (Part 118). Smeared 3D FIXED 09-16 -- two GS bugs (Part 119); open: Ranking-screen
+sky dome looks upside down. Parts below are **newest first** -- Part 119 is the top of the file.
 
 ---
 
@@ -130,12 +132,146 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 | 4.6 | Past `CAppLogoMain` (3-pass logo loop) | `[st4:stat] ret1=1` | **DONE 09-10** -- fired t=322 on the 420 s run. Part 107 |
 | 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **DONE 09-13** -- root cause: `sdbzSyscallThunk` re-issued thread-switching syscalls (Part 114). 450 s, `PS2X_SKIPFMV=0`, Fix B OFF: CAppLogoMain `ret1=1` t~335 -> `0x4fae50` CAppCopyRight t~340 -> `0x4f9a70` CAppDemoMovie t~374, demo movie playing at run end. See **Part 115** |
 | 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]`. | **REACHED 09-13** -- after CAppDemoMovie's 83 s attract timeout, vt `0x4fa210` = `CAppTitleMain` from t~580 (binary-verified: vtable slot 2 returns `aCapptitlemain`). Visual check vs PCSX2 still pending. See **Part 116** |
-| 6 | Main menu navigable | pad input reaches the menu state machine; `CAppTitleMain` Tick state 2 waits on button mask `0x10` | **NEXT** |
-| 7 | Character select | -- | later |
-| 8 | In-game | -- | later |
+| 6 | Main menu navigable | pad input reaches the menu state machine; `CAppTitleMain` Tick state 2 waits on button mask `0x10` | **REACHED 09-15** -- `dis/main_menu.pix` loaded t~939 and t~1055, then char select. Whether pad input or attract flow drove it was not recorded. Part 117 |
+| 7 | Character select | `ply/sel.ani` + `ply/p01/p01asel.*` loaded; gstate `0,0,0,1` -> `1,1,0,1` | **REACHED 09-15** -- t~1111-1129, Goku in P1 slot (user-confirmed on screen). Part 117 |
+| 8 | In-game | -- | **NEXT** (attract demo fight already loads stage + 2 fighters, t~779-843) |
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 119 (2026-09-16) -- WARPED 3D SMEARING FIXED: two GS bugs (affine texturing + strip queue). Guest FP rounding made PCSX2-exact on the way, but it was NOT the cause
+
+### 1. Guest FP rounding -- made exact, then FALSIFIED as the warp
+- A/B on `mat4_multiply_0x108220`: host round-to-nearest gives proj2.z `0x44a00000` (1280); guest
+  round-toward-zero + FTZ + DAZ gives `0x449fe000` (1279) = PCSX2. Live PCSX2 read at `0x509010`
+  in CAppTitleMain gives proj0 `0x44332362`; host RN gives `0x4433236e`.
+- FIX (approved core edits): `Ps2ApplyGuestFpMode()` in `ps2_runtime_macros.h`, called once on
+  `gameThread` in `ps2_runtime.cpp` (logs `[fp] guest FP mode: MXCSR=0xffc0`). `PS2X_GUEST_FP=0`
+  turns it off.
+- Per-op rounding READ FROM PCSX2 SOURCE (curl+grep, `iFPU.cpp` is the live rec): EE `sqrt.s` =
+  nearest -> `FPU_SQRT_S` now `Ps2FpuSqrtS` (108 sites). EE `rsqrt.s` and all VU ops = chop (already
+  right). `PS2_VDIV` reverted to chop.
+- OPEN deviation: EE `div.s` is nearest in PCSX2 but the recompiler inlines raw `/` at 788 sites, so
+  ours chops. Needs a generator change. Negative-operand `sqrt.s` also differs (PCSX2 `sqrt(|x|)`).
+- **Run 09-16 05:38 (900 s): proj0 `0x44332362` + proj2.z `0x449fe000` bit-exact at the title (46
+  samples) -- and the user saw the 3D still smeared.** Rounding is correct and is not the warp.
+  (That run still had `PS2X_VUROUND=1` exported in the shell; does not affect the conclusion.)
+
+### 2. The real causes -- both in the GS, both verified by direct source read
+- **A. Affine texturing** -- `ps2_gs_rasterizer.cpp` `drawTriangle`, `fst==0`: each vertex was divided
+  by its own q, then `sampleTexture()` divided again. The two divides cancel exactly, leaving plain
+  screen-space UV interpolation. Invisible on 2D (q==1), which is why Stage 5.11's sprite-only replay
+  never caught it. Fix: interpolate raw s, t, q; `sampleTexture` does the one divide (`fabsQ` guard).
+- **B. Strip queue desync** -- `ps2_gs_gpu.cpp` `GS::vertexKick`: `if (!drawing) return;` skipped the
+  strip/fan rotation on ADC=1 / XYZ3 / XYZF3 kicks. The next vertex went to slot 3, which the
+  rasterizer never reads, so every strip join drew a stale triangle. Fix: rotate on every kick, guard
+  only the draw. Matches PCSX2 `GSState::VertexKick`.
+- `cl /Zs` EXIT=0 both, no new warnings. **Built 06:14, run 06:21: user reports NO smearing.**
+- My Q-latch hypothesis (ST->RGBAQ) was wrong: Q is carried.
+- Audited clean: GIF tag decode, PACKED lanes, XYZ 12.4 decode, REGLIST, VIF1 UNPACK, XGKICK.
+
+### 3. Found, NOT fixed (none match the smear)
+PRMODE ignored when PRMODECONT.AC==0 (`activeContext`); XYOFFSET applied as `>>4` on an already
+/16 vertex (sub-pixel); int truncation in sprite/line/point paths only; same pre-divide in the sprite
+path; no triangle guard-band reject; V4-5 unpack missing `<<3` (`ps2_vif1_interpreter.cpp`); Q reset
+to 1.0 per GIFtag; `PS2_IF_AGRESSIVE_LOGS` block in `vertexKick` uses non-existent `m_prim.type`.
+
+### 4. OPEN -- Ranking screen
+The game again reaches RANKING (scenes `0x632b90` / `0x6330d0` after title `0x632eb0`). User sees a
+cloud **sky dome that looks upside down**, no characters, no platform. User never saw characters in
+any build, so that is not from fix B. NOT yet confirmed as a bug -- no PCSX2 reference of this screen.
+Note: Part 118's `logs/vucap/demo10` is a PCSX2 capture of the **Ranking 3D background**.
+
+## Part 118 (2026-09-15) -- WARPED 3D: VIF1 UNPACK + VU1 interpreter EXONERATED by an offline PCSX2 capture replay
+
+### Tooling built
+- **PCSX2 capture build** at `F:\PCSX2-src` (HEAD `26c7b71b1`, Release AVX2, VS 18). New
+  `pcsx2/DebugTools/VuCapture.{h,cpp}` writes `.vucap`: VIF1 words, VU1 run start/end state + memory
+  CRCs, XGKICK bytes, vsync. DebugServer on 21512, commands `vucap` / `vucap_stop` / `vucap_status`.
+  Needs VU1 recompiler off and MTVU off (`Documents\PCSX2\inis\PCSX2.ini`).
+- `build_scripts/pcsx2_ee.py --vucap OUT --frames N [--fullmem FIRST LAST] --wait` starts a capture.
+- `build_scripts/vucap.py CAP [--runs N] [--vif]` = loss check + summary.
+- `ps2xTest/src/ps2_vu1_capture_replay_tests.cpp` + standalone exe target `ps2x_vucap_replay`
+  (because `ps2x_tests` no longer builds: 6 stale test files). Env: `PS2X_VUCAP`, `_MODE resync|free`,
+  `_OUT`, `_MAXRUNS`, `_CORRUPT_VIF`, `_CORRUPT_MICRO`.
+- Captures in `logs/vucap/`: `demo10` (Ranking 3D bg, 9531 runs), `fight20` (30136 runs),
+  `fight5full` (full memory per run), `test60` (no 3D), `demo.vucap` 2.5 GB (mistake, deleted 09-15).
+
+### Results (VERIFIED)
+- `fight20` free mode, 30,136 runs: **0 mismatches** in data memory, VF, VI, XGKICK bytes/count;
+  18 runs VF within 1e-3.
+- `fight5full` resync, 4,742 runs: **0 mismatches**.
+- Negative controls both fire: VIF byte flip -> data-CRC diff at run 169; micro byte 0x420 flipped
+  before every run -> VF/VI/kick diffs from run 91.
+- Harness trap found: MSCAL/MSCNT+UNPACK runs the program inside the PCSX2 VIF handler, so its VIF
+  record lands after the run. Harness reads ahead (164 / 1335 such kicks).
+
+### Open -- remaining suspects (hypotheses)
+- (a) A VIF command split across two DMA **starts**: our runtime parses each DMA start's buffer on
+  its own (chain concatenated, `ps2_memory.cpp` ~1951), no carry-over. Test WRITTEN, not built:
+  `DMASTART` record (type 10) at top of `dmaVIF1` (`Vif1_Dma.cpp`); `vucap.py` prints the pending
+  count. `cl /Zs` clean.
+- (b) EE COP2 translator bugs (VLQI/VSQI, VDIV /0, VSQRT, VFTOI) -- need regen; plan "Deferred".
+- (c) GS side.
+- Not tested: our UNPACK treats STCYCL wl==0 as 1, PCSX2 as 256.
+
+## Part 117 (2026-09-14/15) -- CHARACTER SELECT REACHED. Recovered-body resume freeze fixed; opening movie (CAppDemoMovie) wired to the host player
+
+### 1. Six gap functions recovered
+`sub_001AC6F0`, `sub_001AD0B0`, `sub_001AD5A0`, `sub_001AD6A0`, `sub_001AD700`, `sub_001AD760`
+regenerated in a scratch recompile (scratch config + output only) and copied into
+`ps2xRuntime/src/lib/Kernel/recovered/` -- 84 bodies total. Holes `0x1ac6f0` / `0x1ad5a0` gone;
+fight models for `p02`/`p12` then loaded. `ps2_iop_irx_loader.cpp` gained an uncapped
+`[ARKD:load] kind= name= dest=` line per job.
+
+### 2. Resume freeze at t=1451 -- root cause and fix (VERIFIED)
+- The dense function table has a slot per 4 bytes; the generated `register_functions.cpp` fills
+  every interior word. Recovered bodies were registered at their ENTRY only.
+- `EeScheduler.cpp` (~:1425) resumes a thread with `hasFunction(context.pc)`; a miss is
+  `reportMissingFunction("EE scheduler")` + `makeDormant`.
+- 09-14 22:00 run: thread 1 yielded in a vtable call at `0x1aca88` inside `sub_001AC6F0`; resume pc
+  `0x1aca90` had no slot -> freeze.
+- Fix: `build_scripts/funcmap/gen_recovered_header.py` parses each body's `// Address: START - END`
+  and emits `{addr, end, &fn}`; the `game_overrides.cpp` loop registers every interior word **only
+  where the slot is empty**. Latent for all 84 bodies.
+- Verified on exe `2026-09-14 23:38`: ran to t=1474 (user closed), zero `EE scheduler` holes.
+
+### 3. Run `2026-09-14 23:38` exe, det=1, `PS2X_FMV=host`, no time limit
+
+| t (s) | event |
+|---|---|
+| ~5-10 | ATARI (110 frames presented) + OKR (135) via host player |
+| 370-580 | CAppDemoMovie -- **black**. `vblSrc=0/28/0`, progress flat: guest idle on its own SofDec |
+| 779-843 | attract demo fight loads stage `s01`, fighters `p02` + `p12`, effects, voices |
+| 931, 1048 | menu screens (`dis/main_menu.pix`) |
+| 1111-1129 | gstate -> `1,1,0,1`; character select, `p01asel.*` (Goku, seen on screen) |
+| 1474 | user closed; clean shutdown |
+
+- 72 `[ARKD:load]`, **zero** missing-file errors (`sceCdSearchFile failed` / `fioOpen error` / `fopen error`).
+- Holes: only `0x1bde88` (x2) and `0x2b733c`, all `codeRegion=no` bad pointers -- known.
+- **Speed (measured):** menus/demo fight 4-5 vbl/s; char select ~45k progress/s = ~2 vbl/s from
+  quantum. Guest-idle column is 0 => CPU-bound; lowering the quantum should not help (hypothesis).
+  Not yet profiled.
+
+### 4. Opening movie wired (code done, `cl /Zs` clean, build + run PENDING)
+Found on PCSX2 paused at the opening:
+- `0x113AA0` (movie open) has exactly three callers: `0x420f40` (ATARI), `0x4217b0` (OKR),
+  `0x3e2f50` -- delay-slot `addiu 0x7a50` loads `movie/op_usa.sfd` (`0x4d7a50`).
+- `0x3E2E80` = open step machine (same shape as `0x420E70`); `0x3E2FF0` = tick/close (starts with
+  `jal 0x113920` like `0x420FC0`, plus a pad Start-skip -> `0x3e1d00` and the 83 s timeout arm).
+- Both in vtable `0x4f9a70` at `+0x38` / `+0x40` -- the CAppDemoMovie of Part 116. OP_USA.SFD is
+  256x448 mpeg1video, 81.35 s, ADX: fits the 83 s net.
+- `Kernel/Fmv/FmvHost.cpp`: third movie row, `openOpening`, `kOpenHooks[]`, banner `installed=N/6`.
+  `game_overrides.cpp`: comment only (the "not an opening logo, do not add" note corrected).
+- Side effect: the `3e2e80` sreg probe and `st4b.3e2ff0` sofdec probe go silent (FmvHost wins).
+- Tool lesson: a lui/addiu scanner missed even `atari.sfd` -- the `lui` sits in a delay slot 42
+  instructions before the `addiu`. Search the callee's `jal` word instead.
+
+### Open
+- Build + run the OP wiring; expect `installed=6/6`, `[fmvhost] OP ... 81.35s`, `OP: finished`.
+- `-HostProfile -RunSeconds 900` to name the CPU cost in the fight.
+- Not assessed this session: whether the 09-14 VIF1 image-desync fix (`ps2_vif1_interpreter.cpp`) changed the title visuals.
+- All recovered bodies, generator, FmvHost and override edits are **uncommitted**.
 
 ## Part 116 (2026-09-13) -- THE GAME REACHES THE TITLE SCREEN: CAppDemoMovie's attract timeout expires and `CAppTitleMain` takes over
 

@@ -1,58 +1,42 @@
-# Handoff note -- 2026-09-12 session end
+# Handoff note -- 2026-09-16 session end (warped 3D)
 
 ## Headline
-**The loadscreen wall is root-caused and experimentally fixed. The SofDec teardown now
-completes and matches PCSX2. The game then stalls again one step later -- almost certainly
-the same defect class, scheduler-side.**
+**The smeared 3D is fixed.** Two GS bugs, built and run: the user sees no smearing.
+The game reaches the **Ranking** screen. New open item: its cloud sky dome looks upside down.
 
-Full detail: `PS2_PROJECT_STATE.md` **Part 113** and
-`memory/project_savepri_poisoned_by_nested_boost.md` (cont.1, cont.2, Next action).
+Full detail: `PS2_PROJECT_STATE.md` **Part 119**; memory `project_capp_scene_identification.md`;
+plan `C:\Users\mwlab\.claude\plans\playful-juggling-fog.md`.
 
-## Root cause (verified: TRACE + CHGPRI probes + oracle A/B)
-- `sub_11E598` / `sub_11E620` (CRI enter/exit) boost the CURRENT thread to `[0x4418F0]`=1
-  and save its old priority in ONE global, `[0x449210]`.
-- `noop_sub_e690` @0x11E690 boosts the SofDec worker from OUTSIDE that bracket
-  (`CHGPRI ra=0x11e6e8`). The worker then enters the CRI section already boosted, saves
-  **1** as its "original", and every later restore re-pins it at priority 1.
-- Worker at pri 1 never sleeps (BAIL C, g36=1) and starves main (pri 24), which holds g36
-  inside `sub_155630` and so never clears it. Self-sustaining livelock.
-- Oracle `[0x449210]` = 0x19 (25). Ours = 0x1.
+## Done this session
+- Guest FP rounding made PCSX2-exact (`Ps2ApplyGuestFpMode`, `FPU_SQRT_S` -> nearest).
+  Projection matrix now bit-exact at the title. **Not the cause of the warp** (still smeared after).
+- Fix A `ps2_gs_rasterizer.cpp` drawTriangle: perspective divide was cancelled -> affine textures.
+- Fix B `ps2_gs_gpu.cpp` vertexKick: ADC=1 / XYZ3 kicks skipped the strip rotation -> stale triangles.
+- Both `cl /Zs` clean. Built 06:14, run 06:21. Smearing gone.
+- Pre-fix copies of both GS files are in the session scratchpad only (not in the repo).
 
-## Fix B (in place, keep it)
-- `ps2xRuntime/src/lib/ps2_runtime.cpp`, inside the 1 Hz `[thsync]` sampler (~line 5360):
-  guarded write `[0x449210] = [0x441908]` (the game's own original).
-- `PS2X_FIX_SAVEPRI=0` disables it -- the A/B switch.
-- Result: fired once (`was=1 now=25`); nLive 1->0, g36 1->0, slots all-zero (oracle
-  signature), w6tick 107 M -> frozen, worker at pri 25.
-- Built into `RelWithDebInfo` exe 2026-09-12 12:45. **Not committed.**
+## Uncommitted core-file edits (all approved)
+`ps2_runtime_macros.h`, `ps2_runtime.cpp`, `game_overrides.cpp`, `ps2_gs_rasterizer.cpp`, `ps2_gs_gpu.cpp`.
+Not committed -- commit only if asked.
 
-## Where it stops now
-- `[warn:stat] acc` froze at **4.0167** at t~123 (SofDec init), BEFORE teardown finished.
-- Host `progress` collapses ~65x after t=274; **no thread RUNNING** -- t1 and t6 both READY,
-  parked at `0x174B30` (ChangeThreadPriority).
-- t=296: worker re-boosted to pri 1, `savepri=24 savetid=1` -- same bug, thread 1 as victim.
-  Fix B's guard cannot catch it (requires `saveTid == wAtid`).
+## Next -- Ranking screen sky (NOT yet proven to be a bug)
+1. User: let PCSX2 run the attract loop to the **Ranking** screen. Take a screenshot there and
+   a GS dump (lands in `PCSX2\snaps`). Take a recomp screenshot too.
+2. Compare. If PCSX2's sky is right way up:
+   - `python build_scripts/gsdump_parse.py <dump>.gs.zst --emit-replay gsdump/ranking.gsr`
+   - replay through our rasterizer (`PS2X_GSDUMP` / `PS2X_GSDUMP_OUT`). Needs a ps2xTest build.
+     Part 118 says `ps2x_tests` no longer builds (6 stale test files) -- check first.
+   - Replay upside down = our rasterizer. Right way up = GS emission upstream.
+3. Already on disk: `logs/vucap/demo10` = PCSX2 VU1 capture of the Ranking 3D background (Part 118).
+4. Also: does PCSX2 show characters or a platform on Ranking? If yes, that is a separate bug.
 
-## Next step
-Scheduler side: **why do two READY threads sit parked inside ChangeThreadPriority with none
-running?** Start in `ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp` and
-`ps2xRuntime/src/lib/Kernel/EeScheduler.cpp` -- both locally modified, diff them first.
-Read-only work; no build needed to start. Part 88's "EE scheduler exonerated" is now only
-half true.
+## Other open items
+- EE `div.s`: PCSX2 rounds nearest, ours chops (788 inlined `/` sites -> generator change).
+- Re-measure the old 67.5% vs 12.2% Z-saturation premise (it was scene-mismatched).
+- Flagged GS items in Part 119 section 3 (PRMODE, XYOFFSET sub-pixel, V4-5 `<<3`, etc.).
 
 ## Do NOT
-- **Do not run long to "wait out" the 83-s timer.** It is frozen, not slow.
-- Do not patch BAIL C -- it is a correct re-entrancy guard.
-- Do not chase `0x14C8C8` / `0x14E8B0` -- they fired n=0; the hang was upstream in the stop.
-- Do not trust `[thsync]` VERDICT strings -- written for the old livelock, now stale.
-
-## Superseded this session
-- Part 111's `[0x500728]` gate: NOT the wall -- `rgate=1` measured with the wall still up.
-- Previous handoff's stuck fade byte `[0x500E50]` (Part 112): **not re-checked this session.**
-  It may be a downstream symptom of this livelock, or it may be the new stall. Unverified --
-  worth one read of `[0x500E50]` in the next run's logs before assuming either.
-- `PS2X_SKIPFMV`: EXONERATED -- the player leaked with movies played for real.
-
-## Standing rules unchanged
-User runs all builds/launches. No runner-file or `.h` edits. See the STOP section of
-`PS2_PROJECT_STATE.md`.
+- Don't chase the warp in the matrix/FPU path again -- falsified.
+- `PS2X_GSHISTORY_DUMP` records from boot with no start gate: useless for a late screen
+  unless a start-time option is added (core file -- ask first).
+- Clear `PS2X_VUROUND` in the shell before runs (it lingered once).
