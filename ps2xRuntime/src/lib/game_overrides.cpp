@@ -1906,6 +1906,23 @@ namespace
         for (const RecoveredFn &rf : kRecoveredFns)
         {
             runtime.registerFunction(rf.addr, rf.fn);
+
+            // Interior words too. The generated table maps every instruction of
+            // a body to that body, and EeScheduler resumes a thread by looking
+            // up its saved pc (hasFunction(context.pc)). With only the entry
+            // registered, a thread that yields inside a recovered body resumes
+            // into a hole and is made dormant. 2026-09-14 22:00 run: thread 1
+            // yielded in the vtable call at 0x1aca88 inside sub_001AC6F0, its
+            // resume pc 0x1aca90 had no slot, and the game froze at t=1451.
+            // Only EMPTY slots are filled, so an override or a neighbouring
+            // body keeps its words.
+            for (uint32_t a = rf.addr + 4u; a < rf.end; a += 4u)
+            {
+                if (!runtime.hasFunction(a))
+                {
+                    runtime.registerFunction(a, rf.fn);
+                }
+            }
         }
 
         registerSdbzSyscallThunks(runtime, std::make_index_sequence<kSdbzSyscallThunkCount>{});
@@ -7148,6 +7165,425 @@ namespace
     }
 
     // =====================================================================
+    // [mtx] WARPED 3D -- THE EE-SIDE TRANSFORM MATRIX  (2026-09-15)
+    // =====================================================================
+    // Measured against a scene-matched PCSX2 capture of the same screen
+    // (CAppDemoMain scores, VU1 program bfe66b4a67 @tpc 0x084):
+    //
+    //   our emitted GIF vertices: Z >= 2^23 in 67.5%, max exactly 0xFFFFFF
+    //   PCSX2 on the same screen: 12.2%
+    //   our VF11.z negative 66.9% of runs vs PCSX2 7.9%
+    //
+    // The VU1 side is EXONERATED: replaying PCSX2's own capture through our
+    // VIF1+VU1 gives 4240 runs / 0 mismatches, and the VU1 microcode we
+    // upload is a byte-exact copy of the ELF's VIF-MPG blobs.  What differs
+    // is the INPUT: VU1 qwords 0..2 hold a DENSE matrix in ours where PCSX2
+    // holds a clean projection (716.6 / -836 / -2048,-2048,1279,-1), and the
+    // V4-32 unpack that fills them carries those floats VERBATIM -- so the EE
+    // wrote them.  PCSX2 builds that block at 0x509010 via
+    //
+    //   mat4_multiply_0x108220(dest=0x509050, srcA=0x508E90, srcB=0x509010)
+    //
+    // confirmed exactly on a paused snapshot (view was identity, so the
+    // product came out byte-identical to the projection).
+    //
+    // This probe answers the one question the captures cannot: does OUR EE
+    // compute a wrong 0x509010, and who writes it?  It hooks the multiply
+    // itself (arguments + the three blocks, before and after) and the caller
+    // 0x108bc0 that sets the block addresses up.
+    //
+    // Off unless PS2X_MTX is set, so it costs one relaxed load when unused.
+    constexpr uint32_t kMtxProj = 0x00509010u;   // srcB: projection block
+    constexpr uint32_t kMtxView = 0x00508E90u;   // srcA: view/camera block
+    constexpr uint32_t kMtxProd = 0x00509050u;   // dest: product block
+    constexpr uint32_t kMtxMultiplyAddr = 0x00108220u;
+    constexpr uint32_t kMtxSetupAddr = 0x00108BC0u;
+    constexpr uint64_t kMtxMaxEmit = 12u;
+    constexpr unsigned kMtxStatPeriodSec = 5u;
+
+    // Round 3 (2026-09-15).  The 5 s reporter is a RACE against the scene:
+    // 0x509010 row2 only holds the screen projection while CAppTitleMain is
+    // up.  Run A caught that window in 14 of 110 samples; run B (VUROUND=1)
+    // caught it in 0 of 110, so the A/B never saw the word it exists to
+    // compare -- an inconclusive run, NOT a negative result.  These gate a
+    // second emit path that latches on the VALUE instead of the clock.
+    constexpr uint32_t kMtxProj2ShapeW = 0xBF800000u;  // -1.0f: perspective row
+    constexpr uint64_t kMtxProj2MaxEmit = 64u;
+
+    // Round 2 (2026-09-15).  Round 1 answered the original question: our
+    // 0x509010 IS the projection, and with an identity view the product equals
+    // it bit-for-bit (130 stat lines, 0 mismatches, and 58 non-identity lines
+    // that do NOT match -- so the probe reads live values, not a stale copy).
+    //
+    // What round 1 also showed is a ONE-WORD divergence it was not aimed at:
+    //
+    //     0x509010 row2 = (-2048, -2048, Z, -1)
+    //     PCSX2  Z = 1279.0 (0x449fe000)     ours Z = 1280.0 (0x44a00000)
+    //
+    // Z comes out of  (-1.000152588)*(-8388501) + (-1)*(8388501): a
+    // cancellation of two ~8.39e6 values whose ULP is exactly 1.0, so one
+    // rounding step decides the entire answer --
+    //     round-to-nearest  (plain SSE, what PS2_VMUL/PS2_VADD do) -> 1280
+    //     round-toward-zero (what the EE FPU and the VUs do)       -> 1279
+    // PCSX2 defaults the FPU and both VUs to Chop/Zero with DaZ/FTZ
+    // (Pcsx2Config.cpp:31) and SLUS-21442 carries no roundModes override.
+    //
+    // PS2X_VUROUND flips the host fp mode on the guest thread so we can re-read
+    // that same word.  1280 -> 1279 confirms the mechanism; 1280 -> 1280 kills
+    // it.  DIAGNOSTIC ONLY: MXCSR is per-thread and the guest thread also runs
+    // host runtime code, so this is the experiment, not the shipping fix -- that
+    // belongs in ps2_runtime_macros.h / guest-thread start and needs sign-off.
+    constexpr uint32_t kMtxNdc = 0x00508ED0u;    // NDC projection  (srcA of 0x509010)
+    constexpr uint32_t kMtxVp = 0x00508FD0u;     // depth viewport  (srcB of 0x509010)
+    constexpr uint32_t kMtxNdc2 = 0x00509090u;   // NDC projection, live-path srcB
+    constexpr uint32_t kMtxMvp = 0x005090D0u;    // view x NDC proj, live-path dest
+
+    // Only the rows that feed the cancelled word, so the arithmetic can be
+    // re-derived offline from the log alone without another run.
+    struct MtxWatch
+    {
+        const char *tag;
+        uint32_t addr;
+    };
+    constexpr unsigned kMtxWatchCount = 8u;
+    constexpr MtxWatch kMtxWatch[kMtxWatchCount] = {
+        {"ndc.r2", kMtxNdc + 0x20u},
+        {"ndc.r3", kMtxNdc + 0x30u},
+        {"vp.r2", kMtxVp + 0x20u},
+        {"vp.r3", kMtxVp + 0x30u},
+        {"scr.r0", kMtxProj + 0x00u},
+        {"scr.r2", kMtxProj + 0x20u},
+        {"ndc2.r2", kMtxNdc2 + 0x20u},
+        {"mvp.r2", kMtxMvp + 0x20u},
+    };
+
+    // Scene identity, so this log lines up against the PCSX2 poller directly.
+    // Round 1's comparison was NOT scene-matched: ours sat in a moving-camera
+    // scene at t=850 while the PCSX2 capture was the identity-camera scores
+    // screen -- enough on its own to explain a "dense vs clean" difference.
+    constexpr uint32_t kMtxAppMain = 0x0063FDF0u;   // current app = [kMtxAppMain+4]
+    constexpr uint32_t kMtxDemoA = 0x00632B90u;     // CAppDemoMain A, the sequencer
+
+    bool mtxEnabled()
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("PS2X_MTX");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
+    }
+
+    bool mtxRoundEnabled()
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("PS2X_VUROUND");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
+    }
+
+    std::atomic<uint32_t> g_mtxCsrApplied{0};
+
+    // Runs on the guest thread -- wrappers are called from it, and the guest is
+    // a single std::thread (ps2_runtime.cpp:3563) -- so one set covers every
+    // guest float op: MSVC x64 under the default /fp:precise emits SSE scalar
+    // for the FPU_*_S macros too, not only for the PS2_V* intrinsics.
+    void mtxApplyGuestFpMode()
+    {
+        if (!mtxRoundEnabled())
+        {
+            return;
+        }
+        static thread_local bool applied = false;
+        if (applied)
+        {
+            return;
+        }
+        applied = true;
+        unsigned int csr = _mm_getcsr();
+        csr = (csr & ~0x6000u) | 0x6000u;   // RC = round toward zero
+        csr |= 0x8000u;                     // FTZ: flush denormal results
+        csr |= 0x0040u;                     // DAZ: denormal inputs read as zero
+        _mm_setcsr(csr);
+        g_mtxCsrApplied.store(_mm_getcsr(), std::memory_order_relaxed);
+        std::cerr << "[mtx] guest FP mode set: MXCSR=0x" << std::hex
+                  << g_mtxCsrApplied.load(std::memory_order_relaxed) << std::dec
+                  << " (RZ+FTZ+DAZ)" << std::endl;
+    }
+
+    PS2Runtime::RecompiledFunction g_mtxMultiplyOrig = nullptr;
+    PS2Runtime::RecompiledFunction g_mtxSetupOrig = nullptr;
+    std::atomic<uint64_t> g_mtxMultiplyCalls{0};
+    std::atomic<uint64_t> g_mtxSetupCalls{0};
+    std::atomic<uint32_t> g_mtxLastA0{0};
+    std::atomic<uint32_t> g_mtxLastA1{0};
+    std::atomic<uint32_t> g_mtxLastA2{0};
+    std::atomic<uint32_t> g_mtxFirstRa{0};
+    // Last product row0 and projection row0/row2, as raw float bits. Row 2 is
+    // the one holding (-2048,-2048,1279,-1) on PCSX2 -- its absence in ours is
+    // the whole finding, so it is worth its own field.
+    std::atomic<uint32_t> g_mtxProjRow0[4];
+    std::atomic<uint32_t> g_mtxProjRow2[4];
+    std::atomic<uint32_t> g_mtxProdRow0[4];
+    std::atomic<uint32_t> g_mtxViewRow0[4];
+    std::atomic<uint32_t> g_mtxWatchRows[kMtxWatchCount][4];
+    std::atomic<uint32_t> g_mtxSceneApp{0};
+    std::atomic<uint32_t> g_mtxSceneStep{0};
+    std::atomic<uint32_t> g_mtxSceneNext{0};
+    std::atomic<uint32_t> g_mtxSceneExit{0};
+    std::atomic<uint32_t> g_mtxSceneSub{0};
+
+    uint32_t mtxRead32(const uint8_t *rdram, uint32_t guestAddr)
+    {
+        if (rdram == nullptr || guestAddr == 0u || guestAddr >= 0x02000000u)
+        {
+            return 0xFFFFFFFFu;
+        }
+        uint32_t v = 0u;
+        std::memcpy(&v, rdram + (guestAddr & 0x01FFFFFCu), sizeof(v));
+        return v;
+    }
+
+    void mtxSnapRow(const uint8_t *rdram, uint32_t guestAddr, std::atomic<uint32_t> *dst)
+    {
+        for (uint32_t i = 0; i < 4u; ++i)
+        {
+            dst[i].store(mtxRead32(rdram, guestAddr + i * 4u), std::memory_order_relaxed);
+        }
+    }
+
+    uint8_t mtxRead8(const uint8_t *rdram, uint32_t guestAddr)
+    {
+        if (rdram == nullptr || guestAddr == 0u || guestAddr >= 0x02000000u)
+        {
+            return 0xFFu;
+        }
+        return rdram[guestAddr & 0x01FFFFFFu];
+    }
+
+    void mtxSnapWatch(const uint8_t *rdram)
+    {
+        for (unsigned w = 0; w < kMtxWatchCount; ++w)
+        {
+            mtxSnapRow(rdram, kMtxWatch[w].addr, g_mtxWatchRows[w]);
+        }
+    }
+
+    // The same fields the PCSX2 poller prints, so the two logs compare directly.
+    void mtxSnapScene(const uint8_t *rdram)
+    {
+        g_mtxSceneApp.store(mtxRead32(rdram, kMtxAppMain + 4u), std::memory_order_relaxed);
+        g_mtxSceneStep.store(mtxRead8(rdram, kMtxDemoA + 0x28u), std::memory_order_relaxed);
+        g_mtxSceneNext.store(mtxRead8(rdram, kMtxDemoA + 0x29u), std::memory_order_relaxed);
+        g_mtxSceneExit.store(mtxRead8(rdram, kMtxDemoA + 0x2Au), std::memory_order_relaxed);
+        g_mtxSceneSub.store(mtxRead8(rdram, kMtxDemoA + 0x30u), std::memory_order_relaxed);
+    }
+
+    // Floats are logged as raw hex AND as decimal: the raw half survives
+    // denormals and NaNs that a decimal-only line would hide, and denormal
+    // survivors are themselves a signal (real VU0 flushes them to zero).
+    void mtxAppendRow(std::ostringstream &oss, const char *tag, const std::atomic<uint32_t> *row)
+    {
+        oss << ' ' << tag << "=[";
+        for (uint32_t i = 0; i < 4u; ++i)
+        {
+            const uint32_t bits = row[i].load(std::memory_order_relaxed);
+            float f = 0.0f;
+            std::memcpy(&f, &bits, sizeof(f));
+            oss << (i ? "," : "") << "0x" << std::hex << bits << std::dec << '(' << f << ')';
+        }
+        oss << ']';
+    }
+
+    void mtxStatLine(const char *why)
+    {
+        std::ostringstream oss;
+        oss << "[mtx:stat] why=" << why
+            << " multiply=" << std::dec << g_mtxMultiplyCalls.load(std::memory_order_relaxed)
+            << "/" << (g_mtxMultiplyOrig != nullptr ? 1 : 0)
+            << " setup=" << g_mtxSetupCalls.load(std::memory_order_relaxed)
+            << "/" << (g_mtxSetupOrig != nullptr ? 1 : 0)
+            << std::hex
+            << " a0=0x" << g_mtxLastA0.load(std::memory_order_relaxed)
+            << " a1=0x" << g_mtxLastA1.load(std::memory_order_relaxed)
+            << " a2=0x" << g_mtxLastA2.load(std::memory_order_relaxed)
+            << " ra0=0x" << g_mtxFirstRa.load(std::memory_order_relaxed)
+            << std::dec;
+        oss << " rz=" << (mtxRoundEnabled() ? 1 : 0)
+            << std::hex
+            << " csr=0x" << g_mtxCsrApplied.load(std::memory_order_relaxed)
+            << " scene=0x" << g_mtxSceneApp.load(std::memory_order_relaxed)
+            << std::dec
+            << " A.step=" << g_mtxSceneStep.load(std::memory_order_relaxed)
+            << " A.next=" << g_mtxSceneNext.load(std::memory_order_relaxed)
+            << " A.exit=" << g_mtxSceneExit.load(std::memory_order_relaxed)
+            << " A.sub=" << g_mtxSceneSub.load(std::memory_order_relaxed);
+        mtxAppendRow(oss, "view0", g_mtxViewRow0);
+        mtxAppendRow(oss, "proj0", g_mtxProjRow0);
+        mtxAppendRow(oss, "proj2", g_mtxProjRow2);
+        mtxAppendRow(oss, "prod0", g_mtxProdRow0);
+        for (unsigned w = 0; w < kMtxWatchCount; ++w)
+        {
+            mtxAppendRow(oss, kMtxWatch[w].tag, g_mtxWatchRows[w]);
+        }
+        oss << '\n';
+        std::cerr << oss.str();
+    }
+
+    void mtxMultiplyWrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        mtxApplyGuestFpMode();
+        // Report the MXCSR actually in force on the guest thread, not the one
+        // this probe set. Since 2026-09-16 the runtime sets guest FP mode
+        // globally at gameThread start, so mtxApplyGuestFpMode() early-returns
+        // when PS2X_VUROUND is unset -- and the old cached value would then
+        // log csr=0x0, reading as "rounding never applied" when it in fact is.
+        g_mtxCsrApplied.store(_mm_getcsr(), std::memory_order_relaxed);
+        const PS2Runtime::RecompiledFunction original = g_mtxMultiplyOrig;
+        if (original == nullptr)
+        {
+            return;
+        }
+        uint32_t a0 = 0u, a1 = 0u, a2 = 0u;
+        const bool on = mtxEnabled() && ctx != nullptr;
+        uint64_t seq = 0u;
+        if (on)
+        {
+            a0 = GPR_U32(ctx, 4);
+            a1 = GPR_U32(ctx, 5);
+            a2 = GPR_U32(ctx, 6);
+            seq = g_mtxMultiplyCalls.fetch_add(1u, std::memory_order_relaxed);
+            g_mtxLastA0.store(a0, std::memory_order_relaxed);
+            g_mtxLastA1.store(a1, std::memory_order_relaxed);
+            g_mtxLastA2.store(a2, std::memory_order_relaxed);
+            if (seq == 0u)
+            {
+                g_mtxFirstRa.store(GPR_U32(ctx, 31), std::memory_order_relaxed);
+            }
+        }
+        original(rdram, ctx, runtime);
+        if (!on)
+        {
+            return;
+        }
+        // Read AFTER the call: dest holds the product, and the sources are
+        // unchanged by the multiply, so one pass captures all three.
+        mtxSnapRow(rdram, kMtxView, g_mtxViewRow0);
+        mtxSnapRow(rdram, kMtxProj, g_mtxProjRow0);
+        mtxSnapRow(rdram, kMtxProj + 0x20u, g_mtxProjRow2);
+        mtxSnapRow(rdram, kMtxProd, g_mtxProdRow0);
+        mtxSnapWatch(rdram);
+        mtxSnapScene(rdram);
+        // Emit whenever row2 CHANGES, so catching the projection no longer
+        // depends on when the reporter thread happens to wake up.  Keyed on
+        // (z,w): z is the word under test and w separates the perspective row
+        // from the block's other tenants.
+        {
+            static std::atomic<uint64_t> proj2Key{~0ull};
+            static std::atomic<uint64_t> proj2Emits{0u};
+            static std::atomic<uint32_t> proj2ShapeSeen{0u};
+            const uint32_t pz = g_mtxProjRow2[2].load(std::memory_order_relaxed);
+            const uint32_t pw = g_mtxProjRow2[3].load(std::memory_order_relaxed);
+            const uint64_t key = (static_cast<uint64_t>(pz) << 32) | pw;
+            if (proj2Key.exchange(key, std::memory_order_relaxed) != key)
+            {
+                // The perspective row's FIRST appearance is the whole point of
+                // the run, so it emits even if churn already burned the budget.
+                const bool shape = (pw == kMtxProj2ShapeW) &&
+                                   (proj2ShapeSeen.exchange(1u, std::memory_order_relaxed) == 0u);
+                if (shape || proj2Emits.fetch_add(1u, std::memory_order_relaxed) < kMtxProj2MaxEmit)
+                {
+                    mtxStatLine(shape ? "proj2.shape" : "proj2");
+                }
+            }
+        }
+        if (seq < kMtxMaxEmit)
+        {
+            std::ostringstream oss;
+            oss << "[mtx] multiply seq=" << std::dec << seq
+                << std::hex << " dest=0x" << a0 << " srcA=0x" << a1 << " srcB=0x" << a2
+                << std::dec;
+            mtxAppendRow(oss, "srcB0", g_mtxProjRow0);
+            mtxAppendRow(oss, "srcB2", g_mtxProjRow2);
+            mtxAppendRow(oss, "dest0", g_mtxProdRow0);
+            oss << '\n';
+            std::cerr << oss.str();
+        }
+        else if (seq == kMtxMaxEmit)
+        {
+            std::cerr << "[cap] tag=mtx.multiply limit=" << std::dec << kMtxMaxEmit
+                      << " -- later calls are still COUNTED; read [mtx:stat]\n";
+        }
+    }
+
+    void mtxSetupWrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        mtxApplyGuestFpMode();
+        const PS2Runtime::RecompiledFunction original = g_mtxSetupOrig;
+        if (original == nullptr)
+        {
+            return;
+        }
+        const bool on = mtxEnabled() && ctx != nullptr;
+        uint64_t seq = 0u;
+        if (on)
+        {
+            seq = g_mtxSetupCalls.fetch_add(1u, std::memory_order_relaxed);
+        }
+        original(rdram, ctx, runtime);
+        if (on && seq < kMtxMaxEmit)
+        {
+            mtxSnapRow(rdram, kMtxProj, g_mtxProjRow0);
+            mtxSnapRow(rdram, kMtxProj + 0x20u, g_mtxProjRow2);
+            std::ostringstream oss;
+            oss << "[mtx] setup seq=" << std::dec << seq << " (0x108bc0 returned)";
+            mtxAppendRow(oss, "proj0", g_mtxProjRow0);
+            mtxAppendRow(oss, "proj2", g_mtxProjRow2);
+            oss << '\n';
+            std::cerr << oss.str();
+        }
+    }
+
+    void applySdbzMatrixProbe(PS2Runtime &runtime)
+    {
+        g_mtxMultiplyOrig = runtime.lookupFunction(kMtxMultiplyAddr);
+        g_mtxSetupOrig = runtime.lookupFunction(kMtxSetupAddr);
+        if (g_mtxMultiplyOrig != nullptr)
+        {
+            runtime.replaceFunction(kMtxMultiplyAddr, &mtxMultiplyWrapper);
+        }
+        if (g_mtxSetupOrig != nullptr)
+        {
+            runtime.replaceFunction(kMtxSetupAddr, &mtxSetupWrapper);
+        }
+
+        std::cerr << "[mtx] enabled=" << (mtxEnabled() ? 1 : 0)
+                  << " multiply=0x" << std::hex << kMtxMultiplyAddr
+                  << (g_mtxMultiplyOrig != nullptr ? "(hooked)" : "(MISSING)")
+                  << " setup=0x" << kMtxSetupAddr
+                  << (g_mtxSetupOrig != nullptr ? "(hooked)" : "(MISSING)")
+                  << std::dec << " statEvery=" << kMtxStatPeriodSec
+                  << "s rz=" << (mtxRoundEnabled() ? 1 : 0)
+                  << " (PS2X_MTX=1 enables; PS2X_VUROUND=1 sets guest RZ+FTZ+DAZ)"
+                  << std::endl;
+
+        if (!mtxEnabled())
+        {
+            return;
+        }
+        static std::once_flag mtxReporterOnce;
+        std::call_once(mtxReporterOnce, [] {
+            std::thread([] {
+                for (;;)
+                {
+                    std::this_thread::sleep_for(std::chrono::seconds(kMtxStatPeriodSec));
+                    mtxStatLine("periodic");
+                }
+            }).detach();
+        });
+    }
+
+    // =====================================================================
     // STAGE 5.16 -- SRD COMPLETION PROBE  (run 67 follow-up, 2026-08-19)
     // =====================================================================
     // Run 67's coverage census killed the sleeping-CRI-thread hypothesis:
@@ -8252,7 +8688,10 @@ namespace
     // NOT stubbed: the third app sharing this vtable shape (0x3E2E80 open /
     // 0x3E2FF0 close, vtable 0x4F9AA0). Its +0x0C is wrap_effect_mgr_set_flag
     // rather than a return-1 stub, so it is a different app class and not an
-    // opening logo. Do not add it without re-deriving that.
+    // opening logo. 2026-09-15: re-derived on PCSX2 -- it is the OPENING MOVIE
+    // app (0x3E2E80 opens movie/op_usa.sfd via 0x113AA0 at 0x3E2F50). The host
+    // player (Kernel/Fmv/FmvHost.cpp, PS2X_FMV=host) owns it; the skip stubs
+    // still leave it alone.
     constexpr uint32_t kSkipFmvFns[4] = {
         0x00420E70u, // CAppLogoAtari   open
         0x00420FC0u, // CAppLogoAtari   close  <- where we hang today
@@ -8324,6 +8763,7 @@ namespace
     PS2_REGISTER_GAME_OVERRIDE("SDBZ Sofdec per-frame driver probe", "SLUS_214.42", 0u, 0u, &applySdbzSofdecProbe);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ SRD completion probe", "SLUS_214.42", 0u, 0u, &applySdbzSrdProbe);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ SIF sreg + logo-step probe", "SLUS_214.42", 0u, 0u, &applySdbzSregProbe);
+    PS2_REGISTER_GAME_OVERRIDE("SDBZ transform-matrix probe", "SLUS_214.42", 0u, 0u, &applySdbzMatrixProbe);
     // Must stay LAST: it replaces 0x420E70, which the sreg probe above also
     // replaces, and the later apply wins.
     PS2_REGISTER_GAME_OVERRIDE("SDBZ opening-logo FMV skip", "SLUS_214.42", 0u, 0u, &applySdbzSkipFmv);

@@ -8,6 +8,7 @@
 #include "runtime/ps2_pipeline_stats.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1106,6 +1107,175 @@ namespace
     }
 
     // -----------------------------------------------------------------------
+    // [texmiss] "drawn but never uploaded" texture log, read by
+    // build_scripts/texmiss.py. Opt-in:
+    //
+    //     PS2X_TEXMISS_LOG=<path>
+    //
+    // Streams every Draw / Transfer / Present history event for the WHOLE run,
+    // one JSON line each, flushed once per GIF packet drain. Independent of
+    // PS2X_GSHISTORY_DUMP below, which keeps its one-shot draws-only behaviour.
+    //
+    // While active:
+    //   - GifTag / Register events are not recorded (recordDebugEventUnlocked),
+    //     so the 512-entry ring only holds events this log uses.
+    //   - Draw entries carry XYOFFSET in regValue and CLAMP in gifSizeBytes (low
+    //     32 bits) / gifNloop (high 32 bits). Those fields are unused on Draw rows
+    //     (the F1 panel prints them only for GifTag / Register rows). The vertex
+    //     bbox is raw primitive space (XYZ / 16), so the checker needs XYOFFSET to
+    //     find framebuffer pixels, and CLAMP to narrow the texels a draw reads.
+    //   - Ring overflow is never silent: a "LOSS" line counts dropped events.
+    //   - If something else paused history (F1 panel), it is resumed and a
+    //     "PAUSED" line is written: events recorded while paused are lost.
+    // -----------------------------------------------------------------------
+    static bool g_texmissInitialized = false;
+    static std::FILE *g_texmissFile = nullptr;
+    static bool g_texmissPauseReported = false;
+    static uint64_t g_texmissLostEvents = 0;
+    static std::chrono::steady_clock::time_point g_texmissStart;
+
+    inline bool texmissActive()
+    {
+        return g_texmissFile != nullptr;
+    }
+
+    double texmissSeconds()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_texmissStart).count();
+    }
+
+    void texmissEnsureInit(GS &gs)
+    {
+        if (g_texmissInitialized)
+        {
+            return;
+        }
+        g_texmissInitialized = true;
+
+        const char *path = std::getenv("PS2X_TEXMISS_LOG");
+        if (!path || !*path)
+        {
+            return;
+        }
+        g_texmissFile = std::fopen(path, "wb");
+        if (!g_texmissFile)
+        {
+            std::cerr << "[texmiss] FAILED to open path=" << path << std::endl;
+            return;
+        }
+        g_texmissStart = std::chrono::steady_clock::now();
+        gs.setDebugHistoryPaused(false);
+        // ring = GS::kDebugHistoryCapacity (ps2_gs_gpu.h).
+        std::fprintf(g_texmissFile, "{\"k\":\"H\",\"ver\":1,\"ring\":512}\n");
+        std::fflush(g_texmissFile);
+        std::cerr << "[texmiss] ACTIVE path=" << path << " ring=512" << std::endl;
+    }
+
+    void texmissResumeIfPaused(GS &gs)
+    {
+        if (!texmissActive() || !gs.isDebugHistoryPaused())
+        {
+            return;
+        }
+        gs.setDebugHistoryPaused(false);
+        std::fprintf(g_texmissFile, "{\"k\":\"PAUSED\",\"t\":%.3f}\n", texmissSeconds());
+        if (!g_texmissPauseReported)
+        {
+            g_texmissPauseReported = true;
+            std::cerr << "[texmiss] history was paused (F1 panel or GSHISTORY) -- resumed; events while paused are lost" << std::endl;
+        }
+    }
+
+    void texmissWriteBatch(const std::vector<GSDebugHistoryEntry> &batch)
+    {
+        std::FILE *f = g_texmissFile;
+        if (!f || batch.empty())
+        {
+            return;
+        }
+        const double t = texmissSeconds();
+
+        // seq restarts at 1 on every clearDebugHistory(), and filtered kinds
+        // never take a seq, so last seq > entries kept means the ring wrapped.
+        const uint64_t lastSeq = batch.back().seq;
+        if (lastSeq > batch.size())
+        {
+            const uint64_t dropped = lastSeq - batch.size();
+            g_texmissLostEvents += dropped;
+            std::fprintf(f, "{\"k\":\"LOSS\",\"v\":%llu,\"t\":%.3f,\"dropped\":%llu,\"total\":%llu}\n",
+                         static_cast<unsigned long long>(batch.back().vsyncTick), t,
+                         static_cast<unsigned long long>(dropped),
+                         static_cast<unsigned long long>(g_texmissLostEvents));
+        }
+
+        for (const GSDebugHistoryEntry &e : batch)
+        {
+            const unsigned long long seq = static_cast<unsigned long long>(e.seq);
+            const unsigned long long tick = static_cast<unsigned long long>(e.vsyncTick);
+            if (e.kind == GSDebugEventKind::Draw)
+            {
+                const unsigned long long clamp =
+                    static_cast<unsigned long long>(e.gifSizeBytes) |
+                    (static_cast<unsigned long long>(e.gifNloop) << 32);
+                std::fprintf(f,
+                    "{\"k\":\"D\",\"s\":%llu,\"v\":%llu,\"t\":%.3f,"
+                    "\"prim\":%u,\"tme\":%u,\"ctxt\":%u,\"n\":%u,"
+                    "\"fbp\":%u,\"fbw\":%u,\"fpsm\":%u,\"fbmsk\":%u,"
+                    "\"x0\":%.4f,\"y0\":%.4f,\"x1\":%.4f,\"y1\":%.4f,"
+                    "\"sc\":[%u,%u,%u,%u],\"ofx\":%u,\"ofy\":%u,\"clamp\":%llu,"
+                    "\"tbp\":%u,\"tbw\":%u,\"psm\":%u,\"tw\":%u,\"th\":%u,"
+                    "\"cbp\":%u,\"cpsm\":%u,\"csm\":%u,\"csa\":%u,\"cld\":%u}\n",
+                    seq, tick, t,
+                    static_cast<unsigned>(e.prim.prim), e.prim.tme ? 1u : 0u, e.prim.ctxt ? 1u : 0u,
+                    static_cast<unsigned>(e.vertexCount),
+                    static_cast<unsigned>(e.frame.fbp), static_cast<unsigned>(e.frame.fbw),
+                    static_cast<unsigned>(e.frame.psm), static_cast<unsigned>(e.frame.fbmsk),
+                    static_cast<double>(e.xMin), static_cast<double>(e.yMin),
+                    static_cast<double>(e.xMax), static_cast<double>(e.yMax),
+                    static_cast<unsigned>(e.scissor.x0), static_cast<unsigned>(e.scissor.y0),
+                    static_cast<unsigned>(e.scissor.x1), static_cast<unsigned>(e.scissor.y1),
+                    static_cast<unsigned>(e.regValue & 0xFFFFull),
+                    static_cast<unsigned>((e.regValue >> 32) & 0xFFFFull),
+                    clamp,
+                    static_cast<unsigned>(e.tex0.tbp0), static_cast<unsigned>(e.tex0.tbw),
+                    static_cast<unsigned>(e.tex0.psm),
+                    static_cast<unsigned>(e.tex0.tw), static_cast<unsigned>(e.tex0.th),
+                    static_cast<unsigned>(e.tex0.cbp), static_cast<unsigned>(e.tex0.cpsm),
+                    static_cast<unsigned>(e.tex0.csm), static_cast<unsigned>(e.tex0.csa),
+                    static_cast<unsigned>(e.tex0.cld));
+            }
+            else if (e.kind == GSDebugEventKind::Transfer)
+            {
+                std::fprintf(f,
+                    "{\"k\":\"X\",\"s\":%llu,\"v\":%llu,\"t\":%.3f,\"xdir\":%u,"
+                    "\"sbp\":%u,\"sbw\":%u,\"spsm\":%u,\"sx\":%u,\"sy\":%u,"
+                    "\"dbp\":%u,\"dbw\":%u,\"dpsm\":%u,\"dx\":%u,\"dy\":%u,"
+                    "\"w\":%u,\"h\":%u,\"px\":%u}\n",
+                    seq, tick, t, static_cast<unsigned>(e.trxdir & 3u),
+                    static_cast<unsigned>(e.bitbltbuf.sbp), static_cast<unsigned>(e.bitbltbuf.sbw),
+                    static_cast<unsigned>(e.bitbltbuf.spsm),
+                    static_cast<unsigned>(e.trxpos.ssax), static_cast<unsigned>(e.trxpos.ssay),
+                    static_cast<unsigned>(e.bitbltbuf.dbp), static_cast<unsigned>(e.bitbltbuf.dbw),
+                    static_cast<unsigned>(e.bitbltbuf.dpsm),
+                    static_cast<unsigned>(e.trxpos.dsax), static_cast<unsigned>(e.trxpos.dsay),
+                    static_cast<unsigned>(e.trxreg.rrw), static_cast<unsigned>(e.trxreg.rrh),
+                    static_cast<unsigned>(e.transferPixels));
+            }
+            else if (e.kind == GSDebugEventKind::Present)
+            {
+                std::fprintf(f,
+                    "{\"k\":\"P\",\"s\":%llu,\"v\":%llu,\"t\":%.3f,"
+                    "\"dfbp\":%u,\"sfbp\":%u,\"w\":%u,\"h\":%u,\"pref\":%u}\n",
+                    seq, tick, t,
+                    static_cast<unsigned>(e.displayFbp), static_cast<unsigned>(e.sourceFbp),
+                    static_cast<unsigned>(e.width), static_cast<unsigned>(e.height),
+                    e.usedPreferred ? 1u : 0u);
+            }
+        }
+        std::fflush(f);
+    }
+
+    // -----------------------------------------------------------------------
     // Live-side counterpart to `gsdump_draws.py --emit-jsonl`. Stage 5.11 needs
     // to diff the live EE path's actual TEX0/CLUT/draw state against an
     // authentic PCSX2 dump; the debug-history ring (GSDebugHistoryEntry) already
@@ -1152,12 +1322,23 @@ namespace
             }
         }
 
-        if (!active || done)
+        texmissEnsureInit(gs);
+        const bool gsHistoryActive = active && !done;
+        if (!gsHistoryActive && !texmissActive())
         {
             return;
         }
 
-        for (GSDebugHistoryEntry e : gs.getDebugHistory())
+        texmissResumeIfPaused(gs);
+        const std::vector<GSDebugHistoryEntry> batch = gs.getDebugHistory();
+        texmissWriteBatch(batch);
+        if (!gsHistoryActive)
+        {
+            gs.clearDebugHistory();
+            return;
+        }
+
+        for (GSDebugHistoryEntry e : batch)
         {
             if (e.kind != GSDebugEventKind::Draw)
             {
@@ -1211,7 +1392,10 @@ namespace
             std::fclose(f);
         }
 
-        gs.setDebugHistoryPaused(true);
+        if (!texmissActive())
+        {
+            gs.setDebugHistoryPaused(true);
+        }
         done = true;
         accum.clear();
     }
@@ -1494,6 +1678,14 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
         return;
     }
 
+    // [texmiss] keep the 512-entry ring for the kinds that log uses. Filtered
+    // before seq is taken, so texmiss's seq-based loss count stays exact.
+    if (texmissActive() &&
+        (entry.kind == GSDebugEventKind::GifTag || entry.kind == GSDebugEventKind::Register))
+    {
+        return;
+    }
+
     const uint64_t tick = m_runtime ? ps2_syscalls::GetCurrentVSyncTick(m_runtime) : 0ull;
     if (m_debugLastVsyncTick == UINT64_MAX)
     {
@@ -1607,6 +1799,17 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
         entry.zMax = std::max(entry.zMax, v.z);
         entry.aMin = std::min(entry.aMin, v.a);
         entry.aMax = std::max(entry.aMax, v.a);
+    }
+
+    // [texmiss] stash XYOFFSET / CLAMP in fields Draw rows don't use.
+    // See the texmiss block above gsHistoryDrainAndMaybeFlush.
+    if (texmissActive())
+    {
+        const uint32_t ci = m_registers.prim.ctxt ? 1u : 0u;
+        entry.regValue = m_registers.ctx[ci].xyoffset.data;
+        const uint64_t clamp = m_registers.ctx[ci].clamp.data;
+        entry.gifSizeBytes = static_cast<uint32_t>(clamp);
+        entry.gifNloop = static_cast<uint32_t>(clamp >> 32);
     }
 
     recordDebugEventUnlocked(entry);
@@ -4382,6 +4585,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         GS &gs;
         ~GsHistoryDrainGuard() { gsHistoryDrainAndMaybeFlush(gs); }
     } historyDrainGuard{*this};
+    // [texmiss] open the log before the first packet, so its uploads are kept.
+    texmissEnsureInit(*this);
 
     if (!data || sizeBytes == 0 || !m_vram)
         return;
@@ -5462,9 +5667,10 @@ void GS::vertexKick(bool drawing)
         }
     });
 
-    if (!drawing)
-        return;
-
+    // A non-drawing kick (ADC=1, XYZ3, XYZF3) must still store the vertex AND
+    // slide the window -- only the draw is suppressed. Returning here used to
+    // skip the rotation below, so the next vertex landed in slot 3, which the
+    // rasterizer never reads, and every strip boundary drew a stale triangle.
     const GSPrimReg prim = m_registers.prim;
 
     int needed = 0;
@@ -5498,39 +5704,42 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (ps2_diag::enabled())
+    if (drawing)
     {
-        // Draw-activity stats consumed by the [gs-activity] probe. Gated so
-        // the draw-dispatch hot path pays nothing (no locked RMW) when
-        // diagnostics are off; the reader on the run-loop thread accepts the
-        // relaxed-atomic staleness.
-        const GSContext &drawCtx = activeContext();
-        m_statPrims.fetch_add(1, std::memory_order_relaxed);
-        m_statLastDrawFbp.store(drawCtx.frame.fbp, std::memory_order_relaxed);
-
-        // [gs:frame-change]: unthrottled — FBP changes are rare and are the
-        // single most useful signal for spotting render-target thrash.
-        static uint32_t s_prevDrawFbp = 0xFFFFFFFFu;
-        if (drawCtx.frame.fbp != s_prevDrawFbp)
+        if (ps2_diag::enabled())
         {
-            const int ctxIndex = m_registers.prim.ctxt ? 1 : 0;
-            RUNTIME_LOG("[gs:frame-change] prim=" << static_cast<uint32_t>(prim.prim)
-                                                   << " ctx=" << ctxIndex
-                                                   << " frame.fbp=0x" << std::hex << drawCtx.frame.fbp
-                                                   << " frame.fbw=" << std::dec << drawCtx.frame.fbw
-                                                   << " frame.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.frame.psm)
-                                                   << " tex0.tbp=0x" << drawCtx.tex0.tbp0
-                                                   << " tex0.tbw=" << std::dec << static_cast<uint32_t>(drawCtx.tex0.tbw)
-                                                   << " tex0.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.tex0.psm)
-                                                   << std::dec
-                                                   << " tme=" << static_cast<uint32_t>(m_registers.prim.tme ? 1u : 0u)
-                                                   << " prmodecont=" << static_cast<uint32_t>(m_registers.prmodecont.ac ? 1u : 0u));
-            s_prevDrawFbp = drawCtx.frame.fbp;
-        }
-    }
+            // Draw-activity stats consumed by the [gs-activity] probe. Gated so
+            // the draw-dispatch hot path pays nothing (no locked RMW) when
+            // diagnostics are off; the reader on the run-loop thread accepts the
+            // relaxed-atomic staleness.
+            const GSContext &drawCtx = activeContext();
+            m_statPrims.fetch_add(1, std::memory_order_relaxed);
+            m_statLastDrawFbp.store(drawCtx.frame.fbp, std::memory_order_relaxed);
 
-    m_rasterizer.drawPrimitive(this);
-    recordDrawDebugEventUnlocked(needed);
+            // [gs:frame-change]: unthrottled — FBP changes are rare and are the
+            // single most useful signal for spotting render-target thrash.
+            static uint32_t s_prevDrawFbp = 0xFFFFFFFFu;
+            if (drawCtx.frame.fbp != s_prevDrawFbp)
+            {
+                const int ctxIndex = m_registers.prim.ctxt ? 1 : 0;
+                RUNTIME_LOG("[gs:frame-change] prim=" << static_cast<uint32_t>(prim.prim)
+                                                       << " ctx=" << ctxIndex
+                                                       << " frame.fbp=0x" << std::hex << drawCtx.frame.fbp
+                                                       << " frame.fbw=" << std::dec << drawCtx.frame.fbw
+                                                       << " frame.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.frame.psm)
+                                                       << " tex0.tbp=0x" << drawCtx.tex0.tbp0
+                                                       << " tex0.tbw=" << std::dec << static_cast<uint32_t>(drawCtx.tex0.tbw)
+                                                       << " tex0.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.tex0.psm)
+                                                       << std::dec
+                                                       << " tme=" << static_cast<uint32_t>(m_registers.prim.tme ? 1u : 0u)
+                                                       << " prmodecont=" << static_cast<uint32_t>(m_registers.prmodecont.ac ? 1u : 0u));
+                s_prevDrawFbp = drawCtx.frame.fbp;
+            }
+        }
+
+        m_rasterizer.drawPrimitive(this);
+        recordDrawDebugEventUnlocked(needed);
+    }
 
     switch (prim.prim)
     {

@@ -2,6 +2,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_pipeline_stats.h"
 #include "runtime/ps2_diag.h"
+#include "Kernel/VuCap/VuCapRecorder.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <cstdio>
@@ -50,25 +51,6 @@ enum VIFCmd : uint8_t
     VIF_DIRECT = 0x50,
     VIF_DIRECTHL = 0x51,
 };
-
-namespace
-{
-    constexpr uint8_t kGifFmtImage = 2u;
-
-    uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
-    {
-        if (!data || sizeBytes < 16u)
-            return 0u;
-
-        uint64_t tagLo = 0u;
-        std::memcpy(&tagLo, data, sizeof(tagLo));
-        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
-        if (flg != kGifFmtImage)
-            return 0u;
-
-        return static_cast<uint32_t>(tagLo & 0x7FFFu);
-    }
-}
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
@@ -326,6 +308,12 @@ namespace
         if (!vif1DumpArmed(sizeBytes))
             return;
 
+        // Only a buffer that actually desynced is worth the one-shot: the clean
+        // warning-screen buffers (264-331 KB) would otherwise claim it long
+        // before the title's bad ones arrive.
+        if (firstBadPos == 0xFFFFFFFFu)
+            return;
+
         const char *path = vif1DumpPath();
 
         // Claim before touching the file so two DMA threads cannot interleave
@@ -357,6 +345,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+
+    // PS2X_VUCAP recorder (Kernel/VuCap): this buffer, plus MEMSYNC when the EE
+    // wrote VU1 memory since the previous call. Named so it lives to the return.
+    vucap::VifCallScope vucapScope(data, sizeBytes, m_vu1Code, m_vu1Data, vif1_regs);
 
     ps2_pipeline_stats::g_vif1Calls.fetch_add(1, std::memory_order_relaxed);
     ps2_pipeline_stats::g_vif1Bytes.fetch_add(sizeBytes, std::memory_order_relaxed);
@@ -454,41 +446,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
-        {
-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            if (availableQw == 0u)
-            {
-                break;
-            }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            ps2diag_gifpath::g_curSite.store(1u, std::memory_order_relaxed);
-            ps2diag_gifpath::g_curSrc.store(dsSrcAt(pos), std::memory_order_relaxed);
-            submitGifPacket(GifPathId::Path2,
-                            imagePacket.data(),
-                            static_cast<uint32_t>(imagePacket.size()),
-                            true,
-                            m_vif1PendingPath2DirectHl);
-            ps2diag_gifpath::g_curSite.store(0u, std::memory_order_relaxed);
-            ps2diag_gifpath::g_curSrc.store(0xFFFFFFFFu, std::memory_order_relaxed);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
-            continue;
-        }
-
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
@@ -690,16 +647,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 ps2diag_gifpath::g_curSite.store(0u, std::memory_order_relaxed);
                 ps2diag_gifpath::g_curSrc.store(0xFFFFFFFFu, std::memory_order_relaxed);
 
-                const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
-                if (imageQw != 0u)
-                {
-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
-                    if (imageQw > inlineImageQw)
-                    {
-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
-                        m_vif1PendingPath2DirectHl = directHl;
-                    }
-                }
+                // No VIF-level image carry-over: a DIRECT command's own count
+                // decides its length. An IMAGE tag whose pixels spill into the
+                // next DIRECT is continued by the GS (m_pendingImageBytes).
+                // Guessing here read pixel data as a tag at the SDBZ title and
+                // swallowed real VIF commands as pixels.
             }
 
             pos += qwCount * 16;

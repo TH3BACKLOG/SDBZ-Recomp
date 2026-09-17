@@ -3,6 +3,7 @@
 #include "ps2_log.h"
 #include "Stubs/GS.h"
 #include "runtime/ee_scheduler.h"
+#include "Kernel/VuCap/VuCapRecorder.h"
 
 #include <bit>
 #include <cstdlib> // std::getenv / std::strtoull for the determinism knobs below
@@ -499,6 +500,7 @@ namespace ps2_syscalls
                 // processEvent(VBlankStart) concurrently increments it would
                 // be a real data race.
                 const uint64_t tickValue = g_vblankTicks.fetch_add(1, std::memory_order_relaxed) + 1u;
+                ::vucap::onVSync(tickValue); // PS2X_VUCAP recorder: arms windows, writes VSYNC
 
                 // Post (thread-safe: interruptWorkerMain is a separate OS
                 // thread, dispatchIrq()/completeVSync() assert executor-thread-

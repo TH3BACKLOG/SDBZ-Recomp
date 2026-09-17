@@ -24,6 +24,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_runtime_interrupt_tests.cpp
     src/ps2_memory_tests.cpp
     src/ps2_vu1_tests.cpp
+    src/ps2_vu1_capture_replay_tests.cpp
     src/ps2_vu_tests.cpp
     src/ps2_gs_tests.cpp
     src/ps2_gsdump_replay_tests.cpp
@@ -56,6 +57,30 @@ add_executable(ps2x_tests
     src/recomp_override_stubs.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
+
+# VU1 capture replay only (no ps2_test_lib), so it builds even when unrelated
+# test files fall behind runtime API changes.
+add_executable(ps2x_vucap_replay
+    src/vucap_replay_main.cpp
+    src/ps2_vu1_capture_replay_tests.cpp
+    src/recomp_override_stubs.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+target_include_directories(ps2x_vucap_replay PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+)
+
+target_link_libraries(ps2x_vucap_replay PRIVATE
+    ps2_runtime
+    ps2_iop
+)
+
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_vucap_replay)
+endif()
 
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
 if(PRINT_GENERATED_CODE)

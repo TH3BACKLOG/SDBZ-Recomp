@@ -46,6 +46,7 @@ HEADER = os.path.join(DEST, "recovered_functions.h")
 
 ADDR_RE = re.compile(r"_0x([0-9a-fA-F]+)\.cpp$")
 SYM_RE = re.compile(r"^void\s+(\w+)\s*\(uint8_t\s*\*\s*rdram", re.M)
+RANGE_RE = re.compile(r"^// Address: 0x([0-9a-fA-F]+) - 0x([0-9a-fA-F]+)", re.M)
 
 BANNER = '''#pragma once
 //
@@ -121,34 +122,50 @@ def gen_header():
     entries = []
     for p in sorted(glob.glob(os.path.join(DEST, "*.cpp"))):
         m = ADDR_RE.search(os.path.basename(p))
-        sym = SYM_RE.search(open(p, errors="ignore").read())
-        if not (m and sym):
-            print(f"  WARN: no address/symbol in {os.path.basename(p)}, skipped")
+        txt = open(p, errors="ignore").read()
+        sym = SYM_RE.search(txt)
+        rng = RANGE_RE.search(txt)
+        if not (m and sym and rng):
+            print(f"  WARN: no address/symbol/range in {os.path.basename(p)}, skipped")
             continue
-        entries.append((int(m.group(1), 16), sym.group(1)))
+        addr = int(m.group(1), 16)
+        start, end = int(rng.group(1), 16), int(rng.group(2), 16)
+        if start != addr or end <= start:
+            print(f"  WARN: range 0x{start:x}-0x{end:x} does not match {os.path.basename(p)}, skipped")
+            continue
+        entries.append((addr, end, sym.group(1)))
     entries.sort()
 
     lines = [BANNER]
-    for addr, sym in entries:
+    for addr, end, sym in entries:
         lines.append(f"void {sym}(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);\n")
     lines.append("""
 // Guest address -> recovered body. Addresses already claimed by a hand-written
 // override (registerFunction or replaceFunction in game_overrides.cpp) are
 // deliberately absent: the working override must keep the address.
+//
+// `end` (exclusive) comes from the body's own "// Address: start - end" line.
+// The generated table maps EVERY instruction of a body to that body, and the EE
+// scheduler resumes a thread by looking up its saved pc -- so registering only
+// the entry leaves a thread that yields inside a recovered body resuming into a
+// hole (2026-09-14: 0x1aca90 inside sub_001AC6F0 froze the game at t=1451).
 struct RecoveredFn
 {
     uint32_t addr;
+    uint32_t end;
     void (*fn)(uint8_t *, R5900Context *, PS2Runtime *);
 };
 
 inline constexpr RecoveredFn kRecoveredFns[] = {
 """)
-    for addr, sym in entries:
-        lines.append(f"    {{0x{addr:08X}u, &{sym}}},\n")
+    for addr, end, sym in entries:
+        lines.append(f"    {{0x{addr:08X}u, 0x{end:08X}u, &{sym}}},\n")
     lines.append("};\n")
 
-    with open(HEADER, "w", newline="\n") as fh:
+    tmp = HEADER + ".tmp"
+    with open(tmp, "w", newline="\n") as fh:
         fh.write("".join(lines))
+    os.replace(tmp, HEADER)
     print(f"wrote {HEADER}: {len(entries)} bodies")
     return len(entries)
 

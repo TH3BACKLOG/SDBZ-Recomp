@@ -2976,15 +2976,15 @@ void GSRasterizer::drawTriangle(GS *gs)
                 }
                 else
                 {
-                    const float invQ0 = 1.0f / fabsQ(v0.q);
-                    const float invQ1 = 1.0f / fabsQ(v1.q);
-                    const float invQ2 = 1.0f / fabsQ(v2.q);
-                    const float sOverQ = (v0.s * invQ0) * w0 + (v1.s * invQ1) * w1 + (v2.s * invQ2) * w2;
-                    const float tOverQ = (v0.t * invQ0) * w0 + (v1.t * invQ1) * w1 + (v2.t * invQ2) * w2;
-                    const float invQ = invQ0 * w0 + invQ1 * w1 + invQ2 * w2;
-                    iq = (std::fabs(invQ) > 1.0e-8f) ? (1.0f / invQ) : 1.0f;
-                    is = sOverQ * iq;
-                    it = tOverQ * iq;
+                    // The GS interpolates S, T and Q LINEARLY in screen space and
+                    // divides per pixel: u = (sum wi*si) / (sum wi*qi). Pre-dividing
+                    // each vertex by its own q here cancelled exactly against
+                    // sampleTexture()'s divide and left affine (PS1-style) texture
+                    // mapping -- invisible on 2D content where q == 1, smeared on 3D.
+                    // sampleTexture() does the one divide, guarded by fabsQ().
+                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
                     iu = 0;
                     iv = 0;
                 }

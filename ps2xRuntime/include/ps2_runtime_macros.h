@@ -140,11 +140,104 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PXOR(a, b) _mm_xor_si128((__m128i)(a), (__m128i)(b))
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
+// ---------------------------------------------------------------------------
+// PS2 float semantics (2026-09-16).
+//
+// The EE FPU and VU0/VU1 round toward zero and treat denormals as zero; the
+// host defaults to round-to-nearest with denormals live.  Verified against
+// PCSX2 on SDBZ's projection matrix at EE 0x509010 during CAppTitleMain:
+//
+//      host round-to-nearest   proj0=0x4433236e  proj2.z=0x44a00000
+//      round-toward-zero       proj0=0x44332362  proj2.z=0x449fe000
+//      PCSX2                   proj0=0x44332362  proj2.z=0x449fe000
+//
+// proj2.z is decided by a single rounding step (catastrophic cancellation of
+// two ~8.39e6 floats whose ULP is exactly 1.0); proj0 is ~12 ULP of
+// accumulated error, so the match there is the stronger of the two.
+//
+// Every PS2_V* and FPU_*_S below is a plain host op, so they all inherit the
+// calling thread's MXCSR -- setting it once on the guest thread covers the
+// lot.  See Ps2ApplyGuestFpMode(), called from PS2Runtime's gameThread.
+//
+// DIV and SQRT are the deliberate exceptions. PCSX2 runs EE divide and EE
+// sqrt at round-to-nearest whatever mode the guest asked for: Pcsx2Config.cpp
+// pins FPUDivFPCR to Nearest, and iFPU.cpp recSQRT_S_xmm loads a nearest MXCSR
+// around the sqrt and restores it after. The helpers below do the same.
+//
+// RSQRT is NOT in that group -- iFPU.cpp recRSQRT_S_xmm leaves the round mode
+// alone -- and neither is anything on the VU side: PCSX2 runs VU0/VU1 blocks
+// under VU0FPCR/VU1FPCR, both chop/zero, and microVU's DIV/SQRT/RSQRT
+// (microVU_Lower.inl) never touch MXCSR at all. Those stay at guest rounding.
+//
+// Read out of PCSX2 master on 2026-09-16, not guessed. Defaults are the ones
+// that apply here: fpuFullMode is off by default, so iFPU.cpp is the live path
+// rather than iFPUd.cpp, and SDBZ's GameDB entry (SLUS-21442) carries no
+// roundModes or clampModes override.
+//
+// Known remaining deviation: the recompiler inlines EE div.s as a raw `/` at
+// 788 sites rather than calling FPU_DIV_S, so guest divides still round toward
+// zero. Closing that needs a generator change, not a runtime one. FPU_SQRT_S
+// has no such problem -- its 108 sites all go through the macro.
+//
+// Also unhandled: on a negative operand PCSX2's sqrt.s returns sqrt(|x|) and
+// raises the I flag, where FPU_SQRT_S returns NaN. Separate question.
+// ---------------------------------------------------------------------------
+
+#define PS2_MXCSR_RC_MASK 0x6000u // bits 14:13, rounding control
+#define PS2_MXCSR_RC_RZ 0x6000u   // RC = round toward zero
+#define PS2_MXCSR_FTZ 0x8000u     // flush denormal results to zero
+#define PS2_MXCSR_DAZ 0x0040u     // denormal inputs read as zero
+
+#if defined(_MSC_VER)
+#pragma fenv_access(on)
+#endif
+
+// Put the calling thread into EE/VU float mode. Idempotent; returns the MXCSR
+// word actually in force so the caller can log what it got rather than what it
+// asked for.
+static inline unsigned int Ps2ApplyGuestFpMode()
+{
+    unsigned int csr = _mm_getcsr();
+    csr = (csr & ~PS2_MXCSR_RC_MASK) | PS2_MXCSR_RC_RZ;
+    csr |= PS2_MXCSR_FTZ;
+    csr |= PS2_MXCSR_DAZ;
+    _mm_setcsr(csr);
+    return _mm_getcsr();
+}
+
+// Divide at round-to-nearest whatever the ambient guest mode is, matching
+// PCSX2. Written with _mm_div_ss / _mm_div_ps rather than `/` so the operation
+// is an opaque intrinsic, which makes it far less liable to be hoisted out
+// from between the two _mm_setcsr calls.
+static inline float Ps2FpuDivS(float a, float b)
+{
+    const unsigned int saved = _mm_getcsr();
+    _mm_setcsr(saved & ~PS2_MXCSR_RC_MASK);
+    const float r = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(a), _mm_set_ss(b)));
+    _mm_setcsr(saved);
+    return r;
+}
+
+// Same treatment for EE sqrt.s. Only the rounding mode is changed here; the
+// negative-operand behaviour is left exactly as it was (see above).
+static inline float Ps2FpuSqrtS(float a)
+{
+    const unsigned int saved = _mm_getcsr();
+    _mm_setcsr(saved & ~PS2_MXCSR_RC_MASK);
+    const float r = _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(a)));
+    _mm_setcsr(saved);
+    return r;
+}
+
+#if defined(_MSC_VER)
+#pragma fenv_access(off)
+#endif
+
 // PS2 VU (Vector Unit) operations
 #define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
 #define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
 #define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
-#define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
+#define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b)) // guest rounding: microVU never overrides MXCSR
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
@@ -608,8 +701,8 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
 #define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
 #define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) sqrtf((float)(a))
+#define FPU_DIV_S(a, b) Ps2FpuDivS((float)(a), (float)(b)) // nearest, per PCSX2
+#define FPU_SQRT_S(a) Ps2FpuSqrtS((float)(a)) // nearest, per PCSX2 iFPU.cpp
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))

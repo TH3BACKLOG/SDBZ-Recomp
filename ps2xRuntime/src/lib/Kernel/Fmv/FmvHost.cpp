@@ -79,13 +79,24 @@ namespace ps2x_fmv
         // apart, and :5073 records the literal disc path \MOVIE\ATARI.SFD;1.
         // Two logo apps, two opens, in that order.
         //
-        // OP.SFD (named by MOVIE/0FLIST.DIR) is the later attract-mode opening
-        // played by a DIFFERENT app. The table is extensible on purpose; do not
-        // wire OP here without re-deriving its phase addresses.
+        // OPENING: the USA build opens "movie/op_usa.sfd" (string 0x4d7a50), not
+        // the OP.SFD that MOVIE/0FLIST.DIR names. Phase addresses re-derived on
+        // PCSX2 2026-09-15, not by resemblance: 0x113AA0 (the movie open) has
+        // exactly three callers -- 0x420f40 (ATARI), 0x4217b0 (OKR) and
+        // 0x3e2f50, whose delay-slot addiu loads 0x4d7a50. 0x3e2f50 sits in
+        // 0x3e2e80, a step machine identical in shape to 0x420e70 (state at
+        // [obj+48], arms 0xF..0x1, same 0x100/0x1C0 open args). 0x3e2ff0 opens
+        // with the same jal 0x113920 as 0x420fc0. Both sit in vtable 0x4f9a70 at
+        // +0x38 / +0x40 (the slots [lstick:stat] reports), so they are dispatched
+        // and replaceable. game_overrides.cpp's [crisrv] notes already had
+        // 0x3e2ff0 as "wait for the movie to end, 83 s safety net"; OP_USA.SFD
+        // runs 81.35 s. 0x3e2ff0 also polls the pad and calls 0x3e1d00 on a
+        // Start-skip; closePhase answers "complete" directly, same as the logos.
         enum MovieId : int
         {
             kMovieAtari = 0,
             kMovieOkrtron = 1,
+            kMovieOpening = 2,
             kMovieCount
         };
 
@@ -101,6 +112,7 @@ namespace ps2x_fmv
         constexpr MovieDef kMovies[kMovieCount] = {
             {"ATARI", "ATARI.SFD", "PS2X_FMV_ATARI", 0x00420E70u, 0x00420FC0u},
             {"OKR", "OKR.SFD", "PS2X_FMV_OKR", 0x004216E0u, 0x00421830u},
+            {"OP", "OP_USA.SFD", "PS2X_FMV_OP", 0x003E2E80u, 0x003E2FF0u},
         };
 
         // -------------------------------------------------------------
@@ -173,7 +185,7 @@ namespace ps2x_fmv
         std::atomic<int> s_state{static_cast<int>(State::Idle)};
         std::atomic<bool> s_abort{false};
         std::atomic<int> s_activeMovie{-1};
-        bool s_completed[kMovieCount] = {false, false};
+        bool s_completed[kMovieCount] = {};
 
         std::thread s_player;
         std::mutex s_frameMutex;
@@ -477,7 +489,7 @@ namespace ps2x_fmv
             const unsigned probe = probeTicks();
             if (probe != 0u)
             {
-                static unsigned s_probeCount[kMovieCount] = {0u, 0u};
+                static unsigned s_probeCount[kMovieCount] = {};
                 if (s_probeCount[movie] < probe)
                 {
                     ++s_probeCount[movie];
@@ -560,6 +572,14 @@ namespace ps2x_fmv
         {
             openPhase(kMovieOkrtron, rdram, ctx, runtime);
         }
+
+        void openOpening(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            openPhase(kMovieOpening, rdram, ctx, runtime);
+        }
+
+        constexpr PS2Runtime::RecompiledFunction kOpenHooks[kMovieCount] = {
+            &openAtari, &openOkrtron, &openOpening};
 
         void closePhase(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
@@ -694,8 +714,7 @@ extern "C" void ps2x_fmv_host_install(PS2Runtime *runtime)
     for (int i = 0; i < kMovieCount; ++i)
     {
         const MovieDef &def = kMovies[i];
-        PS2Runtime::RecompiledFunction openFn =
-            (i == kMovieAtari) ? &openAtari : &openOkrtron;
+        PS2Runtime::RecompiledFunction openFn = kOpenHooks[i];
         if (runtime->lookupFunction(def.openFn) != nullptr &&
             runtime->replaceFunction(def.openFn, openFn))
         {
@@ -712,10 +731,12 @@ extern "C" void ps2x_fmv_host_install(PS2Runtime *runtime)
     // already printed by now (the skip defaults ON) and would otherwise mislead.
     // A partial install must not read as success --
     // see feedback_stubbed_hardware_has_no_error_path.
+    const unsigned expected = 2u * static_cast<unsigned>(kMovieCount);
     std::cerr << "[fmvhost] ACTIVE -- host FFmpeg player owns"
-                 " 0x420e70/0x420fc0/0x4216e0/0x421830, OVERRIDING [skipfmv]'s stubs."
-                 " installed=" << installed << "/4"
-              << (installed == 4u ? "" : "  <-- INCOMPLETE, expected 4")
+                 " 0x420e70/0x420fc0/0x4216e0/0x421830/0x3e2e80/0x3e2ff0,"
+                 " OVERRIDING [skipfmv]'s stubs."
+                 " installed=" << installed << "/" << expected
+              << (installed == expected ? "" : "  <-- INCOMPLETE")
               << (probeTicks() != 0u ? "  [PROBE MODE: no decoding]" : "")
               << std::endl;
 }

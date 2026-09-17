@@ -4,6 +4,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_pipeline_stats.h"
 #include "ps2_vu1_detail.h"
+#include "Kernel/VuCap/VuCapRecorder.h"
 
 #include <algorithm>
 #include <cfenv>
@@ -922,6 +923,9 @@ void VU1Interpreter::finishXgkick()
 
     ps2_pipeline_stats::g_xgkicks.fetch_add(1, std::memory_order_relaxed);
     ps2_pipeline_stats::g_xgkickBytes.fetch_add(m_xgkick.totalBytes, std::memory_order_relaxed);
+
+    if (vucap::hot())
+        vucap::kick(m_xgkick.sourceAddress, m_xgkick.packet.data(), m_xgkick.totalBytes);
 
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);

@@ -11,6 +11,7 @@
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
+#include "Kernel/VuCap/VuCapRecorder.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Stubs/Pad.h"
@@ -1298,6 +1299,7 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    vucap::setStateSource(&m_vu1.state());
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
@@ -1312,9 +1314,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool vucapOn = vucap::hot();
+                                     const uint64_t vucapCycles = m_vu1.state().cycles;
+                                     if (vucapOn)
+                                         vucap::runStart(startPC >> 3, top, itop, m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                         m_vu1.state(), cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     if (vucapOn)
+                                         vucap::runEnd(m_vu1.state(), m_vu1.state().cycles - vucapCycles >= 65536u,
+                                                       cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -1331,9 +1341,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool vucapOn = vucap::hot();
+                                     const uint64_t vucapCycles = m_vu1.state().cycles;
+                                     if (vucapOn)
+                                         vucap::runStart(m_vu1.state().pc >> 3, top, itop, m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                         m_vu1.state(), cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     if (vucapOn)
+                                         vucap::runEnd(m_vu1.state(), m_vu1.state().cycles - vucapCycles >= 65536u,
+                                                       cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -3545,6 +3563,33 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
     {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        // EE/VU float semantics (2026-09-16). The EE FPU and both VUs round
+        // toward zero with denormals flushed; the host defaults to
+        // round-to-nearest. Nothing in the runtime set MXCSR before this, so
+        // every guest float op ran in the wrong mode. Confirmed against PCSX2
+        // on SDBZ's projection matrix at EE 0x509010 - see the comment over
+        // Ps2ApplyGuestFpMode() in ps2_runtime_macros.h for the words.
+        //
+        // EeScheduler runs ALL guest threads cooperatively on this one OS
+        // thread (see the comment above), and the interrupt worker posts
+        // events rather than touching guest context, so this single call
+        // covers all guest execution.
+        //
+        // PS2X_GUEST_FP=0 restores host rounding for A/B comparison.
+        {
+            const char *fpEnv = std::getenv("PS2X_GUEST_FP");
+            if (fpEnv != nullptr && fpEnv[0] == '0')
+            {
+                RUNTIME_LOG("[fp] guest FP mode DISABLED by PS2X_GUEST_FP=0"
+                            " - host round-to-nearest" << std::endl);
+            }
+            else
+            {
+                const unsigned int csr = Ps2ApplyGuestFpMode();
+                RUNTIME_LOG("[fp] guest FP mode: MXCSR=0x" << std::hex << csr
+                            << std::dec << " (RZ+FTZ+DAZ)" << std::endl);
+            }
+        }
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);

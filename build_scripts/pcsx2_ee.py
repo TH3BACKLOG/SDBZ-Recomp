@@ -77,13 +77,56 @@ def main():
                     help="read LEN bytes at ADDR into OUT (binary)")
     ap.add_argument("--peek", nargs=2, metavar=("ADDR", "LEN"),
                     help="read and hexdump to stdout")
+    ap.add_argument("--vucap", metavar="OUT",
+                    help="vucap build only: record VU1/VIF1/XGKICK traffic to OUT (.vucap)")
+    ap.add_argument("--frames", type=int, default=60,
+                    help="frames to record with --vucap (0 = until --vucap-stop)")
+    ap.add_argument("--fullmem", nargs=2, type=int, metavar=("FIRST", "LAST"),
+                    help="also store full VU1 data memory for runs FIRST..LAST (1-based)")
+    ap.add_argument("--wait", action="store_true",
+                    help="with --vucap: poll until the capture is done")
+    ap.add_argument("--vucap-status", action="store_true", help="print capture status")
+    ap.add_argument("--vucap-stop", action="store_true", help="stop the capture")
     args = ap.parse_args()
 
-    if not args.dump and not args.peek:
-        ap.error("one of --dump or --peek is required")
+    if not (args.dump or args.peek or args.vucap or args.vucap_status or args.vucap_stop):
+        ap.error("one of --dump, --peek, --vucap, --vucap-status, --vucap-stop is required")
 
     srv = DebugServer(args.host, args.port)
     try:
+        if args.vucap:
+            import os
+            import time
+            first, last = args.fullmem if args.fullmem else (1, 0)
+            srv.send({"cmd": "vucap", "path": os.path.abspath(args.vucap),
+                      "frames": args.frames, "fullmem_from": first, "fullmem_to": last})
+            print(f"vucap requested -> {os.path.abspath(args.vucap)} ({args.frames} frames)")
+            polls = 0
+            started = False
+            while args.wait:
+                st = srv.send({"cmd": "vucap_status"})["data"]
+                polls += 1
+                print(f"  {st['state']}: frames={st['frames']} runs={st['runs']} "
+                      f"kicks={st['kick_chunks']} bytes={st['bytes']}")
+                # The request is picked up at the next vsync, so the state seen right
+                # after sending it is still the PREVIOUS capture's ("done"/"idle").
+                # Only a state reached after armed/capturing belongs to this request.
+                if st["state"] in ("armed", "capturing"):
+                    started = True
+                if (started and st["state"] in ("done", "idle")) or st["state"] == "error" \
+                        or (not started and polls > 30):
+                    if st["error"]:
+                        print(f"  error: {st['error']}")
+                    break
+                time.sleep(1.0)
+
+        if args.vucap_stop:
+            srv.send({"cmd": "vucap_stop"})
+            print("vucap stop requested")
+
+        if args.vucap_status:
+            print(json.dumps(srv.send({"cmd": "vucap_status"})["data"], indent=2))
+
         if args.peek:
             addr = int(args.peek[0], 0)
             data = srv.read_range(addr, int(args.peek[1], 0), args.cpu)

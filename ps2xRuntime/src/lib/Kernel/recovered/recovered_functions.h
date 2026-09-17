@@ -33,285 +33,190 @@
 struct R5900Context;
 class PS2Runtime;
 
-void sub_199240_tail00103F30_0x103f30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00115348_0x115348(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001153C8_0x1153c8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117248_0x117248(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117498_0x117498(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001174F8_0x1174f8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117558_0x117558(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117580_0x117580(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117588_0x117588(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117590_0x117590(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001175A8_0x1175a8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001175B0_0x1175b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117710_0x117710(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117730_0x117730(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00117978_0x117978(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00119B70_0x119b70(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00119F38_0x119f38(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00121CC8_0x121cc8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00121DC8_0x121dc8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00122108_0x122108(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001242C8_0x1242c8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0012BFB0_0x12bfb0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0012C0A8_0x12c0a8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0012EA80_0x12ea80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0012EA90_0x12ea90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0012EAA0_0x12eaa0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0012EAB0_0x12eab0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0012EB18_0x12eb18(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_132430_tail0012F750_0x12f750(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001314B0_0x1314b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001314D0_0x1314d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001314F0_0x1314f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00137590_0x137590(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001375E0_0x1375e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00137628_0x137628(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00137630_0x137630(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00137888_0x137888(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00138018_0x138018(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00138110_0x138110(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001384C0_0x1384c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00138568_0x138568(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001385A8_0x1385a8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001385F8_0x1385f8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001386C0_0x1386c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001386F0_0x1386f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00138720_0x138720(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00138758_0x138758(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00138788_0x138788(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00138A28_0x138a28(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0013AF20_0x13af20(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0013C8E8_0x13c8e8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0013C940_0x13c940(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0013CA18_0x13ca18(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_14A840_tail0014A890_0x14a890(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0014D010_0x14d010(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0014E330_0x14e330(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001505F0_0x1505f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00155808_0x155808(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00130348_0x130348(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001581B8_0x1581b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001582D8_0x1582d8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001590F0_0x1590f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0015B7D8_0x15b7d8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0015B7F0_0x15b7f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0015BB78_0x15bb78(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0015E460_0x15e460(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00167D08_0x167d08(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016B368_0x16b368(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016B398_0x16b398(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016B580_0x16b580(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016C888_0x16c888(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016C898_0x16c898(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E0D0_0x16e0d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E0F0_0x16e0f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E128_0x16e128(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E780_0x16e780(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E788_0x16e788(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E798_0x16e798(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E7A8_0x16e7a8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016E7B8_0x16e7b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F008_0x16f008(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F308_0x16f308(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F328_0x16f328(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F348_0x16f348(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F360_0x16f360(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F3B8_0x16f3b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F4A0_0x16f4a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F4A8_0x16f4a8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F4B0_0x16f4b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F4B8_0x16f4b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F598_0x16f598(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F5A0_0x16f5a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F5A8_0x16f5a8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F5B0_0x16f5b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F5B8_0x16f5b8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_0016F678_0x16f678(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00170110_0x170110(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00170158_0x170158(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_001706E0_0x1706e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00173F90_0x173f90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001750C0_0x1750c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00182820_0x182820(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_186068_tail00182878_0x182878(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_186068_tail00182940_0x182940(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_186068_tail00182AB0_0x182ab0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_186068_tail00182AC8_0x182ac8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_1DBDB0_tail001CD4F0_0x1cd4f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_1DBE00_tail001CD5E0_0x1cd5e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_290A50_tail002A6640_0x2a6640(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_290A70_tail002A6770_0x2a6770(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_2B0530_tail002ADD50_0x2add50(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00177AA8_0x177aa8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00178B58_0x178b58(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0019C5D0_0x19c5d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001AC6F0_0x1ac6f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001AD0B0_0x1ad0b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001AD5A0_0x1ad5a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001AD6A0_0x1ad6a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001AD700_0x1ad700(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001AD760_0x1ad760(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001BA820_0x1ba820(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001BB750_0x1bb750(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001BC2A0_0x1bc2a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001BC4E0_0x1bc4e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001BF270_0x1bf270(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001C0040_0x1c0040(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001C97F0_0x1c97f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001CAF20_0x1caf20(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D2490_0x1d2490(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D2D80_0x1d2d80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D30D0_0x1d30d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D4F00_0x1d4f00(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D6BB0_0x1d6bb0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D83C0_0x1d83c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D93F0_0x1d93f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D9790_0x1d9790(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001D9BC0_0x1d9bc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001DA1B0_0x1da1b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001E5650_0x1e5650(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001EB910_0x1eb910(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001ECF80_0x1ecf80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001EFA00_0x1efa00(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001F01D0_0x1f01d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001F0540_0x1f0540(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001F5560_0x1f5560(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001F56F0_0x1f56f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001F5C90_0x1f5c90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001F5ED0_0x1f5ed0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0022C6D0_0x22c6d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0022CA60_0x22ca60(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0022CDC0_0x22cdc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023B3C0_0x23b3c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023C0E0_0x23c0e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023C2E0_0x23c2e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023C3D0_0x23c3d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023D840_0x23d840(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023E280_0x23e280(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023E490_0x23e490(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0023E530_0x23e530(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002407B0_0x2407b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00240980_0x240980(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00240B10_0x240b10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00241C90_0x241c90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00241CB0_0x241cb0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002972F0_0x2972f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_2B1310_tail002B6880_0x2b6880(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_2E1B80_tail002E3910_0x2e3910(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_2E1B40_tail002E3920_0x2e3920(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002B8AC0_0x2b8ac0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002B94C0_0x2b94c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002CA200_0x2ca200(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002CF080_0x2cf080(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002E3DA0_0x2e3da0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002E3F40_0x2e3f40(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_2F8180_tail002E5010_0x2e5010(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_1F5950_tail002FCD10_0x2fcd10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_309F10_tail00305DE0_0x305de0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_309F30_tail00305DF0_0x305df0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_309FE0_tail00305E00_0x305e00(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_30A000_tail00305E10_0x305e10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_309F90_tail00307100_0x307100(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_30A020_tail00307A40_0x307a40(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_30A050_tail00307F80_0x307f80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_30A320_tail00308600_0x308600(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_40B130_tail00343480_0x343480(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_370C80_tail003704B0_0x3704b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_3793D0_tail00377DA0_0x377da0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_37AA50_tail00379390_0x379390(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_398E10_tail00397C50_0x397c50(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_3A2B60_tail003A26E0_0x3a26e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_3A2B70_tail003A2700_0x3a2700(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_3A32F0_tail003A2ED0_0x3a2ed0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002F4430_0x2f4430(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002F4690_0x2f4690(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002F4E10_0x2f4e10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00300690_0x300690(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0032B8C0_0x32b8c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0038AF90_0x38af90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0038D920_0x38d920(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0038DAC0_0x38dac0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0038DBC0_0x38dbc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0038DCC0_0x38dcc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003A24D0_0x3a24d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003A2D00_0x3a2d00(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003D0770_0x3d0770(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00425028_0x425028(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00425118_0x425118(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
-void sub_00428190_0x428190(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_0042A0E8_0x42a0e8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
 // Guest address -> recovered body. Addresses already claimed by a hand-written
 // override (registerFunction or replaceFunction in game_overrides.cpp) are
 // deliberately absent: the working override must keep the address.
+//
+// `end` (exclusive) comes from the body's own "// Address: start - end" line.
+// The generated table maps EVERY instruction of a body to that body, and the EE
+// scheduler resumes a thread by looking up its saved pc -- so registering only
+// the entry leaves a thread that yields inside a recovered body resuming into a
+// hole (2026-09-14: 0x1aca90 inside sub_001AC6F0 froze the game at t=1451).
 struct RecoveredFn
 {
     uint32_t addr;
+    uint32_t end;
     void (*fn)(uint8_t *, R5900Context *, PS2Runtime *);
 };
 
 inline constexpr RecoveredFn kRecoveredFns[] = {
-    {0x00103F30u, &sub_199240_tail00103F30_0x103f30},
-    {0x00115348u, &sub_00115348_0x115348},
-    {0x001153C8u, &sub_001153C8_0x1153c8},
-    {0x00117248u, &sub_00117248_0x117248},
-    {0x00117498u, &sub_00117498_0x117498},
-    {0x001174F8u, &sub_001174F8_0x1174f8},
-    {0x00117558u, &sub_00117558_0x117558},
-    {0x00117580u, &sub_00117580_0x117580},
-    {0x00117588u, &sub_00117588_0x117588},
-    {0x00117590u, &sub_00117590_0x117590},
-    {0x001175A8u, &sub_001175A8_0x1175a8},
-    {0x001175B0u, &sub_001175B0_0x1175b0},
-    {0x00117710u, &sub_00117710_0x117710},
-    {0x00117730u, &sub_00117730_0x117730},
-    {0x00117978u, &sub_00117978_0x117978},
-    {0x00119B70u, &sub_00119B70_0x119b70},
-    {0x00119F38u, &sub_00119F38_0x119f38},
-    {0x00121CC8u, &sub_00121CC8_0x121cc8},
-    {0x00121DC8u, &sub_00121DC8_0x121dc8},
-    {0x00122108u, &sub_00122108_0x122108},
-    {0x001242C8u, &sub_001242C8_0x1242c8},
-    {0x0012BFB0u, &sub_0012BFB0_0x12bfb0},
-    {0x0012C0A8u, &sub_0012C0A8_0x12c0a8},
-    {0x0012EA80u, &sub_0012EA80_0x12ea80},
-    {0x0012EA90u, &sub_0012EA90_0x12ea90},
-    {0x0012EAA0u, &sub_0012EAA0_0x12eaa0},
-    {0x0012EAB0u, &sub_0012EAB0_0x12eab0},
-    {0x0012EB18u, &sub_0012EB18_0x12eb18},
-    {0x0012F750u, &sub_132430_tail0012F750_0x12f750},
-    {0x001314B0u, &sub_001314B0_0x1314b0},
-    {0x001314D0u, &sub_001314D0_0x1314d0},
-    {0x001314F0u, &sub_001314F0_0x1314f0},
-    {0x00137590u, &sub_00137590_0x137590},
-    {0x001375E0u, &sub_001375E0_0x1375e0},
-    {0x00137628u, &sub_00137628_0x137628},
-    {0x00137630u, &sub_00137630_0x137630},
-    {0x00137888u, &sub_00137888_0x137888},
-    {0x00138018u, &sub_00138018_0x138018},
-    {0x00138110u, &sub_00138110_0x138110},
-    {0x001384C0u, &sub_001384C0_0x1384c0},
-    {0x00138568u, &sub_00138568_0x138568},
-    {0x001385A8u, &sub_001385A8_0x1385a8},
-    {0x001385F8u, &sub_001385F8_0x1385f8},
-    {0x001386C0u, &sub_001386C0_0x1386c0},
-    {0x001386F0u, &sub_001386F0_0x1386f0},
-    {0x00138720u, &sub_00138720_0x138720},
-    {0x00138758u, &sub_00138758_0x138758},
-    {0x00138788u, &sub_00138788_0x138788},
-    {0x00138A28u, &sub_00138A28_0x138a28},
-    {0x0013AF20u, &sub_0013AF20_0x13af20},
-    {0x0013C8E8u, &sub_0013C8E8_0x13c8e8},
-    {0x0013C940u, &sub_0013C940_0x13c940},
-    {0x0013CA18u, &sub_0013CA18_0x13ca18},
-    {0x0014A890u, &sub_14A840_tail0014A890_0x14a890},
-    {0x0014D010u, &sub_0014D010_0x14d010},
-    {0x0014E330u, &sub_0014E330_0x14e330},
-    {0x001505F0u, &sub_001505F0_0x1505f0},
-    {0x00155808u, &sub_00155808_0x155808},
-    {0x001581B8u, &sub_001581B8_0x1581b8},
-    {0x001582D8u, &sub_001582D8_0x1582d8},
-    {0x001590F0u, &sub_001590F0_0x1590f0},
-    {0x0015B7D8u, &sub_0015B7D8_0x15b7d8},
-    {0x0015B7F0u, &sub_0015B7F0_0x15b7f0},
-    {0x0015BB78u, &sub_0015BB78_0x15bb78},
-    {0x0015E460u, &sub_0015E460_0x15e460},
-    {0x00167D08u, &sub_00167D08_0x167d08},
-    {0x0016B368u, &sub_0016B368_0x16b368},
-    {0x0016B398u, &sub_0016B398_0x16b398},
-    {0x0016B580u, &sub_0016B580_0x16b580},
-    {0x0016C888u, &sub_0016C888_0x16c888},
-    {0x0016C898u, &sub_0016C898_0x16c898},
-    {0x0016E0D0u, &sub_0016E0D0_0x16e0d0},
-    {0x0016E0F0u, &sub_0016E0F0_0x16e0f0},
-    {0x0016E128u, &sub_0016E128_0x16e128},
-    {0x0016E780u, &sub_0016E780_0x16e780},
-    {0x0016E788u, &sub_0016E788_0x16e788},
-    {0x0016E798u, &sub_0016E798_0x16e798},
-    {0x0016E7A8u, &sub_0016E7A8_0x16e7a8},
-    {0x0016E7B8u, &sub_0016E7B8_0x16e7b8},
-    {0x0016F008u, &sub_0016F008_0x16f008},
-    {0x0016F308u, &sub_0016F308_0x16f308},
-    {0x0016F328u, &sub_0016F328_0x16f328},
-    {0x0016F348u, &sub_0016F348_0x16f348},
-    {0x0016F360u, &sub_0016F360_0x16f360},
-    {0x0016F3B8u, &sub_0016F3B8_0x16f3b8},
-    {0x0016F4A0u, &sub_0016F4A0_0x16f4a0},
-    {0x0016F4A8u, &sub_0016F4A8_0x16f4a8},
-    {0x0016F4B0u, &sub_0016F4B0_0x16f4b0},
-    {0x0016F4B8u, &sub_0016F4B8_0x16f4b8},
-    {0x0016F598u, &sub_0016F598_0x16f598},
-    {0x0016F5A0u, &sub_0016F5A0_0x16f5a0},
-    {0x0016F5A8u, &sub_0016F5A8_0x16f5a8},
-    {0x0016F5B0u, &sub_0016F5B0_0x16f5b0},
-    {0x0016F5B8u, &sub_0016F5B8_0x16f5b8},
-    {0x0016F678u, &sub_0016F678_0x16f678},
-    {0x00170110u, &sub_00170110_0x170110},
-    {0x00170158u, &sub_00170158_0x170158},
-    {0x001706E0u, &sub_001706E0_0x1706e0},
-    {0x00173F90u, &sub_00173F90_0x173f90},
-    {0x001750C0u, &sub_001750C0_0x1750c0},
-    {0x00182820u, &sub_00182820_0x182820},
-    {0x00182878u, &sub_186068_tail00182878_0x182878},
-    {0x00182940u, &sub_186068_tail00182940_0x182940},
-    {0x00182AB0u, &sub_186068_tail00182AB0_0x182ab0},
-    {0x00182AC8u, &sub_186068_tail00182AC8_0x182ac8},
-    {0x001CD4F0u, &sub_1DBDB0_tail001CD4F0_0x1cd4f0},
-    {0x001CD5E0u, &sub_1DBE00_tail001CD5E0_0x1cd5e0},
-    {0x002A6640u, &sub_290A50_tail002A6640_0x2a6640},
-    {0x002A6770u, &sub_290A70_tail002A6770_0x2a6770},
-    {0x002ADD50u, &sub_2B0530_tail002ADD50_0x2add50},
-    {0x002B6880u, &sub_2B1310_tail002B6880_0x2b6880},
-    {0x002E3910u, &sub_2E1B80_tail002E3910_0x2e3910},
-    {0x002E3920u, &sub_2E1B40_tail002E3920_0x2e3920},
-    {0x002E5010u, &sub_2F8180_tail002E5010_0x2e5010},
-    {0x002FCD10u, &sub_1F5950_tail002FCD10_0x2fcd10},
-    {0x00305DE0u, &sub_309F10_tail00305DE0_0x305de0},
-    {0x00305DF0u, &sub_309F30_tail00305DF0_0x305df0},
-    {0x00305E00u, &sub_309FE0_tail00305E00_0x305e00},
-    {0x00305E10u, &sub_30A000_tail00305E10_0x305e10},
-    {0x00307100u, &sub_309F90_tail00307100_0x307100},
-    {0x00307A40u, &sub_30A020_tail00307A40_0x307a40},
-    {0x00307F80u, &sub_30A050_tail00307F80_0x307f80},
-    {0x00308600u, &sub_30A320_tail00308600_0x308600},
-    {0x00343480u, &sub_40B130_tail00343480_0x343480},
-    {0x003704B0u, &sub_370C80_tail003704B0_0x3704b0},
-    {0x00377DA0u, &sub_3793D0_tail00377DA0_0x377da0},
-    {0x00379390u, &sub_37AA50_tail00379390_0x379390},
-    {0x00397C50u, &sub_398E10_tail00397C50_0x397c50},
-    {0x003A26E0u, &sub_3A2B60_tail003A26E0_0x3a26e0},
-    {0x003A2700u, &sub_3A2B70_tail003A2700_0x3a2700},
-    {0x003A2ED0u, &sub_3A32F0_tail003A2ED0_0x3a2ed0},
-    {0x00425028u, &sub_00425028_0x425028},
-    {0x00425118u, &sub_00425118_0x425118},
-    {0x00428190u, &sub_00428190_0x428190},
-    {0x0042A0E8u, &sub_0042A0E8_0x42a0e8},
+    {0x00119B70u, 0x00119F38u, &sub_00119B70_0x119b70},
+    {0x00119F38u, 0x0011A280u, &sub_00119F38_0x119f38},
+    {0x00130348u, 0x00130360u, &sub_00130348_0x130348},
+    {0x001581B8u, 0x001581E8u, &sub_001581B8_0x1581b8},
+    {0x00173F90u, 0x00174038u, &sub_00173F90_0x173f90},
+    {0x001750C0u, 0x001750D0u, &sub_001750C0_0x1750c0},
+    {0x00177AA8u, 0x00177AB8u, &sub_00177AA8_0x177aa8},
+    {0x00178B58u, 0x00178BE8u, &sub_00178B58_0x178b58},
+    {0x0019C5D0u, 0x0019C5F0u, &sub_0019C5D0_0x19c5d0},
+    {0x001AC6F0u, 0x001AD0B0u, &sub_001AC6F0_0x1ac6f0},
+    {0x001AD0B0u, 0x001AD5A0u, &sub_001AD0B0_0x1ad0b0},
+    {0x001AD5A0u, 0x001AD6A0u, &sub_001AD5A0_0x1ad5a0},
+    {0x001AD6A0u, 0x001AD700u, &sub_001AD6A0_0x1ad6a0},
+    {0x001AD700u, 0x001AD760u, &sub_001AD700_0x1ad700},
+    {0x001AD760u, 0x001AD7B0u, &sub_001AD760_0x1ad760},
+    {0x001BA820u, 0x001BA850u, &sub_001BA820_0x1ba820},
+    {0x001BB750u, 0x001BB780u, &sub_001BB750_0x1bb750},
+    {0x001BC2A0u, 0x001BC340u, &sub_001BC2A0_0x1bc2a0},
+    {0x001BC4E0u, 0x001BC510u, &sub_001BC4E0_0x1bc4e0},
+    {0x001BF270u, 0x001BF2E0u, &sub_001BF270_0x1bf270},
+    {0x001C0040u, 0x001C0060u, &sub_001C0040_0x1c0040},
+    {0x001C97F0u, 0x001C9810u, &sub_001C97F0_0x1c97f0},
+    {0x001CAF20u, 0x001CAF40u, &sub_001CAF20_0x1caf20},
+    {0x001D2490u, 0x001D24B0u, &sub_001D2490_0x1d2490},
+    {0x001D2D80u, 0x001D2DA0u, &sub_001D2D80_0x1d2d80},
+    {0x001D30D0u, 0x001D30F0u, &sub_001D30D0_0x1d30d0},
+    {0x001D4F00u, 0x001D4F20u, &sub_001D4F00_0x1d4f00},
+    {0x001D6BB0u, 0x001D6BD0u, &sub_001D6BB0_0x1d6bb0},
+    {0x001D83C0u, 0x001D83E0u, &sub_001D83C0_0x1d83c0},
+    {0x001D93F0u, 0x001D9410u, &sub_001D93F0_0x1d93f0},
+    {0x001D9790u, 0x001D97B0u, &sub_001D9790_0x1d9790},
+    {0x001D9BC0u, 0x001D9BE0u, &sub_001D9BC0_0x1d9bc0},
+    {0x001DA1B0u, 0x001DA1D0u, &sub_001DA1B0_0x1da1b0},
+    {0x001E5650u, 0x001E5670u, &sub_001E5650_0x1e5650},
+    {0x001EB910u, 0x001EB930u, &sub_001EB910_0x1eb910},
+    {0x001ECF80u, 0x001ECFA0u, &sub_001ECF80_0x1ecf80},
+    {0x001EFA00u, 0x001EFA20u, &sub_001EFA00_0x1efa00},
+    {0x001F01D0u, 0x001F01F0u, &sub_001F01D0_0x1f01d0},
+    {0x001F0540u, 0x001F0560u, &sub_001F0540_0x1f0540},
+    {0x001F5560u, 0x001F5580u, &sub_001F5560_0x1f5560},
+    {0x001F56F0u, 0x001F5710u, &sub_001F56F0_0x1f56f0},
+    {0x001F5C90u, 0x001F5CB0u, &sub_001F5C90_0x1f5c90},
+    {0x001F5ED0u, 0x001F5F10u, &sub_001F5ED0_0x1f5ed0},
+    {0x0022C6D0u, 0x0022C6F0u, &sub_0022C6D0_0x22c6d0},
+    {0x0022CA60u, 0x0022CA80u, &sub_0022CA60_0x22ca60},
+    {0x0022CDC0u, 0x0022CDE0u, &sub_0022CDC0_0x22cdc0},
+    {0x0023B3C0u, 0x0023B3E0u, &sub_0023B3C0_0x23b3c0},
+    {0x0023C0E0u, 0x0023C100u, &sub_0023C0E0_0x23c0e0},
+    {0x0023C2E0u, 0x0023C300u, &sub_0023C2E0_0x23c2e0},
+    {0x0023C3D0u, 0x0023C450u, &sub_0023C3D0_0x23c3d0},
+    {0x0023D840u, 0x0023D860u, &sub_0023D840_0x23d840},
+    {0x0023E280u, 0x0023E2A0u, &sub_0023E280_0x23e280},
+    {0x0023E490u, 0x0023E4B0u, &sub_0023E490_0x23e490},
+    {0x0023E530u, 0x0023E550u, &sub_0023E530_0x23e530},
+    {0x002407B0u, 0x002407D0u, &sub_002407B0_0x2407b0},
+    {0x00240980u, 0x002409A0u, &sub_00240980_0x240980},
+    {0x00240B10u, 0x00240B30u, &sub_00240B10_0x240b10},
+    {0x00241C90u, 0x00241CD0u, &sub_00241C90_0x241c90},
+    {0x00241CB0u, 0x00241CCCu, &sub_00241CB0_0x241cb0},
+    {0x002972F0u, 0x00297310u, &sub_002972F0_0x2972f0},
+    {0x002B6880u, 0x002B6900u, &sub_2B1310_tail002B6880_0x2b6880},
+    {0x002B8AC0u, 0x002B8ADCu, &sub_002B8AC0_0x2b8ac0},
+    {0x002B94C0u, 0x002B94E0u, &sub_002B94C0_0x2b94c0},
+    {0x002CA200u, 0x002CA220u, &sub_002CA200_0x2ca200},
+    {0x002CF080u, 0x002CF0A0u, &sub_002CF080_0x2cf080},
+    {0x002E3DA0u, 0x002E3E60u, &sub_002E3DA0_0x2e3da0},
+    {0x002E3F40u, 0x002E3F60u, &sub_002E3F40_0x2e3f40},
+    {0x002E5010u, 0x002E5040u, &sub_2F8180_tail002E5010_0x2e5010},
+    {0x002F4430u, 0x002F4450u, &sub_002F4430_0x2f4430},
+    {0x002F4690u, 0x002F46B0u, &sub_002F4690_0x2f4690},
+    {0x002F4E10u, 0x002F4E70u, &sub_002F4E10_0x2f4e10},
+    {0x00300690u, 0x003006B0u, &sub_00300690_0x300690},
+    {0x0032B8C0u, 0x0032B8E0u, &sub_0032B8C0_0x32b8c0},
+    {0x0038AF90u, 0x0038B030u, &sub_0038AF90_0x38af90},
+    {0x0038D920u, 0x0038D940u, &sub_0038D920_0x38d920},
+    {0x0038DAC0u, 0x0038DAE0u, &sub_0038DAC0_0x38dac0},
+    {0x0038DBC0u, 0x0038DBE0u, &sub_0038DBC0_0x38dbc0},
+    {0x0038DCC0u, 0x0038DCE0u, &sub_0038DCC0_0x38dcc0},
+    {0x003A24D0u, 0x003A24F0u, &sub_003A24D0_0x3a24d0},
+    {0x003A2D00u, 0x003A2D20u, &sub_003A2D00_0x3a2d00},
+    {0x003D0770u, 0x003D0790u, &sub_003D0770_0x3d0770},
+    {0x00425028u, 0x00425118u, &sub_00425028_0x425028},
+    {0x00425118u, 0x004251D8u, &sub_00425118_0x425118},
+    {0x0042A0E8u, 0x0042A150u, &sub_0042A0E8_0x42a0e8},
 };
