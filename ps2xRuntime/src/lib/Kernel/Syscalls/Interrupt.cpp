@@ -266,7 +266,15 @@ namespace ps2_syscalls
 
     void dispatchDmacHandlersForCause(uint8_t *, PS2Runtime *runtime, uint32_t cause)
     {
-        runtime->eeScheduler().dispatchIrq(true, cause);
+        EeScheduler &ee = runtime->eeScheduler();
+        if (!ee.onExecutorThread())
+        {
+            // Off-executor caller (host threads, unit tests with no bound
+            // executor): dispatchIrq() is executor-only, so queue it.
+            ee.postEvent(EeEvent{EeEventType::Dmac, cause, 0});
+            return;
+        }
+        ee.dispatchIrq(true, cause);
     }
 
     uint64_t GetCurrentVSyncTick(PS2Runtime *runtime)
