@@ -9,7 +9,6 @@
 #include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Stubs/Pad.h"
-#include "runtime/ps2_iop.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "imgui.h"
@@ -78,7 +77,7 @@ namespace
         }
     }
 
-    const char *iopRpcSidName(uint32_t sid)
+    std::string iopRpcSidName(const ps2x::iop::DebugSnapshot &snapshot, uint32_t sid)
     {
         for (const ps2x::iop::DebugService &service : snapshot.services)
         {
@@ -88,6 +87,7 @@ namespace
                 return service.name;
             }
         }
+        return {};
     }
 
     std::string pressedPadButtons(uint16_t activeLowButtons)
@@ -144,7 +144,9 @@ namespace
             {kSifRpcDebugFlagCallback, "callback"},
             {kSifRpcDebugFlagMissingClient, "bad-client"},
             {kSifRpcDebugFlagServerDispatch, "server"},
-            {kSifRpcDebugFlagDtx, "dtx"},
+            {kSifRpcDebugFlagUnhandled, "unhandled"},
+            {kSifRpcDebugFlagFallbackCopy, "fallback-copy"},
+            {kSifRpcDebugFlagFallbackZero, "fallback-zero"},
         };
 
         std::string out;
@@ -158,6 +160,27 @@ namespace
                 }
                 out += name.name;
             }
+        }
+        return out;
+    }
+
+    std::string rpcPreviewBytes(const uint8_t *bytes, uint32_t count)
+    {
+        if (!bytes || count == 0u)
+        {
+            return "";
+        }
+
+        std::string out;
+        char item[4] = {};
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            std::snprintf(item, sizeof(item), "%02X", bytes[i]);
+            if (!out.empty())
+            {
+                out.push_back(' ');
+            }
+            out += item;
         }
         return out;
     }
@@ -911,6 +934,7 @@ namespace
     void drawIopTab(PS2Runtime &runtime)
     {
         uint8_t *rdram = runtime.memory().getRDRAM();
+        const ps2x::iop::DebugSnapshot iopSnapshot = runtime.iopDebugSnapshot();
 
         struct ModuleRow
         {
@@ -968,7 +992,6 @@ namespace
         uint32_t rpcPacketIndex = 0;
         uint32_t rpcServerIndex = 0;
         uint32_t rpcActiveQueue = 0;
-        SoundDriverRpcState soundState{};
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             rpcInitialized = g_rpc_initialized;
@@ -976,8 +999,6 @@ namespace
             rpcPacketIndex = g_rpc_packet_index;
             rpcServerIndex = g_rpc_server_index;
             rpcActiveQueue = g_rpc_active_queue;
-            soundState = g_soundDriverRpcState;
-
             servers.reserve(g_rpc_servers.size());
             for (const auto &[sid, state] : g_rpc_servers)
             {
@@ -1004,24 +1025,6 @@ namespace
                   { return a.sid < b.sid; });
         std::sort(clients.begin(), clients.end(), [](const RpcClientRow &a, const RpcClientRow &b)
                   { return a.clientPtr < b.clientPtr; });
-
-        PS2DtxCompatLayout dtxLayout{};
-        size_t dtxRemoteCount = 0;
-        size_t dtxTransferCount = 0;
-        size_t dtxSjxCount = 0;
-        size_t dtxRnaCount = 0;
-        size_t dtxSjrmtCount = 0;
-        uint32_t dtxNextUrpcObj = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-            dtxLayout = g_dtxCompatLayout;
-            dtxRemoteCount = g_dtx_remote_by_id.size();
-            dtxTransferCount = g_dtx_transfer_by_id.size();
-            dtxSjxCount = g_dtx_sjx_by_handle.size();
-            dtxRnaCount = g_dtx_ps2rna_by_handle.size();
-            dtxSjrmtCount = g_dtx_sjrmt_by_handle.size();
-            dtxNextUrpcObj = g_dtx_next_urpc_obj;
-        }
 
         auto hasServer = [&](uint32_t sid)
         {
@@ -1066,30 +1069,15 @@ namespace
         ImGui::SeparatorText("ps2xIOP HLE services");
         if (ImGui::BeginTable("iop_hle_services", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
         {
-            struct ServiceRow
-            {
-                const char *name;
-                uint32_t sid;
-                bool dynamic;
-            };
-            const ServiceRow services[] = {
-                {"LIBSD", IOP_SID_LIBSD, false},
-                {"Fatal Frame SDRDRV", IOP_SID_FATAL_FRAME_SDRDRV, false},
-                {"LOTR SOUND", IOP_SID_LOTR_SOUND, false},
-                {"LOTR CLFILE", IOP_SID_LOTR_CLFILE, false},
-                {"DBCMAN", 0x80001300u, false},
-                {"DTX compat", dtxLayout.rpcSid, true},
-            };
-
             ImGui::TableSetupColumn("Service");
             ImGui::TableSetupColumn("Active");
             ImGui::TableSetupColumn("SID");
-            ImGui::TableSetupColumn("Configured");
-            ImGui::TableSetupColumn("EE server registered");
+            ImGui::TableSetupColumn("EE server");
+            ImGui::TableSetupColumn("Metrics");
             ImGui::TableHeadersRow();
-            for (const ServiceRow &service : services)
+            for (const ps2x::iop::DebugService &service : iopSnapshot.services)
             {
-                if (service.dynamic && service.sid == 0u)
+                if (service.sids.empty())
                 {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
@@ -1149,6 +1137,11 @@ namespace
             ImGui::EndTable();
         }
 
+        for (const std::string &diagnostic : iopSnapshot.diagnostics)
+        {
+            ImGui::TextDisabled("%s", diagnostic.c_str());
+        }
+
         ImGui::SeparatorText("SIF RPC state");
         ImGui::Text("initialized=%u servers=%zu clients=%zu nextId=%u packetIndex=%u serverIndex=%u activeQueue=0x%08X",
                     rpcInitialized ? 1u : 0u,
@@ -1178,7 +1171,8 @@ namespace
                 ImGui::TableNextColumn();
                 ImGui::Text("0x%08X", row.sid);
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(iopRpcSidName(row.sid));
+                const std::string serviceName = iopRpcSidName(iopSnapshot, row.sid);
+                ImGui::TextUnformatted(serviceName.c_str());
                 ImGui::TableNextColumn();
                 ImGui::Text("0x%08X", row.sdPtr);
                 ImGui::TableNextColumn();
@@ -1219,7 +1213,8 @@ namespace
                 ImGui::TableNextColumn();
                 ImGui::Text("0x%08X", row.sid);
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(iopRpcSidName(row.sid));
+                const std::string serviceName = iopRpcSidName(iopSnapshot, row.sid);
+                ImGui::TextUnformatted(serviceName.c_str());
                 ImGui::TableNextColumn();
                 ImGui::Text("%u", row.busy ? 1u : 0u);
                 ImGui::TableNextColumn();
@@ -1235,38 +1230,11 @@ namespace
             }
             ImGui::EndTable();
         }
-
-        ImGui::SeparatorText("Sound driver / DTX compat");
-        ImGui::Text("SoundDriver initialized=%u owner=0x%p storage=0x%08X/%u status=0x%08X addrTable=0x%08X hd=0x%08X sq=0x%08X data=0x%08X",
-                    soundState.initialized ? 1u : 0u,
-                    reinterpret_cast<void *>(soundState.ownerRuntime),
-                    soundState.storageBaseAddr,
-                    soundState.storageSize,
-                    soundState.statusAddr,
-                    soundState.addrTableAddr,
-                    soundState.hdBaseAddr,
-                    soundState.sqBaseAddr,
-                    soundState.dataBaseAddr);
-        ImGui::Text("DTX configured=%u sid=0x%08X obj=[0x%08X,0x%08X) stride=0x%X fnTable=0x%08X objTable=0x%08X dispatcher=0x%08X nextObj=0x%08X",
-                    dtxLayout.isConfigured() ? 1u : 0u,
-                    dtxLayout.rpcSid,
-                    dtxLayout.urpcObjBase,
-                    dtxLayout.urpcObjLimit,
-                    dtxLayout.urpcObjStride,
-                    dtxLayout.urpcFnTableBase,
-                    dtxLayout.urpcObjTableBase,
-                    dtxLayout.dispatcherFuncAddr,
-                    dtxNextUrpcObj);
-        ImGui::Text("DTX states: remote=%zu transfer=%zu sjx=%zu ps2rna=%zu sjrmt=%zu",
-                    dtxRemoteCount,
-                    dtxTransferCount,
-                    dtxSjxCount,
-                    dtxRnaCount,
-                    dtxSjrmtCount);
     }
 
-    void drawRpcHistoryTab()
+    void drawRpcHistoryTab(PS2Runtime &runtime)
     {
+        const ps2x::iop::DebugSnapshot iopSnapshot = runtime.iopDebugSnapshot();
         std::vector<SifRpcDebugEvent> events;
         uint64_t nextSeq = 0;
         {
@@ -1293,6 +1261,66 @@ namespace
         ImGui::Checkbox("Only CallRpc", &onlyCalls);
         ImGui::SameLine();
         ImGui::Checkbox("Hide bind/register/init", &hideBindNoise);
+
+        ImGui::SeparatorText("IOP/RPC tracer");
+        ImGui::TextDisabled("Unhandled rows are RPC calls that no HLE service or EE server callback consumed; the runtime used copy/zero fallback.");
+        static bool tracerOnlyUnhandled = true;
+        ImGui::Checkbox("Only unhandled", &tracerOnlyUnhandled);
+        if (ImGui::BeginTable("iop_rpc_tracer", 9,
+                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                              ImVec2(0, 220)))
+        {
+            ImGui::TableSetupColumn("Seq");
+            ImGui::TableSetupColumn("SID");
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Rpc#");
+            ImGui::TableSetupColumn("PC");
+            ImGui::TableSetupColumn("Send");
+            ImGui::TableSetupColumn("Recv");
+            ImGui::TableSetupColumn("Send[0..15]");
+            ImGui::TableSetupColumn("Recv[0..15]");
+            ImGui::TableHeadersRow();
+
+            for (const SifRpcDebugEvent &event : events)
+            {
+                const char *op = event.op ? event.op : "";
+                if (std::strcmp(op, "CallRpc") != 0)
+                {
+                    continue;
+                }
+                const bool unhandled = (event.flags & kSifRpcDebugFlagUnhandled) != 0u;
+                if (tracerOnlyUnhandled && !unhandled)
+                {
+                    continue;
+                }
+
+                const std::string sendPreview = rpcPreviewBytes(event.sendPreview, event.sendPreviewSize);
+                const std::string recvPreview = rpcPreviewBytes(event.recvPreview, event.recvPreviewSize);
+
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", static_cast<unsigned long long>(event.seq));
+                ImGui::TableNextColumn();
+                ImGui::Text("0x%08X", event.sid);
+                ImGui::TableNextColumn();
+                const std::string serviceName = iopRpcSidName(iopSnapshot, event.sid);
+                ImGui::TextUnformatted(serviceName.c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("0x%08X", event.rpcNum);
+                ImGui::TableNextColumn();
+                ImGui::Text("0x%08X", event.pc);
+                ImGui::TableNextColumn();
+                ImGui::Text("0x%08X/%u", event.sendBuf, event.sendSize);
+                ImGui::TableNextColumn();
+                ImGui::Text("0x%08X/%u", event.recvBuf, event.recvSize);
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(sendPreview.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(recvPreview.c_str());
+            }
+            ImGui::EndTable();
+        }
 
         if (ImGui::BeginTable("rpc_history", 20,
                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
@@ -1348,7 +1376,8 @@ namespace
                 ImGui::TableNextColumn();
                 ImGui::Text("0x%08X", event.sid);
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(iopRpcSidName(event.sid));
+                const std::string serviceName = iopRpcSidName(iopSnapshot, event.sid);
+                ImGui::TextUnformatted(serviceName.c_str());
                 ImGui::TableNextColumn();
                 ImGui::Text("0x%08X", event.rpcNum);
                 ImGui::TableNextColumn();
@@ -2223,7 +2252,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
             }
             if (ImGui::BeginTabItem("RPC History"))
             {
-                drawRpcHistoryTab();
+                drawRpcHistoryTab(runtime);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("PAD"))
