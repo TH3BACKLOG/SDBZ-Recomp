@@ -45,6 +45,14 @@ namespace
         TestEnv() : rdram(PS2_RAM_SIZE, 0u)
         {
         }
+
+        // Mirrors SchedFixture: the retired ps2_syscalls::notifyRuntimeStop()
+        // reset process-global scheduler state that no longer exists. Stopping
+        // is now per-runtime, so it belongs in this destructor.
+        ~TestEnv()
+        {
+            runtime.requestStop();
+        }
     };
 
     std::atomic<uint32_t> g_vblankStartHits{0u};
@@ -127,7 +135,6 @@ namespace
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
-        notifyRuntimeStop();
         // Defensive cleanup: reset the global INTC handler tables, enable masks,
         // and pending latch so each test starts from a known INTC state.
         resetInterruptHandlerState();
@@ -203,7 +210,6 @@ void register_ps2_runtime_interrupt_tests()
     {
         tc.Run("SetVSyncFlag updates guest flag and monotonic tick", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kFlagAddr = 0x1000u;
@@ -241,7 +247,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("VSync worker updates GS CSR FIELD bit for MMIO polling loops", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -302,7 +307,6 @@ void register_ps2_runtime_interrupt_tests()
         // is asserted when at least two ticks were observed.
         tc.Run("Disjoint-bit GS CSR writers (SIGNAL vs FINISH vs vsync FIELD) never lose word-level updates", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -323,7 +327,7 @@ void register_ps2_runtime_interrupt_tests()
             setRegU32(ctx, 4, kFlagAddr);
             setRegU32(ctx, 5, kTickAddr);
             t.IsTrue(callSyscall(0x73u, env.rdram.data(), &ctx, &env.runtime), "SetVSyncFlag syscall should dispatch");
-            const uint64_t tickBefore = GetCurrentVSyncTick();
+            const uint64_t tickBefore = GetCurrentVSyncTick(&env.runtime);
 
             std::atomic<uint32_t> setAnomaliesA{0u}, clearAnomaliesA{0u};
             std::atomic<uint32_t> setAnomaliesB{0u}, clearAnomaliesB{0u};
@@ -376,7 +380,7 @@ void register_ps2_runtime_interrupt_tests()
 
             racerA.join();
             racerB.join();
-            const uint64_t ticksElapsed = GetCurrentVSyncTick() - tickBefore;
+            const uint64_t ticksElapsed = GetCurrentVSyncTick(&env.runtime) - tickBefore;
 
             t.Equals(setAnomaliesA.load(), 0u, "racer A: SIGNAL set must never be lost to a concurrent whole-word CSR RMW");
             t.Equals(clearAnomaliesA.load(), 0u, "racer A: SIGNAL W1C-clear must never be lost to a concurrent whole-word CSR RMW");
@@ -394,7 +398,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("INTC VBLANK handlers respect EnableIntc and DisableIntc masks", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             g_vblankStartHits.store(0u, std::memory_order_relaxed);
@@ -478,7 +481,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("sceDmaSend dispatches completed VIF1 DMAC handler with latched END tag", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -527,7 +529,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("MMIO VIF1 chain completion dispatches DMAC handler after CHCR store", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -574,7 +575,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("native GIF DMA MMIO kick dispatches completed DMAC handler", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -626,7 +626,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("negative interrupt-safe EE syscall ids dispatch", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kEventParamAddr = 0x1200u;
@@ -693,7 +692,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("WaitEventFlag blocks and wakes when SetEventFlag publishes bits", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kParamAddr = 0x1200u;
@@ -781,7 +779,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("PollEventFlag WEF_CLEAR clears only matched bits", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kParamAddr = 0x1400u;
@@ -839,16 +836,19 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("WaitVSyncTick returns when runtime stop is requested", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             std::atomic<bool> waiterDone{false};
             std::atomic<bool> waiterThrew{false};
+            // WaitVSyncTick now takes the calling guest context; this TestEnv
+            // has no ctx member, so the waiter thread supplies its own.
+            R5900Context waiterCtx{};
+            std::memset(&waiterCtx, 0, sizeof(waiterCtx));
             std::thread waiter([&]()
             {
                 try
                 {
-                    WaitVSyncTick(env.rdram.data(), &env.runtime);
+                    WaitVSyncTick(env.rdram.data(), &waiterCtx, &env.runtime);
                 }
                 catch (...)
                 {
@@ -897,7 +897,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("raisePendingIntc delivers to a registered handler on the next drain tick", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);
@@ -944,7 +943,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("undelivered pending cause survives the age window then drops", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);
@@ -984,7 +982,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("pending cause persists across the raise-vs-registration race", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);
@@ -1037,7 +1034,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("vblank causes are excluded from the pending latch", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);

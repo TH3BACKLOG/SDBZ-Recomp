@@ -8,6 +8,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "ps2_log.h"
+#include "runtime/ee_scheduler.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -53,6 +54,19 @@ void ps2FrameTraceRecord(uint32_t funcStart, uint32_t entryPc, uint32_t entrySp,
 // Guest-progress counter (ps2_scheduler.cpp): one tick per 128 guest back-edges.
 // Same extern-between-.cpp rule as above.
 extern "C" uint64_t ps2x_guest_progress();
+
+// 2026-09-22 [sema3] -- mirrors written by EeScheduler.cpp on every semaphore-3
+// event. Same extern-between-.cpp rule. These must sit at TRUE file scope: the
+// stat line below lives inside an anonymous namespace, and declaring them there
+// would give them internal linkage and fail to link.
+extern std::atomic<uint64_t> g_ps2xSema3Signals;
+extern std::atomic<uint64_t> g_ps2xSema3WaitPass;
+extern std::atomic<uint64_t> g_ps2xSema3WaitBlock;
+extern std::atomic<uint32_t> g_ps2xSema3LastSigC0;
+extern std::atomic<uint32_t> g_ps2xSema3LastSigC1;
+extern std::atomic<uint32_t> g_ps2xSema3LastSigC2;
+extern std::atomic<uint32_t> g_ps2xSema3LastSigC3;
+extern std::atomic<int32_t> g_ps2xSema3LastSigCount;
 
 // Delivered-vblank counter (Kernel/Syscalls/Interrupt.cpp). A plain relaxed
 // atomic load -- no CRT, no lock -- which is why the HWWATCH VEH below may call
@@ -411,6 +425,15 @@ namespace
 // so touching it costs a 30+ hour rebuild. Same cross-TU pattern as the
 // [frametrace] symbols above.
 void ps2xTraceCallsInstall(PS2Runtime &runtime);
+
+// Defined in Kernel/EeScheduler.cpp, at true global scope there (not inside
+// its anonymous namespace) so this extern binds to it. Declared at file
+// scope here too -- NOT inside this file's own anonymous namespace below --
+// for the same reason: an extern declared inside an anonymous namespace
+// gets that namespace's internal linkage and can never bind to a symbol
+// from another TU, regardless of the `extern` keyword (verified by C7631
+// when first tried nested at the point of use in workerShutdownWrapper).
+extern std::atomic<bool> g_ps2x_teardownActive;
 
 namespace ps2_game_overrides
 {
@@ -6162,6 +6185,12 @@ namespace
         {"st4b.3e2ff0", 0x003e2ff0u},
         {"crisrv.11d510", 0x0011D510u},
         {"cvfsrd.131190", 0x00131190u},
+        // Part 150: CAppRankingBase_Update. This is the ONLY thing that can
+        // increment halfword[obj+0x5C], which is the only thing that can make
+        // CAppDemoMainAlt_Update return 1 and let the phase machine leave
+        // state 4 (F1).  Its return value is the whole question, so it is
+        // captured in sofdecCapturePost, not on entry.
+        {"rank.41b2b0", 0x0041B2B0u},
     };
     constexpr size_t kSofdecSiteCount = sizeof(kSofdecSites) / sizeof(kSofdecSites[0]);
 
@@ -6497,6 +6526,104 @@ namespace
     std::atomic<uint32_t> g_cvfsStatOut{0xFFFFFFFFu};
     std::atomic<uint32_t> g_cvfsDevAfter{0xFFFFFFFFu};
 
+    // =====================================================================
+    // Part 150 -- [heapwatch] / [heapfail] / [st4c] / [rank:stat]
+    // =====================================================================
+    // Part 149's log already contained the answer to the t=717s hard stall,
+    // in a register dump at the first dispatch hole (t=667s):
+    //
+    //   [guest-branch:missing-target] op=JR source=0x1bde88 target=0x0
+    //     a0=0x0  s0=0x0  s5=0x1bde80  sp=0x1ffba00
+    //     [stack] 0x1ffb9f0 (sp-0x10) 0x465158 ...
+    //
+    // a0 = 0. 0x1bde80 is a C++ virtual-dispatch stub (lw $t9,0($a0);
+    // lw $t9,36($t9); jr $t9), so the object is NULL, not corrupted.  The
+    // [frametrace] in the same dump puts it under
+    //   fighter_track_tick_clone_11 -> tree_clone(0x19e940) -> tree_walk(0x1be350)
+    // i.e. tree_clone allocated a node, got NULL back, and passed it on
+    // unchecked.  49s later thread 1 is THS_DORMANT and thread 2 is orphaned
+    // on semaphore id 3 -- nothing left to schedule.
+    //
+    // The allocator, hand-disassembled (IDA drops '&', so the pseudo-C for
+    // 0x18d680 lies about 0x465158 -- it is a POINTER TO the heap handle,
+    // not the handle):
+    //
+    //   0x111280  accounting wrapper -- counts failures, returns NULL UNCHECKED
+    //     0x18d680  lock -> alloc -> unlock; handle = *(u32*)0x465158
+    //       0x18d978  dlmalloc-style free list
+    //
+    // and it keeps its own telemetry, gp-relative (gp = 0x503070, set at
+    // 0x1001c0), which nothing in this file has ever read:
+    //
+    //   gp-10608 (0x500700)  allocations SUCCEEDED
+    //   gp-10604 (0x500704)  allocations FAILED      <-- the decisive word
+    //   gp-10600 (0x500708)  high-water mark (ptr+size)
+    //   gp-32752 (0x4FB080)  lowest stack pointer seen
+    //
+    // OPEN QUESTION this probe settles in one read: heap EXHAUSTION vs heap
+    // CORRUPTION.  failed != 0  => exhaustion.  failed == 0 while the holes
+    // still fire => the free list is handing out bad chunks.
+    //
+    // Everything is derived from the LIVE $gp and the derived addresses are
+    // printed alongside the values, so a wrong gp convicts the probe instead
+    // of producing a confident wrong number
+    // ([[feedback_probe_gate_on_shape_not_address]]).
+    constexpr uint32_t kHeapHandlePtr = 0x00465158u;  // from 0x18D688/0x18D698
+    constexpr uint64_t kHeapFailMaxEmit = 64u;
+
+    std::atomic<uint32_t> g_heapGp{0u};
+    std::atomic<uint32_t> g_heapOkAddr{0u};
+    std::atomic<uint32_t> g_heapFailAddr{0u};
+    std::atomic<uint32_t> g_heapOk{0xFFFFFFFFu};
+    std::atomic<uint32_t> g_heapFail{0xFFFFFFFFu};
+    std::atomic<uint32_t> g_heapFailPrev{0xFFFFFFFFu};
+    std::atomic<uint32_t> g_heapFailMax{0u};
+    std::atomic<uint32_t> g_heapHigh{0xFFFFFFFFu};
+    std::atomic<uint32_t> g_heapStackLow{0xFFFFFFFFu};
+    std::atomic<uint32_t> g_heapHandle{0xFFFFFFFFu};
+    std::atomic<uint64_t> g_heapSamples{0u};
+    std::atomic<uint64_t> g_heapFailEvents{0u};
+
+    // ---- [st4c] -- the F1 probe, aimed by SHAPE ---------------------------
+    // [st4] was gated on 0x420260 and [st4b] on 0x3e2ff0; both objects went
+    // dormant at t=348s / t=422s, so both counters simply froze -- which
+    // reads exactly like "nothing happened".  Third recurrence of
+    // [[feedback_probe_gate_on_shape_not_address]].
+    //
+    // This one hardcodes NO object and NO callee.  0x3E0E60 is the phase
+    // machine for every CApp, so the gate is just "this object is in state 4",
+    // and the rows are keyed by whatever vtable is live.  A run where the
+    // stuck class never appears shows up as a missing row, not as a zero.
+    //
+    // Fields are the branch conditions of CAppDemoMainAlt_Update (0x3e35c0),
+    // one per instruction that consumes them
+    // ([[feedback_bind_every_probe_to_an_instruction]]):
+    //   halfword[obj+0x5C]  the counter that must reach 1
+    //   byte[obj+0x2E]      gates the virtual[+0x5C] + float[obj+0x64] += f0 arm
+    //   float[obj+0x64]     the accumulator that arm advances
+    //   camera_fade_is_active()  recomputed from its own two gp bytes
+    // Changes are COUNTED, not just snapshotted ([[feedback_probe_the_final_value]]).
+    constexpr size_t kSt4cSlots = 4u;
+    std::atomic<uint32_t> g_st4cVt[kSt4cSlots];
+    std::atomic<uint32_t> g_st4cVt40[kSt4cSlots];
+    std::atomic<uint32_t> g_st4cObj[kSt4cSlots];
+    std::atomic<uint64_t> g_st4cSamples[kSt4cSlots];
+    std::atomic<uint32_t> g_st4cH5C[kSt4cSlots];
+    std::atomic<uint64_t> g_st4cH5CChg[kSt4cSlots];
+    std::atomic<uint32_t> g_st4cB2E[kSt4cSlots];
+    std::atomic<uint32_t> g_st4cF64[kSt4cSlots];
+    std::atomic<uint64_t> g_st4cF64Chg[kSt4cSlots];
+    std::atomic<uint32_t> g_st4cFadeMode[kSt4cSlots];
+    std::atomic<uint32_t> g_st4cFadeState[kSt4cSlots];
+    std::atomic<uint64_t> g_st4cFadeBusy[kSt4cSlots];
+    std::atomic<uint64_t> g_st4cTableFull{0u};
+
+    // ---- [rank] -- CAppRankingBase_Update's return -------------------------
+    std::atomic<uint64_t> g_rankRetNz{0u};
+    std::atomic<uint32_t> g_rankRet{0xFFFFFFFFu};
+    std::atomic<uint64_t> g_rankRetHist[8];
+    std::atomic<uint64_t> g_rankRetOther{0u};
+
     bool sofdecAddrOk(uint32_t a)
     {
         return a != 0u && a < 0x02000000u;
@@ -6615,6 +6742,144 @@ namespace
                 g_warnFadeState.store(fstate, std::memory_order_relaxed);
                 if (fmode == 1u || fmode == 2u || fstate == 3u || fstate == 4u)
                     g_warnFadeBusy.fetch_add(1u, std::memory_order_relaxed);
+            }
+
+            // ---- [heapwatch] (Part 150) -------------------------------------
+            // Sampled here because 0x3E0E60 is per-frame and already has rdram
+            // and a trustworthy $gp -- no new hook, no hot-path cost, and the
+            // LAST sample is taken on the last frame before the main thread
+            // dies, which is exactly the moment in question.
+            {
+                const uint32_t gpH   = GPR_U32(ctx, 28);
+                const uint32_t aOk    = gpH - 10608u;
+                const uint32_t aFail  = gpH - 10604u;
+                const uint32_t aHigh  = gpH - 10600u;
+                const uint32_t aStack = gpH - 32752u;
+
+                const uint32_t okN   = sofdecRead32(rdram, aOk);
+                const uint32_t failN = sofdecRead32(rdram, aFail);
+                const uint32_t highN = sofdecRead32(rdram, aHigh);
+                const uint32_t heapN = sofdecRead32(rdram, kHeapHandlePtr);
+
+                g_heapGp.store(gpH, std::memory_order_relaxed);
+                g_heapOkAddr.store(aOk, std::memory_order_relaxed);
+                g_heapFailAddr.store(aFail, std::memory_order_relaxed);
+                g_heapOk.store(okN, std::memory_order_relaxed);
+                g_heapFail.store(failN, std::memory_order_relaxed);
+                g_heapHigh.store(highN, std::memory_order_relaxed);
+                g_heapStackLow.store(sofdecRead32(rdram, aStack), std::memory_order_relaxed);
+                g_heapHandle.store(heapN, std::memory_order_relaxed);
+                g_heapSamples.fetch_add(1u, std::memory_order_relaxed);
+                if (failN != 0xFFFFFFFFu
+                    && failN > g_heapFailMax.load(std::memory_order_relaxed))
+                {
+                    g_heapFailMax.store(failN, std::memory_order_relaxed);
+                }
+
+                // Emit on every CHANGE, not on every sample: a single failure
+                // is the event, and its position in the log is its timestamp.
+                // prev=0xffffffff marks the first sample (the baseline), so a
+                // counter that is already nonzero at boot is distinguishable
+                // from one that goes nonzero mid-run.
+                const uint32_t prevFail =
+                    g_heapFailPrev.exchange(failN, std::memory_order_relaxed);
+                if (failN != prevFail)
+                {
+                    const uint64_t e =
+                        g_heapFailEvents.fetch_add(1u, std::memory_order_relaxed);
+                    if (e < kHeapFailMaxEmit)
+                    {
+                        std::ostringstream oss;
+                        oss << "[heapfail] n=" << std::dec << e
+                            << " failed=" << failN
+                            << " prev=" << static_cast<int64_t>(
+                                   static_cast<int32_t>(prevFail))
+                            << " ok=" << okN
+                            << std::hex
+                            << " gp=0x" << gpH
+                            << " failAddr=0x" << aFail
+                            << " high=0x" << highN
+                            << " heap=0x" << heapN
+                            << " obj=0x" << a0
+                            << std::dec << "\n";
+                        std::cerr << oss.str();
+                    }
+                    else if (e == kHeapFailMaxEmit)
+                    {
+                        std::cerr << "[cap] tag=heapfail limit="
+                                  << std::dec << kHeapFailMaxEmit
+                                  << " -- later changes are still tracked;"
+                                     " read [heapwatch:stat] failed=/failMax=,"
+                                     " not these lines\n";
+                    }
+                }
+            }
+
+            // ---- [st4c] (Part 150) ------------------------------------------
+            // Gate: "in state 4", keyed by the LIVE vtable. Nothing about which
+            // object or which callee is assumed.
+            if (st == 4u && sofdecAddrOk(vt))
+            {
+                size_t slot = kSt4cSlots;
+                for (size_t i = 0; i < kSt4cSlots; ++i)
+                {
+                    const uint32_t have = g_st4cVt[i].load(std::memory_order_relaxed);
+                    if (have == vt)
+                    {
+                        slot = i;
+                        break;
+                    }
+                    if (have == 0u)
+                    {
+                        g_st4cVt[i].store(vt, std::memory_order_relaxed);
+                        slot = i;
+                        break;
+                    }
+                }
+
+                if (slot >= kSt4cSlots)
+                {
+                    // More than kSt4cSlots distinct classes reached state 4.
+                    // Counted separately so a full table cannot silently look
+                    // like "that class never appeared".
+                    g_st4cTableFull.fetch_add(1u, std::memory_order_relaxed);
+                }
+                else
+                {
+                    g_st4cVt40[slot].store(vt40, std::memory_order_relaxed);
+                    g_st4cObj[slot].store(a0, std::memory_order_relaxed);
+                    g_st4cSamples[slot].fetch_add(1u, std::memory_order_relaxed);
+
+                    // lhu [obj+0x5C] -- little-endian, so the low half of the
+                    // aligned word at 0x5C.
+                    const uint32_t h5c = sofdecRead32(rdram, a0 + 0x5Cu) & 0xFFFFu;
+                    if (g_st4cH5C[slot].exchange(h5c, std::memory_order_relaxed) != h5c)
+                    {
+                        g_st4cH5CChg[slot].fetch_add(1u, std::memory_order_relaxed);
+                    }
+
+                    g_st4cB2E[slot].store(sofdecRead8(rdram, a0 + 0x2Eu),
+                                          std::memory_order_relaxed);
+
+                    const uint32_t f64 = sofdecRead32(rdram, a0 + 0x64u);
+                    if (g_st4cF64[slot].exchange(f64, std::memory_order_relaxed) != f64)
+                    {
+                        g_st4cF64Chg[slot].fetch_add(1u, std::memory_order_relaxed);
+                    }
+
+                    // Same two gp bytes camera_fade_is_active (0x2C1BB0) reads,
+                    // recomputed rather than called so the probe cannot perturb
+                    // the fade it is measuring.
+                    const uint32_t gpC = GPR_U32(ctx, 28);
+                    const uint32_t cmode  = sofdecRead8(rdram, gpC - 8736u);
+                    const uint32_t cstate = sofdecRead8(rdram, gpC - 8735u);
+                    g_st4cFadeMode[slot].store(cmode, std::memory_order_relaxed);
+                    g_st4cFadeState[slot].store(cstate, std::memory_order_relaxed);
+                    if (cmode == 1u || cmode == 2u || cstate == 3u || cstate == 4u)
+                    {
+                        g_st4cFadeBusy[slot].fetch_add(1u, std::memory_order_relaxed);
+                    }
+                }
             }
             return;
         }
@@ -6816,6 +7081,19 @@ namespace
             g_st4bSubAfter.store(
                 sofdecRead32(rdram, g_st4bA0.load(std::memory_order_relaxed) + 48u),
                 std::memory_order_relaxed);
+        }
+        else if (kSofdecSites[site].addr == 0x0041B2B0u)
+        {
+            // CAppDemoMainAlt_Update does `s1 = CAppRankingBase_Update(s0) & 0xFF`
+            // and only increments halfword[obj+0x5C] when s1 != 0, so the masked
+            // value is the actual decision -- the full $v0 is kept alongside it
+            // in case the high bits ever carry something.
+            const uint32_t raw = GPR_U32(ctx, 2);
+            const uint32_t masked = raw & 0xFFu;
+            g_rankRet.store(raw, std::memory_order_relaxed);
+            if (masked != 0u) { g_rankRetNz.fetch_add(1u, std::memory_order_relaxed); }
+            if (masked < 8u) { g_rankRetHist[masked].fetch_add(1u, std::memory_order_relaxed); }
+            else             { g_rankRetOther.fetch_add(1u, std::memory_order_relaxed); }
         }
     }
 
@@ -7075,6 +7353,147 @@ namespace
         }
         oss << "other:" << g_cvfsStatInOther.load(std::memory_order_relaxed)
             << "\n";
+
+        // ---- Part 150 lines -------------------------------------------------
+        // Seventh line: [heapwatch]. THE decisive field is FAILED=. Non-zero =>
+        // heap exhaustion; zero while the 0x1bde88 dispatch holes still fire =>
+        // free-list corruption instead. gp/okAddr/failAddr are printed so a
+        // wrong $gp convicts the probe rather than producing a wrong number.
+        // samples=0 means the phase machine never ran -- that is a probe miss,
+        // not a measurement of zero failures.
+        {
+            oss << "[heapwatch:stat] why=" << why
+                << std::dec
+                << " samples=" << g_heapSamples.load(std::memory_order_relaxed)
+                << " failEvents=" << g_heapFailEvents.load(std::memory_order_relaxed)
+                << " ok=" << g_heapOk.load(std::memory_order_relaxed)
+                << " FAILED=" << g_heapFail.load(std::memory_order_relaxed)
+                << " failMax=" << g_heapFailMax.load(std::memory_order_relaxed)
+                << std::hex
+                << " gp=0x" << g_heapGp.load(std::memory_order_relaxed)
+                << " okAddr=0x" << g_heapOkAddr.load(std::memory_order_relaxed)
+                << " failAddr=0x" << g_heapFailAddr.load(std::memory_order_relaxed)
+                << " high=0x" << g_heapHigh.load(std::memory_order_relaxed)
+                << " stackLow=0x" << g_heapStackLow.load(std::memory_order_relaxed)
+                << " heapPtrAddr=0x" << kHeapHandlePtr
+                << " heap=0x" << g_heapHandle.load(std::memory_order_relaxed)
+                << std::dec << "\n";
+        }
+
+        // 2026-09-22 [sema3] -- Part 157. EE thread 2 parks in WaitSema on
+        // semaphore id 3 (pc=0x1759e8, the consumer loop sub_1759A0) and never
+        // wakes. The sampled SEMA3 records in run_probe.jsonl can miss the LAST
+        // signal by up to the sampling stride, and the last one is precisely the
+        // record that names who stopped ringing the doorbell -- so these mirrors
+        // are written on EVERY id-3 event and this line is always exact.
+        //
+        // HOW TO READ IT. sig= stops climbing while wblk= rises by one and stays
+        // => the consumer parked and nobody signalled again; lastC0..C3 then name
+        // the last successful signaller and its callers. sig= still climbing while
+        // the thread stays parked would mean something else entirely -- signals
+        // landing on a DIFFERENT semaphore object than the one being waited on.
+        //
+        // sig=0 is a PROBE MISS, not a measurement that nothing signals id 3.
+        // lastC0=0x0 means the signaller reached SignalSema without going through
+        // the dispatch table (direct call or tail j) -- the recorded tracer
+        // blind spot, not an absent caller.
+        {
+            oss << "[sema3:stat] why=" << why
+                << std::dec
+                << " sig=" << g_ps2xSema3Signals.load(std::memory_order_relaxed)
+                << " wpass=" << g_ps2xSema3WaitPass.load(std::memory_order_relaxed)
+                << " wblk=" << g_ps2xSema3WaitBlock.load(std::memory_order_relaxed)
+                << " lastCount=" << g_ps2xSema3LastSigCount.load(std::memory_order_relaxed)
+                << std::hex
+                << " lastC0=0x" << g_ps2xSema3LastSigC0.load(std::memory_order_relaxed)
+                << " lastC1=0x" << g_ps2xSema3LastSigC1.load(std::memory_order_relaxed)
+                << " lastC2=0x" << g_ps2xSema3LastSigC2.load(std::memory_order_relaxed)
+                << " lastC3=0x" << g_ps2xSema3LastSigC3.load(std::memory_order_relaxed)
+                << std::dec << "\n";
+        }
+
+        // Eighth: [st4c], one row per class that reached state 4. Verification
+        // contract ([[feedback_degenerate_result_convicts_the_probe]]): the row
+        // whose obj= matches [lstick:stat]'s live object is the only one that
+        // describes the stall. If that row shows a healthy, changing machine
+        // while [lstick:stat] st=4:N keeps rising, the probe is mis-aimed again
+        // and must NOT be reported as a finding.
+        {
+            bool anyRow = false;
+            for (size_t i = 0; i < kSt4cSlots; ++i)
+            {
+                const uint32_t vtS = g_st4cVt[i].load(std::memory_order_relaxed);
+                if (vtS == 0u)
+                {
+                    continue;
+                }
+                anyRow = true;
+                const uint32_t fb = g_st4cF64[i].load(std::memory_order_relaxed);
+                oss << "[st4c:stat] why=" << why
+                    << std::dec << " slot=" << i
+                    << std::hex
+                    << " vt=0x" << vtS
+                    << " vt40=0x" << g_st4cVt40[i].load(std::memory_order_relaxed)
+                    << " obj=0x" << g_st4cObj[i].load(std::memory_order_relaxed)
+                    << std::dec
+                    << " samples=" << g_st4cSamples[i].load(std::memory_order_relaxed)
+                    << " h5C=" << g_st4cH5C[i].load(std::memory_order_relaxed)
+                    << " h5Cchg=" << g_st4cH5CChg[i].load(std::memory_order_relaxed)
+                    << " b2E=" << g_st4cB2E[i].load(std::memory_order_relaxed)
+                    << " f64=" << sofdecF32(fb)
+                    << " f64chg=" << g_st4cF64Chg[i].load(std::memory_order_relaxed)
+                    << " fadeMode=" << g_st4cFadeMode[i].load(std::memory_order_relaxed)
+                    << " fadeState=" << g_st4cFadeState[i].load(std::memory_order_relaxed)
+                    << " fadeBusy=" << g_st4cFadeBusy[i].load(std::memory_order_relaxed)
+                    << "\n";
+            }
+            if (!anyRow)
+            {
+                oss << "[st4c:stat] why=" << why
+                    << " rows=0 -- NOTHING reached phase-machine state 4 yet"
+                       " (this is a probe miss, not a measurement)\n";
+            }
+            oss << "[st4c:stat] why=" << why << std::dec
+                << " tableFull=" << g_st4cTableFull.load(std::memory_order_relaxed)
+                << " slots=" << kSt4cSlots << "\n";
+        }
+
+        // Ninth: [rank]. calls=N/0 means 0x41B2B0 was not registered and the
+        // wrapper never installed -- distinguishable from "installed but never
+        // called" (N/1 with calls=0).
+        {
+            uint64_t rankCalls = 0u;
+            uint32_t rankA0 = 0u;
+            int rankInstalled = 0;
+            for (size_t i = 0; i < kSofdecSiteCount; ++i)
+            {
+                if (kSofdecSites[i].addr != 0x0041B2B0u)
+                {
+                    continue;
+                }
+                rankCalls = g_sofdecCalls[i].load(std::memory_order_relaxed);
+                rankA0 = g_sofdecLastA0[i].load(std::memory_order_relaxed);
+                rankInstalled = (g_sofdecOrig[i] != nullptr) ? 1 : 0;
+            }
+            oss << "[rank:stat] why=" << why
+                << std::dec
+                << " installed=" << rankInstalled
+                << " calls=" << rankCalls
+                << " retNz=" << g_rankRetNz.load(std::memory_order_relaxed)
+                << std::hex
+                << " lastRet=0x" << g_rankRet.load(std::memory_order_relaxed)
+                << " a0=0x" << rankA0
+                << std::dec << " retHist=";
+            for (size_t i = 0; i < 8u; ++i)
+            {
+                const uint64_t n = g_rankRetHist[i].load(std::memory_order_relaxed);
+                if (n != 0u)
+                {
+                    oss << i << ":" << n << ",";
+                }
+            }
+            oss << "other:" << g_rankRetOther.load(std::memory_order_relaxed) << "\n";
+        }
 
         std::cerr << oss.str();
     }
@@ -8752,6 +9171,308 @@ namespace
                   << " (PS2X_SKIPFMV=0 plays them for real)" << std::endl;
     }
 
+    // Part 120 (2026-09-17). The RANKING/GAME-OVER black-screen freeze: the
+    // whole scheduler halts within ~2s of `[thsync]` VERDICT flipping to
+    // GATE-OPEN-BUT-DEAD. ps2_runtime.cpp:5371-5381 already named the
+    // mechanism -- sub_11FC40, called every pass by frame thread sub_11E8D0,
+    // reads the one-shot wake latch [0x44193C] (oracle name "mreq") and, if
+    // set, ReferThreadStatus's then WakeupThread's the target tid in
+    // [0x441988] (oracle: always 1, the main thread), clearing the latch only
+    // if that lands. In the frozen run mreq stays 1 forever, i.e. the clear
+    // never re-fires -- either the checker stops being called, or the wake
+    // itself silently no-ops.
+    //
+    // Live breakpointing AFTER the freeze already happened turned out to be
+    // useless (recomp_wait_for_break kept returning a stale bp_hit latched
+    // from before the dispatch loop died -- see PS2_PROJECT_STATE.md Part
+    // 120 S2). This probe answers the question from inside the runtime
+    // instead: every time the checker runs with mreq==1 on entry, snapshot
+    // the target thread's EeScheduler-side status/wait-reason/wakeupCount
+    // before and after the pass-through call. EeScheduler::wakeupThread()
+    // (EeScheduler.cpp:2273) only calls makeReady() -- the branch that
+    // actually wakes a thread -- when status is Waiting/WaitingSuspended AND
+    // wait.reason==Sleep; every other case just does ++wakeupCount and
+    // leaves the thread asleep. If status/reason before this call is NOT
+    // Waiting+Sleep, that is the root cause: the guest's WakeupThread(1)
+    // call is landing in our own no-op branch.
+    //
+    // Off unless PS2X_WAKECHK is set, and even then only logs when mreq==1
+    // on entry, so it costs one relaxed load + one guest memory read on the
+    // overwhelming majority of (uninteresting) calls.
+    constexpr uint32_t kWakeCheckAddr = 0x0011FC40u;
+    constexpr uint32_t kWakeReqAddr = 0x0044193Cu;  // mreq: one-shot wake-request latch
+    constexpr uint32_t kWakeTidAddr = 0x00441988u;  // tid the checker wakes (oracle: 1)
+
+    bool wakechkEnabled()
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("PS2X_WAKECHK");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
+    }
+
+    const char *wakeStatusName(EeThreadStatus s)
+    {
+        switch (s)
+        {
+            case EeThreadStatus::Running: return "Running";
+            case EeThreadStatus::Ready: return "Ready";
+            case EeThreadStatus::Waiting: return "Waiting";
+            case EeThreadStatus::WaitingSuspended: return "WaitingSuspended";
+            case EeThreadStatus::Suspended: return "Suspended";
+            case EeThreadStatus::Dormant: return "Dormant";
+        }
+        return "?";
+    }
+
+    const char *wakeReasonName(EeWaitReason r)
+    {
+        switch (r)
+        {
+            case EeWaitReason::None: return "None";
+            case EeWaitReason::Sleep: return "Sleep";
+            case EeWaitReason::Semaphore: return "Semaphore";
+            case EeWaitReason::EventFlag: return "EventFlag";
+            case EeWaitReason::VSync: return "VSync";
+            case EeWaitReason::External: return "External";
+            case EeWaitReason::Mpeg: return "Mpeg";
+        }
+        return "?";
+    }
+
+    PS2Runtime::RecompiledFunction g_wakeCheckOrig = nullptr;
+    std::atomic<uint64_t> g_wakeCheckCalls{0};
+
+    void wakeCheckWrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const PS2Runtime::RecompiledFunction original = g_wakeCheckOrig;
+        if (original == nullptr)
+        {
+            return;
+        }
+        if (!wakechkEnabled() || runtime == nullptr)
+        {
+            original(rdram, ctx, runtime);
+            return;
+        }
+
+        const uint32_t mreqBefore = mtxRead32(rdram, kWakeReqAddr);
+        if (mreqBefore != 1u)
+        {
+            // The overwhelming majority of passes: nothing pending, nothing
+            // to learn. Stay silent so the interesting calls aren't buried.
+            original(rdram, ctx, runtime);
+            return;
+        }
+
+        const uint32_t mtid = mtxRead32(rdram, kWakeTidAddr);
+        EeScheduler &ee = runtime->eeScheduler();
+        const GuestThread *tgt = ee.thread(static_cast<int>(mtid));
+        const bool foundBefore = (tgt != nullptr);
+        const EeThreadStatus statusBefore = foundBefore ? tgt->status : EeThreadStatus::Dormant;
+        const EeWaitReason reasonBefore = foundBefore ? tgt->wait.reason : EeWaitReason::None;
+        const uint32_t wakeupCountBefore = foundBefore ? tgt->wakeupCount : 0u;
+
+        original(rdram, ctx, runtime);
+
+        const uint32_t mreqAfter = mtxRead32(rdram, kWakeReqAddr);
+        tgt = ee.thread(static_cast<int>(mtid));  // re-fetch: vector storage may move
+        const bool foundAfter = (tgt != nullptr);
+        const EeThreadStatus statusAfter = foundAfter ? tgt->status : EeThreadStatus::Dormant;
+        const EeWaitReason reasonAfter = foundAfter ? tgt->wait.reason : EeWaitReason::None;
+        const uint32_t wakeupCountAfter = foundAfter ? tgt->wakeupCount : 0u;
+
+        const uint64_t seq = g_wakeCheckCalls.fetch_add(1u, std::memory_order_relaxed);
+        std::cerr << "[wakechk] seq=" << std::dec << seq
+                  << " mtid=" << mtid
+                  << " mreq(before/after)=" << mreqBefore << "/" << mreqAfter
+                  << (mreqAfter == 0u ? "(CLEARED)" : "(STILL SET)")
+                  << " found(before/after)=" << (foundBefore ? 1 : 0) << "/" << (foundAfter ? 1 : 0)
+                  << " status(before/after)=" << wakeStatusName(statusBefore) << "/" << wakeStatusName(statusAfter)
+                  << " reason(before/after)=" << wakeReasonName(reasonBefore) << "/" << wakeReasonName(reasonAfter)
+                  << " wakeupCount(before/after)=" << wakeupCountBefore << "/" << wakeupCountAfter
+                  << std::endl;
+    }
+
+    void applySdbzWakeCheckProbe(PS2Runtime &runtime)
+    {
+        g_wakeCheckOrig = runtime.lookupFunction(kWakeCheckAddr);
+        if (g_wakeCheckOrig != nullptr)
+        {
+            runtime.replaceFunction(kWakeCheckAddr, &wakeCheckWrapper);
+        }
+        std::cerr << "[wakechk] enabled=" << (wakechkEnabled() ? 1 : 0)
+                  << " hook=0x" << std::hex << kWakeCheckAddr
+                  << (g_wakeCheckOrig != nullptr ? "(hooked)" : "(MISSING)")
+                  << std::dec
+                  << " (PS2X_WAKECHK=1 enables; logs only when mreq==1 on entry)"
+                  << std::endl;
+    }
+
+    // Part 124 (2026-09-17). Continuation of the RANKING/GAME-OVER black-
+    // screen freeze (Part 120-123). Live comparison against PCSX2 (the
+    // oracle) at the identical RANKING screen showed our runtime diverges
+    // from real hardware: real PS2 stays at 3 threads with mreq/
+    // qword_4419B8/qword_4419C0 all back at 0; ours bursts to 6 threads and
+    // never clears mreq. Static analysis (decomp.py) traced the chain: a
+    // module refcount (dword_4418E4) hitting zero calls module_obj_unk_b
+    // (0x11F3F8, sets qword_4419B8=1 to tell the sub_11E8D0 background
+    // worker's `while (!qword_4419B8)` loop to stop) then module_obj_unk_e
+    // (0x11F680), which busy-loops calling WakeupThread + a resume-if-
+    // suspended helper on the worker (dword_441980) until the worker itself
+    // sets qword_4419C0=1 to acknowledge and exits its loop. On real
+    // hardware this completes within the same frame (confirmed live:
+    // dword_441980/qword_4419B8/qword_4419C0 all read 0 once the RANKING
+    // screen is up). If our runtime never lets the worker observe
+    // qword_4419B8==1 and exit, 0x11F680 never returns -- consistent with
+    // the thread-1 livelock already found live (Part 122) and the
+    // permanently-stuck mreq (Part 120/121).
+    //
+    // This probe answers whether 0x11F680 is even reached, and if so,
+    // whether it ever returns. Off unless PS2X_TEARDOWNCHK is set. A
+    // "RETURNED" line should follow its "ENTER" line almost immediately on
+    // correct behavior; ENTER with no matching RETURNED for the rest of the
+    // run is itself the finding.
+    constexpr uint32_t kWorkerShutdownAddr = 0x0011F680u;
+    constexpr uint32_t kWorkerTidAddr = 0x00441980u;
+    constexpr uint32_t kWorkerStopFlagAddr = 0x004419B8u;
+    constexpr uint32_t kWorkerAckFlagAddr = 0x004419C0u;
+
+    bool teardownChkEnabled()
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("PS2X_TEARDOWNCHK");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
+    }
+
+    PS2Runtime::RecompiledFunction g_workerShutdownOrig = nullptr;
+    std::atomic<uint64_t> g_workerShutdownCalls{0};
+
+    // Part 127: Part 126's [waketrace] cap (64 hits, id==4-only filter) was
+    // exhausted entirely by ordinary gameplay wakeups of thread 4 BEFORE this
+    // function was ever entered -- teardownchk ENTER landed at run_log.txt
+    // line 32312, all 64 waketrace hits at lines 22581-23586. g_ps2x_teardownActive
+    // (declared at file scope above, defined in EeScheduler.cpp) is held true
+    // only while inside the call to sub_11F680 below, so [waketrace]'s cap is
+    // spent on wakes actually issued from the shutdown retry loop instead.
+
+    void workerShutdownWrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const PS2Runtime::RecompiledFunction original = g_workerShutdownOrig;
+        if (original == nullptr)
+        {
+            return;
+        }
+        if (!teardownChkEnabled() || runtime == nullptr)
+        {
+            original(rdram, ctx, runtime);
+            return;
+        }
+
+        const uint64_t seq = g_workerShutdownCalls.fetch_add(1u, std::memory_order_relaxed);
+        const uint32_t tid = mtxRead32(rdram, kWorkerTidAddr);
+        const uint32_t stopBefore = mtxRead32(rdram, kWorkerStopFlagAddr);
+        const uint32_t ackBefore = mtxRead32(rdram, kWorkerAckFlagAddr);
+        std::cerr << "[teardownchk] seq=" << std::dec << seq
+                  << " ENTER tid=" << tid
+                  << " stopFlag=" << stopBefore
+                  << " ackFlag=" << ackBefore
+                  << std::endl;
+
+        g_ps2x_teardownActive.store(true, std::memory_order_relaxed);
+        original(rdram, ctx, runtime);
+        g_ps2x_teardownActive.store(false, std::memory_order_relaxed);
+
+        const uint32_t stopAfter = mtxRead32(rdram, kWorkerStopFlagAddr);
+        const uint32_t ackAfter = mtxRead32(rdram, kWorkerAckFlagAddr);
+        std::cerr << "[teardownchk] seq=" << seq
+                  << " RETURNED tid=" << tid
+                  << " stopFlag=" << stopAfter
+                  << " ackFlag=" << ackAfter
+                  << std::endl;
+    }
+
+    void applySdbzWorkerShutdownProbe(PS2Runtime &runtime)
+    {
+        g_workerShutdownOrig = runtime.lookupFunction(kWorkerShutdownAddr);
+        if (g_workerShutdownOrig != nullptr)
+        {
+            runtime.replaceFunction(kWorkerShutdownAddr, &workerShutdownWrapper);
+        }
+        std::cerr << "[teardownchk] enabled=" << (teardownChkEnabled() ? 1 : 0)
+                  << " hook=0x" << std::hex << kWorkerShutdownAddr
+                  << (g_workerShutdownOrig != nullptr ? "(hooked)" : "(MISSING)")
+                  << std::dec
+                  << " (PS2X_TEARDOWNCHK=1 enables; logs ENTER/RETURNED around"
+                     " the sub_11F680 worker-shutdown wait-loop)"
+                  << std::endl;
+    }
+
+    // -------------------------------------------------------------------
+    // SDBZ SofDec/mwPly SIF-link synthesis (PS2_PROJECT_STATE.md Part 142)
+    //
+    // The RANKING/GAME-OVER screen's per-frame pause/resume poll
+    // (noop_wrapper___471 and 3 sibling call sites, all on the movie/mwPly
+    // object) gates on wrap_sif_is_bound (0x1687b8) returning exactly 3 --
+    // CRI Sofdec's own "SIF-RPC stream link complete" sentinel, read back
+    // from *(handle+72). Two independent facts, both confirmed by reading
+    // the decoded MIPS and the runtime source (not guessed), make that
+    // value unreachable through real code:
+    //
+    //   1. wrap_sif_is_bound_0x1687b8's own bind call always invokes
+    //      sif_bind_rpc with the handle forced to 0 (decoded in full),
+    //      which structurally cannot write *(handle+72) -- that write
+    //      lives behind a branch only reachable with a nonzero handle.
+    //   2. The only IOP module that could write it via a real reply,
+    //      CRI_ADXI.IRX, is never loaded by this runtime -- a deliberate,
+    //      already-documented decision (Kernel/Stubs/SIF.cpp:131-146),
+    //      the same one already closed out for the separate Stage 5.14/
+    //      5.15 SFD-stream-ack gap.
+    //
+    // Synthesize the completion the same way SJX/DTX's own bind is already
+    // echo-completed in Kernel/Stubs/SIF.cpp: no fabricated payload crosses
+    // back, just the one documented sentinel CRI's own middleware would
+    // have written given a working real module.
+    void sdbzSifIsBoundAlwaysLinked1687B8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t handle = GPR_U32(ctx, 4); // $a0
+
+        if (handle != 0u)
+        {
+            WRITE32(handle + 72u, 3u);
+            SET_GPR_S32(ctx, 2, 3);
+
+            static std::atomic<uint32_t> s_sifBoundFixLogs{0u};
+            if (s_sifBoundFixLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+            {
+                std::cerr << "[sifboundfix] handle=0x" << std::hex << handle
+                          << " ra=0x" << GPR_U32(ctx, 31) << std::dec << std::endl;
+            }
+        }
+        else
+        {
+            // Object not constructed yet -- answer "not bound" without touching
+            // memory, same outcome the real function's own a0==0 guard yields.
+            SET_GPR_S32(ctx, 2, -1);
+        }
+
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    void applySdbzSofDecSifLinkFix(PS2Runtime &runtime)
+    {
+        constexpr uint32_t kSifIsBoundAddr = 0x001687B8u;
+        runtime.replaceFunction(kSifIsBoundAddr, &sdbzSifIsBoundAlwaysLinked1687B8);
+        std::cerr << "[sifboundfix] enabled hook=0x" << std::hex << kSifIsBoundAddr << std::dec
+                  << " (synthesizes CRI Sofdec's SIF-RPC stream-link-complete status;"
+                     " see PS2_PROJECT_STATE.md Part 142)"
+                  << std::endl;
+    }
+
     PS2_REGISTER_GAME_OVERRIDE("RECVX sound-driver compat", "slus_201.84", 0u, 0u, &applyRecvxSoundDriverCompat);
     PS2_REGISTER_GAME_OVERRIDE("RECVX DTX compat", "slus_201.84", 0u, 0u, &applyRecvxDtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("LotR sound RPC compat", "SLUS_205.78", 0u, 0u, &applyLotrSoundRpcCompat);
@@ -8761,9 +9482,12 @@ namespace
     PS2_REGISTER_GAME_OVERRIDE("SDBZ packet build-order probe", "SLUS_214.42", 0u, 0u, &applySdbzPacketOrder);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ movie-open gate probe", "SLUS_214.42", 0u, 0u, &applySdbzMovieGate);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ Sofdec per-frame driver probe", "SLUS_214.42", 0u, 0u, &applySdbzSofdecProbe);
+    PS2_REGISTER_GAME_OVERRIDE("SDBZ SofDec SIF-link synthesis", "SLUS_214.42", 0u, 0u, &applySdbzSofDecSifLinkFix);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ SRD completion probe", "SLUS_214.42", 0u, 0u, &applySdbzSrdProbe);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ SIF sreg + logo-step probe", "SLUS_214.42", 0u, 0u, &applySdbzSregProbe);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ transform-matrix probe", "SLUS_214.42", 0u, 0u, &applySdbzMatrixProbe);
+    PS2_REGISTER_GAME_OVERRIDE("SDBZ main-wake resume probe", "SLUS_214.42", 0u, 0u, &applySdbzWakeCheckProbe);
+    PS2_REGISTER_GAME_OVERRIDE("SDBZ worker-shutdown probe", "SLUS_214.42", 0u, 0u, &applySdbzWorkerShutdownProbe);
     // Must stay LAST: it replaces 0x420E70, which the sreg probe above also
     // replaces, and the later apply wins.
     PS2_REGISTER_GAME_OVERRIDE("SDBZ opening-logo FMV skip", "SLUS_214.42", 0u, 0u, &applySdbzSkipFmv);

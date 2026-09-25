@@ -162,3 +162,20 @@ ida_scripts/idapy_ps2/*
 # PCSX2 dump (build_scripts/gsdump_parse.py --emit-replay) and runs to megabytes.
 gsdump/*
 gsdump_replay*.bmp
+
+# Game-derived / local-only (added 2026-09-24): recovered guest bodies are
+# transliterated retail code; textures/meshes are extracted game assets.
+# (11 older recovered/*.cpp are already tracked -- ignore rules don't touch them.)
+ps2xRuntime/src/lib/Kernel/recovered/sub_*.cpp
+SDBZ?Textures/
+meshdump/
+_backup_recovered_*/
+_quarantine_stale_output_*/
+build.testonly/
+ps2x_rec/
+output_scratch_*/
+config.scratch_*.toml
+cheatengine-mcp/
+x64dbg/
+__pycache__/
+imgui.ini

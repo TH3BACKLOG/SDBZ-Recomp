@@ -503,7 +503,7 @@ void register_ps2_sif_rpc_tests()
             layout.completionCallbacks = {kEndFunc, 0u, 0u, 0u};
             ps2_syscalls::setSoundDriverCompatLayout(layout);
 
-            env.runtime.registerFunction(kEndFunc, lotrSoundEndCallbackShouldNotRun);
+            env.runtime.registerFunction(kEndFunc, lotrSoundEndCallback);
             g_lotrSoundCallbackHits = 0u;
 
             SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);

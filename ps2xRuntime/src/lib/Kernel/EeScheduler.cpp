@@ -5,6 +5,7 @@
 #include "recomp_debug_writer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,18 @@
 extern "C" void ps2x_probe_kv(const char *name, int n,
                               const char *const *keys, const uint64_t *vals);
 
+// 2026-09-22 [sema3] -- defined at file scope in ps2_runtime.cpp, after the
+// anonymous namespace that owns the per-thread dispatch ring. Declared here
+// rather than in a header because ps2_dispatch_history.h neighbours the runner
+// include graph and extern-between-.cpp is this project's sanctioned cross-TU
+// pattern (game_overrides.cpp:47-50).
+//
+// INHERITED LIMIT, stated so a short chain is not misread: this ring is fed by
+// dispatchGuestBranch(). A function reached by a direct call or a tail `j`
+// never appears in it. An empty c0..c3 is therefore NOT evidence that nothing
+// called SignalSema -- it means the path bypassed the dispatch table.
+extern std::size_t ps2xDispatchHistoryTail(uint32_t *out, std::size_t n) noexcept;
+
 // Defined in Syscalls/Thread.cpp. Declared here rather than in a header for the
 // same reason as every other ps2x_* free function in this file: ee_scheduler.h
 // is pulled in by ~4,520 generated TUs, so touching it is a 30h rebuild.
@@ -58,6 +71,11 @@ namespace
     uint64_t g_dispatchOther = 0;
     uint64_t g_sleepBlocked = 0;
     uint64_t g_sleepFast = 0;
+    // 2026-09-17 part 121 -- see [semwatch:vblchain] at the VBlankStart
+    // reschedule site in processDueDeadlines(): counts every time the
+    // VBlankStart->VBlankEnd->VBlankStart chain successfully re-arms itself.
+    // Read alongside [semwatch:waitforever]'s vblChain= field.
+    std::atomic<uint32_t> g_vblankRescheduleCount{0u};
     // 2026-09-08 part 102 -- these counters were added by part 87 to test a
     // wakeupCount-runaway theory. THAT THEORY IS FALSIFIED; they are kept
     // because they are what falsified it. Do not re-derive it.
@@ -257,6 +275,17 @@ extern "C" uint64_t ps2x_guest_resumes()
 // one EeScheduler/PS2Runtime instance per process, same assumption the old
 // singleton-style ps2sched code made.
 static EeScheduler *s_activeScheduler = nullptr;
+
+// 2026-09-22 -- the dispatch-trace ring is per GUEST THREAD (ps2_runtime.cpp).
+// It therefore has to be cleared when a tid is minted, or a recycled tid would
+// inherit the dead thread's PCs -- SchedulerRecoveryIsolation/R2. Clearing at
+// CREATION rather than at death is deliberate: thread death has four separate
+// paths (normal return, exitThreadWithHandlers, terminateThread, the
+// requestStop sweep) and missing any one of them would leave the stale ring in
+// place, whereas allocateThreadId() is the single point every tid comes from.
+// extern-between-.cpp, no header, per the project rule.
+extern "C" void ps2x_dispatch_history_reset(int tid);
+extern "C" void ps2x_dispatch_history_reset_all();
 
 // Current guest thread id, or 0 if none is running (ported off ps2sched's
 // thread_local g_currentThreadId, which used -1 for "none" -- 0 works
@@ -820,7 +849,7 @@ EeScheduler::~EeScheduler()
 
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 {
-    m_executorThread = std::this_thread::get_id();
+    m_executorThread.store(std::this_thread::get_id(), std::memory_order_release);
     m_rdram = rdram;
     m_readyQueues = {};
     m_threads.clear();
@@ -866,6 +895,12 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_gsVSyncCallbackGp = 0;
     m_gsVSyncCallbackSp = 0;
     m_runtime.memory().gs().vsyncTick.store(0u, std::memory_order_release);
+
+    // reset() wipes threads, semaphores and event flags; the per-guest-thread
+    // dispatch rings are the same class of state and would otherwise survive
+    // into the next scheduler generation (visible in the test suite as one
+    // suite's PCs appearing in the next suite's trace).
+    ps2x_dispatch_history_reset_all();
 
     GuestThread main{};
     main.id = kMainThreadId;
@@ -923,6 +958,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     publishSnapshot();
 }
 
+// Forward decl: real definition (Part 127) is further down this same TU.
+extern std::atomic<bool> g_ps2x_teardownActive;
+
 void EeScheduler::run()
 {
     assertExecutor();
@@ -930,6 +968,11 @@ void EeScheduler::run()
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
+        // pumpGuestThreads() only (m_pumpMode is false in production).
+        if (m_pumpMode && std::chrono::steady_clock::now() >= m_pumpDeadline)
+        {
+            break;
+        }
         processPendingEvents();
         if (m_stopRequested.load(std::memory_order_acquire))
         {
@@ -939,9 +982,30 @@ void EeScheduler::run()
         if (m_currentThreadId == 0)
         {
             GuestThread *next = selectReady();
+            // Part 132: after transferIfRequested() throws to give a newly-
+            // Ready higher-priority thread its turn, does selectReady() here
+            // actually return THAT thread, or something else? [xferchk]
+            // showed willThrow=1 once, then m_rescheduleRequested=0 forever
+            // after -- this settles whether the picked thread ever was id 4.
+            if (g_ps2x_teardownActive.load(std::memory_order_relaxed))
+            {
+                std::cerr << "[selectchk] picked=" << (next ? next->id : 0)
+                          << " picked.pri=" << (next ? next->currentPriority : -1)
+                          << " t4status=" << (thread(4) ? static_cast<int>(thread(4)->status) : -1)
+                          << " t4pri=" << (thread(4) ? thread(4)->currentPriority : -1)
+                          << std::endl;
+            }
             if (!next && m_pendingInvocations.empty())
             {
                 publishSnapshot();
+                // pumpGuestThreads() returns here rather than sleeping:
+                // "nothing left to dispatch" is the pump completion condition,
+                // whereas for run() it is just an idle tick. m_pumpMode is
+                // false in production, so this is a no-op there.
+                if (m_pumpMode)
+                {
+                    break;
+                }
                 waitForEvent();
                 continue;
             }
@@ -1396,6 +1460,76 @@ void EeScheduler::run()
                 std::abort();
             }
 
+            // 2026-09-22 -- run the thread's registered exit handlers before it
+            // goes dormant.
+            //
+            // Until now the ONLY path that ran an exit handler was
+            // ExitThread/ExitDeleteThread -- see exitThreadWithHandlers() in
+            // Kernel/Syscalls/Thread.cpp, the single call site of
+            // PS2Runtime::takeEeExitHandlers(). A thread whose entry function
+            // simply RETURNS, which is the ordinary way a guest thread ends and
+            // is exactly the EXPECTED case identified above, reached
+            // makeDormant() here with its handlers still sitting in
+            // PS2Runtime's map: never run, never cleared. That is what failed
+            // SchedulerBorrowedWorker/W2, whose fiber body registers a handler
+            // and then just returns.
+            //
+            // Handlers are pushed as invocations rather than called directly,
+            // because this is run()'s own loop: there is no syscall frame to
+            // throw EeDispatcherTransfer out of, the way invokeCurrentSequence()
+            // does. The `continue` below hands them to the dispatcher on the
+            // next iteration. takeEeExitHandlers() ERASES, so when the last
+            // handler returns and control arrives back here with an empty
+            // invocation stack there is nothing left to take and the thread
+            // goes dormant exactly as before -- no extra state, no loop risk.
+            //
+            // Deliberately NOT done for the SUSPECT case, nor for the negative
+            // pseudo-thread ids: a $ra==0 return we cannot attribute to this
+            // thread's own entry is not a thread ending, and a pseudo-thread
+            // has no guest handlers. External death paths (terminateThread at
+            // :2193, the requestStop sweep at :3992) are also deliberately left
+            // alone -- there the target is not running and its stack has been
+            // reclaimed, so there is nothing safe to run a guest handler on.
+            if (zeroPcExpected && running->id > 0 && running->invocations.empty())
+            {
+                const auto exitHandlers = m_runtime.takeEeExitHandlers(running->id);
+                std::vector<GuestInvocation> exitInvocations;
+                exitInvocations.reserve(exitHandlers.size());
+                for (const PS2Runtime::EeExitHandlerRegistration &handler : exitHandlers)
+                {
+                    if (handler.function == 0u || !m_runtime.hasFunction(handler.function))
+                    {
+                        continue;
+                    }
+                    GuestInvocation invocation{};
+                    invocation.kind = GuestInvocationKind::ExitHandler;
+                    invocation.context = running->activeContext();
+                    invocation.context.pc = handler.function;
+                    SET_GPR_U32(&invocation.context, 4, handler.argument);
+                    SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+                    SET_GPR_U32(&invocation.context, 31, 0u);
+                    exitInvocations.push_back(std::move(invocation));
+                }
+                if (!exitInvocations.empty())
+                {
+                    // Reverse push so the FIRST-registered handler ends up on
+                    // TOP of the stack and therefore runs first -- the same
+                    // ordering invokeCurrentSequence() establishes (:3273).
+                    for (auto it = exitInvocations.rbegin(); it != exitInvocations.rend(); ++it)
+                    {
+                        it->sequence = ++m_invocationSequence;
+                        const uint32_t invPc = it->context.pc;
+                        const uint32_t invSp = getRegU32(&it->context, 29);
+                        const uint8_t invKind = static_cast<uint8_t>(it->kind);
+                        running->invocations.push_back(std::move(*it));
+                        eeRecordInv(EeInvKind::PushSequence, running->id, invPc, invSp,
+                                    running->invocations.size(), m_eeCycle, invKind);
+                    }
+                    publishSnapshot();
+                    continue;
+                }
+            }
+
             makeDormant(*running);
             m_currentThreadId = 0;
             continue;
@@ -1442,6 +1576,20 @@ void EeScheduler::run()
             continue;
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
+        // Part 132 [f680disp] -- does the scheduler ever dispatch back into
+        // sub_11F680 (0x11f680-0x11f750) after WakeupThread's preemption
+        // throw unwinds thread 1 out of it mid-call? [xferchk]/[selectchk]
+        // showed the throw fire and thread 4 self-delete cleanly, but no
+        // further [teardownchk] RETURNED ever appears -- this settles
+        // whether thread 1 is redispatched into the retry loop at all, and
+        // if so at which label (true entry 0x11f680 vs a mid-function
+        // resume), rather than silently running its own unrelated code.
+        if (g_ps2x_teardownActive.load(std::memory_order_relaxed) &&
+            context.pc >= 0x11f680u && context.pc <= 0x11f750u)
+        {
+            std::cerr << "[f680disp] tid=" << running->id << " pc=0x" << std::hex << context.pc
+                      << std::dec << " eeCycle=" << m_eeCycle << std::endl;
+        }
         s_semwatchLastDispatchPc = context.pc;
         s_semwatchLastDispatchTid = running->id;
         s_dispatchHist[s_dispatchHistPos % 4u] = context.pc;
@@ -1913,6 +2061,13 @@ void EeScheduler::run()
 
     m_guestExecuting.store(false, std::memory_order_release);
     m_running.store(false, std::memory_order_release);
+    // Gated strictly on m_stopRequested: run() also exits via the m_pumpMode
+    // deadline break above, and unwinding there would dormant every worker on
+    // every pumpGuestThreads() call.
+    if (m_stopRequested.load(std::memory_order_acquire))
+    {
+        unwindForStop();
+    }
     copyMainContextToRuntime();
     publishSnapshot();
 }
@@ -2016,6 +2171,9 @@ int EeScheduler::createThread(const EeThreadCreateParams &params)
     {
         return KE_ERROR;
     }
+
+    // Fresh ring for a fresh thread -- see the declaration comment above.
+    ps2x_dispatch_history_reset(id);
 
     GuestThread thread{};
     thread.id = id;
@@ -2140,6 +2298,82 @@ int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSaf
     return KE_OK;
 }
 
+// Part 146 (2026-09-20, PS2_PROJECT_STATE.md) -- suspendCount desync probe.
+//
+// [thsync]'s own embedded VERDICT ("rgate==1 yet the worker did not tick; the
+// resume is reaching ResumeThread and failing") pointed here. suspendThread
+// below bumps target->suspendCount UNCONDITIONALLY, even when the thread is
+// already Suspended/WaitingSuspended (those switch cases just `break`, they
+// do not skip the increment above them). resumeThread only actually wakes
+// the thread once the count decrements back to 0. If the guest's own
+// "SuspendThread-if-not-already" check (sub_11E8D0, Part 111) ever calls the
+// real syscall while our runtime's status is already Suspended -- a one-
+// frame guest/runtime desync would be enough -- suspendCount silently climbs
+// past 1, and RenderDispatch's single per-frame ResumeThread call (Part 111:
+// one call, no loop) can never bring it back to 0. That is exactly the
+// observed shape from Part 144-145's run: rgate genuinely 1, ResumeThread
+// genuinely called every frame, worker never actually wakes, no error
+// surfaced either way (KE_OK on both the double-suspend and the stuck-resume
+// paths).
+//
+// Two anomaly counters, both ALWAYS ON (no env var) so a "zero hits" result
+// is trustworthy rather than "never checked"
+// ([[feedback_capped_probes_false_negatives]]): [suspenddbl] fires the
+// instant suspendThread is called on a thread already Suspended/
+// WaitingSuspended (the over-increment event itself); [suspendstuck] fires
+// the instant resumeThread decrements the count but it does not reach 0 (the
+// direct, mechanical match for "ResumeThread reached but failing"). Both are
+// capped at 256 -- this should be RARE-TO-NEVER in correct operation, so the
+// cap cannot starve a real signal the way a cap on routine traffic can
+// ([[feedback_probe_gate_on_shape_not_address]] -- gated on the anomalous
+// shape, not on a specific address/tid, since the worker's tid varies by run
+// -- 6 in the run that motivated this probe, 4 in the unrelated RANKING-
+// teardown path Part 125's [waketrace] already covers, 14 on the PCSX2
+// oracle).
+//
+// PS2X_SUSPENDTRACE=1 additionally traces every suspendThread/resumeThread
+// call regardless of anomaly, optionally filtered to one id via
+// PS2X_SUSPENDTRACE_ID (unset/-1 = all ids); capped separately since this is
+// opt-in, high-volume, and only meant for deep follow-up once the anomaly
+// counters above say something is actually wrong.
+namespace
+{
+    std::atomic<uint32_t> g_suspendDoubleHits{0u};
+    std::atomic<uint32_t> g_suspendStuckResumeHits{0u};
+    std::atomic<uint32_t> g_suspendTraceHits{0u};
+
+    bool suspendtraceEnabled()
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("PS2X_SUSPENDTRACE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
+    }
+
+    int suspendtraceTargetId()
+    {
+        static const int id = [] {
+            const char *e = std::getenv("PS2X_SUSPENDTRACE_ID");
+            return (e && *e) ? std::atoi(e) : -1;
+        }();
+        return id;
+    }
+
+    void suspendProbeBanner()
+    {
+        static const bool printed = [] {
+            std::cerr << "[suspenddbl] probe installed -- always-on suspendCount desync "
+                         "detector for EeScheduler::suspendThread/resumeThread "
+                         "(PS2_PROJECT_STATE.md Part 146); set PS2X_SUSPENDTRACE=1 "
+                         "(optionally PS2X_SUSPENDTRACE_ID=<tid>) for a full per-call trace"
+                      << std::endl;
+            return true;
+        }();
+        (void)printed;
+    }
+}
+
 int EeScheduler::suspendThread(int id, bool interruptSafe)
 {
     assertExecutor();
@@ -2156,6 +2390,12 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
     {
         return KE_DORMANT;
     }
+
+    suspendProbeBanner();
+    const EeThreadStatus statusBeforeSuspend = target->status;
+    const uint32_t suspendCountBeforeSuspend = target->suspendCount;
+    const bool alreadySuspended = statusBeforeSuspend == EeThreadStatus::Suspended ||
+                                   statusBeforeSuspend == EeThreadStatus::WaitingSuspended;
 
     ++target->suspendCount;
     switch (target->status)
@@ -2182,6 +2422,36 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
     {
         m_rescheduleRequested = true;
     }
+
+    if (alreadySuspended)
+    {
+        const uint32_t n = g_suspendDoubleHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 256u)
+        {
+            std::cerr << "[suspenddbl] n=" << n << " id=" << id
+                      << " statusBefore=" << static_cast<int>(statusBeforeSuspend)
+                      << " suspendCountBefore=" << suspendCountBeforeSuspend
+                      << " suspendCountAfter=" << target->suspendCount
+                      << " statusAfter=" << static_cast<int>(target->status)
+                      << " interruptSafe=" << interruptSafe
+                      << " eeCycle=" << m_eeCycle << std::endl;
+        }
+    }
+    if (suspendtraceEnabled() &&
+        (suspendtraceTargetId() < 0 || suspendtraceTargetId() == id))
+    {
+        const uint32_t n = g_suspendTraceHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 4096u)
+        {
+            std::cerr << "[suspendtrace] n=" << n << " op=S id=" << id
+                      << " statusBefore=" << static_cast<int>(statusBeforeSuspend)
+                      << " suspendCountBefore=" << suspendCountBeforeSuspend
+                      << " suspendCountAfter=" << target->suspendCount
+                      << " statusAfter=" << static_cast<int>(target->status)
+                      << " eeCycle=" << m_eeCycle << std::endl;
+        }
+    }
+
     publishSnapshot();
     return KE_OK;
 }
@@ -2200,11 +2470,43 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
     }
     if (target->suspendCount == 0)
     {
+        if (suspendtraceEnabled() &&
+            (suspendtraceTargetId() < 0 || suspendtraceTargetId() == id))
+        {
+            const uint32_t n = g_suspendTraceHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 4096u)
+            {
+                std::cerr << "[suspendtrace] n=" << n << " op=R id=" << id
+                          << " result=KE_NOT_SUSPEND status=" << static_cast<int>(target->status)
+                          << " eeCycle=" << m_eeCycle << std::endl;
+            }
+        }
         return KE_NOT_SUSPEND;
     }
     --target->suspendCount;
     if (target->suspendCount != 0)
     {
+        const uint32_t n = g_suspendStuckResumeHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 256u)
+        {
+            std::cerr << "[suspendstuck] n=" << n << " id=" << id
+                      << " suspendCountAfter=" << target->suspendCount
+                      << " status=" << static_cast<int>(target->status)
+                      << " interruptSafe=" << interruptSafe
+                      << " eeCycle=" << m_eeCycle << std::endl;
+        }
+        if (suspendtraceEnabled() &&
+            (suspendtraceTargetId() < 0 || suspendtraceTargetId() == id))
+        {
+            const uint32_t n2 = g_suspendTraceHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n2 <= 4096u)
+            {
+                std::cerr << "[suspendtrace] n=" << n2 << " op=R id=" << id
+                          << " result=stillSuspended suspendCountAfter=" << target->suspendCount
+                          << " status=" << static_cast<int>(target->status)
+                          << " eeCycle=" << m_eeCycle << std::endl;
+            }
+        }
         return KE_OK;
     }
     if (target->status == EeThreadStatus::WaitingSuspended)
@@ -2215,6 +2517,17 @@ int EeScheduler::resumeThread(int id, bool interruptSafe)
     {
         enqueueReady(*target);
         requestPreemptionIfHigher(*target, interruptSafe);
+    }
+    if (suspendtraceEnabled() &&
+        (suspendtraceTargetId() < 0 || suspendtraceTargetId() == id))
+    {
+        const uint32_t n = g_suspendTraceHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 4096u)
+        {
+            std::cerr << "[suspendtrace] n=" << n << " op=R id=" << id
+                      << " result=woken status=" << static_cast<int>(target->status)
+                      << " eeCycle=" << m_eeCycle << std::endl;
+        }
     }
     publishSnapshot();
     return KE_OK;
@@ -2270,6 +2583,117 @@ void EeScheduler::sleepCurrent()
     blockCurrent(EeWaitState{EeWaitReason::Sleep, std::monostate{}});
 }
 
+// 2026-09-17 part 125 -- Part 124's [teardownchk] proved sub_11F680 (the
+// RANKING/GAME-OVER worker-shutdown wait-loop) is entered once and never
+// returns; [thsync] showed the worker thread (dword_441980, this run's id
+// was 4) go to Sleep once at t=405s and never change state again for the
+// rest of the run -- no toggling, unlike thread 1's separate, already-
+// disproven wake path (Part 120's [wakechk] on sub_11FC40/mtid=1). This is
+// the first direct look at what happens inside THIS wakeupThread() call for
+// that specific target: does it take the makeReady() branch (a real wake)
+// or the ++wakeupCount branch (the no-op Part 120 originally suspected, just
+// on the wrong thread)? [wakechk]/THLIFE could not answer this because
+// neither hooks this call site (sub_11F680 calls it via a different syscall
+// thunk than sub_11FC40, and THLIFE's "WATCH"-tag sink never reaches
+// run_log.txt -- see [[feedback_probe_sink_vs_log_tag]]). std::cerr direct,
+// not ps2x_probe_kv, so this is guaranteed to land in run_log.txt.
+//
+// Off unless PS2X_WAKETRACE is set. Filters on PS2X_WAKETRACE_ID (default
+// 4, this run's known-stuck id) so it doesn't drown in unrelated wakeups
+// elsewhere in the game; capped at 64 hits for that id so a genuinely
+// hot/legitimate wake pattern on the same id can't flood the log.
+namespace
+{
+    bool waketraceEnabled()
+    {
+        static const bool on = [] {
+            const char *e = std::getenv("PS2X_WAKETRACE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return on;
+    }
+
+    int waketraceTargetId()
+    {
+        static const int id = [] {
+            const char *e = std::getenv("PS2X_WAKETRACE_ID");
+            return (e && *e) ? std::atoi(e) : 4;
+        }();
+        return id;
+    }
+
+    std::atomic<uint32_t> g_waketraceHits{0u};
+}
+
+// Part 127 (2026-09-17). The Part 126 "64/64 makeReady, s4 correct,
+// stopFlagRaw always 0" result turned out to be a false premise: teardownchk
+// showed sub_11F680's ENTER landed at run_log.txt line 32312, but ALL 64
+// waketrace hits landed earlier, at lines 22581-23586 -- thread 4 gets woken
+// routinely during ordinary gameplay (it's a general worker, not shutdown-
+// only), and the id==4 filter alone let the cap exhaust on that unrelated
+// traffic long before the RANKING-screen shutdown sequence ever started.
+// Zero of the 64 captured samples were actually from sub_11F680's retry
+// loop. This flag (set by workerShutdownWrapper in game_overrides.cpp for
+// the duration of its call into sub_11F680) additionally gates the trace so
+// the 64-hit cap is spent only on wakes issued from inside the shutdown
+// wait-loop itself.
+std::atomic<bool> g_ps2x_teardownActive{false};
+
+// Part 147 (2026-09-20, PS2_PROJECT_STATE.md) -- wakeupThread visibility probe.
+//
+// Part 146's suspendCount hypothesis is REFUTED: a build+run with that probe
+// live showed zero [suspenddbl]/[suspendstuck] hits across a 187s
+// GATE-OPEN-BUT-DEAD window (t=444-631s). But re-reading the same run's raw
+// [thsync] thread-6 field (not just its rgate/VERDICT summary) shows it is
+// NOT frozen -- it toggles st=12 (WaitingSuspended) <-> st=4 (Waiting) every
+// few seconds for the entire 187s, matching the guest's own per-frame design
+// exactly (Part 111: sub_11E8D0 suspends it every frame; RenderDispatch's
+// ResumeThread un-suspends it every frame while rgate==1). suspendCount
+// bookkeeping is provably clean -- that transition only happens on a real,
+// successful resumeThread() call. What never happens across the whole
+// window is a transition to Ready/Running: the thread keeps getting
+// un-suspended, but never actually WAKES from the underlying Sleep wait it
+// was parked in before any of this started. That makes wakeupThread the new
+// prime suspect -- specifically, whether it is ever called on this thread at
+// all while it sits in Waiting/WaitingSuspended, and if so, which branch
+// (real makeReady() wake vs. the silent ++wakeupCount no-op below) it takes.
+//
+// The existing [waketrace] probe (Part 125/126/127/132, immediately below
+// this scheduler function) cannot see this: it is hardcoded to
+// PS2X_WAKETRACE_ID (default 4) and gated on g_ps2x_teardownActive, which is
+// only set inside the RANKING-screen shutdown wrapper -- neither applies to
+// this earlier, opening-movie GATE-OPEN-BUT-DEAD window (this run's worker
+// was tid 6, and teardown was never entered). [wakerelevant] is unconditional
+// on id and the teardown flag; it fires whenever wakeupThread is called on
+// ANY thread that is currently Waiting/WaitingSuspended (the only population
+// where the branch choice matters), capped at 512 -- generous enough to
+// survive the full width of a GATE-OPEN-BUT-DEAD window without silently
+// starving on ordinary background wakeups the way a smaller cap could
+// ([[feedback_capped_probes_false_negatives]]), paired with a one-time
+// unconditional install banner so its absence can't be mistaken for a
+// probe that never ran.
+namespace
+{
+    std::atomic<uint32_t> g_wakeSwallowHits{0u};
+    std::atomic<uint32_t> g_wakeMissHits{0u};
+
+    void wakeRelevantProbeBanner()
+    {
+        static const bool printed = [] {
+            std::cerr << "[wakeswallow] probe installed -- always-on wakeupThread anomaly "
+                         "detector, id- and teardown-gate-free (PS2_PROJECT_STATE.md Part 147); "
+                         "[wakeswallow]=makeReady branch taken but statusAfter!=Ready (swallowed "
+                         "by suspendCount!=0), [wakemiss]=wakeupCountOnly branch taken on a "
+                         "target that was genuinely Waiting/WaitingSuspended; the older "
+                         "[waketrace] (PS2X_WAKETRACE) stays scoped to id=4 + the "
+                         "RANKING-teardown window only"
+                      << std::endl;
+            return true;
+        }();
+        (void)printed;
+    }
+}
+
 int EeScheduler::wakeupThread(int id, bool interruptSafe)
 {
     assertExecutor();
@@ -2286,6 +2710,14 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     {
         return KE_DORMANT;
     }
+    wakeRelevantProbeBanner();
+    const bool trace = waketraceEnabled() && id == waketraceTargetId() &&
+                        g_ps2x_teardownActive.load(std::memory_order_relaxed);
+    const EeThreadStatus statusBefore = target->status;
+    const EeWaitReason reasonBefore = target->wait.reason;
+    const uint32_t wakeupCountBefore = target->wakeupCount;
+    const bool wasWaitingRelevant = statusBefore == EeThreadStatus::Waiting ||
+                                     statusBefore == EeThreadStatus::WaitingSuspended;
     if ((target->status == EeThreadStatus::Waiting || target->status == EeThreadStatus::WaitingSuspended) &&
         target->wait.reason == EeWaitReason::Sleep)
     {
@@ -2293,6 +2725,84 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
         if (id > 0 && id < kDispatchMaxId)
         {
             ++g_wakeReady[id];
+        }
+        // Part 147 follow-up: the FIRST version of this probe logged every
+        // successful wake unconditionally and drowned in ids 1/4/5's routine
+        // every-frame Sleep/wake traffic -- the 512 cap was gone in the first
+        // ~20M eeCycles (a handful of seconds), nowhere near a
+        // GATE-OPEN-BUT-DEAD window that starts hundreds of seconds in. One
+        // hit did get through before saturation: id=6, statusBefore=
+        // WaitingSuspended(3), and after the call suspendCountAfter=1 with
+        // statusAfter=Suspended(4) -- not Ready(1). That is precisely the
+        // silent bail this file's own Part 132 comment already documents two
+        // screens down: makeReady() takes the "real wake" branch here, but
+        // internally, if suspendCount != 0 at call time, it sets
+        // status=Suspended and returns WITHOUT enqueueing -- "branch=
+        // makeReady" alone cannot tell a genuine wake from this swallow.
+        // [wakeswallow] isolates exactly that swallow (statusAfter != Ready
+        // after this branch was taken), unconditional, capped generously
+        // (2048, not 512) so ordinary high-frequency traffic on other
+        // threads can't exhaust the budget before a rare event later in a
+        // long run -- see [[feedback_capped_probes_false_negatives]].
+        if (target->status != EeThreadStatus::Ready)
+        {
+            const uint32_t n = g_wakeSwallowHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 2048u)
+            {
+                std::cerr << "[wakeswallow] n=" << n << " id=" << id
+                          << " statusBefore=" << static_cast<int>(statusBefore)
+                          << " reasonBefore=" << static_cast<int>(reasonBefore)
+                          << " suspendCountAfter=" << target->suspendCount
+                          << " statusAfter=" << static_cast<int>(target->status)
+                          << " interruptSafe=" << interruptSafe
+                          << " eeCycle=" << m_eeCycle << std::endl;
+            }
+        }
+        if (trace)
+        {
+            const uint32_t n = g_waketraceHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 64u)
+            {
+                // Part 126 addition: sub_11E8D0 (thread 4's worker loop) parks its
+                // callee-saved $s4 (GPR 20) = &qword_4419B8 (stopFlag) ONCE at
+                // function entry, then re-reads *(s4) at the loop-bottom check
+                // (0x11e994) via a register-indirect READ64, not a re-derived
+                // constant. sub_11F680 (the shutdown waiter) sets qword_4419B8=1
+                // on every one of ITS retry iterations before calling this
+                // function, so thread 4 should see it set on the very next
+                // loop-bottom check and exit -- it never does, across 64
+                // observed wakes and (per [teardownchk]) the whole 600s run.
+                // Two live hypotheses this line is built to separate: (a) $s4
+                // itself has drifted off 0x4419B8 in this thread's persisted
+                // context (a register-preservation bug across the nested
+                // SleepThread call chain), or (b) $s4 is fine and the raw
+                // memory at 0x4419B8 genuinely still reads 0 here (stopFlag
+                // write not landing/visible). pc==0 means GPR 20 was never
+                // populated (context not yet resumed to that point this hit).
+                R5900Context *activeCtxPtr = &target->activeContext();
+                const uint32_t s4 = GPR_U32(activeCtxPtr, 20);
+                const uint64_t stopFlagRaw = Ps2FastRead64(m_rdram, 0x4419B8u);
+                // Part 132: makeReady() (line ~3573) has a branch the original
+                // [waketrace] line could not see -- if target.suspendCount != 0
+                // at call time, makeReady sets status=Suspended and RETURNS
+                // WITHOUT enqueueing, leaving the thread parked until a
+                // separate resumeThread()-style call decrements suspendCount
+                // to 0. "branch=makeReady" alone does not distinguish a real
+                // enqueue from this silent bail -- statusAfter/suspendCountAfter
+                // do: statusAfter==Suspended (not Ready) with suspendCountAfter!=0
+                // means makeReady swallowed the wake instead of scheduling it.
+                std::cerr << "[waketrace] n=" << n << " id=" << id
+                          << " branch=makeReady statusBefore=" << static_cast<int>(statusBefore)
+                          << " reasonBefore=" << static_cast<int>(reasonBefore)
+                          << " wakeupCountBefore=" << wakeupCountBefore
+                          << " suspendCount=" << target->suspendCount
+                          << " statusAfter=" << static_cast<int>(target->status)
+                          << " interruptSafe=" << interruptSafe
+                          << " pcBefore=0x" << std::hex << activeCtxPtr->pc << std::dec
+                          << " s4=0x" << std::hex << s4 << std::dec
+                          << " stopFlagRaw=0x" << std::hex << stopFlagRaw << std::dec
+                          << " eeCycle=" << m_eeCycle << std::endl;
+            }
         }
     }
     else
@@ -2302,6 +2812,39 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
         {
             ++g_wakeAcc[id];
             g_wakeCountLast[id] = static_cast<uint32_t>(target->wakeupCount);
+        }
+        if (trace)
+        {
+            const uint32_t n = g_waketraceHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 64u)
+            {
+                std::cerr << "[waketrace] n=" << n << " id=" << id
+                          << " branch=wakeupCountOnly statusBefore=" << static_cast<int>(statusBefore)
+                          << " reasonBefore=" << static_cast<int>(reasonBefore)
+                          << " wakeupCountBefore=" << wakeupCountBefore
+                          << " wakeupCountAfter=" << target->wakeupCount
+                          << " interruptSafe=" << interruptSafe
+                          << " eeCycle=" << m_eeCycle << std::endl;
+            }
+        }
+        // Part 147: the other near miss -- target WAS Waiting/WaitingSuspended
+        // (a real sleeper) but reason != Sleep, so the wake was swallowed
+        // into a plain counter bump with no status change at all. Own
+        // counter/cap, independent of [wakeswallow] above, so neither can
+        // starve the other's budget.
+        if (wasWaitingRelevant)
+        {
+            const uint32_t n = g_wakeMissHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 2048u)
+            {
+                std::cerr << "[wakemiss] n=" << n << " id=" << id
+                          << " branch=wakeupCountOnly statusBefore=" << static_cast<int>(statusBefore)
+                          << " reasonBefore=" << static_cast<int>(reasonBefore)
+                          << " wakeupCountBefore=" << wakeupCountBefore
+                          << " wakeupCountAfter=" << target->wakeupCount
+                          << " interruptSafe=" << interruptSafe
+                          << " eeCycle=" << m_eeCycle << std::endl;
+            }
         }
     }
     publishSnapshot();
@@ -2429,6 +2972,23 @@ int EeScheduler::releaseWait(int id, bool interruptSafe)
 void EeScheduler::transferIfRequested(bool interruptSafe)
 {
     assertExecutor();
+    // Part 132: does thread_resume_if_suspended's ReferThreadStatus(4) call
+    // (sub_11ED90, inside sub_11F680's retry loop) ever reach this point with
+    // all three guard conditions clear? If m_insideInterrupt is unexpectedly
+    // true here, every yield/preemption in the whole teardown call chain is
+    // silently suppressed -- thread 4 gets marked Ready (confirmed correct by
+    // [waketrace]) but this is the only place that would actually let it run,
+    // and it would never fire. Gated on g_ps2x_teardownActive so it only logs
+    // during the actual shutdown retry loop, not general gameplay traffic.
+    if (g_ps2x_teardownActive.load(std::memory_order_relaxed))
+    {
+        std::cerr << "[xferchk] interruptSafe=" << interruptSafe
+                  << " m_insideInterrupt=" << m_insideInterrupt
+                  << " m_rescheduleRequested=" << m_rescheduleRequested
+                  << " m_currentThreadId=" << m_currentThreadId
+                  << " willThrow=" << (!interruptSafe && !m_insideInterrupt && m_rescheduleRequested)
+                  << std::endl;
+    }
     if (interruptSafe || m_insideInterrupt || !m_rescheduleRequested)
     {
         return;
@@ -2502,17 +3062,162 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
     return id;
 }
 
+// 2026-09-22 [sema3] ---------------------------------------------------------
+// WHY THIS EXISTS. Part 157 pinned the stall. The last [thsync] line of the
+// frozen run reads:
+//
+//   nTh=2 [1:st=16,...] [2:st=4,wt=2,wid=3,pri=0,pc=0x1759e8]
+//
+// wt=2 is a semaphore wait, wid=3 is the id, and 0x1759e8 is the instruction
+// after the WaitSema stub at 0x174ce0 (li $v1,0x44 -- verified against the
+// project's own EE syscall table, not assumed). sub_1759A0 is a __noreturn
+// command-queue consumer: WaitSema, pop a 2-byte command from a 512-entry ring,
+// dispatch. So semaphore 3 is a producer->consumer doorbell.
+//
+// The teardown at ~t=1277 s is ORDERLY and is NOT the bug: it runs the state
+// tick at 0x3d1eb0 -> vtable thunk 0x3d2d90 -> obj_detach_and_free_resources
+// (0x3d1c40), which is a designed, timer-driven transition. The defect is that
+// after it, nobody rings the bell again.
+//
+// WHY A PROBE AND NOT STATIC ANALYSIS. SignalSema (0x174cc0) has 78 call sites
+// in this binary and the semaphore id is assigned at runtime, so no xref can
+// say which call site owns id 3. Only a run can.
+//
+// COST. One int compare on the semaphore path; every other id does no work at
+// all. That is deliberate. The three uncapped [semwatch] probes removed from
+// these same three functions on 2026-09-22 produced 2,636 lines in a single
+// 232 KB test log, and guest semaphore traffic is far heavier than the tests'.
+// This is a TIMING bug, so an expensive probe perturbs what it exists to
+// measure.
+//
+// SAMPLING. First 128 records unconditionally, then every 32nd, hard cap 8192,
+// with a [cap] line on saturation -- because a saturated probe and a probe that
+// never fired otherwise produce identical output.
+//
+// The decisive record is the LAST signal before the freeze, and sampling can
+// miss it by up to the stride. So the totals and the final caller chain are
+// ALSO mirrored into the g_ps2xSema3* atomics below, which game_overrides.cpp
+// prints on its periodic [sema3:stat] line. Those are written on EVERY id-3
+// event, so the final state is exact regardless of sampling.
+std::atomic<uint64_t> g_ps2xSema3Signals{0};
+std::atomic<uint64_t> g_ps2xSema3WaitPass{0};
+std::atomic<uint64_t> g_ps2xSema3WaitBlock{0};
+std::atomic<uint32_t> g_ps2xSema3LastSigC0{0};
+std::atomic<uint32_t> g_ps2xSema3LastSigC1{0};
+std::atomic<uint32_t> g_ps2xSema3LastSigC2{0};
+std::atomic<uint32_t> g_ps2xSema3LastSigC3{0};
+std::atomic<int32_t> g_ps2xSema3LastSigCount{-1};
+
+namespace
+{
+    constexpr int kSema3Id = 3;
+    constexpr uint64_t kSema3FirstN = 128u;
+    constexpr uint64_t kSema3EveryNth = 32u;
+    constexpr uint64_t kSema3HardCap = 8192u;
+
+    constexpr uint64_t kSema3OpSignal = 0u;
+    constexpr uint64_t kSema3OpWaitPass = 1u;
+    constexpr uint64_t kSema3OpWaitBlock = 2u;
+
+    std::atomic<uint64_t> g_sema3Seen{0};
+    std::atomic<uint64_t> g_sema3Emitted{0};
+    std::atomic<bool> g_sema3CapAnnounced{false};
+
+    void sema3Note(uint64_t op, int count, uint64_t waiters, int guestTid)
+    {
+        const uint64_t n = g_sema3Seen.fetch_add(1u, std::memory_order_relaxed);
+
+        uint32_t chain[4] = {0u, 0u, 0u, 0u};
+        (void)ps2xDispatchHistoryTail(chain, 4u);
+
+        if (op == kSema3OpSignal)
+        {
+            g_ps2xSema3Signals.fetch_add(1u, std::memory_order_relaxed);
+            g_ps2xSema3LastSigC0.store(chain[0], std::memory_order_relaxed);
+            g_ps2xSema3LastSigC1.store(chain[1], std::memory_order_relaxed);
+            g_ps2xSema3LastSigC2.store(chain[2], std::memory_order_relaxed);
+            g_ps2xSema3LastSigC3.store(chain[3], std::memory_order_relaxed);
+            g_ps2xSema3LastSigCount.store(count, std::memory_order_relaxed);
+        }
+        else if (op == kSema3OpWaitPass)
+        {
+            g_ps2xSema3WaitPass.fetch_add(1u, std::memory_order_relaxed);
+        }
+        else
+        {
+            g_ps2xSema3WaitBlock.fetch_add(1u, std::memory_order_relaxed);
+        }
+
+        if (n >= kSema3FirstN && (n % kSema3EveryNth) != 0u)
+        {
+            return;
+        }
+
+        const uint64_t emitted = g_sema3Emitted.load(std::memory_order_relaxed);
+        if (emitted >= kSema3HardCap)
+        {
+            if (!g_sema3CapAnnounced.exchange(true, std::memory_order_relaxed))
+            {
+                std::cerr << "[cap] tag=sema3 saturated at " << emitted << std::endl;
+            }
+            return;
+        }
+        g_sema3Emitted.store(emitted + 1u, std::memory_order_relaxed);
+
+        // "gtid", not "tid": ps2x_probe_kv auto-stamps a HOST tid on every
+        // record, and two keys of the same name in one JSON object is exactly
+        // the kind of silent misread this sink exists to prevent.
+        const char *keys[9];
+        uint64_t vals[9];
+        int k = 0;
+        keys[k] = "op";
+        vals[k++] = op;
+        keys[k] = "seen";
+        vals[k++] = n;
+        keys[k] = "count";
+        vals[k++] = static_cast<uint64_t>(static_cast<uint32_t>(count));
+        keys[k] = "waiters";
+        vals[k++] = waiters;
+        keys[k] = "gtid";
+        vals[k++] = static_cast<uint64_t>(static_cast<uint32_t>(guestTid));
+        keys[k] = "c0";
+        vals[k++] = chain[0];
+        keys[k] = "c1";
+        vals[k++] = chain[1];
+        keys[k] = "c2";
+        vals[k++] = chain[2];
+        keys[k] = "c3";
+        vals[k++] = chain[3];
+        ps2x_probe_kv("SEMA3", k, keys, vals);
+    }
+}
+
 int EeScheduler::signalSemaphore(int id, bool interruptSafe)
 {
     assertExecutor();
+    // 2026-09-22 -- the [semwatch:signal]/[semwatch:wait]/[semwatch:block]
+    // probes that lived on these three paths are REMOVED. Unlike every other
+    // probe in this file they were neither capped nor gated on
+    // g_ps2x_teardownActive, and they sat on the hottest kernel paths in the
+    // program: 2,636 probe lines in one 232 KB ps2x_tests log, and guest
+    // semaphore traffic is orders of magnitude heavier than the tests'.
+    //
+    // That is the recorded 225 MB-in-64 s / 42 %-of-run-CPU class. It matters
+    // beyond log size: the open question is a TIMING one (the EE stall at
+    // t~1277 s), so an unbounded probe on SignalSema/WaitSema perturbs the
+    // measurement it exists to serve. Re-arm capped, the way the rest are.
     EeSemaphore *object = semaphore(id);
-    std::cerr << "[semwatch:signal] id=" << id << " interruptSafe=" << interruptSafe
-              << " found=" << (object != nullptr)
-              << " waiters=" << (object ? object->waiters.size() : 0u)
-              << " count=" << (object ? object->count : -1) << std::endl;
     if (!object)
     {
         return KE_UNKNOWN_SEMID;
+    }
+    // Pre-state on purpose: waiters>0 here means this signal will WAKE the
+    // consumer, waiters==0 means it only bumps the count. Recording after the
+    // branch would lose that distinction.
+    if (id == kSema3Id)
+    {
+        sema3Note(kSema3OpSignal, object->count,
+                  static_cast<uint64_t>(object->waiters.size()), m_currentThreadId);
     }
     if (!object->waiters.empty())
     {
@@ -2553,9 +3258,10 @@ int EeScheduler::pollSemaphore(int id)
 void EeScheduler::waitSemaphore(int id)
 {
     assertExecutor();
+    // 2026-09-22 -- [semwatch:wait] removed here; see the note in
+    // signalSemaphore() above for why an uncapped probe on this path is a
+    // measurement hazard and not merely noise.
     EeSemaphore *object = semaphore(id);
-    std::cerr << "[semwatch:wait] id=" << id << " found=" << (object != nullptr)
-              << " count=" << (object ? object->count : -1) << std::endl;
     if (!object)
     {
         GuestThread *self = currentThread();
@@ -2565,6 +3271,11 @@ void EeScheduler::waitSemaphore(int id)
     }
     if (object->count != 0)
     {
+        if (id == kSema3Id)
+        {
+            sema3Note(kSema3OpWaitPass, object->count,
+                      static_cast<uint64_t>(object->waiters.size()), m_currentThreadId);
+        }
         --object->count;
         GuestThread *self = currentThread();
         assert(self != nullptr);
@@ -2575,7 +3286,14 @@ void EeScheduler::waitSemaphore(int id)
     GuestThread *self = currentThread();
     assert(self != nullptr);
     object->waiters.push_back(self->id);
-    std::cerr << "[semwatch:block] id=" << id << " threadId=" << self->id << std::endl;
+    // 2026-09-22 -- [semwatch:block] removed here; see signalSemaphore().
+    // [sema3] records the PARK. In the frozen run this fires once for id 3 and
+    // then nothing signals again, which is the whole shape of the bug.
+    if (id == kSema3Id)
+    {
+        sema3Note(kSema3OpWaitBlock, object->count,
+                  static_cast<uint64_t>(object->waiters.size()), self->id);
+    }
     blockCurrent(EeWaitState{EeWaitReason::Semaphore, EeSemaphoreWait{id}});
 }
 
@@ -2774,13 +3492,13 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         const uint32_t n = s_invokeXThreadLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
         if (n <= 32u)
         {
-            const bool sameThread = (m_executorThread == std::this_thread::get_id());
+            const bool sameThread = (m_executorThread.load(std::memory_order_acquire) == std::this_thread::get_id());
             std::cerr << "[semwatch:invokexthread] #" << n
                       << " kind=" << static_cast<int>(invocation.kind)
                       << " tag=0x" << std::hex << invocation.tag << std::dec
                       << " sameThread=" << sameThread
                       << " callerTid=" << std::hash<std::thread::id>{}(std::this_thread::get_id())
-                      << " execTid=" << std::hash<std::thread::id>{}(m_executorThread)
+                      << " execTid=" << std::hash<std::thread::id>{}(m_executorThread.load(std::memory_order_acquire))
                       << std::endl;
         }
     }
@@ -3166,7 +3884,7 @@ uint8_t *EeScheduler::rdram() const noexcept
 
 void EeScheduler::bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram)
 {
-    if (m_executorThread == std::thread::id{})
+    if (m_executorThread.load(std::memory_order_acquire) == std::thread::id{})
     {
         reset(rdram, ctx);
         GuestThread *main = selectReady();
@@ -3217,6 +3935,7 @@ void EeScheduler::publishSnapshot()
     next.sliceEndCycle = m_sliceEndCycle;
     next.nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
     next.runningThreadId = m_currentThreadId;
+    next.pendingInvocations = m_pendingInvocations.size();
     next.threads.reserve(m_threads.size());
     for (const auto &[id, item] : m_threads)
     {
@@ -3271,7 +3990,115 @@ void EeScheduler::publishSnapshot()
 
 void EeScheduler::assertExecutor() const
 {
-    assert(m_executorThread == std::this_thread::get_id());
+    assert(m_executorThread.load(std::memory_order_acquire) == std::this_thread::get_id());
+}
+
+bool EeScheduler::onExecutorThread() const noexcept
+{
+    return m_executorThread.load(std::memory_order_acquire) == std::this_thread::get_id();
+}
+
+bool EeScheduler::callerHasNoGuestThread() const noexcept
+{
+    return m_currentThreadId < 0;
+}
+
+EeScheduler::BorrowedWorkerToken EeScheduler::beginBorrowedWorker()
+{
+    BorrowedWorkerToken token;
+    token.executor = m_executorThread.load(std::memory_order_acquire);
+    token.currentThreadId = m_currentThreadId;
+
+    // Adopt first: acquireInvocationThread() and the syscall that follows both
+    // run assertExecutor().
+    m_executorThread.store(std::this_thread::get_id(), std::memory_order_release);
+
+    GuestThread &worker = acquireInvocationThread();
+    token.workerId = worker.id;
+    m_currentThreadId = worker.id;
+    return token;
+}
+
+void EeScheduler::endBorrowedWorker(const BorrowedWorkerToken &token)
+{
+    // The pseudo-thread record is left in m_threads exactly as
+    // acquireInvocationThread() minted it: Dormant with no invocations, so the
+    // next borrow reuses this slot rather than minting a new id every call.
+    m_currentThreadId = token.currentThreadId;
+    m_executorThread.store(token.executor, std::memory_order_release);
+}
+
+void EeScheduler::pumpGuestThreads(std::chrono::milliseconds budget)
+{
+    // 2026-09-22 -- executor ownership, held for the WHOLE pump.
+    //
+    // The bug this closes: SchedTestSupport's pumpGuest() tests
+    // onExecutorThread() and then calls in here, which asserts the same thing
+    // again. Between those two reads a borrowing host thread could run
+    // beginBorrowedWorker() and take the executor, so the assert below fired
+    // and the process aborted -- SchedulerJoinHost/AA6, and the batch
+    // `Scheduler` run, which is why no all-suites run has ever completed.
+    //
+    // Taking the lock BEFORE the assert is the whole point: a borrow already
+    // in flight now makes us wait here instead of racing it, and
+    // endBorrowedWorker() has restored the previous executor by the time we
+    // acquire -- so the assert is then checking a value that cannot change
+    // underneath us for as long as we hold this.
+    //
+    // No deadlock: every borrowed syscall is synchronous. terminateThread()
+    // unwinds its target with makeDormant() and returns (:2171), and
+    // blockCurrent() THROWS EeDispatcherTransfer rather than waiting (:4068).
+    // Nothing a borrower can call needs us to pump it first. The retired
+    // fiber layer's join-on-g_sched_cv, which DID need that and which the AA6
+    // test comment still describes, is gone.
+    std::lock_guard<std::recursive_mutex> ownership(m_executorMutex);
+    assertExecutor();
+
+    // Park the syscall-issuing main thread for the duration. It is Running
+    // (bindMainContextForSyscall() made it so on the first syscall) and its
+    // context is not real guest code -- dispatching it would walk into the
+    // pc==0 path in run() and mark it Dormant. Putting it back on the ready
+    // queue and excluding it from selection leaves exactly the state the next
+    // bindMainContextForSyscall() asserts on: Ready, queued, current == 0.
+    if (m_currentThreadId == kMainThreadId)
+    {
+        GuestThread *main = thread(kMainThreadId);
+        assert(main != nullptr);
+        enqueueReady(*main, true);
+        m_currentThreadId = 0;
+    }
+
+    m_pumpExcludedThreadId = kMainThreadId;
+    m_pumpDeadline = std::chrono::steady_clock::now() + budget;
+    m_pumpMode = true;
+
+    // run() can propagate a guest exception (its own catch(...) rethrows), so
+    // the pump flags are cleared on every path -- leaving m_pumpMode set would
+    // silently turn the production loop into a non-blocking spin.
+    struct PumpScope
+    {
+        EeScheduler &s;
+        ~PumpScope()
+        {
+            s.m_pumpMode = false;
+            s.m_pumpExcludedThreadId = 0;
+        }
+    } scope{*this};
+
+    run();
+
+    // A budget-exhausted exit can leave a worker Running. Leaving it current
+    // would make the NEXT host syscall execute as that worker instead of main
+    // (bindMainContextForSyscall() only re-binds main when current == 0), so
+    // park it back on the ready queue. The idle exit path cannot reach here
+    // with a thread running -- that is its own completion condition.
+    if (m_currentThreadId != 0 && m_currentThreadId != kMainThreadId)
+    {
+        GuestThread *running = currentThread();
+        assert(running != nullptr);
+        enqueueReady(*running, true);
+        m_currentThreadId = 0;
+    }
 }
 
 int EeScheduler::allocateThreadId()
@@ -3341,12 +4168,22 @@ GuestThread *EeScheduler::selectReady()
         {
             continue;
         }
-        const int id = queue.front();
-        queue.pop_front();
-        GuestThread *selected = thread(id);
-        assert(selected != nullptr);
-        assert(selected->status == EeThreadStatus::Ready);
-        return selected;
+        // m_pumpExcludedThreadId is 0 outside pumpGuestThreads(), and no real
+        // thread id is ever 0, so in production the first iteration always
+        // matches and this is exactly the old front()/pop_front().
+        for (auto it = queue.begin(); it != queue.end(); ++it)
+        {
+            if (*it == m_pumpExcludedThreadId)
+            {
+                continue;
+            }
+            const int id = *it;
+            queue.erase(it);
+            GuestThread *selected = thread(id);
+            assert(selected != nullptr);
+            assert(selected->status == EeThreadStatus::Ready);
+            return selected;
+        }
     }
     return nullptr;
 }
@@ -3360,6 +4197,66 @@ void EeScheduler::makeRunning(GuestThread &item)
     probeDispatch(item.id);
     if (item.id >= 0) { m_lastRealThreadId = item.id; }
     renewTimeSlice();
+}
+
+void EeScheduler::unwindForStop()
+{
+    // 2026-09-22 -- the shutdown unwind that went missing with the fiber layer.
+    //
+    // The retired scheduler_shutdown() terminated every live fiber before it
+    // returned. Its replacement, requestStop(), only raises two flags
+    // (EeScheduler.cpp:1969) -- so run()'s while-loop exits and nothing ever
+    // moves the workers out of Running/Ready/Waiting. They are left in
+    // whatever state the stop interrupted, forever.
+    //
+    // In production that was invisible: the process is tearing down anyway.
+    // In-process it is not, and it is the single cause of all six
+    // "threads drained/terminated after stop" assertions (Y2, W3, U4, AA5,
+    // G1, R1).
+    //
+    // Safety: this runs only after run()'s dispatch loop has exited, so no
+    // guest thread has a live host frame -- a step or generated function must
+    // already have returned for the loop to observe m_stopRequested at all.
+    // makeDormant() is the same helper exitCurrent()/terminateThread() use,
+    // so wait-object bookkeeping and the ready queue are unwound identically.
+
+    // NOT assertExecutor(). m_executorThread is a plain std::thread::id that
+    // beginBorrowedWorker() (:3753) writes from a host thread while
+    // onExecutorThread() (:3737) reads it from the pump -- an unsynchronised
+    // cross-thread access. So the pump can enter run() believing it owns the
+    // executor and find, by the time the loop exits, that a borrowed host
+    // worker has taken ownership. SchedulerJoinHost/AA6 does exactly this.
+    //
+    // Unwinding every thread from a thread that no longer owns the scheduler
+    // would race the borrow's own bookkeeping, so the correct action here is
+    // to skip: whoever does own the executor will unwind when its own run()
+    // exits, and a host join like AA6's terminates its target explicitly
+    // anyway. Aborting would be worse than skipping, and doing it regardless
+    // would be worse than both.
+    //
+    // This is a guard, not a fix -- the ownership race itself is still open.
+    if (!onExecutorThread())
+    {
+        return;
+    }
+    for (auto &entry : m_threads)
+    {
+        GuestThread &item = entry.second;
+        if (item.id == kMainThreadId)
+        {
+            continue;
+        }
+        if (item.status == EeThreadStatus::Dormant && item.invocations.empty())
+        {
+            continue;
+        }
+        makeDormant(item);
+    }
+    if (m_currentThreadId != kMainThreadId)
+    {
+        m_currentThreadId = 0;
+    }
+    publishSnapshot();
 }
 
 void EeScheduler::makeDormant(GuestThread &item)
@@ -3607,6 +4504,18 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
                               scheduled.hostDeadline + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
+                // 2026-09-17 part 121 -- [semwatch:vblchain]: companion to
+                // [semwatch:waitforever]. That probe proved waitForEvent()
+                // enters the unconditional-block branch (m_deadlines empty)
+                // right at the black-screen freeze and wakes exactly once,
+                // but never explains WHY m_deadlines was empty there -- the
+                // VBlankStart->VBlankEnd->VBlankStart chain above is supposed
+                // to be self-perpetuating forever. This counts every
+                // self-reschedule so the next freeze's [semwatch:waitforever]
+                // line can be cross-read against it: if the count stopped
+                // climbing before the "entering" line, the chain died before
+                // the wait, not because of it.
+                g_vblankRescheduleCount.fetch_add(1u, std::memory_order_relaxed);
             }
             processEvent(scheduled.event);
         }
@@ -3775,13 +4684,15 @@ void EeScheduler::waitForEvent()
             const uint32_t n = s_waitForeverLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
             if (n <= 32u)
             {
-                std::cerr << "[semwatch:waitforever] #" << n << " entering eeCycle=" << m_eeCycle << std::endl;
+                std::cerr << "[semwatch:waitforever] #" << n << " entering eeCycle=" << m_eeCycle
+                          << " vblChain=" << g_vblankRescheduleCount.load(std::memory_order_relaxed) << std::endl;
             }
             m_eventCv.wait(lock, [this]()
                            { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
             if (n <= 32u)
             {
-                std::cerr << "[semwatch:waitforever] #" << n << " woke eeCycle=" << m_eeCycle << std::endl;
+                std::cerr << "[semwatch:waitforever] #" << n << " woke eeCycle=" << m_eeCycle
+                          << " vblChain=" << g_vblankRescheduleCount.load(std::memory_order_relaxed) << std::endl;
             }
         }
         return;

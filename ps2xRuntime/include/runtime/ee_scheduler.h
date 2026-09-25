@@ -221,6 +221,23 @@ struct EeKernelSnapshot
     std::vector<EeThreadSnapshot> threads;
     std::vector<EeSemaphoreSnapshot> semaphores;
     std::vector<EeEventFlagSnapshot> eventFlags;
+
+    // 2026-09-22 -- invocations QUEUED but not yet dispatched.
+    //
+    // Without this the snapshot cannot express "drained". dispatchIrq() only
+    // queues (queueInvocation -> m_pendingInvocations), and a queued
+    // invocation has no thread yet, so every observer that walked `threads`
+    // alone reported a fully-dormant kernel while a handler was still owed a
+    // dispatch. SchedTestSupport's drainedWithin() did exactly that.
+    //
+    // It is NOT enough to say "the pump drains everything anyway":
+    // pumpGuestThreads() takes a BUDGET, and run() breaks on that deadline at
+    // the top of its loop (EeScheduler.cpp:960) BEFORE it ever reaches the
+    // `!next && m_pendingInvocations.empty()` completion test at :986. A 2 ms
+    // budget -- pumpGuest()'s default -- therefore returns with work still
+    // queued, intermittently. Measured, not reasoned: SchedulerStackIsolation
+    // failed 3 of 8 identical isolated runs on this exact window.
+    std::size_t pendingInvocations = 0;
 };
 
 enum class EeEventType : uint8_t
@@ -384,9 +401,87 @@ public:
     // the duration, e.g. `std::lock_guard lock(scheduler.hostInvocationMutex());`.
     [[nodiscard]] std::mutex &hostInvocationMutex() noexcept { return m_hostInvocationMutex; }
 
+    // Held for the whole span in which a thread acts as the executor, so that
+    // ownership cannot change under a thread that is mid-pump.
+    //
+    // LOCK ORDER, everywhere, no exceptions: executorMutex() first, then
+    // hostInvocationMutex(). pumpGuestThreads() takes only the first and its
+    // inner run() takes only the second, so that order has no cycle.
+    [[nodiscard]] std::recursive_mutex &executorMutex() noexcept { return m_executorMutex; }
+
     // Direct syscall tests use the same main-thread record without starting a
     // second executor. Production execution calls reset() before run().
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
+
+    // True when the caller is the thread that owns guest execution -- the one
+    // that called reset(), i.e. the thread run() dispatches on.
+    //
+    // 2026-09-21: this is the public replacement for the retired
+    // ps2fiber_on_executor_thread(). The comparison already existed, but only
+    // inside the private assertExecutor(), so a caller that wanted to ASK
+    // rather than assert had no way to.
+    [[nodiscard]] bool onExecutorThread() const noexcept;
+
+    // Bounded cooperative pump: runs the normal run() dispatch loop until
+    // every guest thread EXCEPT the syscall-issuing main thread is blocked,
+    // dormant or finished, or `budget` elapses.
+    //
+    // 2026-09-21: exists because run() is the ONLY code that dispatches a
+    // Ready guest thread, and it never returns. A host caller that drives the
+    // scheduler through direct syscall calls (ps2xTest) therefore had no way
+    // to let the threads it started actually execute -- a StartThread'd thread
+    // went Ready and stayed Ready forever, which is why every scheduler test
+    // that needed a worker to RUN failed while the ones that did not, passed.
+    //
+    // Must be called on the executor thread. Returns with main Ready and
+    // m_currentThreadId == 0, which is exactly the state the next
+    // bindMainContextForSyscall() expects.
+    void pumpGuestThreads(std::chrono::milliseconds budget);
+
+    // ---- borrowed host workers -------------------------------------------
+    // A host thread that is NOT the executor but needs to issue a guest
+    // syscall: the IRQ worker running a GS callback, or a test's std::thread.
+    //
+    // 2026-09-21: before this existed every such call went
+    // bindMainContextForSyscall() -> assertExecutor() -> abort. FOUR whole
+    // Scheduler suites (BorrowedGuard, BorrowedWorker, Stress, Window) died on
+    // that single assert.
+    //
+    // beginBorrowedWorker() makes the CALLING thread the executor and gives it
+    // a NEGATIVE pseudo-thread id from acquireInvocationThread(), so it has no
+    // real guest thread. endBorrowedWorker() restores both.
+    //
+    // WARNING: the caller MUST hold executorMutex() AND THEN
+    // hostInvocationMutex(), both for the whole span, in that order.
+    //
+    // 2026-09-22 -- hostInvocationMutex() alone was not enough, and the old
+    // comment here said why without noticing it was describing a bug: it
+    // brackets run()'s function() dispatch only, "does NOT exclude run()'s
+    // between-dispatch bookkeeping, so this is only sound while the real
+    // executor is parked". In SchedulerJoinHost/AA6 the real executor is NOT
+    // parked -- it is spinning in waitUntil() -> pumpGuest(), which reads
+    // m_executorThread outside that mutex. The borrow stole the executor
+    // between that read and pumpGuestThreads()' own assertExecutor(), and the
+    // process aborted. executorMutex() closes exactly that window.
+    struct BorrowedWorkerToken
+    {
+        std::thread::id executor;
+        int currentThreadId = 0;
+        int workerId = 0;
+    };
+    [[nodiscard]] BorrowedWorkerToken beginBorrowedWorker();
+    void endBorrowedWorker(const BorrowedWorkerToken &token);
+
+    // True when the caller has no real guest thread -- its current id is a
+    // negative pseudo-tid. A thread syscall issued in that state cannot mean
+    // "self", so the Thread.cpp entry points return KE_ILLEGAL_THID instead of
+    // acting on whatever record happens to be current.
+    //
+    // This also hardens a defect Part 47 caught with the PSEUDOREFER probe: a
+    // pseudo-tid leaked out of GetThreadId and came back in as
+    // iReferThreadStatus(a0=-403) just before the t=129s stall. Under this rule
+    // that is a clean error instead of a silent lookup.
+    [[nodiscard]] bool callerHasNoGuestThread() const noexcept;
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
@@ -408,6 +503,7 @@ private:
     [[nodiscard]] GuestThread *selectReady();
     void makeRunning(GuestThread &thread);
     void makeDormant(GuestThread &thread);
+    void unwindForStop();
     void removeFromWaitObject(GuestThread &thread);
     [[noreturn]] void blockCurrent(EeWaitState wait);
     void makeReady(GuestThread &thread, int result, bool interruptSafe);
@@ -451,15 +547,34 @@ private:
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
     int m_currentThreadId = 0;
     int m_lastRealThreadId = 0;
+    // pumpGuestThreads() state. Zero/false in production, where the pump-mode
+    // branches in run() and selectReady() are therefore never taken. Thread id
+    // 0 is never a real thread (kMainThreadId is 1), so it is a safe
+    // "exclude nothing" sentinel.
+    bool m_pumpMode = false;
+    int m_pumpExcludedThreadId = 0;
+    std::chrono::steady_clock::time_point m_pumpDeadline{};
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
-    std::thread::id m_executorThread{};
+    // 2026-09-22 -- atomic because this is genuinely touched cross-thread:
+    // beginBorrowedWorker() WRITES it from a borrowing host thread while the
+    // executor READS it through onExecutorThread()/assertExecutor(). As a
+    // plain std::thread::id that was an unsynchronised access -- a data race,
+    // i.e. UB, not merely a stale read. Atomic removes the UB; m_executorMutex
+    // below removes the check-then-act window that remains.
+    std::atomic<std::thread::id> m_executorThread{};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};
     std::mutex m_hostInvocationMutex;
+    // Serialises EXECUTOR OWNERSHIP, which m_hostInvocationMutex does not:
+    // that one brackets a single guest function() call, this one brackets a
+    // whole span of ACTING as the executor. Recursive because
+    // pumpGuestThreads() takes it and then re-enters run(), and because a
+    // borrowing thread may legitimately pump itself.
+    std::recursive_mutex m_executorMutex;
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;

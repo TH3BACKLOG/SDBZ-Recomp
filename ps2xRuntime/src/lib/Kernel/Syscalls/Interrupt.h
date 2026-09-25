@@ -27,6 +27,11 @@ namespace ps2_syscalls
         // while evaluating a function argument, i.e. before any lock is taken.
         extern std::atomic<uint32_t> g_enabled_intc_mask;
         extern std::atomic<uint32_t> g_enabled_dmac_mask;
+        // Defined in Interrupt.cpp. Declared here so the interrupt regression
+        // tests can assert on raise/drain bookkeeping directly; this header is
+        // included by 1 runtime .cpp and the test files only -- no generated TU
+        // includes it, so it is not on the 30k-TU rebuild path.
+        extern std::atomic<uint32_t> g_pending_intc_causes;
         extern uint64_t g_vsync_tick_counter;
         extern VSyncFlagRegistration g_vsync_registration;
         constexpr uint32_t kPendingIntcMaxAgeTicks = 120u;

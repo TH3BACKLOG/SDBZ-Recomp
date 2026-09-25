@@ -64,7 +64,6 @@ namespace ps2_syscalls
         std::atomic<bool> g_irq_worker_running{false};
         std::thread g_irq_worker_thread; // joinable worker handle so stopInterruptWorker() can join it
 
-        std::atomic<uint32_t> g_pending_intc_causes{0u};              // bitmask, one pending bit per cause
         std::atomic<uint32_t> g_pending_intc_age[32] = {};            // drain ticks since raise, per cause
         // The age entries are atomic because raisePendingIntc (any thread) resets
         // an age while the interrupt worker thread increments it in drainPendingIntc.
@@ -75,6 +74,14 @@ namespace ps2_syscalls
             result.bindMainContextForSyscall(*ctx, rdram);
             return result;
         }
+    }
+
+    namespace interrupt_state
+    {
+        // Lives here rather than in the anonymous namespace above because the
+        // interrupt regression tests assert on raise/drain bookkeeping directly
+        // and so need external linkage; Interrupt.h declares it.
+        std::atomic<uint32_t> g_pending_intc_causes{0u}; // bitmask, one pending bit per cause
     }
 
     using namespace interrupt_state;

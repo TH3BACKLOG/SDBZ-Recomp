@@ -1,3 +1,32 @@
+// ===========================================================================
+// PORTED to the per-runtime EeScheduler API on 2026-09-21 (was disabled behind
+// PS2X_SCHED_TESTS_PORTED since the Phase 3d/3e refactor deleted ps2sched).
+//
+// Mapping used throughout this file:
+//   ps2sched::scheduler_init()      -> deleted; no process-global scheduler.
+//   ps2sched::scheduler_shutdown()  -> runtime.requestStop() (SchedFixture's
+//                                      destructor already does this).
+//   g_activeThreads.load() == 0     -> drainedWithin(runtime, timeout), i.e.
+//                                      EeScheduler::isIdle().
+//   ps2sched::host_token_waiters()  -> ps2x_test::parkedHostWorkerWaiters();
+//                                      the guest token became a plain
+//                                      std::mutex, so the waiter publishes its
+//                                      own intent (see SchedTestSupport.h).
+//   ParkedHostWorker w;             -> ParkedHostWorker w(runtime.eeScheduler()).
+//   g_thread_map_mutex/g_nextThreadId
+//                                   -> createDormantWorkerWithId(), which walks
+//                                      the private allocator from outside.
+//
+// Two semantic notes, both flagged at their sites:
+//   * G1's original failure mode (requestStop joining a parked worker) is now
+//     STRUCTURALLY IMPOSSIBLE -- PS2Runtime::requestStop() is signal-only. The
+//     test is kept to pin the surviving invariant, not the old bug.
+//   * ParkedHostWorker's bounded-acquisition fairness is NOT a verified
+//     equivalent of the old token's starvation gate (SchedTestSupport.h
+//     documents this). H1-H3 assert bounded acquisition and are the tests that
+//     would expose it if the plain mutex turns out to be unfair in practice.
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
 // Scheduler / runtime regression tests grounded in how real recompiled PS2
 // guests exercise the N=1 fiber scheduler. Each suite here targets a bug that
@@ -141,6 +170,86 @@ namespace
     }
 
     // ------------------------------------------------------------------
+    // 2026-09-21: the two halves of startSchedWorker, split so R2 can force
+    // GENUINE thread-id reuse.
+    //
+    // The old test seeded the allocator directly (`g_nextThreadId = T1` under
+    // g_thread_map_mutex). EeScheduler::allocateThreadId() is private and
+    // m_nextThreadId has no public seam, so instead we drive the allocator the
+    // way a guest would: it marches monotonically over [2, 255] with wrap,
+    // skipping live ids (EeScheduler.cpp, allocateThreadId), so creating
+    // dormant scratch threads and KEEPING them live walks it forward until it
+    // hands back the freed id we want. Bounded by the 254-id range.
+    // ------------------------------------------------------------------
+    int32_t createDormantWorker(uint8_t *rdram, PS2Runtime *runtime,
+                                uint32_t entryAddr, int priority,
+                                uint32_t stackAddr, uint32_t stackSize)
+    {
+        constexpr uint32_t kThreadParamAddr = 0x2E40u;
+        const uint32_t threadParam[7] = {
+            0u, entryAddr, stackAddr, stackSize, 0u,
+            static_cast<uint32_t>(priority), 0u,
+        };
+        std::memcpy(rdram + kThreadParamAddr, threadParam, sizeof(threadParam));
+
+        R5900Context createCtx{};
+        setRegU32(createCtx, 4, kThreadParamAddr);
+        ps2_syscalls::CreateThread(rdram, &createCtx, runtime);
+        return getRegS32(createCtx, 2);
+    }
+
+    bool startExistingWorker(uint8_t *rdram, PS2Runtime *runtime, int32_t tid)
+    {
+        // See startSchedWorker: thread ids are reused, so drop any step history a
+        // terminated predecessor left on this tid. R2 forces this case on purpose.
+        schedStepResetThread(tid);
+        R5900Context startCtx{};
+        setRegU32(startCtx, 4, static_cast<uint32_t>(tid));
+        setRegU32(startCtx, 5, 0u);
+        ps2_syscalls::StartThread(rdram, &startCtx, runtime);
+        return getRegS32(startCtx, 2) == 0;
+    }
+
+    void deleteWorkerById(uint8_t *rdram, PS2Runtime *runtime, int32_t tid)
+    {
+        R5900Context d{};
+        setRegU32(d, 4, static_cast<uint32_t>(tid));
+        ps2_syscalls::DeleteThread(rdram, &d, runtime);
+    }
+
+    // Walks the id allocator until it hands back `wanted` (which must already
+    // be free). Returns the dormant thread now occupying `wanted`, created
+    // with the given entry/stack so the caller can just StartThread it; or -1.
+    // Scratch ids consumed along the way are released before returning.
+    int32_t createDormantWorkerWithId(uint8_t *rdram, PS2Runtime *runtime, int32_t wanted,
+                                      uint32_t entryAddr, int priority,
+                                      uint32_t stackAddr, uint32_t stackSize)
+    {
+        std::vector<int32_t> scratch;
+        int32_t got = -1;
+        for (int attempts = 0; attempts < 300; ++attempts)
+        {
+            const int32_t id = createDormantWorker(rdram, runtime, entryAddr, priority,
+                                                   stackAddr, stackSize);
+            if (id <= 0)
+            {
+                break;
+            }
+            if (id == wanted)
+            {
+                got = id;
+                break;
+            }
+            scratch.push_back(id);
+        }
+        for (const int32_t id : scratch)
+        {
+            deleteWorkerById(rdram, runtime, id);
+        }
+        return got;
+    }
+
+    // ------------------------------------------------------------------
     // Control words (kernel-area scratch, disjoint from other suites)
     // ------------------------------------------------------------------
     constexpr uint32_t kThStop  = 0x00060000u; // 1 => guest loops exit
@@ -160,19 +269,19 @@ namespace
     // g_host_token_waiters executor gate.
     static void stepPingA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        while (rdramRead32Raw(rdram, kThStop) == 0u)
+        SchedStep step(rdram, ctx, runtime);
+        // The stop word is read through step.value() so the replayed prefix of
+        // this loop takes the SAME branch it took originally -- a raw read would
+        // see a flag the test has since set and break out mid-replay.
+        while (step.value([&] { return rdramRead32Raw(rdram, kThStop) == 0u ? 1 : 0; }) != 0)
         {
             const int32_t sidX = static_cast<int32_t>(rdramRead32Raw(rdram, kThSidX));
             const int32_t sidY = static_cast<int32_t>(rdramRead32Raw(rdram, kThSidY));
-            R5900Context w{};
-            setRegU32(w, 4, static_cast<uint32_t>(sidX));
-            ps2_syscalls::WaitSema(rdram, &w, runtime);
-            rdramWrite32Raw(rdram, kThCount, rdramRead32Raw(rdram, kThCount) + 1u);
-            R5900Context s{};
-            setRegU32(s, 4, static_cast<uint32_t>(sidY));
-            ps2_syscalls::SignalSema(rdram, &s, runtime);
+            step.call(ps2_syscalls::WaitSema, static_cast<uint32_t>(sidX));
+            step.once([&] { rdramWrite32Raw(rdram, kThCount, rdramRead32Raw(rdram, kThCount) + 1u); });
+            step.call(ps2_syscalls::SignalSema, static_cast<uint32_t>(sidY));
         }
-        ctx->pc = 0u;
+        step.finish();
     }
 
     // A guest loop that never blocks and never returns to the dispatch loop:
@@ -185,7 +294,7 @@ namespace
         while (rdramRead32Raw(rdram, kThStop) == 0u)
         {
             rdramWrite32Raw(rdram, kThCount, rdramRead32Raw(rdram, kThCount) + 1u);
-            runtime->shouldPreemptGuestExecution(); // recompiled back-edge hook
+            SCHED_YIELD_POINT(runtime); // recompiled back-edge hook
         }
         ctx->pc = 0u;
     }
@@ -222,13 +331,19 @@ namespace
         ctx->pc = 0u;
     }
 
-    // Guest-context stop shape: spin (no yields) until the REAL interrupt
-    // worker parks for the guest token, then call requestStop() from inside
-    // the fiber - exactly what the unimplemented-function default handler
-    // does when a guest thread faults. kThStop is a spin escape hatch.
+    // Guest-context stop shape: spin (no yields) until a host worker is parked
+    // for the guest token, then call requestStop() from inside the guest
+    // thread - exactly what the unimplemented-function default handler does
+    // when a guest thread faults. kThStop is a spin escape hatch.
+    //
+    // 2026-09-21: was `ps2sched::host_token_waiters() == 0`, waiting on the
+    // REAL interrupt worker. EeScheduler serialises host invocations with a
+    // plain std::mutex, which cannot report its blocked waiters, so G1 now
+    // constructs an explicit ParkedHostWorker and we poll its published
+    // intent. Same shape; the thing being waited for is now observable.
     static void stepGuestContextStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        while (ps2sched::host_token_waiters() == 0 &&
+        while (ps2x_test::parkedHostWorkerWaiters().load(std::memory_order_acquire) == 0 &&
                rdramRead32Raw(rdram, kThStop) == 0u)
         {
             // busy spin: no yield points, so the parked worker stays parked
@@ -256,18 +371,15 @@ namespace
 
     static void stepPingB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        while (rdramRead32Raw(rdram, kThStop) == 0u)
+        SchedStep step(rdram, ctx, runtime);
+        while (step.value([&] { return rdramRead32Raw(rdram, kThStop) == 0u ? 1 : 0; }) != 0)
         {
             const int32_t sidX = static_cast<int32_t>(rdramRead32Raw(rdram, kThSidX));
             const int32_t sidY = static_cast<int32_t>(rdramRead32Raw(rdram, kThSidY));
-            R5900Context w{};
-            setRegU32(w, 4, static_cast<uint32_t>(sidY));
-            ps2_syscalls::WaitSema(rdram, &w, runtime);
-            R5900Context s{};
-            setRegU32(s, 4, static_cast<uint32_t>(sidX));
-            ps2_syscalls::SignalSema(rdram, &s, runtime);
+            step.call(ps2_syscalls::WaitSema, static_cast<uint32_t>(sidY));
+            step.call(ps2_syscalls::SignalSema, static_cast<uint32_t>(sidX));
         }
-        ctx->pc = 0u;
+        step.finish();
     }
 
     // ------------------------------------------------------------------
@@ -304,45 +416,46 @@ namespace
     // ring, never A's.
     static void stepIsoA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        runtime->lookupFunction(0x00700A80u); // push A's marker into A's ring
+        SchedStep step(rdram, ctx, runtime);
+        // The marker push is a step: re-entering after the park below would
+        // otherwise push it a second time and change the ring this test reads.
+        step.once([&] { runtime->lookupFunction(0x00700A80u); }); // push A's marker into A's ring
 
-        R5900Context s{};
-        setRegU32(s, 4, rdramRead32Raw(rdram, 0x00061004u)); // sidB
-        ps2_syscalls::SignalSema(rdram, &s, runtime);        // let B run
+        step.call(ps2_syscalls::SignalSema, rdramRead32Raw(rdram, 0x00061004u)); // sidB -- let B run
+        step.call(ps2_syscalls::WaitSema, rdramRead32Raw(rdram, 0x00061000u));   // sidA -- park; B runs meanwhile
 
-        R5900Context w{};
-        setRegU32(w, 4, rdramRead32Raw(rdram, 0x00061000u)); // sidA
-        ps2_syscalls::WaitSema(rdram, &w, runtime);          // park; B runs meanwhile
-
-        const std::string trace = runtime->debugCurrentDispatchTrace(); // A resumes: inspect A's own ring
-        rdramWrite32Raw(rdram, 0x00061010u,
-            (trace.find("700b80") != std::string::npos ||
-             trace.find("700b00") != std::string::npos) ? 1u : 0u); // kRiAForeign
-        rdramWrite32Raw(rdram, 0x00061018u,
-            (trace.find("700a80") != std::string::npos) ? 1u : 0u); // kRiAOwn
-        ctx->pc = 0u;
+        step.once([&]
+        {
+            const std::string trace = runtime->debugCurrentDispatchTrace(); // A resumes: inspect A's own ring
+            rdramWrite32Raw(rdram, 0x00061010u,
+                (trace.find("700b80") != std::string::npos ||
+                 trace.find("700b00") != std::string::npos) ? 1u : 0u); // kRiAForeign
+            rdramWrite32Raw(rdram, 0x00061018u,
+                (trace.find("700a80") != std::string::npos) ? 1u : 0u); // kRiAOwn
+        });
+        step.finish();
     }
 
     // Fiber B: wait for A's handoff, push its own marker, inspect its OWN
     // trace, then signal A back.
     static void stepIsoB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        R5900Context w{};
-        setRegU32(w, 4, rdramRead32Raw(rdram, 0x00061004u)); // sidB
-        ps2_syscalls::WaitSema(rdram, &w, runtime);
+        SchedStep step(rdram, ctx, runtime);
+        step.call(ps2_syscalls::WaitSema, rdramRead32Raw(rdram, 0x00061004u)); // sidB
 
-        runtime->lookupFunction(0x00700B80u); // push B's marker into B's ring
-        const std::string trace = runtime->debugCurrentDispatchTrace();
-        rdramWrite32Raw(rdram, 0x00061014u,
-            (trace.find("700a80") != std::string::npos ||
-             trace.find("700a00") != std::string::npos) ? 1u : 0u); // kRiBForeign
-        rdramWrite32Raw(rdram, 0x0006101Cu,
-            (trace.find("700b80") != std::string::npos) ? 1u : 0u); // kRiBOwn
+        step.once([&]
+        {
+            runtime->lookupFunction(0x00700B80u); // push B's marker into B's ring
+            const std::string trace = runtime->debugCurrentDispatchTrace();
+            rdramWrite32Raw(rdram, 0x00061014u,
+                (trace.find("700a80") != std::string::npos ||
+                 trace.find("700a00") != std::string::npos) ? 1u : 0u); // kRiBForeign
+            rdramWrite32Raw(rdram, 0x0006101Cu,
+                (trace.find("700b80") != std::string::npos) ? 1u : 0u); // kRiBOwn
+        });
 
-        R5900Context s{};
-        setRegU32(s, 4, rdramRead32Raw(rdram, 0x00061000u)); // sidA
-        ps2_syscalls::SignalSema(rdram, &s, runtime);        // wake A
-        ctx->pc = 0u;
+        step.call(ps2_syscalls::SignalSema, rdramRead32Raw(rdram, 0x00061000u)); // sidA -- wake A
+        step.finish();
     }
 
     // R2 probe: same entry PC for both the original fiber (run==0) and the
@@ -386,70 +499,164 @@ namespace
     constexpr uint32_t kSiTopA     = 0x00063010u; // B1: invoke $sp seen by A
     constexpr uint32_t kSiTopB     = 0x00063014u; // B1: invoke $sp seen by B
     constexpr uint32_t kSiDmacTopA = 0x00063018u; // B3: handler $sp seen by A
-    constexpr uint32_t kSiDmacTopB = 0x0006301Cu; // B3: handler $sp seen by B
+    constexpr uint32_t kSiNestTopOuter = 0x00063020u; // I2: $sp of the depth-0 invocation
+    constexpr uint32_t kSiNestTopInner = 0x00063024u; // I2: $sp of the depth-1 invocation
 
     // ---- I1 (B1): RPC/override invoke stack isolation ----------------------
     // Invoked BY rpcInvokeFunction; ctx is its internal `tmp`, so $29 is the
     // scratch-stack top and $31 is rpcInvokeFunction's return sentinel.
     static void stepInvokeRecordA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        rdramWrite32Raw(rdram, kSiTopA, getRegU32(ctx, 29));      // record A's scratch top
-        R5900Context s{}; setRegU32(s, 4, rdramRead32Raw(rdram, kSiSemB));
-        ps2_syscalls::SignalSema(rdram, &s, runtime);            // let B proceed
-        R5900Context w{}; setRegU32(w, 4, rdramRead32Raw(rdram, kSiSemA));
-        ps2_syscalls::WaitSema(rdram, &w, runtime);              // PARK inside invoke; A's stack stays live
-        ctx->pc = getRegU32(ctx, 31);                            // resume: return to sentinel -> invoke loop ends
+        SchedStep step(rdram, ctx, runtime);
+        const uint32_t retSentinel = getRegU32(ctx, 31);
+        step.once([&] { rdramWrite32Raw(rdram, kSiTopA, getRegU32(ctx, 29)); }); // record A's scratch top
+        step.call(ps2_syscalls::SignalSema, rdramRead32Raw(rdram, kSiSemB));     // let B proceed
+        step.call(ps2_syscalls::WaitSema, rdramRead32Raw(rdram, kSiSemA));       // PARK inside invoke; A's stack stays live
+        step.finishAt(retSentinel);                              // resume: return to sentinel -> invoke loop ends
     }
     static void stepInvokeRecordB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        rdramWrite32Raw(rdram, kSiTopB, getRegU32(ctx, 29));      // A's scratch STILL live here
-        R5900Context s{}; setRegU32(s, 4, rdramRead32Raw(rdram, kSiSemA));
-        ps2_syscalls::SignalSema(rdram, &s, runtime);            // wake A
-        ctx->pc = getRegU32(ctx, 31);
+        SchedStep step(rdram, ctx, runtime);
+        const uint32_t retSentinel = getRegU32(ctx, 31);
+        step.once([&] { rdramWrite32Raw(rdram, kSiTopB, getRegU32(ctx, 29)); }); // A's scratch STILL live here
+        step.call(ps2_syscalls::SignalSema, rdramRead32Raw(rdram, kSiSemA));     // wake A
+        step.finishAt(retSentinel);
     }
     static void stepInvokeEntryA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ps2_syscalls::dispatchNumericSyscall(rdramRead32Raw(rdram, kSiSysA), rdram, ctx, runtime);
-        ctx->pc = 0u;
+        // 2026-09-22 -- this was the ONLY step function in the suite with no
+        // SchedStep, and that is what failed I1's drain.
+        //
+        // The invoke below parks inside stepInvokeRecordA (WaitSema on semA),
+        // which throws out of this frame. When B wakes A the invocation resumes,
+        // finishes and POPS -- and the thread's own pc is still this entry, so
+        // run() re-dispatches stepInvokeEntryA FROM THE TOP. With no step record
+        // it issued a SECOND dispatchNumericSyscall: a fresh invoke that signals
+        // semB (B has already exited, nobody is waiting) and then parks on semA
+        // with nobody left to signal it. The fiber never exits, so drainedWithin()
+        // times out.
+        //
+        // stepInvokeEntryB survived the identical re-dispatch only because it
+        // already had a SchedStep to replay. Re-dispatching at the entry is
+        // CORRECT scheduler behaviour -- a host step function has no mid-function
+        // pc to resume at, which is the whole reason SchedStep exists -- so this
+        // is a test defect, not a runtime one.
+        SchedStep step(rdram, ctx, runtime);
+        step.once([&]
+        {
+            ps2_syscalls::dispatchNumericSyscall(rdramRead32Raw(rdram, kSiSysA), rdram, ctx, runtime);
+        });
+        step.finish();
     }
     static void stepInvokeEntryB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        R5900Context w{}; setRegU32(w, 4, rdramRead32Raw(rdram, kSiSemB));
-        ps2_syscalls::WaitSema(rdram, &w, runtime);              // wait until A recorded + parked
-        ps2_syscalls::dispatchNumericSyscall(rdramRead32Raw(rdram, kSiSysB), rdram, ctx, runtime);
-        ctx->pc = 0u;
+        SchedStep step(rdram, ctx, runtime);
+        step.call(ps2_syscalls::WaitSema, rdramRead32Raw(rdram, kSiSemB)); // wait until A recorded + parked
+        step.once([&]
+        {
+            ps2_syscalls::dispatchNumericSyscall(rdramRead32Raw(rdram, kSiSysB), rdram, ctx, runtime);
+        });
+        step.finish();
     }
 
-    // ---- I2 (B3): inline DMAC handler stack isolation ----------------------
-    // Runs AS a DMAC handler; ctx is runHandlers' irqCtx, so $29 is the
-    // reserved handler-stack top.
+    // ---- I2: invocation stacks are reserved per {thread, depth} -----------
+    //
+    // 2026-09-22 -- restructured. The previous version had two fibers ping-pong
+    // through INLINE DMAC dispatch: handler A recorded its $sp, signalled semB
+    // and then parked on semA *inside interrupt context*, so that handler B
+    // would record its own $sp while A's handler stack was still live.
+    //
+    // That shape is not reachable under EeScheduler, and the trace says so
+    // rather than the code review: dispatchIrq() only QUEUES (queueInvocation
+    // -> m_pendingInvocations), so entry A (tid 2) went dormant at eeCycle=8
+    // with its handler not yet run, and the queued invocation was then pushed
+    // onto whichever thread ran next -- tid 3, entry B's thread
+    // (EeScheduler.cpp:1528). Handler A parked there
+    // ([semwatch:blockcurrent] #2 tid=3 reason=2 waitId=1 invocationsSize=1
+    // pc=0x701600), starving entry B's own body, so cause 6 was never
+    // dispatched, handler B never ran and nobody ever signalled semA. Third
+    // stale-design test found this week, after U2 and U3/U4.
+    //
+    // The CONTRACT underneath is live, so this is a restructure and not a
+    // retirement. EeScheduler::invocationStackTop() (EeScheduler.cpp:3399)
+    // reserves a stack keyed by
+    //
+    //     {owner->id, owner->invocations.size()}
+    //
+    // i.e. by thread AND by nesting depth, with the key taken BEFORE the
+    // push_back. Two invocations that can be live simultaneously therefore
+    // differ in at least one component and get different stacks; two at the
+    // same {tid, depth} deliberately SHARE, because they cannot overlap.
+    //
+    // I1 already covers the thread component (two fibers, one depth each).
+    // Nothing covered the DEPTH component, which is the half a future refactor
+    // is most likely to break -- collapsing the key to just the tid would keep
+    // I1 green. So the two halves below are:
+    //
+    //   1. an interrupt handler runs on a RESERVED stack, not on the stack of
+    //      the thread it interrupted (the DMAC subject I2 was written for,
+    //      minus the part that required blocking in interrupt context);
+    //   2. an invocation nested inside a LIVE one gets a disjoint stack.
+    //
+    // Neither half blocks, so both are deterministic -- no race to lose and no
+    // flake to chase later. The nesting uses the INVOKE path
+    // (dispatchSyscallOverride -> invokeCurrent, System.cpp:573) because that
+    // is the only path that nests synchronously: it throws EeDispatcherTransfer
+    // and the inner invocation runs while the outer is still on the stack. The
+    // DMAC path cannot nest, which is exactly what the old test assumed it
+    // could.
+
+    // Runs AS a DMAC handler; ctx is the invocation context, so $29 is the
+    // stack EeScheduler reserved for it.
     static void stepDmacRecordA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        rdramWrite32Raw(rdram, kSiDmacTopA, getRegU32(ctx, 29));
-        R5900Context s{}; setRegU32(s, 4, rdramRead32Raw(rdram, kSiSemB));
-        ps2_syscalls::SignalSema(rdram, &s, runtime);
-        R5900Context w{}; setRegU32(w, 4, rdramRead32Raw(rdram, kSiSemA));
-        ps2_syscalls::WaitSema(rdram, &w, runtime);              // PARK inside dispatch; A's handler stack live
-        ctx->pc = 0u;                                            // handler returns
+        SchedStep step(rdram, ctx, runtime);
+        step.once([&] { rdramWrite32Raw(rdram, kSiDmacTopA, getRegU32(ctx, 29)); });
+        step.finish();
     }
-    static void stepDmacRecordB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        rdramWrite32Raw(rdram, kSiDmacTopB, getRegU32(ctx, 29)); // A's handler stack STILL live
-        R5900Context s{}; setRegU32(s, 4, rdramRead32Raw(rdram, kSiSemA));
-        ps2_syscalls::SignalSema(rdram, &s, runtime);            // wake A
-        ctx->pc = 0u;
-    }
+
+    // Guest thread body: queue the cause-5 handler, then return.
     static void stepDmacDispatchA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u); // inline on fiber
-        ctx->pc = 0u;
+        SchedStep step(rdram, ctx, runtime);
+        step.once([&] { ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u); });
+        step.finish();
     }
-    static void stepDmacDispatchB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+
+    // Depth-0 invocation: record our own reserved $sp, then invoke a SECOND,
+    // DISTINCT override from inside it. Distinct numbers are mandatory, not
+    // stylistic -- dispatchSyscallOverride bails on
+    // hasInvocation(SyscallOverride, syscallNumber) (System.cpp:544), so
+    // re-entering the SAME number would silently not nest at all and the test
+    // would pass by measuring nothing.
+    static void stepNestOuter(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        R5900Context w{}; setRegU32(w, 4, rdramRead32Raw(rdram, kSiSemB));
-        ps2_syscalls::WaitSema(rdram, &w, runtime);              // wait until A recorded + parked
-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 6u);
-        ctx->pc = 0u;
+        SchedStep step(rdram, ctx, runtime);
+        step.once([&] { rdramWrite32Raw(rdram, kSiNestTopOuter, getRegU32(ctx, 29)); });
+        step.once([&]
+        {
+            ps2_syscalls::dispatchNumericSyscall(rdramRead32Raw(rdram, kSiSysB), rdram, ctx, runtime);
+        });
+        step.finish();
+    }
+
+    // Depth-1 invocation: record our own reserved $sp. Nothing blocks.
+    static void stepNestInner(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SchedStep step(rdram, ctx, runtime);
+        step.once([&] { rdramWrite32Raw(rdram, kSiNestTopInner, getRegU32(ctx, 29)); });
+        step.finish();
+    }
+
+    // Guest thread body for the nesting half: invoke override A (depth 0).
+    static void stepNestEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SchedStep step(rdram, ctx, runtime);
+        step.once([&]
+        {
+            ps2_syscalls::dispatchNumericSyscall(rdramRead32Raw(rdram, kSiSysA), rdram, ctx, runtime);
+        });
+        step.finish();
     }
 
     // ------------------------------------------------------------------
@@ -485,40 +692,53 @@ namespace
     // One handler for both fibers; $a0 selects mode. mode 1 = A (park), 2 = B (mark).
     static void stepOverrideHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // SchedStep first: it restores $a0-$a3 to the values this handler was
+        // entered with, so the mode read below survives the park in the mode-1
+        // branch. It also keys on (tid, entry pc), so this handler parking while
+        // NESTED inside stepOverrideA gets its own step sequence rather than
+        // interleaving with its caller's.
+        SchedStep step(rdram, ctx, runtime);
         const uint32_t mode = getRegU32(ctx, 4); // $a0, forwarded by rpcInvokeFunction
+        const uint32_t retSentinel = getRegU32(ctx, 31);
         if (mode == 1u)
         {
-            rdramWrite32Raw(rdram, kOvAEntered, 1u);
-            R5900Context s{}; setRegU32(s, 4, rdramRead32Raw(rdram, kOvSidStartB));
-            ps2_syscalls::SignalSema(rdram, &s, runtime);   // release B
-            R5900Context w{}; setRegU32(w, 4, rdramRead32Raw(rdram, kOvSidResumeA));
-            ps2_syscalls::WaitSema(rdram, &w, runtime);      // PARK: N is on A's override stack
-            rdramWrite32Raw(rdram, kOvARan, 1u);             // resumed
+            step.once([&] { rdramWrite32Raw(rdram, kOvAEntered, 1u); });
+            step.call(ps2_syscalls::SignalSema, rdramRead32Raw(rdram, kOvSidStartB));  // release B
+            step.call(ps2_syscalls::WaitSema, rdramRead32Raw(rdram, kOvSidResumeA));   // PARK: N is on A's override stack
+            step.once([&] { rdramWrite32Raw(rdram, kOvARan, 1u); });                   // resumed
         }
         else
         {
-            rdramWrite32Raw(rdram, kOvBRan, 1u);             // B's override actually ran
+            step.once([&] { rdramWrite32Raw(rdram, kOvBRan, 1u); });                   // B's override actually ran
         }
         setReturnU32(ctx, 0u);
-        ctx->pc = getRegU32(ctx, 31);                        // return through rpcInvoke sentinel
+        step.finishAt(retSentinel);                          // return through rpcInvoke sentinel
     }
 
     static void stepOverrideA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setRegU32(*ctx, 4, 1u);                               // mode A (park)
-        runtime->handleSyscall(rdram, ctx, kOvSyscall);      // -> dispatchSyscallOverride -> handler parks
-        ctx->pc = 0u;
+        // handleSyscall runs the override INLINE, so when the handler parks the
+        // throw unwinds through here too -- hence a step, not a bare call.
+        SchedStep step(rdram, ctx, runtime);
+        step.once([&]
+        {
+            setRegU32(*ctx, 4, 1u);                           // mode A (park)
+            runtime->handleSyscall(rdram, ctx, kOvSyscall);   // -> dispatchSyscallOverride -> handler parks
+        });
+        step.finish();
     }
 
     static void stepOverrideB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        R5900Context w{}; setRegU32(w, 4, rdramRead32Raw(rdram, kOvSidStartB));
-        ps2_syscalls::WaitSema(rdram, &w, runtime);          // proceed only after A has parked
-        setRegU32(*ctx, 4, 2u);                               // mode B (mark)
-        runtime->handleSyscall(rdram, ctx, kOvSyscall);      // fix: B's override runs; bug: skipped -> builtin
-        R5900Context s{}; setRegU32(s, 4, rdramRead32Raw(rdram, kOvSidResumeA));
-        ps2_syscalls::SignalSema(rdram, &s, runtime);        // wake A regardless -> clean drain in both cases
-        ctx->pc = 0u;
+        SchedStep step(rdram, ctx, runtime);
+        step.call(ps2_syscalls::WaitSema, rdramRead32Raw(rdram, kOvSidStartB)); // proceed only after A has parked
+        step.once([&]
+        {
+            setRegU32(*ctx, 4, 2u);                           // mode B (mark)
+            runtime->handleSyscall(rdram, ctx, kOvSyscall);   // fix: B's override runs; bug: skipped -> builtin
+        });
+        step.call(ps2_syscalls::SignalSema, rdramRead32Raw(rdram, kOvSidResumeA)); // wake A regardless -> clean drain
+        step.finish();
     }
 
     // ------------------------------------------------------------------
@@ -539,15 +759,17 @@ namespace
     // back-edge hook until terminated. B never self-exits — it is killed by
     // A's TerminateThread(B), which guarantees B is still joinable when A
     // enters join_fiber (so the priority floor is actually exercised). The
-    // yield_point inside shouldPreemptGuestExecution throws ThreadExitException
-    // once terminateRequested is set (by A, or by scheduler_shutdown on
-    // teardown), unwinding B cleanly. kThStop is a belt-and-suspenders escape.
+    // 2026-09-22: the comment here used to say shouldPreemptGuestExecution()
+    // THROWS ThreadExitException once terminateRequested is set. It does not --
+    // that was the retired yield_point() contract. checkpointDue() is noexcept
+    // and returns a bool, so B must return on it (SCHED_YIELD_POINT) to hand
+    // run() back its loop. kThStop is a belt-and-suspenders escape.
     static void stepJoinStarveTarget(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         rdramWrite32Raw(rdram, kJsBStarted, 1u);
         while (rdramRead32Raw(rdram, kThStop) == 0u)
         {
-            runtime->shouldPreemptGuestExecution(); // yield_point: throws on terminate
+            SCHED_YIELD_POINT(runtime); // back-edge hook: returns on terminate/stop
         }
         ctx->pc = 0u;
     }
@@ -561,12 +783,11 @@ namespace
     // kJsJoinReturned only AFTER TerminateThread returns.
     static void stepJoinStarveJoiner(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        SchedStep step(rdram, ctx, runtime);
         const int32_t targetTid = static_cast<int32_t>(rdramRead32Raw(rdram, kJsTargetTid));
-        R5900Context tcx{};
-        setRegU32(tcx, 4, static_cast<uint32_t>(targetTid));
-        ps2_syscalls::TerminateThread(rdram, &tcx, runtime); // -> join_fiber(targetTid)
-        rdramWrite32Raw(rdram, kJsJoinReturned, 1u);
-        ctx->pc = 0u;
+        step.call(ps2_syscalls::TerminateThread, static_cast<uint32_t>(targetTid)); // -> join_fiber(targetTid)
+        step.once([&] { rdramWrite32Raw(rdram, kJsJoinReturned, 1u); });
+        step.finish();
     }
 
 } // anonymous namespace
@@ -626,7 +847,7 @@ void register_scheduler_token_handoff_tests()
             t.IsTrue(spinning, "H1: ping-pong fibers are running");
 
             // Host worker (interrupt-worker shape): parks for the guest token.
-            ParkedHostWorker worker;
+            ParkedHostWorker worker(runtime.eeScheduler());
 
             // THE regression assertion: the worker must win the token while the
             // fibers are still ping-ponging (bounded wait — a starved worker
@@ -640,7 +861,7 @@ void register_scheduler_token_handoff_tests()
             signalSchedSema(rdram.data(), &runtime, sidX);
             signalSchedSema(rdram.data(), &runtime, sidY);
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
             const bool workerFinished = worker.finishedWithin(std::chrono::milliseconds(3000));
 
             t.IsTrue(acquiredWhileBusy,
@@ -673,7 +894,7 @@ void register_scheduler_token_handoff_tests()
             const bool spinning = waitForWordAtLeast(rdram, kThCount, 1000u, std::chrono::milliseconds(2000));
             t.IsTrue(spinning, "H2: fiber is spinning through yield_point samples");
 
-            ParkedHostWorker worker;
+            ParkedHostWorker worker(runtime.eeScheduler());
 
             // THE regression assertion: without yield_point step 4 the fiber
             // never leaves ps2fiber_resume, so the worker cannot win the token
@@ -684,7 +905,7 @@ void register_scheduler_token_handoff_tests()
             // executor idles, and the parked worker (if still parked) proceeds.
             rdramWrite32(rdram, kThStop, 1u);
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
             const bool workerFinished = worker.finishedWithin(std::chrono::milliseconds(3000));
 
             t.IsTrue(acquiredWhileSpinning,
@@ -715,7 +936,7 @@ void register_scheduler_token_handoff_tests()
             const bool spinning = waitForWordAtLeast(rdram, kThCount, 1000u, std::chrono::milliseconds(2000));
             t.IsTrue(spinning, "H3: fiber is spinning across function dispatches");
 
-            ParkedHostWorker worker;
+            ParkedHostWorker worker(runtime.eeScheduler());
 
             // THE regression assertion: the function bodies never call the
             // back-edge hook, so only the dispatch-loop preempt can yield.
@@ -724,7 +945,7 @@ void register_scheduler_token_handoff_tests()
             // Escape hatch + teardown.
             rdramWrite32(rdram, kThStop, 1u);
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
             const bool workerFinished = worker.finishedWithin(std::chrono::milliseconds(3000));
 
             t.IsTrue(acquiredWhileSpinning,
@@ -780,81 +1001,99 @@ void register_scheduler_rpc_loop_park_tests()
                      "R1: equal-priority fiber ran while sceSifRpcLoop was active "
                      "(the RPC server fiber must park via SleepThread)");
 
-            // Teardown: scheduler_shutdown() terminates the parked server
-            // fiber (SleepThread observes terminateRequested and unwinds).
-            // Bounded even on regression: shutdown's terminate also unwinds a
-            // hot-spinning server at its next dispatch-loop yield point.
-            ps2sched::scheduler_shutdown();
-            t.Equals(g_activeThreads.load(std::memory_order_acquire), 0,
-                     "R1: all fibers terminated after shutdown");
+            // Teardown: requestStop() terminates the parked server thread
+            // (SleepThread observes the stop and unwinds). Bounded even on
+            // regression: the stop also unwinds a hot-spinning server at its
+            // next dispatch-loop yield point.
+            //
+            // 2026-09-21: was scheduler_shutdown() + g_activeThreads==0. The
+            // process-global fiber count is gone; isIdle() (via drainedWithin)
+            // is the drain check, and it asserts the same thing -- no guest
+            // thread left running or ready.
+            runtime.requestStop();
+            t.IsTrue(drainedWithin(runtime, std::chrono::milliseconds(3000)),
+                     "R1: all guest threads terminated after stop");
         });
     }); // MiniTest::Case("SchedulerRpcLoopPark")
 }
 
 // ---------------------------------------------------------------------------
-// requestStop() from GUEST context (a fiber on the executor thread) must not
-// join host workers: a worker parked in async_guest_begin() waits for
-// g_running_fiber == nullptr, which can never happen while the joining fiber
-// IS the running fiber - a deadlock (reached whenever the unimplemented-
-// function default fault handler calls requestStop from a fiber while an
-// interrupt worker is parked for the token). notifyRuntimeStop must
-// signal-only in that case; scheduler_shutdown() joins later on the main
-// thread.
+// requestStop() from GUEST context must not block on host workers.
+//
+// ORIGINAL BUG (pre-Phase-3d): a worker parked in ps2sched::async_guest_begin()
+// waited for g_running_fiber == nullptr, which could never happen while the
+// joining fiber WAS the running fiber -- a deadlock, reached whenever the
+// unimplemented-function default fault handler called requestStop from a fiber
+// while an interrupt worker was parked for the guest token.
+//
+// 2026-09-21 -- ⚠️ THE ORIGINAL FAILURE MODE IS NOW STRUCTURALLY IMPOSSIBLE.
+// PS2Runtime::requestStop() (ps2_runtime.cpp) is signal-only: it sets
+// m_stopRequested and calls EeScheduler::requestStop(), and JOINS NOTHING.
+// There is no longer any code path by which requestStop could wait on a host
+// worker, so this test can no longer fail the way it was written to fail.
+//
+// It is kept, not deleted, because the INVARIANT is still worth pinning: a
+// stop issued from guest context must return to the guest. If someone later
+// reintroduces a join (or a blocking drain) inside requestStop, this goes red
+// again. What changed is the contention it is exercised under -- see below.
 // ---------------------------------------------------------------------------
 void register_scheduler_guest_context_stop_tests()
 {
     MiniTest::Case("SchedulerGuestContextStop", [](TestCase &tc)
     {
-        tc.Run("G1: requestStop from a fiber does not deadlock against a parked worker", [](TestCase &t)
+        tc.Run("G1: requestStop from guest context returns while a host worker is parked", [](TestCase &t)
         {
-            notifyRuntimeStop();
-            ps2sched::scheduler_init();
-            PS2Runtime runtime;
-            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            SchedFixture fx;
+            PS2Runtime &runtime = fx.runtime;
+            std::vector<uint8_t> &rdram = fx.rdram;
 
             runtime.registerFunction(0x00700700u, &stepGuestContextStop);
             rdramWrite32(rdram, kThStop, 0u);
             rdramWrite32(rdram, kThFlag, 0u);
 
-            // Real interrupt worker: each VBlank tick it takes AsyncGuestScope
-            // (even with zero INTC handlers), parking in async_guest_begin()
-            // while our spinning fiber holds the executor.
-            EnsureVSyncWorkerRunning(rdram.data(), &runtime);
-
             const int32_t tid = startSchedWorker(rdram.data(), &runtime,
                                                  0x00700700u, 10, nextWorkerStackBase(0x2000u), 0x2000u);
-            t.IsTrue(tid > 0, "G1: fiber started");
+            t.IsTrue(tid > 0, "G1: guest thread started");
             if (tid <= 0)
             {
-                ps2sched::scheduler_shutdown(); runtime.requestStop(); return;
-            }
-
-            // THE regression assertion: the fiber observes the parked worker,
-            // calls requestStop() from guest context, and RETURNS (writing the
-            // flag). Unfixed, notifyRuntimeStop joins the parked worker from
-            // the fiber and wedges before the flag write.
-            const bool stopReturned = waitForWord(rdram, kThFlag, 1u, std::chrono::milliseconds(5000));
-
-            t.IsTrue(stopReturned,
-                     "G1: requestStop() invoked on the guest executor returned "
-                     "(worker stop must be signal-only from guest context)");
-
-            if (!stopReturned)
-            {
-                // The fiber is wedged inside the join; the executor cannot be
-                // shut down. Return WITHOUT scheduler_shutdown so the failure
-                // above is reported instead of hanging here. (The next suite's
-                // scheduler_init will SCHED_REQUIRE-abort the process - a loud
-                // bounded failure, never a silent hang.)
+                rdramWrite32(rdram, kThStop, 1u);
                 return;
             }
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
-            t.IsTrue(drained, "G1: fiber drained after guest-context stop");
+            // ORDER IS LOAD-BEARING. The worker must be constructed AFTER the
+            // guest thread is dispatching, because EeScheduler::run() holds
+            // hostInvocationMutex() for the duration of each guest dispatch
+            // (EeScheduler.cpp, see hostInvocationMutex()'s doc comment). With
+            // the guest spinning inside its dispatch, the worker genuinely
+            // blocks and its published intent stays visible for the whole
+            // spin. Constructed BEFORE the thread started, it would win the
+            // uncontended mutex instantly and the guest would spin forever on
+            // a counter that had already returned to zero.
+            //
+            // Replaces the old EnsureVSyncWorkerRunning(): the real interrupt
+            // worker takes the mutex directly and publishes nothing, so the
+            // guest has no way to observe that it is parked.
+            ParkedHostWorker worker(runtime.eeScheduler());
 
-            // Main-thread shutdown performs the real joins (idempotent stops).
-            ps2sched::scheduler_shutdown();
-            runtime.requestStop();
+            // THE assertion: the guest observes the parked worker, calls
+            // requestStop() from guest context, and RETURNS (writing the flag).
+            const bool stopReturned = waitForWord(rdram, kThFlag, 1u, std::chrono::milliseconds(5000));
+
+            // Escape hatch first, so a red assertion never leaves the guest
+            // spinning and the worker blocked behind it (the ParkedHostWorker
+            // destructor joins unconditionally).
+            rdramWrite32(rdram, kThStop, 1u);
+
+            t.IsTrue(stopReturned,
+                     "G1: requestStop() invoked from guest context returned "
+                     "(stop must be signal-only, never a join)");
+
+            const bool workerFinished = worker.finishedWithin(std::chrono::milliseconds(3000));
+            t.IsTrue(workerFinished,
+                     "G1: parked host worker acquired the host-invocation mutex and finished");
+
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
+            t.IsTrue(drained, "G1: guest thread drained after guest-context stop");
         });
     }); // MiniTest::Case("SchedulerGuestContextStop")
 }
@@ -963,15 +1202,41 @@ void register_scheduler_dmac_guest_dispatch_tests()
 
             const bool done = waitForWord(rdram, kThFlag, 1u, std::chrono::milliseconds(3000));
             t.IsTrue(done, "M1: guest-context dispatch returned");
+
+            // 2026-09-22 -- the counts are read AFTER a drain, never at the
+            // sentinel.
+            //
+            // This test was written against the ps2sched dispatcher, which ran
+            // DMAC handlers INLINE on the fiber servicing the syscall -- hence
+            // the "SYNCHRONOUSLY" wording above and the original
+            // t.Equals(rdramRead32(rdram, kThSent), 1u) sitting immediately
+            // after the sentinel. EeScheduler::dispatchIrq() only QUEUES
+            // (queueInvocation -> m_pendingInvocations, EeScheduler.cpp:3295)
+            // and the handler runs when the scheduler next dispatches, so a
+            // read taken at the sentinel is 0 no matter how healthy the runtime
+            // is. It was measuring before the work it measures could happen.
+            //
+            // [m1probe] established that by measurement rather than inference:
+            //   hasHandlerFn=1 hasEntryFn=1 flag=1 sentAfterGuest=0
+            //   sentAfterDrain=1 sentAfterHost=1 sentAfterHostPump=2
+            // The handler fires exactly once per dispatch; only the read points
+            // were wrong. Before the drainedWithin() pump fix in
+            // SchedTestSupport.h every one of those numbers was 0 -- that
+            // defect is what hid this one, so both had to be measured to
+            // separate them.
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
+            t.IsTrue(drained, "M1: fiber drained");
+
             t.Equals(rdramRead32(rdram, kThSent), 1u,
                      "M1: handler ran exactly once from guest context");
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
-            t.IsTrue(drained, "M1: fiber drained");
-
             // Host-thread path must still borrow the token and work: dispatch
-            // the same cause from this (non-executor) thread.
+            // the same cause from this (non-executor) thread. Same rule --
+            // queue, drain, then read.
             ps2_syscalls::dispatchDmacHandlersForCause(rdram.data(), &runtime, 5u);
+            t.IsTrue(drainedWithin(runtime, std::chrono::milliseconds(3000)),
+                     "M1: host-path dispatch drained");
+
             t.Equals(rdramRead32(rdram, kThSent), 2u,
                      "M1: handler also runs via the borrowed-token host path");
         });
@@ -1053,7 +1318,7 @@ void register_scheduler_recovery_isolation_tests()
                 return;
             }
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
             t.IsTrue(drained, "R1: both fibers completed the handoff and exited");
 
             // THE regression assertions: under the shared thread_local, A and
@@ -1097,30 +1362,32 @@ void register_scheduler_recovery_isolation_tests()
                 return;
             }
 
-            const bool drained1 = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained1 = drainedWithin(runtime, std::chrono::milliseconds(3000));
             t.IsTrue(drained1, "R2: fiber 1 fully torn down (FiberContext destroyed)");
 
             // Force GENUINE tid reuse: erase T1 from the kernel thread map
-            // (DeleteThread requires THS_DORMANT, which on_fiber_exit already
-            // set), then seed the tid allocator so the next CreateThread hands
-            // out exactly T1 again. Both operations are serialized under
-            // g_thread_map_mutex, the same lock CreateThread's allocator holds.
-            {
-                R5900Context d{};
-                setRegU32(d, 4, static_cast<uint32_t>(T1));
-                ps2_syscalls::DeleteThread(rdram.data(), &d, &runtime);
-            }
-            {
-                std::lock_guard<std::mutex> lk(g_thread_map_mutex);
-                g_nextThreadId = T1;
-            }
+            // (DeleteThread requires THS_DORMANT, which thread exit already
+            // set), then walk the allocator around until it hands out exactly
+            // T1 again.
+            //
+            // 2026-09-21: was a direct `g_nextThreadId = T1` seed under
+            // g_thread_map_mutex. EeScheduler owns the allocator privately now
+            // (allocateThreadId(), m_nextThreadId) with no public seam, so we
+            // drive it from outside instead -- see createDormantWorkerWithId.
+            deleteWorkerById(rdram.data(), &runtime, T1);
 
             rdramWrite32(rdram, kReuseRun, 1u);
-            const int32_t T2 = startSchedWorker(rdram.data(), &runtime,
-                                                kEntryReuse, 10, 0x0053C000u, 0x2000u);
+            const int32_t T2 = createDormantWorkerWithId(rdram.data(), &runtime, T1,
+                                                         kEntryReuse, 10, 0x0053C000u, 0x2000u);
             t.Equals(T2, T1, "R2: tid genuinely recycled (not merely a fresh, different tid)");
+            if (T2 != T1)
+            {
+                return;
+            }
+            t.IsTrue(startExistingWorker(rdram.data(), &runtime, T2),
+                     "R2: recycled-tid thread started");
 
-            const bool drained2 = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained2 = drainedWithin(runtime, std::chrono::milliseconds(3000));
             t.IsTrue(drained2, "R2: fiber 2 (reused tid) completed");
 
             // THE regression assertion: under the shared thread_local, fiber 2
@@ -1213,7 +1480,7 @@ void register_scheduler_stack_isolation_tests()
             const int32_t tidB = startSchedWorker(rdram.data(), &runtime, kEntryB, 10, nextWorkerStackBase(0x2000u), 0x2000u);
             t.IsTrue(tidA > 0 && tidB > 0, "I1: both fibers started");
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
             t.IsTrue(drained, "I1: both fibers completed the handoff and exited");
 
             const uint32_t topA = rdramRead32(rdram, kSiTopA);
@@ -1229,55 +1496,83 @@ void register_scheduler_stack_isolation_tests()
               ps2_syscalls::SetSyscall(rdram.data(), &s, &runtime); }
         });
 
-        // I2 --- B3: two fibers interleaving through inline DMAC dispatch must
-        // run handlers on disjoint stacks. RED on ucontext against the shared
-        // getAsyncHandlerStackTop cache (dmacTopA == dmacTopB).
-        tc.Run("I2: inline DMAC handler stack is isolated across interleaved fibers", [](TestCase &t)
+        // I2 --- the invocation-stack reservation contract. See the step
+        // functions above for why this no longer ping-pongs two fibers through
+        // inline DMAC dispatch, and for the trace that settled it.
+        tc.Run("I2: invocation stacks are reserved per {thread, depth}", [](TestCase &t)
         {
             SchedFixture fx;
             PS2Runtime &runtime = fx.runtime;
             std::vector<uint8_t> &rdram = fx.rdram;
 
-            constexpr uint32_t kEntryA = 0x00701400u, kEntryB = 0x00701500u;
-            constexpr uint32_t kHndA = 0x00701600u, kHndB = 0x00701700u;
+            constexpr uint32_t kEntryA = 0x00701400u, kHndA = 0x00701600u;
+            constexpr uint32_t kNestEntry = 0x00701500u;
+            constexpr uint32_t kNestOuter = 0x00701700u, kNestInner = 0x00701800u;
+            constexpr uint32_t kSysNestA = 0x00005A03u, kSysNestB = 0x00005A04u;
+            constexpr uint32_t kWorkerSize = 0x2000u;
 
-            runtime.registerFunction(kEntryA, &stepDmacDispatchA);
-            runtime.registerFunction(kEntryB, &stepDmacDispatchB);
-            runtime.registerFunction(kHndA,  &stepDmacRecordA);
-            runtime.registerFunction(kHndB,  &stepDmacRecordB);
+            runtime.registerFunction(kEntryA,    &stepDmacDispatchA);
+            runtime.registerFunction(kHndA,      &stepDmacRecordA);
+            runtime.registerFunction(kNestEntry, &stepNestEntry);
+            runtime.registerFunction(kNestOuter, &stepNestOuter);
+            runtime.registerFunction(kNestInner, &stepNestInner);
 
-            int32_t hidA = -1, hidB = -1;
+            // ---------- half 1: an interrupt handler gets its OWN stack -----
+            int32_t hidA = -1;
             { R5900Context a{}; setRegU32(a,4,5u); setRegU32(a,5,kHndA); setRegU32(a,6,0u); setRegU32(a,7,0u);
               ps2_syscalls::AddDmacHandler(rdram.data(), &a, &runtime); hidA = getRegS32(a, 2); }
-            { R5900Context a{}; setRegU32(a,4,6u); setRegU32(a,5,kHndB); setRegU32(a,6,0u); setRegU32(a,7,0u);
-              ps2_syscalls::AddDmacHandler(rdram.data(), &a, &runtime); hidB = getRegS32(a, 2); }
-            t.IsTrue(hidA > 0 && hidB > 0, "I2: DMAC handlers registered");
+            t.IsTrue(hidA > 0, "I2: DMAC handler registered");
 
-            SemaPair semas(rdram.data(), &runtime, createSchedSema, deleteSchedSema,
-                           0, 1, 0, 1);
-            rdramWrite32(rdram, kSiSemA, static_cast<uint32_t>(semas.a()));
-            rdramWrite32(rdram, kSiSemB, static_cast<uint32_t>(semas.b()));
             rdramWrite32(rdram, kSiDmacTopA, 0u);
-            rdramWrite32(rdram, kSiDmacTopB, 0u);
 
-            const int32_t tidA = startSchedWorker(rdram.data(), &runtime, kEntryA, 10, nextWorkerStackBase(0x2000u), 0x2000u);
-            const int32_t tidB = startSchedWorker(rdram.data(), &runtime, kEntryB, 10, nextWorkerStackBase(0x2000u), 0x2000u);
-            t.IsTrue(tidA > 0 && tidB > 0, "I2: both fibers started");
+            // The base is bound to a local so the handler's $sp can be checked
+            // against the interrupted thread's actual stack range rather than
+            // against a re-derived guess.
+            const uint32_t workerBase = nextWorkerStackBase(kWorkerSize);
+            const int32_t tidA = startSchedWorker(rdram.data(), &runtime, kEntryA, 10,
+                                                  workerBase, kWorkerSize);
+            t.IsTrue(tidA > 0, "I2: dispatch fiber started");
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
-            t.IsTrue(drained, "I2: both fibers completed dispatch and exited");
+            t.IsTrue(drainedWithin(runtime, std::chrono::milliseconds(3000)),
+                     "I2: dispatch fiber and its queued handler both completed");
 
             const uint32_t topA = rdramRead32(rdram, kSiDmacTopA);
-            const uint32_t topB = rdramRead32(rdram, kSiDmacTopB);
-            t.IsTrue(topA != 0u && topB != 0u, "I2: both dispatches reserved a handler stack");
-            t.IsTrue(topA != topB,
-                     "I2: interleaved inline DMAC dispatches must run on DISJOINT stacks");
+            t.IsTrue(topA != 0u, "I2: the DMAC handler ran on a reserved stack");
+            t.IsTrue(topA < workerBase || topA >= workerBase + kWorkerSize,
+                     "I2: an interrupt handler must NOT run on the interrupted thread's stack");
 
-            // Cleanup: RemoveDmacHandler reads cause=$a0, handlerId=$a1.
+            // ---------- half 2: nesting depth gets its OWN stack ------------
+            { R5900Context s{}; setRegU32(s,4,kSysNestA); setRegU32(s,5,kNestOuter);
+              ps2_syscalls::SetSyscall(rdram.data(), &s, &runtime); }
+            { R5900Context s{}; setRegU32(s,4,kSysNestB); setRegU32(s,5,kNestInner);
+              ps2_syscalls::SetSyscall(rdram.data(), &s, &runtime); }
+            rdramWrite32(rdram, kSiSysA, kSysNestA);
+            rdramWrite32(rdram, kSiSysB, kSysNestB);
+            rdramWrite32(rdram, kSiNestTopOuter, 0u);
+            rdramWrite32(rdram, kSiNestTopInner, 0u);
+
+            const int32_t tidN = startSchedWorker(rdram.data(), &runtime, kNestEntry, 10,
+                                                  nextWorkerStackBase(kWorkerSize), kWorkerSize);
+            t.IsTrue(tidN > 0, "I2: nesting fiber started");
+            t.IsTrue(drainedWithin(runtime, std::chrono::milliseconds(3000)),
+                     "I2: nested invocations completed and the fiber exited");
+
+            const uint32_t outer = rdramRead32(rdram, kSiNestTopOuter);
+            const uint32_t inner = rdramRead32(rdram, kSiNestTopInner);
+            t.IsTrue(outer != 0u && inner != 0u,
+                     "I2: both nested invocations reserved a stack");
+            t.IsTrue(outer != inner,
+                     "I2: an invocation nested inside a LIVE one must get a DISJOINT stack");
+
+            // Cleanup: RemoveDmacHandler reads cause=$a0, handlerId=$a1, and the
+            // syscall overrides are process-global, so later suites see them
+            // unless they are erased here.
             { R5900Context r{}; setRegU32(r,4,5u); setRegU32(r,5,static_cast<uint32_t>(hidA));
               ps2_syscalls::RemoveDmacHandler(rdram.data(), &r, &runtime); }
-            { R5900Context r{}; setRegU32(r,4,6u); setRegU32(r,5,static_cast<uint32_t>(hidB));
-              ps2_syscalls::RemoveDmacHandler(rdram.data(), &r, &runtime); }
+            { R5900Context s{}; setRegU32(s,4,kSysNestA); setRegU32(s,5,0u);
+              ps2_syscalls::SetSyscall(rdram.data(), &s, &runtime); }
+            { R5900Context s{}; setRegU32(s,4,kSysNestB); setRegU32(s,5,0u);
+              ps2_syscalls::SetSyscall(rdram.data(), &s, &runtime); }
         });
 
         // I3 --- shared-mechanism contract (stands in for B4). dispatchGuest-
@@ -1328,19 +1623,17 @@ void register_scheduler_override_isolation_tests()
             runtime.registerFunction(kOvEntryB, &stepOverrideB);
             runtime.registerFunction(kOvHandler, &stepOverrideHandler);
 
-            // Register the override directly (avoids SetSyscall's guest-memory
-            // mirroring side effects); State.h is already included.
-            {
-                std::lock_guard<std::mutex> lk(g_syscall_override_mutex);
-                g_syscall_overrides[kOvSyscall] = kOvHandler;
-            }
+            // Register the override directly. Passing rdram = nullptr skips the
+            // guest-memory table mirroring, which is the SetSyscall side effect
+            // this test is avoiding; the map is per-runtime and self-locking.
+            runtime.setEeSyscallOverride(nullptr, kOvSyscall, kOvHandler);
 
             SemaPair semas(rdram.data(), &runtime, createSchedSema, deleteSchedSema,
                            0, 1, 0, 1);
             t.IsTrue(semas.a() > 0 && semas.b() > 0, "O1: semas created");
             if (semas.a() <= 0 || semas.b() <= 0)
             {
-                { std::lock_guard<std::mutex> lk(g_syscall_override_mutex); g_syscall_overrides.erase(kOvSyscall); }
+                runtime.setEeSyscallOverride(nullptr, kOvSyscall, 0u);
                 return;
             }
             const int32_t sidStartB  = semas.a();
@@ -1358,11 +1651,11 @@ void register_scheduler_override_isolation_tests()
             t.IsTrue(tidA > 0 && tidB > 0, "O1: both fibers started");
             if (tidA <= 0 || tidB <= 0)
             {
-                { std::lock_guard<std::mutex> lk(g_syscall_override_mutex); g_syscall_overrides.erase(kOvSyscall); }
+                runtime.setEeSyscallOverride(nullptr, kOvSyscall, 0u);
                 return;
             }
 
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
             // A timeout here means the PARK mechanism failed (WaitSema nested in
             // the override invoke) — NOT the B2 guard. Debug the park, not the fix.
             t.IsTrue(drained, "O1: both fibers completed the handoff and exited");
@@ -1379,7 +1672,7 @@ void register_scheduler_override_isolation_tests()
             t.Equals(rdramRead32(rdram, kOvBRan), 1u,
                      "O1: fiber B's own override must run while fiber A is parked inside the same syscall's override");
 
-            { std::lock_guard<std::mutex> lk(g_syscall_override_mutex); g_syscall_overrides.erase(kOvSyscall); }
+            runtime.setEeSyscallOverride(nullptr, kOvSyscall, 0u);
         });
     }); // MiniTest::Case("SchedulerOverrideIsolation")
 }
@@ -1494,8 +1787,9 @@ void register_scheduler_join_starvation_tests()
                 signalSchedSema(rdram.data(), &runtime, sidX);
                 signalSchedSema(rdram.data(), &runtime, sidY);
             }
-            const bool drained = drainedWithin(std::chrono::milliseconds(3000));
+            const bool drained = drainedWithin(runtime, std::chrono::milliseconds(3000));
             t.IsTrue(drained, "J1: all fibers quiesced after teardown");
         });
     }); // MiniTest::Case("SchedulerJoinStarvation")
 }
+

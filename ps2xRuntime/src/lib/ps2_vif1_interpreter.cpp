@@ -28,6 +28,41 @@ namespace ps2diag_chainord
 uint32_t resolveSrc(uint32_t pos);
 }
 
+// 2026-09-22 Part 158 [vumat] -- defined in game_overrides.cpp. Declared here
+// rather than in a header: any .h edit rebuilds all 30,000+ generated runner
+// TUs (30+ hours). extern-between-.cpp is the sanctioned cross-TU pattern.
+extern "C" void ps2x_probe_kv(const char *name, int n,
+                              const char *const *keys, const uint64_t *vals);
+
+namespace
+{
+// Log-spaced sampling, same shape as the [vflip] probe: a cap that fills from
+// the start of the run only ever sees the first instant, which is how the first
+// oracle comparison came out meaningless. Stride doubles every kVumatGrowEvery
+// records, so a bounded number of dumps still spans the whole run.
+//
+// 2026-09-23 Part 159 follow-up: doubling every 4 TAKEN dumps caps dump 23 at
+// MSCAL #251 (worked out by hand from these constants) -- Part 159 confirmed
+// this empirically, 12 of 24 dumps landed at the SAME earliest `progress`
+// value VFLIP ever saw 3D geometry. Doubling every SINGLE dump instead
+// (kVumatGrowEvery=1) pushes dump 23 out past MSCAL #16.7M, so the 24 dumps
+// should actually spread across the run instead of bunching at its start.
+constexpr uint32_t kVumatDumps = 24u;      // MSCALs dumped
+constexpr uint32_t kVumatQuads = 256u;     // quadwords per dump (low 4 KB)
+constexpr uint32_t kVumatGrowEvery = 1u;
+std::atomic<bool> g_vumatArmed{[] {
+    const char *e = std::getenv("PS2X_VUMAT");
+    return e != nullptr && e[0] != 0 && e[0] != '0';
+}()};
+// Plain, not atomic: the VIF1 interpreter is driven from one thread, like the
+// g_mscal counter beside it. A locked RMW on this path is the shape that once
+// cost 19% of guest throughput.
+uint64_t g_vumatSeen = 0;
+uint64_t g_vumatNext = 0;
+uint64_t g_vumatStride = 1;
+uint32_t g_vumatTaken = 0;
+} // namespace
+
 enum VIFCmd : uint8_t
 {
     VIF_NOP = 0x00,
@@ -554,6 +589,54 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
             ps2_pipeline_stats::g_mscal.fetch_add(1, std::memory_order_relaxed);
+            if (g_vumatArmed.load(std::memory_order_relaxed) && m_vu1Data != nullptr)
+            {
+                const uint64_t seen = g_vumatSeen++;
+                if (seen == g_vumatNext && g_vumatTaken < kVumatDumps)
+                {
+                    const uint32_t dump = g_vumatTaken++;
+                    if ((g_vumatTaken % kVumatGrowEvery) == 0u &&
+                        g_vumatStride < (1ull << 40))
+                    {
+                        g_vumatStride *= 2ull;
+                    }
+                    g_vumatNext = seen + g_vumatStride;
+                    // Raw bit patterns, not floats: the reader decodes them, so
+                    // no host rounding or printf format can alter what VU1 saw.
+                    static const char *const mk[] = {
+                        "dump", "mscal", "pc", "top", "itop", "q", "w0", "w1", "w2", "w3"};
+                    for (uint32_t qi = 0; qi < kVumatQuads; ++qi)
+                    {
+                        uint32_t w[4];
+                        std::memcpy(w, m_vu1Data + qi * 16u, sizeof(w));
+                        if ((w[0] | w[1] | w[2] | w[3]) == 0u)
+                        {
+                            continue; // untouched memory carries nothing
+                        }
+                        const uint64_t mv[] = {
+                            static_cast<uint64_t>(dump),
+                            static_cast<uint64_t>(seen),
+                            static_cast<uint64_t>(startPC),
+                            static_cast<uint64_t>(runTop),
+                            static_cast<uint64_t>(runItop),
+                            static_cast<uint64_t>(qi),
+                            static_cast<uint64_t>(w[0]),
+                            static_cast<uint64_t>(w[1]),
+                            static_cast<uint64_t>(w[2]),
+                            static_cast<uint64_t>(w[3])};
+                        ps2x_probe_kv("VUMAT", 10, mk, mv);
+                    }
+                }
+                else if (g_vumatTaken >= kVumatDumps && seen == g_vumatNext)
+                {
+                    // A saturated probe and a probe that never fired look
+                    // identical in the output, so say so explicitly.
+                    RUNTIME_LOG("[cap] tag=vumat limit=" << kVumatDumps
+                                                         << " -- disarming");
+                    g_vumatNext = ~0ull;
+                    g_vumatArmed.store(false, std::memory_order_relaxed);
+                }
+            }
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;

@@ -3639,7 +3639,6 @@ void register_ps2_gs_tests()
 
         tc.Run("sceGsSyncV waits on VBlank and reports interlaced field parity", [](TestCase &t)
         {
-            notifyRuntimeStop();
             ps2_stubs::resetGsSyncVCallbackState();
 
             PS2Runtime runtime;
@@ -3660,9 +3659,9 @@ void register_ps2_gs_tests()
             // inside it, which shifts the base and makes any hardcoded absolute
             // field expectation unanswerable -- only the relative parity checks
             // below remain valid in that case.
-            const uint64_t tickPreSetup = ps2_syscalls::GetCurrentVSyncTick();
+            const uint64_t tickPreSetup = ps2_syscalls::GetCurrentVSyncTick(&runtime);
             ps2_stubs::sceGsResetGraph(rdram.data(), &resetCtx, &runtime);
-            const uint64_t tickPostSetup = ps2_syscalls::GetCurrentVSyncTick();
+            const uint64_t tickPostSetup = ps2_syscalls::GetCurrentVSyncTick(&runtime);
             const bool baseUnambiguous = (tickPreSetup == tickPostSetup);
 
             R5900Context sync0{};
@@ -3681,7 +3680,7 @@ void register_ps2_gs_tests()
             // is simply wrong. Deriving the expected field from the observed
             // tick keeps this assertion correct under that jitter while still
             // catching real regressions in the field-parity logic.
-            const uint64_t tick0 = ps2_syscalls::GetCurrentVSyncTick();
+            const uint64_t tick0 = ps2_syscalls::GetCurrentVSyncTick(&runtime);
             const int32_t field0 = static_cast<int32_t>(getRegU32Test(sync0, 2));
             if (baseUnambiguous)
             {
@@ -3690,7 +3689,7 @@ void register_ps2_gs_tests()
 
             R5900Context sync1{};
             ps2_stubs::sceGsSyncV(rdram.data(), &sync1, &runtime);
-            const uint64_t tick1 = ps2_syscalls::GetCurrentVSyncTick();
+            const uint64_t tick1 = ps2_syscalls::GetCurrentVSyncTick(&runtime);
             const int32_t field1 = static_cast<int32_t>(getRegU32Test(sync1, 2));
 
             // Liveness: the second call must have actually waited for a new
@@ -3727,13 +3726,11 @@ void register_ps2_gs_tests()
             t.Equals(static_cast<int32_t>(getRegU32Test(syncProg, 2)), 1, "progressive sceGsSyncV should always return one");
 
             runtime.requestStop();
-            notifyRuntimeStop();
             ps2_stubs::resetGsSyncVCallbackState();
         });
 
         tc.Run("sceGsSyncVCallback uses the shared VBlank worker", [](TestCase &t)
         {
-            notifyRuntimeStop();
             ps2_stubs::resetGsSyncVCallbackState();
             g_gsSyncCallbackHits.store(0u, std::memory_order_relaxed);
             g_gsSyncCallbackLastTick.store(0u, std::memory_order_relaxed);
@@ -3764,7 +3761,6 @@ void register_ps2_gs_tests()
             t.Equals(getRegU32Test(clearCtx, 2), kCallbackAddr, "clearing sceGsSyncVCallback should return the previous callback");
 
             runtime.requestStop();
-            notifyRuntimeStop();
             ps2_stubs::resetGsSyncVCallbackState();
         });
 

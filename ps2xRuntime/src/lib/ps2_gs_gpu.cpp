@@ -1025,10 +1025,42 @@ namespace
         return false;
     }
 
+// 2026-09-22 Part 158 [vflip] -- defined in game_overrides.cpp. Declared here
+// rather than in a header: any .h edit rebuilds all 30,000+ generated runner
+// TUs (30+ hours). extern-between-.cpp is the sanctioned cross-TU pattern.
+extern "C" void ps2x_probe_kv(const char *name, int n,
+                              const char *const *keys, const uint64_t *vals);
+
     std::atomic<uint32_t> s_debugGifPacketCount{0};
     std::atomic<uint32_t> s_debugGsRegisterCount{0};
     std::atomic<uint32_t> s_debugGsPackedVertexCount{0};
     std::atomic<uint32_t> s_debugGsVertexKickCount{0};
+
+    // 2026-09-22 Part 158 [vflip] -- see the block in GS::vertexKick.
+    // Plain (non-atomic) counters: vertexKick is only ever entered from the
+    // single GIF-consumer thread, same as m_vtxCount which it already ++'s
+    // unguarded. A locked RMW here would sit on a 3.5M-hit/frame path, which
+    // is exactly the shape that once cost 19% of guest throughput.
+    // v2: one cap per bucket, but sampled with a GROWING stride so the records
+    // span the WHOLE run instead of its first instant. v1 filled from the start
+    // and therefore never saw the fight -- the defect that made the first
+    // comparison against the PCSX2 oracle meaningless.
+    constexpr uint32_t kVflipCap = 1536u;
+    constexpr uint32_t kVflipGrowEvery = 32u; // double the stride every N taken
+    std::atomic<bool> s_vflipArmed{[] {
+        const char *e = std::getenv("PS2X_VFLIP");
+        return e != nullptr && e[0] != 0 && e[0] != '0';
+    }()};
+    struct VflipBucket
+    {
+        uint64_t seen = 0;   // primitives of this kind seen so far
+        uint64_t next = 0;   // index of the next one to record
+        uint64_t stride = 1; // gap to the one after that
+        uint32_t taken = 0;  // records emitted
+    };
+    // Plain (non-atomic): vertexKick is only ever entered from the single
+    // GIF-consumer thread, same as m_vtxCount which it already ++'s unguarded.
+    VflipBucket s_vflipBucket[3];
     std::atomic<uint32_t> s_debugCopyRegCount{0};
     std::atomic<uint32_t> s_debugTexaWriteCount{0};
     std::atomic<uint32_t> s_debugCvFontUploadCount{0};
@@ -5734,6 +5766,102 @@ void GS::vertexKick(bool drawing)
                                                        << " tme=" << static_cast<uint32_t>(m_registers.prim.tme ? 1u : 0u)
                                                        << " prmodecont=" << static_cast<uint32_t>(m_registers.prmodecont.ac ? 1u : 0u));
                 s_prevDrawFbp = drawCtx.frame.fbp;
+            }
+        }
+
+        // 2026-09-22 Part 158 [vflip] -- the captured gameplay frames
+        // (ps2x_rec_56940 / _57660) show the background AND the fighters
+        // mirrored about the screen's horizontal centre while the GAME OVER /
+        // RANKING text stays upright. Two hypotheses survive that picture:
+        //   (A) a vertex-Y mirror inside the VU1 3D transform
+        //   (B) a V-coordinate flip on the full-screen sprite that composites
+        //       the offscreen 3D target (fbp 0x70) onto the display buffer
+        // The image alone CANNOT separate them: if the fighters live inside
+        // the composited render target then (B) moves them too, so "their
+        // positions moved" does not rule out a texture flip.
+        //
+        // They differ in exactly one observable, on the 512x448 composite:
+        //   v rises as y rises   => texture sampled upright   => NOT (B) => (A)
+        //   v falls as y rises   => texture sampled inverted  => (B), and that
+        //                           IS the flip; no further search needed.
+        //
+        // Already eliminated from this run's own log, at zero cost: XYOFFSET
+        // (OFX=1792 OFY=1824, textbook PS2 centring) and SCISSOR (SCAY0=0
+        // SCAY1=447, upright). So the GS-side setup is not the flip.
+        //
+        // THREE separate caps, because triangles outnumber the composite
+        // sprite by ~10000:1 in a single frame -- one shared cap would fill
+        // with triangles before the composite was ever sampled, and would
+        // then read as "the composite never drew", which is the false
+        // negative this probe exists to avoid. Each cap announces itself:
+        // a saturated probe and a probe that never fired look identical.
+        if (s_vflipArmed.load(std::memory_order_relaxed))
+        {
+            const GSVertex &va = m_vtxQueue[0];
+            const GSVertex &vb = m_vtxQueue[needed - 1];
+            const bool isSprite = (prim.prim == GS_PRIM_SPRITE);
+            const float spanX = (va.x > vb.x) ? (va.x - vb.x) : (vb.x - va.x);
+            const bool isFull = isSprite && spanX >= 256.0f;
+            const uint32_t bucket = isFull ? 2u : (isSprite ? 1u : 0u);
+            VflipBucket &bk = s_vflipBucket[bucket];
+            const uint64_t seen = bk.seen++;
+            if (seen == bk.next && bk.taken < kVflipCap)
+            {
+                ++bk.taken;
+                if ((bk.taken % kVflipGrowEvery) == 0u && bk.stride < (1ull << 40))
+                {
+                    bk.stride *= 2ull;
+                }
+                bk.next = seen + bk.stride;
+                const GSContext &vc = activeContext();
+                // y/x are kept in GS 12.4 units (the value before the /16.0f at
+                // the XYZ2 decode) so the reader never has to guess a rounding.
+                // t is scaled by 4096 for the same reason. v is raw UV.
+                static const char *const vk[] = {
+                    "bucket", "prim", "tme", "fst", "fbp", "tbp0",
+                    "y0", "y1", "x0", "x1", "v0", "v1", "t0", "t1", "n",
+                    "ctxt", "ofx", "ofy", "scay0", "scay1"};
+                const uint64_t vv[] = {
+                    static_cast<uint64_t>(bucket),
+                    static_cast<uint64_t>(prim.prim),
+                    static_cast<uint64_t>(m_registers.prim.tme ? 1u : 0u),
+                    static_cast<uint64_t>(m_registers.prim.fst ? 1u : 0u),
+                    static_cast<uint64_t>(vc.frame.fbp),
+                    static_cast<uint64_t>(vc.tex0.tbp0),
+                    static_cast<uint64_t>(static_cast<int64_t>(va.y * 16.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(vb.y * 16.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(va.x * 16.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(vb.x * 16.0f)),
+                    static_cast<uint64_t>(va.v),
+                    static_cast<uint64_t>(vb.v),
+                    static_cast<uint64_t>(static_cast<int64_t>(va.t * 4096.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(vb.t * 4096.0f)),
+                    static_cast<uint64_t>(seen),
+                    // The context is the gap in v1: "XYOFFSET eliminated" was
+                    // read off a FRAME_1 sample, i.e. context 1 only. If the 3D
+                    // layer draws through context 2 that never applied to it.
+                    static_cast<uint64_t>(m_registers.prim.ctxt ? 1u : 0u),
+                    static_cast<uint64_t>(vc.xyoffset.ofx),
+                    static_cast<uint64_t>(vc.xyoffset.ofy),
+                    static_cast<uint64_t>(vc.scissor.y0),
+                    static_cast<uint64_t>(vc.scissor.y1)};
+                ps2x_probe_kv("VFLIP", 20, vk, vv);
+            }
+            else if (bk.taken == kVflipCap && seen == bk.next)
+            {
+                // A saturated probe and a probe that never fired look identical
+                // in the output, so say so explicitly.
+                RUNTIME_LOG("[cap] tag=vflip bucket=" << bucket
+                                                      << " limit=" << kVflipCap);
+                bk.next = ~0ull;
+                if (s_vflipBucket[0].taken >= kVflipCap &&
+                    s_vflipBucket[1].taken >= kVflipCap &&
+                    s_vflipBucket[2].taken >= kVflipCap)
+                {
+                    // All three satisfied -- disarm so the hot path drops back
+                    // to a single relaxed load for the rest of the run.
+                    s_vflipArmed.store(false, std::memory_order_relaxed);
+                }
             }
         }
 

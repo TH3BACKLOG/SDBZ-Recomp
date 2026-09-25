@@ -175,6 +175,22 @@ PRESETS = {
         ("p734", 0x500734, 32),     # [s1+4]; gates the 0x10E6C0 call at 0x113cc4
         ("gamemode", 0x5E6B3C, 8),  # 0x00 = MainMenu; width unverified
     ],
+    # Part 132 (2026-09-18): sub_11E8D0's worker loop (the thread sub_11F680
+    # is trying to shut down, Parts 124-129) makes two indirect calls each
+    # pass -- sub_1201F0 (single fn ptr) and sub_13C688 (5-slot table, only
+    # entry 0 watched here). Both are zeroed at ADX_Init (0x11F268) and no
+    # static writer for either was found via `decomp.py grep` -- ambiguous,
+    # not evidence either way (a function IDA failed to decompile is simply
+    # absent from the dump). This preset answers "are they ever nonzero at
+    # all" cheaply, with zero new C++, before either is chased as the hang.
+    "teardown": [
+        ("adxcb", 0x54BF38, 32),    # sub_1201F0's single indirect-call fn ptr
+        ("adxcbarg", 0x54BF3C, 32), # ...and its one argument
+        ("tbl0fn", 0x54E9F0, 32),   # sub_13C688's 5-slot table, entry 0 fn ptr
+        ("tbl0arg", 0x54E9F4, 32),  # ...entry 0 arg
+        ("stopflag", 0x4419B8, 32), # qword_4419B8, loop's own stop condition
+        ("ackflag", 0x4419C0, 32),  # qword_4419C0, worker's ack back to sub_11F680
+    ],
 }
 
 

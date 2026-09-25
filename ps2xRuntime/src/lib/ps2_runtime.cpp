@@ -86,6 +86,19 @@ namespace
     std::string formatDispatchHistory();
 }
 
+// [journal] Ordered address-range guest-store journal. DEFINED in
+// Kernel/Diag/trace_calls.cpp; declared here rather than in a header for the
+// same reason as everything else on this page -- a .h edit rebuilds every
+// generated runner TU (30+ hours). extern-between-.cpp is the sanctioned
+// cross-TU pattern in this project. These three declarations must stay in sync
+// with that file.
+namespace ps2_journal
+{
+    extern std::atomic<bool> g_armed;
+    std::size_t install(const char *spec);
+    void onStore(uint32_t addr, uint32_t size, uint64_t lo, uint64_t hi, uint32_t pc) noexcept;
+}
+
 namespace ps2_watch
 {
     // Out-of-line definitions for the forward decls in ps2_runtime.h. Kept
@@ -100,9 +113,20 @@ namespace ps2_watch
     // destination address is not known in advance (e.g. a clobbered $ra slot
     // on a stack frame whose address moves run-to-run).
     //
-    // Accuracy note: ctx->pc is set at function entry / midasm hooks /
-    // control-flow points, NOT per instruction. A hit therefore names the
-    // writing FUNCTION (usually the basic block), not the exact store.
+    // Accuracy note -- CORRECTED 2026-09-21 (Part 154), MEASURED:
+    // ctx->pc IS assigned per instruction by the current codegen. A generated
+    // body has MORE ctx->pc assignments than instructions (e.g.
+    // ADX_Init_0x11f268.cpp: 126 assignments / 96 instructions). The previous
+    // text here -- "set at function entry / midasm hooks / control-flow
+    // points, NOT per instruction" -- was stale and understated what a hit
+    // tells you.
+    //
+    // Branch DELAY SLOTS were checked specifically, since that is where a
+    // per-instruction pc would plausibly go stale. It does not: over a
+    // 300-file sample of output/, all 1050 delay-slot stores have a ctx->pc
+    // assignment in the 5 preceding lines, and in all 1050 the value assigned
+    // is the STORE's own address (branch_pc carries the branch separately).
+    // A hit therefore names the storing INSTRUCTION, exactly.
     std::atomic<uint32_t> g_trapValue{0};
     std::atomic<uint32_t> g_trapAddrLo{0};
     std::atomic<uint32_t> g_trapAddrHi{0xFFFFFFFFu};
@@ -146,6 +170,15 @@ namespace ps2_watch
                           << std::dec << std::endl;
                 break;
             }
+        }
+
+        // [journal] Ordered address-range store journal (PS2X_JOURNAL). Must
+        // run BEFORE the watch-registry bail below, or arming the journal
+        // alone -- with no PS2X_WATCH -- would record nothing.
+        // Implementation: Kernel/Diag/trace_calls.cpp.
+        if (ps2_journal::g_armed.load(std::memory_order_relaxed))
+        {
+            ps2_journal::onStore(addr, size, lo, hi, pc);
         }
 
         // Bail before the mutex when no address-keyed watch is registered --
@@ -416,20 +449,165 @@ namespace ps2_syscalls
     extern std::atomic<uint32_t> g_syscallOverrideLastBranch;
 }
 
+// ---------------------------------------------------------------------------
+// Dispatch-trace ring storage, keyed by GUEST THREAD rather than by host
+// thread.
+//
+// 2026-09-22 -- this was a single `thread_local DispatchHistory
+// g_dispatchHistory;` justified with "EeScheduler runs all guest threads
+// cooperatively on a single game thread, so a plain thread_local is
+// equivalent to the current execution context's history". That reasoning is
+// inverted: running every fiber on ONE host thread is exactly why one
+// thread_local is NOT per-fiber. Every guest thread shared a single 64-entry
+// ring, so each trace= dump was contaminated with the PCs of whichever other
+// fibers happened to be interleaved, and a recycled tid inherited the dead
+// thread's PCs.
+//
+// ps2_dispatch_history.h still documents the contract that dropped: "Owned
+// per-fiber by FiberContext (fresh per fiber, gone at teardown); host workers
+// / non-fiber callers use a per-OS-thread fallback." Phase 3d retired
+// FiberContext and never replaced the per-fiber ownership. That is precisely
+// what SchedulerRecoveryIsolation/R1 and /R2 were written to catch.
+//
+// This is not only a test concern. formatDispatchHistory() is what the
+// [ee:zero-pc-dormant] dump and the watchdog print to answer "what did THIS
+// thread execute before it died". A shared ring makes that answer WRONG
+// rather than merely noisy -- it attributes another fiber's PCs to the thread
+// under investigation.
+//
+// Fixed table + linear scan, not a map: pushDispatchPc() is called from
+// lookupFunction(), the universal dispatch choke point, so this has to stay
+// allocation-free and the returned slot pointer must never be invalidated.
+// The scan is off the hot path -- the cached {tid, slot} pair absorbs every
+// dispatch that is not a context switch, leaving one cross-TU call plus one
+// compare in the common case, next to the unconditional `lock xadd` on
+// g_globalDispatchNext that the same function already pays. That is a cost
+// ARGUMENT, not a measurement; if a later profile disagrees, the cache is the
+// thing to attack.
+//
+// Declared extern rather than through a header: ps2x_guest_current_thread_id()
+// is defined in Kernel/EeScheduler.cpp, and ee_scheduler.h must not grow a
+// dependency here (see the extern-between-.cpp rule used throughout this file).
+extern "C" int ps2x_guest_current_thread_id();
+
+namespace
+{
+    // 32 live guest threads is far above anything SDBZ has been observed to
+    // hold; overflow is a documented, counted fallback rather than a silent
+    // one, because a diagnostic that degrades quietly is the exact failure
+    // mode this whole change exists to remove.
+    constexpr uint32_t kDispatchHistorySlots = 32u;
+
+    struct DispatchHistorySlot
+    {
+        int tid = 0; // 0 == free
+        DispatchHistory hist;
+    };
+
+    thread_local DispatchHistorySlot g_dispatchHistorySlots[kDispatchHistorySlots];
+
+    // Used when no guest thread is current: host workers, the watchdog, and
+    // anything dispatching before the scheduler is bound. This is the
+    // "per-OS-thread fallback" the header describes.
+    thread_local DispatchHistory g_dispatchHistoryHost;
+
+    thread_local int g_dispatchHistoryCachedTid = 0;
+    thread_local DispatchHistory *g_dispatchHistoryCached = nullptr;
+
+    std::atomic<uint32_t> g_dispatchHistoryOverflow{0u};
+
+    DispatchHistory *dispatchHistorySlotFor(int tid)
+    {
+        DispatchHistorySlot *freeSlot = nullptr;
+        for (uint32_t i = 0u; i < kDispatchHistorySlots; ++i)
+        {
+            DispatchHistorySlot &s = g_dispatchHistorySlots[i];
+            if (s.tid == tid)
+            {
+                return &s.hist;
+            }
+            if (freeSlot == nullptr && s.tid == 0)
+            {
+                freeSlot = &s;
+            }
+        }
+        if (freeSlot == nullptr)
+        {
+            // Table full. Say so ONCE -- this is off the hot path (cache miss
+            // plus full scan), and a trace that silently shares the host slot
+            // would reintroduce the very contamination being fixed.
+            const uint32_t n = g_dispatchHistoryOverflow.fetch_add(1u, std::memory_order_relaxed);
+            if (n == 0u)
+            {
+                std::cerr << "[dispatchring] slot table full (" << kDispatchHistorySlots
+                          << " guest threads); further traces share the host fallback"
+                          << std::endl;
+            }
+            return &g_dispatchHistoryHost;
+        }
+        freeSlot->tid = tid;
+        freeSlot->hist = DispatchHistory{};
+        return &freeSlot->hist;
+    }
+}
+
+// Global scope so Kernel/EeScheduler.cpp can reach these; the storage above
+// stays TU-private.
+extern "C" void ps2x_dispatch_history_reset(int tid)
+{
+    if (tid <= 0)
+    {
+        return;
+    }
+    for (uint32_t i = 0u; i < kDispatchHistorySlots; ++i)
+    {
+        DispatchHistorySlot &s = g_dispatchHistorySlots[i];
+        if (s.tid != tid)
+        {
+            continue;
+        }
+        s.hist = DispatchHistory{};
+        s.tid = 0;
+    }
+    // The cache may still point at the slot just released.
+    g_dispatchHistoryCachedTid = 0;
+    g_dispatchHistoryCached = nullptr;
+}
+
+extern "C" void ps2x_dispatch_history_reset_all()
+{
+    for (uint32_t i = 0u; i < kDispatchHistorySlots; ++i)
+    {
+        g_dispatchHistorySlots[i].tid = 0;
+        g_dispatchHistorySlots[i].hist = DispatchHistory{};
+    }
+    g_dispatchHistoryHost = DispatchHistory{};
+    g_dispatchHistoryCachedTid = 0;
+    g_dispatchHistoryCached = nullptr;
+}
+
 namespace
 {
     constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000080u;
     constexpr uint32_t EXCEPTION_VECTOR_TLB_REFILL = 0x80000000u;
     constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00200u;
 
-    // EeScheduler runs all guest threads cooperatively on a single game thread
-    // (Phase 3d, retiring ps2sched's per-fiber storage), so a plain
-    // thread_local is equivalent to "the current execution context"'s history.
-    thread_local DispatchHistory g_dispatchHistory;
-
+    // Resolves to the ring owned by the CURRENTLY RUNNING GUEST THREAD -- see
+    // the storage block above this anonymous namespace for why a plain
+    // thread_local was wrong. tid <= 0 means no guest thread is current (host
+    // worker, watchdog, pre-bind dispatch) and uses the per-OS-thread fallback.
     DispatchHistory &currentDispatchHistory()
     {
-        return g_dispatchHistory;
+        const int tid = ps2x_guest_current_thread_id();
+        if (tid == g_dispatchHistoryCachedTid && g_dispatchHistoryCached != nullptr)
+        {
+            return *g_dispatchHistoryCached;
+        }
+        DispatchHistory *h = (tid <= 0) ? &g_dispatchHistoryHost
+                                        : dispatchHistorySlotFor(tid);
+        g_dispatchHistoryCachedTid = tid;
+        g_dispatchHistoryCached = h;
+        return *h;
     }
 
     // Guest clock: one tick per 128 guest back-edges. Defined in
@@ -1032,6 +1210,55 @@ namespace
         }
         return out;
     }
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-22 [journal] -- cross-TU read of the current thread's dispatch ring.
+//
+// WHY THIS EXISTS. The store journal records the STORING pc. For the open
+// question -- who tore down the object at 0x61a5c0 at t~1277 s -- the storing
+// pc is 0x3d1d94, which we already knew before arming anything. The answer we
+// need is the CALLER, and that lives in the per-thread dispatch ring that
+// pushDispatchPc() maintains.
+//
+// formatDispatchHistory() cannot be reused: it lives in the anonymous
+// namespace above (internal linkage) and returns a std::string, which does not
+// fit ps2x_probe_kv's uint64_t value array. Returning raw PCs instead keeps the
+// record in the structured JSONL sink rather than adding another std::cerr
+// line -- the plan's WP1/§10 rule, and the same discipline that just took the
+// three uncapped [semwatch] probes out of EeScheduler.cpp.
+//
+// Non-static and declared extern in Kernel/Diag/trace_calls.cpp: the sanctioned
+// cross-.cpp pattern here, because any header edit rebuilds 30,000+ runner TUs.
+//
+// COST: none on the hot path. This is called only from emitRecord(), which
+// runs on a journal MATCH -- rare by construction. The miss path in onStore()
+// is untouched.
+//
+// LIMIT, stated because a silent one would be worse: this reads the ring that
+// dispatchGuestBranch() feeds. A callee reached by a direct call or a tail `j`
+// that bypasses the dispatch table will not appear (the recorded tracer
+// blind-spot class). Absence of a caller here is therefore NOT evidence of no
+// caller.
+std::size_t ps2xDispatchHistoryTail(uint32_t *out, std::size_t n) noexcept
+{
+    if (out == nullptr || n == 0u)
+    {
+        return 0u;
+    }
+
+    const DispatchHistory &h = currentDispatchHistory();
+    const std::size_t ringSize = h.pcs.size();
+    const std::size_t have = h.wrapped ? ringSize : static_cast<std::size_t>(h.next);
+    const std::size_t take = (have < n) ? have : n;
+
+    // Most recent first: index 0 is the immediately-preceding dispatch.
+    for (std::size_t i = 0; i < take; ++i)
+    {
+        const std::size_t idx = (static_cast<std::size_t>(h.next) + ringSize - 1u - i) % ringSize;
+        out[i] = h.pcs[idx];
+    }
+    return take;
 }
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
@@ -3455,6 +3682,24 @@ void PS2Runtime::run()
 
         RUNTIME_LOG("[trapval] armed value=0x" << std::hex << value
                                                << " range=[0x" << lo << ",0x" << hi << ")" << std::dec);
+    }
+
+    // [journal] env hook: PS2X_JOURNAL=LO:HI[:LABEL][,...] arms the ordered
+    // address-range store journal (Kernel/Diag/trace_calls.cpp). Unlike
+    // PS2X_WATCH -- which POLLS once per frame and therefore cannot see a
+    // value written and overwritten inside one frame -- this records EVERY
+    // store to the range, in order, with the guest PC, to the structured
+    // JSONL sink as probe=JOURNAL. Unset => zero behavioural change and the
+    // per-store residual cost stays exactly one relaxed bool load.
+    //
+    // g_writeWatchActive is the gate ps2TraceGuestWrite() actually tests, so
+    // arming the journal must raise it too -- otherwise onGuestWrite() is
+    // never reached and the journal silently records nothing.
+    if (const std::size_t armed = ps2_journal::install(std::getenv("PS2X_JOURNAL")))
+    {
+        ps2_watch::g_writeWatchActive.store(true, std::memory_order_relaxed);
+        ps2_diag::set_enabled(true);
+        RUNTIME_LOG("[journal] armed " << armed << " range(s) from PS2X_JOURNAL");
     }
 
     // [frametrace] env hook: PS2X_FRAMETRACE=1 arms the bounded call-frame ring

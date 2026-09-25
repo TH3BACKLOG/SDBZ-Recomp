@@ -4,6 +4,8 @@
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_diag.h"
 #include "ps2_log.h"
+#include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -2893,6 +2895,130 @@ void GSRasterizer::drawSprite(GS *gs)
     }
 }
 
+// [meshdump] PS2X_MESHDUMP=<path> -- ad-hoc 3D-asset capture (2026-09-18).
+//
+// Dumps every triangle drawTriangle() submits to a Wavefront OBJ: position
+// (screen-space, post-VU1/post-projection -- one frozen pose/camera angle,
+// correct topology and UV, not a re-posable rest-pose rig) plus a
+// perspective-correct UV computed with the exact same math sampleTexture()
+// uses (fst ? raw u,v/16 : s,t divided by fabsQ(q), scaled by texture size).
+// A comment line notes the bound texture (tbp0/psm/tw/th) whenever it
+// changes, to pair the dump with the existing `SDBZ Textures/*.tm2` files.
+//
+// The file is TRUNCATED and rewritten every time the vsync tick advances, so
+// it always holds only the most-recently-completed (or in-progress) frame's
+// geometry, not the whole run -- there's no target-screen detection, so the
+// user starts the game with this set, waits for the desired character/screen
+// to be on-screen, then kills the process and opens whatever's on disk.
+//
+// Entirely opt-in: nothing is written unless PS2X_MESHDUMP names an output
+// file, so a normal run pays one getenv.
+namespace ps2diag_meshdump
+{
+inline const char *outPath()
+{
+    static const char *path = []() -> const char * {
+        const char *p = std::getenv("PS2X_MESHDUMP");
+        std::cerr << "[meshdump] env PS2X_MESHDUMP=" << (p ? p : "(unset)") << std::endl;
+        return p;
+    }();
+    return path;
+}
+
+inline void noteTriangleSeen()
+{
+    static std::atomic<uint64_t> count{0};
+    uint64_t n = ++count;
+    if (n <= 5 || (n % 2000) == 0)
+        std::cerr << "[meshdump] drawTriangle hit #" << n << std::endl;
+}
+
+struct State
+{
+    std::ofstream file;
+    uint64_t lastTick = ~0ull;
+    uint32_t nextIndex = 1;
+    uint32_t lastTbp0 = 0xFFFFFFFFu;
+    bool lastTexValid = false;
+};
+
+inline State &state()
+{
+    static State s;
+    return s;
+}
+
+inline void dumpTriangle(uint64_t tick, const GSVertex &v0, const GSVertex &v1, const GSVertex &v2,
+                          const GSContext &ctx, bool textured, bool fst)
+{
+    noteTriangleSeen();
+    const char *path = outPath();
+    if (!path || path[0] == '\0')
+        return;
+
+    State &s = state();
+    if (tick != s.lastTick)
+    {
+        s.file.close();
+        s.file.open(path, std::ios::out | std::ios::trunc);
+        s.lastTick = tick;
+        s.nextIndex = 1;
+        s.lastTexValid = false;
+    }
+    if (!s.file.is_open())
+        return;
+
+    if (textured)
+    {
+        uint32_t tbp0 = static_cast<uint32_t>(ctx.tex0.tbp0);
+        if (!s.lastTexValid || tbp0 != s.lastTbp0)
+        {
+            s.file << "# tex tbp0=0x" << std::hex << tbp0
+                   << " psm=0x" << static_cast<uint32_t>(ctx.tex0.psm) << std::dec
+                   << " tw=" << (1u << ctx.tex0.tw)
+                   << " th=" << (1u << ctx.tex0.th) << "\n";
+            s.lastTbp0 = tbp0;
+            s.lastTexValid = true;
+        }
+    }
+
+    const int texW = 1 << ctx.tex0.tw;
+    const int texH = 1 << ctx.tex0.th;
+    auto texelUV = [&](const GSVertex &v) -> std::pair<float, float>
+    {
+        if (!textured)
+            return { 0.0f, 0.0f };
+        float texUf, texVf;
+        if (fst)
+        {
+            texUf = static_cast<float>(v.u) / 16.0f;
+            texVf = static_cast<float>(v.v) / 16.0f;
+        }
+        else
+        {
+            const float invQ = 1.0f / fabsQ(v.q);
+            texUf = v.s * invQ * static_cast<float>(texW);
+            texVf = v.t * invQ * static_cast<float>(texH);
+        }
+        return { texUf / static_cast<float>(texW), 1.0f - texVf / static_cast<float>(texH) };
+    };
+
+    const GSVertex *verts[3] = { &v0, &v1, &v2 };
+    for (const GSVertex *v : verts)
+        s.file << "v " << v->x << ' ' << v->y << ' ' << v->z << "\n";
+    for (const GSVertex *v : verts)
+    {
+        const auto [u, vv] = texelUV(*v);
+        s.file << "vt " << u << ' ' << vv << "\n";
+    }
+    s.file << "f " << s.nextIndex << "/" << s.nextIndex << ' '
+           << (s.nextIndex + 1) << "/" << (s.nextIndex + 1) << ' '
+           << (s.nextIndex + 2) << "/" << (s.nextIndex + 2) << "\n";
+    s.nextIndex += 3;
+    s.file.flush();
+}
+}
+
 void GSRasterizer::drawTriangle(GS *gs)
 {
     const auto prim = gs->m_registers.prim;
@@ -2901,6 +3027,9 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
+
+    const uint64_t meshdumpTick = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+    ps2diag_meshdump::dumpTriangle(meshdumpTick, v0, v1, v2, ctx, prim.tme != 0, prim.fst != 0);
 
     int ofx = ctx.xyoffset.ofx >> 4;
     int ofy = ctx.xyoffset.ofy >> 4;

@@ -277,6 +277,50 @@ namespace ps2_syscalls
             return result;
         }
 
+        // 2026-09-21: a borrowed host worker (EeScheduler::beginBorrowedWorker)
+        // has a NEGATIVE pseudo-thread id, so it has no guest thread at all.
+        // Every thread syscall below either names a thread or means "self";
+        // neither is answerable in that state, so the whole family returns
+        // KE_ILLEGAL_THID rather than resolving against whatever record is
+        // current. Returns true when it has answered the syscall.
+        bool rejectBorrowedWorker(EeScheduler &ee, R5900Context *ctx)
+        {
+            if (!ee.callerHasNoGuestThread())
+            {
+                return false;
+            }
+            // 2026-09-22 -- SELF-TARGETING ONLY. The comment above says the
+            // family "either names a thread or means 'self'; neither is
+            // answerable in that state", but only the second half is true. A
+            // call that names an explicit, positive tid does not need the
+            // caller to be a guest thread at all: EeScheduler::changePriority,
+            // suspendThread, resumeThread, terminateThread, cancelWakeup and
+            // referStatus all resolve their target by id and already return
+            // KE_UNKNOWN_THID for an id that is not there. Rejecting those was
+            // a loss of function, not a safety property.
+            //
+            // $a0 == 0 is this file's own self sentinel -- see
+            // iCancelWakeupThread just below, which spells the same test out
+            // by hand, and EeScheduler::changePriority's `if (id == 0) id =
+            // m_currentThreadId;`. For rotateReadyQueueImpl $a0 is a PRIORITY
+            // rather than a tid, but 0 means "my priority" there, so the same
+            // test carries the same meaning.
+            //
+            // SchedulerBorrowedGuard/Y3 pins the intended behaviour and is
+            // unaffected: all seven of its cases pass a0 = 0.
+            //
+            // This is what broke VSyncAndPriority/S2, which freezes the
+            // executor with a borrow and then calls
+            // ChangeThreadPriority(tidA, 5) -- an explicit tid, answerable,
+            // and rejected anyway, so A was never re-sorted.
+            if (getRegU32(ctx, 4) != 0u)
+            {
+                return false;
+            }
+            setReturnS32(ctx, KE_ILLEGAL_THID);
+            return true;
+        }
+
         int rawThreadStatus(EeThreadStatus status)
         {
             switch (status)
@@ -372,6 +416,7 @@ namespace ps2_syscalls
                                 bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            if (rejectBorrowedWorker(ee, ctx)) { return; }
             const int id = static_cast<int>(getRegU32(ctx, 4));
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
@@ -472,6 +517,7 @@ namespace ps2_syscalls
                                   bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            if (rejectBorrowedWorker(ee, ctx)) { return; }
             const int result = ee.rotateReadyQueue(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
             // 2026-09-01 part 48 -- the third and last producer of -403.
             if (result == KE_ILLEGAL_PRIORITY)
@@ -800,6 +846,7 @@ namespace ps2_syscalls
     void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
         uint32_t ownedStack = 0;
         const int result = ee.terminateThread(static_cast<int>(getRegU32(ctx, 4)), ownedStack, false);
         if (ownedStack != 0u)
@@ -812,6 +859,7 @@ namespace ps2_syscalls
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
         const int susId = static_cast<int>(getRegU32(ctx, 4));
         const int susBefore = lifecycleStatusOf(ee, susId);
         const int result = ee.suspendThread(susId, false);
@@ -823,6 +871,7 @@ namespace ps2_syscalls
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
         const int resId = static_cast<int>(getRegU32(ctx, 4));
         const int resBefore = lifecycleStatusOf(ee, resId);
         const int result = ee.resumeThread(resId, false);
@@ -857,11 +906,38 @@ namespace ps2_syscalls
         {
             const uint64_t n =
                 g_pseudoTidSeen.fetch_add(1, std::memory_order_relaxed) + 1u;
-            static const char *const k[] = {"raw", "given", "pc", "ra", "n"};
+            // 2026-09-22 Part 157 -- "a0" added.
+            //
+            // All 590 PSEUDOTID records in the t=593s run share ONE call site:
+            // pc=0x175b7c, ra=0x11ed18. That is the syscall inside the CRI ADX
+            // helper sub_175B68, called from sub_11ECD8. Disassembled, the
+            // instruction after this syscall is:
+            //
+            //     beq $s0, $a0, loc_175B98     ; GetThreadId() == target tid ?
+            //
+            // and only the taken branch enqueues a command and calls
+            // iSignalSema (0x174cd0, syscall 0x43) on the semaphore whose id
+            // lives at dword_560D70 -- semaphore 3, the doorbell that guest
+            // thread 2 (sub_1759A0) sleeps on forever. Measured in that run:
+            // sig=0 signals in 593 s, wblk=1, thread 2 blocked at progress 647.
+            //
+            // raw is -1 on every one of the 590 calls and we substitute
+            // given=1 (588x) or 6 (2x). Whether that substitution breaks the
+            // compare depends entirely on $a0, which we were not recording --
+            // so the "wrong branch" story stays a HYPOTHESIS until this field
+            // lands. a0 == given would mean the branch is taken and sema 3 is
+            // idle by design; a0 != given every time makes the substitution the
+            // prime suspect.
+            //
+            // Cost: one already-guarded register read on a path that fired 590
+            // times in 593 s -- nowhere near
+            // [[feedback_hot_path_probe_costs_runtime]] territory.
+            static const char *const k[] = {"raw", "given", "a0", "pc", "ra", "n"};
             const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(raw)),
                                   static_cast<uint64_t>(static_cast<uint32_t>(given)),
+                                  getRegU32(ctx, 4),
                                   ctx->pc, getRegU32(ctx, 31), n};
-            ps2x_probe_kv("PSEUDOTID", 5, k, v);
+            ps2x_probe_kv("PSEUDOTID", 6, k, v);
         }
         setReturnS32(ctx, given);
     }
@@ -874,6 +950,7 @@ namespace ps2_syscalls
     static void referThreadStatusImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
         int id = static_cast<int>(getRegU32(ctx, 4));
         if (id == 0)
         {
@@ -959,8 +1036,9 @@ namespace ps2_syscalls
 
     void CancelWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx,
-                     scheduler(rdram, ctx, runtime).cancelWakeup(static_cast<int>(getRegU32(ctx, 4))));
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
+        setReturnS32(ctx, ee.cancelWakeup(static_cast<int>(getRegU32(ctx, 4))));
     }
 
     void iCancelWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

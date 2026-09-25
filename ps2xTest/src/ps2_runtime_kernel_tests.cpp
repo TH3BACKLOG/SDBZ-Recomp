@@ -3,6 +3,7 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "runtime/ee_scheduler.h"
 
 #include <atomic>
 #include <chrono>
@@ -13,18 +14,6 @@
 #include <thread>
 #include <vector>
 
-// g_currentThreadId is an `inline thread_local int` defined in the kernel's
-// internal State.h (ps2xRuntime/.../Kernel/Syscalls/Helpers/State.h, default 1).
-// Only sub-case H of the semaphore-return-value test reaches into it: the worker
-// thread sets its own guest tid so ReleaseWaitThread(tid) can target the exact
-// ThreadInfo that the worker's WaitSema put into THS_WAIT.
-//
-// ODR-safety: this declaration MUST stay byte-for-byte type-compatible with that
-// definition (`thread_local int`, same name, no namespace). It is an `extern`
-// declaration of an existing inline thread_local, NOT a second definition, so the
-// linker binds to the runtime's instance. If the runtime ever changes the type or
-// moves it into a namespace, update this line in lockstep or the build will break.
-extern thread_local int g_currentThreadId;
 
 using namespace ps2_syscalls;
 
@@ -61,7 +50,10 @@ namespace
     std::atomic<uint32_t> gEventWaitGate{0};
     std::atomic<uint32_t> gTerminateSemaWaitReady{0};
 
-    struct EeThreadStatus
+    // Guest ABI mirror of what ReferThreadStatus writes into RAM. Named
+    // ...Abi to avoid colliding with the scheduler's `enum class
+    // EeThreadStatus` from runtime/ee_scheduler.h.
+    struct EeThreadStatusAbi
     {
         int32_t status;
         uint32_t func;
@@ -87,7 +79,7 @@ namespace
         uint32_t option;
     };
 
-    static_assert(sizeof(EeThreadStatus) == 0x30u, "Unexpected ee_thread_status_t size.");
+    static_assert(sizeof(EeThreadStatusAbi) == 0x30u, "Unexpected ee_thread_status_t size.");
     static_assert(sizeof(EeSemaStatus) == 0x18u, "Unexpected ee_sema_t size.");
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
@@ -249,6 +241,14 @@ namespace
         {
             std::memset(&ctx, 0, sizeof(ctx));
         }
+
+        // Mirrors SchedFixture: the retired ps2_syscalls::notifyRuntimeStop()
+        // reset process-global scheduler state that no longer exists. Stopping
+        // is now per-runtime, so it belongs in this destructor.
+        ~TestEnv()
+        {
+            runtime.requestStop();
+        }
     };
 }
 
@@ -282,7 +282,7 @@ void register_ps2_runtime_kernel_tests()
             ReferThreadStatus(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should succeed for created thread");
 
-            EeThreadStatus status{};
+            EeThreadStatusAbi status{};
             std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
             t.Equals(status.status, THS_DORMANT, "new thread should be dormant before StartThread");
             t.Equals(status.func, threadParam[1], "status.func should match entry");
@@ -334,7 +334,7 @@ void register_ps2_runtime_kernel_tests()
             ReferThreadStatus(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should still succeed after failed StartThread");
 
-            EeThreadStatus status{};
+            EeThreadStatusAbi status{};
             std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
             t.Equals(status.status, THS_DORMANT, "thread should remain dormant when StartThread fails early");
 
@@ -627,7 +627,6 @@ void register_ps2_runtime_kernel_tests()
                 // worker's WaitSema creates a fresh ThreadInfo that ReleaseWaitThread can target.
                 // Prior tests leave stale entries at low tids (2, 3, ...), which would make
                 // ReleaseWaitThread find a non-waiting ThreadInfo and return KE_NOT_WAIT.
-                constexpr int kWorkerTid = 0x7FFE;
                 TestEnv env;
                 const uint32_t semaParam[6] = {0u, 2u, 0u, 0u, 0u, 0u};
                 writeGuestWords(env.rdram.data(), K_PARAM_ADDR, semaParam, 6);
@@ -640,7 +639,6 @@ void register_ps2_runtime_kernel_tests()
                 int32_t workerRet = 0;
 
                 std::thread worker([&]() {
-                    g_currentThreadId = kWorkerTid;
                     R5900Context wctx{};
                     setRegU32(wctx, 4, static_cast<uint32_t>(sid));
                     writeGuestU32(env.rdram.data(), K_SEMA_WAIT_READY_ADDR, 1u);
@@ -649,19 +647,31 @@ void register_ps2_runtime_kernel_tests()
                 });
 
                 // Wait until the worker is confirmed blocking in WaitSema.
+                // Post-EeScheduler: a host thread entering WaitSema is given a
+                // pseudo-thread by acquireInvocationThread(); it no longer sets a
+                // thread_local g_currentThreadId (that global is gone). So instead
+                // of choosing the worker's tid we ask the kernel snapshot which
+                // thread is actually parked on this semaphore -- which is what the
+                // old impersonation was standing in for anyway.
+                int workerTid = 0;
                 const bool waiterBlocking = waitUntil([&]() {
-                    R5900Context statusCtx{};
-                    setRegU32(statusCtx, 4, static_cast<uint32_t>(sid));
-                    setRegU32(statusCtx, 5, K_STATUS_ADDR);
-                    ReferSemaStatus(env.rdram.data(), &statusCtx, &env.runtime);
-                    EeSemaStatus st{};
-                    std::memcpy(&st, env.rdram.data() + K_STATUS_ADDR, sizeof(st));
-                    return st.wait_threads >= 1;
+                    const EeKernelSnapshot snap = env.runtime.eeScheduler().snapshot();
+                    for (const EeThreadSnapshot &th : snap.threads)
+                    {
+                        const bool waiting = th.status == EeThreadStatus::Waiting ||
+                                             th.status == EeThreadStatus::WaitingSuspended;
+                        if (waiting && th.waitReason == EeWaitReason::Semaphore && th.waitId == sid)
+                        {
+                            workerTid = th.id;
+                            return true;
+                        }
+                    }
+                    return false;
                 }, std::chrono::milliseconds(500));
                 t.IsTrue(waiterBlocking, "sub-case H: worker must be blocking in WaitSema before force-release");
 
                 // Force-release the worker via ReleaseWaitThread.
-                setRegU32(env.ctx, 4, static_cast<uint32_t>(kWorkerTid));
+                setRegU32(env.ctx, 4, static_cast<uint32_t>(workerTid));
                 ReleaseWaitThread(env.rdram.data(), &env.ctx, &env.runtime);
                 t.Equals(getRegS32(env.ctx, 2), KE_OK,
                          "sub-case H: ReleaseWaitThread must succeed");
@@ -700,7 +710,7 @@ void register_ps2_runtime_kernel_tests()
 
             // Sub-case I: blocking WaitSema woken by SignalSema returns sid (the sid-on-success wake scenario).
             // init=0 forces the worker to block; SignalSema uses cv.notify_one() (not
-            // ReleaseWaitThread), so the worker needs no g_currentThreadId identity.
+            // ReleaseWaitThread), so the worker needs no guest thread identity.
             {
                 TestEnv env;
                 const uint32_t semaParam[6] = {0u, 1u, 0u, 0u, 0u, 0u};
@@ -758,17 +768,14 @@ void register_ps2_runtime_kernel_tests()
 
             // Reset all global sema/thread state so no entries (e.g. the 0x7FFE ThreadInfo
             // from sub-case H) leak into subsequent test cases.
-            notifyRuntimeStop();
         });
 
         tc.Run("WaitEventFlag preserves waitsuspend state when a suspended thread blocks", [](TestCase &t)
         {
-            // StartThread enqueues a guest fiber; nothing executes it unless the
-            // fiber scheduler's executor thread is running, so this test must
-            // bracket itself with scheduler_init()/scheduler_shutdown() like the
-            // Scheduler* suites do.
-            notifyRuntimeStop();
-            ps2sched::scheduler_init();
+            // StartThread enqueues a guest fiber. Post-EeScheduler there is no
+            // process-global scheduler to bracket: TestEnv owns its own
+            // PS2Runtime (hence its own EeScheduler), and its destructor
+            // requests the stop.
 
             TestEnv env;
 
@@ -836,13 +843,13 @@ void register_ps2_runtime_kernel_tests()
                     return false;
                 }
 
-                EeThreadStatus status{};
+                EeThreadStatusAbi status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
                 return status.waitType == TSW_EVENT;
             }, std::chrono::milliseconds(200));
             t.IsTrue(waiting, "waiter thread should block on the event flag");
 
-            EeThreadStatus waitingStatus{};
+            EeThreadStatusAbi waitingStatus{};
             std::memcpy(&waitingStatus, env.rdram.data() + K_STATUS_ADDR, sizeof(waitingStatus));
             t.Equals(waitingStatus.status, THS_WAITSUSPEND,
                      "event-flag wait should report THS_WAITSUSPEND when the thread is already suspended");
@@ -868,7 +875,7 @@ void register_ps2_runtime_kernel_tests()
                 t.Equals(getRegS32(statusCtx, 2), KE_OK,
                          "ReferThreadStatus should succeed after SetEventFlag");
 
-                EeThreadStatus status{};
+                EeThreadStatusAbi status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
                 t.Equals(status.status, THS_WAITSUSPEND,
                          "a suspended waiter stays THS_WAITSUSPEND until ResumeThread lifts the suspend gate");
@@ -889,7 +896,7 @@ void register_ps2_runtime_kernel_tests()
                     return false;
                 }
 
-                EeThreadStatus status{};
+                EeThreadStatusAbi status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
                 return status.status == THS_DORMANT;
             }, std::chrono::milliseconds(200));
@@ -903,9 +910,7 @@ void register_ps2_runtime_kernel_tests()
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "DeleteThread should clean up the waiter thread");
 
-            ps2sched::scheduler_shutdown();
             env.runtime.requestStop();
-            notifyRuntimeStop();
         });
 
         tc.Run("TerminateThread unwinds semaphore wait as a normal thread exit", [](TestCase &t)
@@ -913,8 +918,6 @@ void register_ps2_runtime_kernel_tests()
             // Bracket with scheduler_init()/scheduler_shutdown() so the enqueued
             // guest fiber runs (see "WaitEventFlag preserves waitsuspend
             // state..." above).
-            notifyRuntimeStop();
-            ps2sched::scheduler_init();
 
             TestEnv env;
 
@@ -978,7 +981,7 @@ void register_ps2_runtime_kernel_tests()
                     return false;
                 }
 
-                EeThreadStatus status{};
+                EeThreadStatusAbi status{};
                 std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));
                 return status.status == THS_WAIT && status.waitType == TSW_SEMA;
             }, std::chrono::milliseconds(200));
@@ -1000,7 +1003,7 @@ void register_ps2_runtime_kernel_tests()
             ReferThreadStatus(env.rdram.data(), &dormantCtx, &env.runtime);
             t.Equals(getRegS32(dormantCtx, 2), KE_OK, "terminated waiter should still have readable status");
 
-            EeThreadStatus dormantStatus{};
+            EeThreadStatusAbi dormantStatus{};
             std::memcpy(&dormantStatus, env.rdram.data() + K_STATUS_ADDR, sizeof(dormantStatus));
             t.Equals(dormantStatus.status, THS_DORMANT, "terminated waiter should become dormant");
 
@@ -1012,9 +1015,7 @@ void register_ps2_runtime_kernel_tests()
             DeleteSema(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), sid, "DeleteSema should return sid while cleaning up the waiter semaphore");
 
-            ps2sched::scheduler_shutdown();
             env.runtime.requestStop();
-            notifyRuntimeStop();
         });
 
         tc.Run("setup heap and allocator primitives track end-of-heap", [](TestCase &t)
@@ -1319,9 +1320,8 @@ void register_ps2_runtime_kernel_tests()
 
         tc.Run("SetSyscall mirrors guest kernel table entries into low memory", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
             constexpr uint32_t kSyscallIndex = 0x83u;
@@ -1349,14 +1349,12 @@ void register_ps2_runtime_kernel_tests()
                      kExpectedGuestAddr,
                      "FindAddress should discover mirrored SetSyscall entries in low guest memory");
 
-            notifyRuntimeStop();
         });
 
         tc.Run("SetSyscall honors signed kernel-table offsets", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kPatchIndex = 0xFFFFC402u;
             constexpr uint32_t kHandler = 0xDEADBEEFu;
@@ -1374,14 +1372,12 @@ void register_ps2_runtime_kernel_tests()
                      kHandler,
                      "SetSyscall should treat the syscall index as a signed offset from the kernel table base");
 
-            notifyRuntimeStop();
         });
 
         tc.Run("guest kernel syscall mirror resets between runs", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
             constexpr uint32_t kGuestSyscallTableProbeBase = 0x000002F0u;
@@ -1394,8 +1390,7 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(callSyscall(0x74u, env.rdram.data(), &env.ctx, &env.runtime),
                      "SetSyscall syscall should dispatch");
 
-            notifyRuntimeStop();
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(env.rdram.data(), &env.runtime);
 
             uint32_t mirrored = 1u;
             std::memcpy(&mirrored, env.rdram.data() + kEntryPhysAddr, sizeof(mirrored));
@@ -1417,7 +1412,6 @@ void register_ps2_runtime_kernel_tests()
 
         tc.Run("SetSyscall override dispatches guest handlers that return through the sentinel", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             constexpr uint32_t kSyscallIndex = 0x91u;
             constexpr uint32_t kHandler = 0x00200000u;
@@ -1436,12 +1430,10 @@ void register_ps2_runtime_kernel_tests()
                      12u,
                      "Successful override dispatch should propagate guest handler return value");
 
-            notifyRuntimeStop();
         });
 
         tc.Run("SetSyscall override preserves KSEG argument sign extension", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             constexpr uint32_t kSyscallIndex = 0x92u;
             constexpr uint32_t kHandler = 0x00200030u;
@@ -1460,12 +1452,10 @@ void register_ps2_runtime_kernel_tests()
                      0x80000004u,
                      "Override invocation should preserve KSEG ordering after 32-bit guest writes");
 
-            notifyRuntimeStop();
         });
 
         tc.Run("SetSyscall override preserves upper 64 bits when writing 32-bit args", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             constexpr uint32_t kSyscallIndex = 0x93u;
             constexpr uint32_t kHandler = 0x00200040u;
@@ -1484,12 +1474,10 @@ void register_ps2_runtime_kernel_tests()
                      1u,
                      "Override invocation should preserve the upper 64 bits of 128-bit GPRs when setting 32-bit args");
 
-            notifyRuntimeStop();
         });
 
         tc.Run("broken syscall overrides fall back to builtin handlers", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             constexpr uint32_t kHandler = 0x00200010u;
             constexpr uint32_t kTableBase = 0x00002000u;
@@ -1515,12 +1503,10 @@ void register_ps2_runtime_kernel_tests()
                      kTableBase + 4u,
                      "Abnormal override exits should fall back to the builtin syscall implementation");
 
-            notifyRuntimeStop();
         });
 
         tc.Run("reentrant syscall overrides fall back to builtin handlers", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             constexpr uint32_t kHandler = 0x00200020u;
             constexpr uint32_t kTableBase = 0x00003000u;
@@ -1546,7 +1532,6 @@ void register_ps2_runtime_kernel_tests()
                      kTableBase + 4u,
                      "Reentrant override dispatch should use builtin syscall implementation");
 
-            notifyRuntimeStop();
         });
 
         tc.Run("Copy syscall (0x5A) performs a memory copy", [](TestCase &t)
@@ -1580,9 +1565,8 @@ void register_ps2_runtime_kernel_tests()
 
         tc.Run("GetEntryAddress syscall (0x5B) returns handler from guest table", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
-            initializeGuestKernelState(env.rdram.data());
+            initializeGuestKernelState(env.rdram.data(), &env.runtime);
 
             constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
             constexpr uint32_t kSyscallIndex = 0x5Au;
@@ -1600,7 +1584,6 @@ void register_ps2_runtime_kernel_tests()
                      kExpectedHandler,
                      "GetEntryAddress should read and return the handler address from the table");
 
-            notifyRuntimeStop();
         });
     });
 }
