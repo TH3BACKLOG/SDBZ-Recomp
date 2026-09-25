@@ -1,17 +1,16 @@
 #include "MiniTest.h"
 #include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
+#include "ps2_iop_transport.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
-#include "runtime/ps2_iop.h"
+#include "runtime/ee_scheduler.h"
 
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <string>
-#include <tuple>
 #include <vector>
 
 using namespace ps2_syscalls;
@@ -21,16 +20,6 @@ namespace ps2_stubs
     void resetSifState();
 }
 
-namespace ps2_syscalls
-{
-    bool handleSoundDriverRpcService(uint8_t *rdram, PS2Runtime *runtime,
-                                     uint32_t sid, uint32_t rpcNum,
-                                     uint32_t sendBuf, uint32_t sendSize,
-                                     uint32_t recvBuf, uint32_t recvSize,
-                                     uint32_t &resultPtr,
-                                     bool &signalNowaitCompletion);
-}
-
 namespace
 {
     constexpr int KE_OK = 0;
@@ -38,6 +27,8 @@ namespace
 
     constexpr uint32_t K_SIF_RPC_MODE_NOWAIT = 0x01u;
     constexpr uint32_t K_STACK_ADDR = 0x00100000u;
+    constexpr uint32_t IOP_SID_MCSERV = 0x80000400u;
+    constexpr uint32_t IOP_SID_LIBSD = 0x80000701u;
 
     #pragma pack(push, 1)
     struct SifRpcHeader
@@ -89,12 +80,26 @@ namespace
         uint32_t end;
         uint32_t next;
     };
+
+    struct McDescParam
+    {
+        int32_t fd;
+        int32_t port;
+        int32_t slot;
+        int32_t size;
+        int32_t offset;
+        int32_t origin;
+        uint32_t buffer;
+        uint32_t param;
+        uint8_t data[16];
+    };
     #pragma pack(pop)
 
     static_assert(sizeof(SifRpcHeader) == 0x10u, "Unexpected SifRpcHeader size.");
     static_assert(sizeof(SifRpcClientData) == 0x28u, "Unexpected SifRpcClientData size.");
     static_assert(sizeof(SifRpcServerData) == 0x44u, "Unexpected SifRpcServerData size.");
     static_assert(sizeof(SifRpcDataQueue) == 0x18u, "Unexpected SifRpcDataQueue size.");
+    static_assert(sizeof(McDescParam) == 0x30u, "Unexpected McDescParam size.");
 
     struct TestEnv
     {
@@ -105,34 +110,25 @@ namespace
         TestEnv() : rdram(PS2_RAM_SIZE, 0)
         {
             ps2_stubs::resetSifState();
-            ps2_syscalls::resetSoundDriverRpcState();
-            ps2_syscalls::clearSoundDriverCompatLayout();
-            ps2_syscalls::clearDtxCompatLayout();
             std::memset(&ctx, 0, sizeof(ctx));
         }
     };
 
-    void setRecvxDtxCompatLayout()
+    ps2x::iop::RpcResult callIop(TestEnv &env,
+                                 uint32_t sid,
+                                 uint32_t function,
+                                 uint32_t sendAddress,
+                                 uint32_t sendSize,
+                                 uint32_t receiveAddress,
+                                 uint32_t receiveSize)
     {
-        PS2DtxCompatLayout layout{};
-        layout.rpcSid = 0x7D000000u;
-        layout.urpcObjBase = 0x01F18000u;
-        layout.urpcObjLimit = 0x01F1FF00u;
-        layout.urpcObjStride = 0x20u;
-        layout.urpcFnTableBase = 0x0034FED0u;
-        layout.urpcObjTableBase = 0x0034FFD0u;
-        layout.dispatcherFuncAddr = 0x002FABC0u;
-        ps2_syscalls::setDtxCompatLayout(layout);
-    }
-
-    std::atomic<uint32_t> g_lotrSoundCallbackHits{0u};
-
-    void lotrSoundEndCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        (void)rdram;
-        (void)runtime;
-        ++g_lotrSoundCallbackHits;
-        ctx->pc = ::getRegU32(ctx, 31);
+        ps2x::iop::RpcRequest request{};
+        request.sid = sid;
+        request.function = function;
+        request.send = {sendAddress, sendSize};
+        request.receive = {receiveAddress, receiveSize};
+        return PS2IopTransport::handleRpc(
+            &env.runtime, env.rdram.data(), &env.ctx, std::move(request));
     }
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
@@ -174,12 +170,6 @@ namespace
         }
     };
 
-    void writeFile(const std::filesystem::path &path, const std::vector<uint8_t> &data)
-    {
-        std::ofstream out(path, std::ios::binary);
-        out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
-    }
-
     template <typename T>
     void writeGuestStruct(uint8_t *rdram, uint32_t addr, const T &value)
     {
@@ -199,6 +189,74 @@ void register_ps2_sif_rpc_tests()
 {
     MiniTest::Case("PS2SifRpc", [](TestCase &tc)
     {
+        tc.Run("SifInitRpc does not reset the running IOP", [](TestCase &t)
+        {
+            TestEnv env;
+
+            env.runtime.eeScheduler().accountCycles(80u);
+            const uint64_t cyclesBeforeInit = env.runtime.iopDebugSnapshot().emulatorCycles;
+            t.IsTrue(cyclesBeforeInit != 0u, "IOP cycle counter should advance before RPC initialization");
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+
+            t.Equals(env.runtime.iopDebugSnapshot().emulatorCycles, cyclesBeforeInit,
+                     "SifInitRpc must not reboot or reset the IOP");
+        });
+
+        tc.Run("SifLoadModule validates ROM modules and activates their HLE service", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kPathAddress = 0x00021000u;
+
+            const auto load = [&](std::string_view path)
+            {
+                std::memcpy(env.rdram.data() + kPathAddress, path.data(), path.size());
+                env.rdram[kPathAddress + path.size()] = 0u;
+                setRegU32(env.ctx, 4, kPathAddress);
+                setRegU32(env.ctx, 5, 0u);
+                setRegU32(env.ctx, 6, 0u);
+                SifLoadModule(env.rdram.data(), &env.ctx, &env.runtime);
+                return getRegS32(env.ctx, 2);
+            };
+
+            t.Equals(load("rom0:NOT_A_REAL_MODULE"), -1,
+                     "SifLoadModule must reject unknown ROM modules instead of fabricating success");
+
+            const int32_t libsdId = load("rom0:LIBSD");
+            t.IsTrue(libsdId > 0, "registered no-BIOS ROM module should receive a real managed ID");
+
+            const auto snapshot = env.runtime.iopDebugSnapshot();
+            bool libsdActive = false;
+            for (const auto &service : snapshot.services)
+            {
+                if (service.name == "libsd")
+                {
+                    libsdActive = service.active;
+                    break;
+                }
+            }
+            t.IsTrue(libsdActive, "loading LIBSD should activate its HLE RPC route");
+        });
+
+        tc.Run("emulated RPC bind waits for a registered IOP server", [](TestCase &t)
+        {
+            TestEnv env;
+
+            constexpr uint32_t kClientAddr = 0x00021F00u;
+            constexpr uint32_t kUnregisteredSid = 0x13572468u;
+
+            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
+            setRegU32(env.ctx, 4, kClientAddr);
+            setRegU32(env.ctx, 5, kUnregisteredSid);
+            setRegU32(env.ctx, 6, 0u);
+            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
+
+            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc transport should complete");
+            const SifRpcClientData client = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
+            t.Equals(client.server, 0u,
+                     "client server pointer must stay null until the emulated IRX registers its SID");
+        });
+
         tc.Run("register bind call updates descriptors and payload", [](TestCase &t)
         {
             TestEnv env;
@@ -291,21 +349,12 @@ void register_ps2_sif_rpc_tests()
             t.Equals(getRegS32(env.ctx, 2), 0, "SifCheckStatRpc should report not busy after synchronous completion");
         });
 
-        tc.Run("Fatal Frame SDRDRV RPC initializes header and loads body archives", [](TestCase &t)
+        tc.Run("MCSERV RPC init and get info report a formatted PS2 card", [](TestCase &t)
         {
             TestEnv env;
-            ScopedTempDir temp("fatal_frame_sdrdrv");
-
-            std::vector<uint8_t> header(64u, 0);
-            const char headerPayload[] = "img-header";
-            std::memcpy(header.data(), headerPayload, sizeof(headerPayload) - 1u);
-            writeFile(temp.path / "img_hd.bin", header);
-
-            constexpr uint32_t kSectorSize = 2048u;
-            std::vector<uint8_t> body(kSectorSize * 2u, 0);
-            const char bodyPayload[] = "archive-data";
-            std::memcpy(body.data() + kSectorSize, bodyPayload, sizeof(bodyPayload) - 1u);
-            writeFile(temp.path / "img_bd.bin", body);
+            const auto mcservModule = env.runtime.loadIopModule("rom0:MCSERV");
+            t.IsTrue(mcservModule.moduleId > 0, "MCSERV test should load its IOP module first");
+            ScopedTempDir temp("mcserv_rpc");
 
             const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
             PS2Runtime::IoPaths ioPaths;
@@ -315,240 +364,110 @@ void register_ps2_sif_rpc_tests()
             ioPaths.mcRoot = temp.path / "mc0";
             PS2Runtime::setIoPaths(ioPaths);
 
-            constexpr uint32_t kSendAddr = 0x00030000u;
-            constexpr uint32_t kRecvAddr = 0x00031000u;
-            constexpr uint32_t kDstAddr = 0x00032000u;
-            constexpr uint32_t kImgHeaderAddr = 0x012F0000u;
-            constexpr uint32_t kLoadId = 3u;
+            constexpr uint32_t kSendAddr = 0x00034000u;
+            constexpr uint32_t kRecvAddr = 0x00035000u;
+            constexpr uint32_t kEndParamAddr = 0x00036000u;
 
-            std::array<uint32_t, 8> commands{};
-            commands[0] = 0x0Eu;
-            commands[2] = 1u; // lbn
-            commands[3] = sizeof(bodyPayload) - 1u;
-            commands[4] = kDstAddr;
-            commands[6] = kLoadId;
-            std::memcpy(env.rdram.data() + kSendAddr, commands.data(), commands.size() * sizeof(uint32_t));
-            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 0x180u);
+            const ps2x::iop::RpcResult initResult =
+                callIop(env, IOP_SID_MCSERV, 0xFEu,
+                        kSendAddr, sizeof(McDescParam), kRecvAddr, 12u);
+            t.IsTrue(initResult.handled, "MCSERV init RPC should be handled");
+            t.Equals(initResult.resultAddress, kRecvAddr, "MCSERV init should return recv buffer");
+            t.IsFalse(initResult.signalNowaitCompletion, "MCSERV init should not request special nowait signaling");
+            t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kRecvAddr + 0u), 0,
+                     "MCSERV init result should succeed");
+            t.IsTrue(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u) >= 0x205u,
+                     "MCSERV init should expose a supported mcserv version");
+            t.IsTrue(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 8u) >= 0x206u,
+                     "MCSERV init should expose a supported mcman version");
 
-            env.runtime.iop().init(env.rdram.data());
-            uint32_t resultPtr = 0u;
-            bool signalNowait = true;
-            const bool initHandled = env.runtime.iop().handleRPC(&env.runtime,
-                                                                 IOP_SID_FATAL_FRAME_SDRDRV,
-                                                                 0u,
-                                                                 0u,
-                                                                 0u,
-                                                                 kRecvAddr,
-                                                                 0x180u,
-                                                                 resultPtr,
-                                                                 signalNowait);
-            t.IsTrue(initHandled, "Fatal Frame SDRDRV init RPC should be handled");
-            t.Equals(std::memcmp(env.rdram.data() + kImgHeaderAddr, "img-header", 10), 0,
-                     "SDRDRV init RPC should load img_hd.bin into the arrangement table");
+            McDescParam getInfo{};
+            getInfo.port = 0;
+            getInfo.slot = 0;
+            getInfo.size = 1;   // formatted requested by XMCSERV libmc
+            getInfo.offset = 1; // free clusters requested by XMCSERV libmc
+            getInfo.origin = 1; // type requested by XMCSERV libmc
+            getInfo.param = kEndParamAddr;
+            writeGuestStruct(env.rdram.data(), kSendAddr, getInfo);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+            std::memset(env.rdram.data() + kEndParamAddr, 0xCC, 192u);
 
-            signalNowait = true;
-            const bool handled = env.runtime.iop().handleRPC(&env.runtime,
-                                                             IOP_SID_FATAL_FRAME_SDRDRV,
-                                                             1u,
-                                                             kSendAddr,
-                                                             static_cast<uint32_t>(commands.size() * sizeof(uint32_t)),
-                                                             kRecvAddr,
-                                                             0x180u,
-                                                             resultPtr,
-                                                             signalNowait);
+            const ps2x::iop::RpcResult getInfoResult =
+                callIop(env, IOP_SID_MCSERV, 0x01u,
+                        kSendAddr, sizeof(McDescParam), kRecvAddr, 4u);
 
             PS2Runtime::setIoPaths(oldPaths);
 
-            t.IsTrue(handled, "Fatal Frame SDRDRV SID should be handled");
-            t.Equals(resultPtr, kRecvAddr, "SDRDRV RPC should return recv buffer");
-            t.IsFalse(signalNowait, "SDRDRV RPC should not request special nowait signaling");
-            t.Equals(std::memcmp(env.rdram.data() + kDstAddr, "archive-data", 12), 0,
-                     "SDRDRV load command should copy bytes from img_bd.bin by LBN");
-            t.Equals(env.rdram[kRecvAddr + 0x6Cu + (kLoadId * 8u)], static_cast<uint8_t>(0),
-                     "SDRDRV load status should report completed");
+            t.IsTrue(getInfoResult.handled, "MCSERV get info RPC should be handled");
+            t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kRecvAddr), 0,
+                     "get info result should succeed");
+            t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kEndParamAddr + 0u), 2,
+                     "get info should report PS2 card type");
+            t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kEndParamAddr + 4u), 0x2000,
+                     "get info should report free clusters");
+            t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kEndParamAddr + 144u), 1,
+                     "get info should report formatted card");
         });
 
-        tc.Run("LotR ClFile RPC opens reads and reports EOF", [](TestCase &t)
+        tc.Run("DBCMAN version RPC returns the 3.10 compatibility response", [](TestCase &t)
         {
             TestEnv env;
-            ScopedTempDir temp("lotr_clfile_rpc");
+            const auto dbcmanModule = env.runtime.loadIopModule("rom0:DBCMAN");
+            t.IsTrue(dbcmanModule.moduleId > 0, "DBCMAN test should load its IOP module first");
 
-            const std::vector<uint8_t> payload = {'a', 'b', 'c'};
-            const std::vector<uint8_t> loadPayload = {'x', 'y', 'z', '!'};
-            writeFile(temp.path / "boot.cfg", payload);
-            writeFile(temp.path / "load.bin", loadPayload);
+            constexpr uint32_t kDbcManSid = 0x80001300u;
+            constexpr uint32_t kCheckVersionRpc = 0x80001363u;
+            constexpr uint32_t kRecvAddr = 0x00035A00u;
+            constexpr uint32_t kDbcManVersion = 0x0310u;
 
-            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
-            PS2Runtime::IoPaths ioPaths;
-            ioPaths.elfDirectory = temp.path;
-            ioPaths.hostRoot = temp.path;
-            ioPaths.cdRoot = temp.path;
-            ioPaths.mcRoot = temp.path / "mc0";
-            PS2Runtime::setIoPaths(ioPaths);
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 16u);
+            const ps2x::iop::RpcResult result =
+                callIop(env, kDbcManSid, kCheckVersionRpc,
+                        0u, 0u, kRecvAddr, 16u);
 
-            constexpr uint32_t kSendAddr = 0x00036000u;
-            constexpr uint32_t kRecvAddr = 0x00037000u;
-            constexpr uint32_t kDstAddr = 0x00038000u;
-
-            env.runtime.iop().init(env.rdram.data());
-
-            auto callClFileRpc = [&](uint32_t rpcNum, uint32_t sendSize) {
-                uint32_t resultPtr = 0u;
-                bool signalNowait = true;
-                const bool handled = env.runtime.iop().handleRPC(&env.runtime,
-                                                                 IOP_SID_LOTR_CLFILE,
-                                                                 rpcNum,
-                                                                 kSendAddr,
-                                                                 sendSize,
-                                                                 kRecvAddr,
-                                                                 0x40u,
-                                                                 resultPtr,
-                                                                 signalNowait);
-                t.IsTrue(handled, "LotR ClFile SID should be handled");
-                t.Equals(resultPtr, kRecvAddr, "ClFile RPC should return recv buffer");
-                t.IsFalse(signalNowait, "ClFile RPC should not request special nowait signaling");
-            };
-
-            std::memset(env.rdram.data() + kSendAddr, 0, 0x100u);
-            std::memcpy(env.rdram.data() + kSendAddr, "boot.cfg", 9u);
-            std::memset(env.rdram.data() + kRecvAddr, 0xAA, 0x40u);
-            callClFileRpc(0x08u, 0x100u);
-
-            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u), 0u,
-                     "open should report success status");
-            const uint32_t handle = readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u);
-            t.IsTrue(handle != 0u, "open should return a non-zero remote file handle");
-
-            std::memset(env.rdram.data() + kSendAddr, 0, 0x100u);
-            std::memcpy(env.rdram.data() + kSendAddr, "missing.cfg", 12u);
-            std::memset(env.rdram.data() + kRecvAddr, 0xAA, 0x40u);
-            callClFileRpc(0x08u, 0x100u);
-            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u), 0u,
-                     "missing file open should not manufacture a handle from path bytes");
-
-            constexpr uint32_t kLoadDstAddr = 0x00039000u;
-            std::memset(env.rdram.data() + kSendAddr, 0, 0x110u);
-            std::memcpy(env.rdram.data() + kSendAddr, "load.bin", 9u);
-            writeGuestU32(env.rdram.data(), kSendAddr + 0x100u, static_cast<uint32_t>(loadPayload.size()));
-            writeGuestU32(env.rdram.data(), kSendAddr + 0x104u, kLoadDstAddr);
-            std::memset(env.rdram.data() + kLoadDstAddr, 0xCC, 0x20u);
-            callClFileRpc(0x01u, 0x110u);
-
-            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u), 5u,
-                     "direct load should report a queued load result");
-            const uint32_t loadHandle = readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u);
-            t.IsTrue(loadHandle >= 3u, "direct load should return a status handle usable by getStatus");
-            t.Equals(std::memcmp(env.rdram.data() + kLoadDstAddr, loadPayload.data(), loadPayload.size()), 0,
-                     "direct load should copy file bytes into the requested guest destination");
-
-            writeGuestU32(env.rdram.data(), kSendAddr, loadHandle);
-            callClFileRpc(0x05u, 0u);
-            writeGuestU32(env.rdram.data(), kSendAddr, loadHandle);
-            callClFileRpc(0x03u, sizeof(uint32_t));
-            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u), 7u,
-                     "direct load getStatus should report completed");
-
-            writeGuestU32(env.rdram.data(), kSendAddr, loadHandle);
-            callClFileRpc(0x06u, sizeof(uint32_t));
-            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u),
-                     static_cast<uint32_t>(loadPayload.size()),
-                     "direct load getSize should report the loaded host file size");
-
-            writeGuestU32(env.rdram.data(), kSendAddr, loadHandle);
-            callClFileRpc(0x09u, sizeof(uint32_t));
-
-            if (handle != 0u)
+            t.IsTrue(result.handled, "DBCMAN check-version RPC should be handled");
+            t.Equals(result.resultAddress, kRecvAddr, "DBCMAN check-version RPC should return the receive buffer");
+            t.IsFalse(result.signalNowaitCompletion, "DBCMAN check-version RPC should not request special nowait signaling");
+            for (uint32_t index = 0u; index < 4u; ++index)
             {
-                std::array<uint32_t, 4> readPacket = {handle, 2u, kDstAddr, 0u};
-                writeGuestStruct(env.rdram.data(), kSendAddr, readPacket);
-                std::memset(env.rdram.data() + kDstAddr, 0, 8u);
-                callClFileRpc(0x0Au, static_cast<uint32_t>(readPacket.size() * sizeof(uint32_t)));
-                t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u), 2u,
-                         "first read should report actual byte count");
-                t.Equals(std::memcmp(env.rdram.data() + kDstAddr, "ab", 2), 0,
-                         "first read should copy file bytes into guest destination");
-
-                writeGuestStruct(env.rdram.data(), kSendAddr, readPacket);
-                std::memset(env.rdram.data() + kDstAddr, 0, 8u);
-                callClFileRpc(0x0Au, static_cast<uint32_t>(readPacket.size() * sizeof(uint32_t)));
-                t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u), 1u,
-                         "short read should report remaining byte count");
-                t.Equals(std::memcmp(env.rdram.data() + kDstAddr, "c", 1), 0,
-                         "short read should copy remaining file byte");
-
-                writeGuestStruct(env.rdram.data(), kSendAddr, readPacket);
-                std::memset(env.rdram.data() + kDstAddr, 0xCC, 8u);
-                callClFileRpc(0x0Au, static_cast<uint32_t>(readPacket.size() * sizeof(uint32_t)));
-                t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u), 0u,
-                         "EOF read should report zero bytes");
-
-                writeGuestU32(env.rdram.data(), kSendAddr, handle);
-                callClFileRpc(0x09u, sizeof(uint32_t));
+                t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + (index * 4u)),
+                         kDbcManVersion,
+                         "DBCMAN should repeat version 3.10 across the response words");
             }
-
-            PS2Runtime::setIoPaths(oldPaths);
         });
 
-        tc.Run("LotR sound RPC invokes guest callback to consume HLE response", [](TestCase &t)
+        tc.Run("LIBSD RPC routes through the IOP audio service", [](TestCase &t)
         {
             TestEnv env;
+            const auto libsdModule = env.runtime.loadIopModule("rom0:LIBSD");
+            t.IsTrue(libsdModule.moduleId > 0, "LIBSD test should load its IOP module first");
 
-            constexpr uint32_t kClientAddr = 0x00039000u;
-            constexpr uint32_t kSemaParamAddr = 0x00039100u;
-            constexpr uint32_t kSendAddr = 0x0003A000u;
-            constexpr uint32_t kRecvAddr = 0x0003C000u;
-            constexpr uint32_t kEndFunc = 0x001FFD70u;
+            constexpr uint32_t kSetVoiceRpc = 0x8010u;
+            constexpr uint32_t kSendAddr = 0x00035B00u;
+            constexpr uint32_t kRecvAddr = 0x00035C00u;
 
-            PS2SoundDriverCompatLayout layout{};
-            layout.completionCallbacks = {kEndFunc, 0u, 0u, 0u};
-            ps2_syscalls::setSoundDriverCompatLayout(layout);
+            std::array<uint32_t, 5> command{};
+            command[0] = 3u;          // voice index
+            command[2] = 0x1000u;    // neutral pitch
+            command[3] = 0x00120000u; // plausible sample address
+            writeGuestStruct(env.rdram.data(), kSendAddr, command);
+            std::memset(env.rdram.data() + kRecvAddr, 0xA5, 16u);
+            const ps2x::iop::RpcResult result =
+                callIop(env, IOP_SID_LIBSD, kSetVoiceRpc,
+                        kSendAddr, static_cast<uint32_t>(sizeof(command)),
+                        kRecvAddr, 16u);
 
-            env.runtime.registerFunction(kEndFunc, lotrSoundEndCallback);
-            g_lotrSoundCallbackHits = 0u;
-
-            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
-
-            const uint32_t semaParam[6] = {0u, 1u, 0u, 0u, 0u, 0u};
-            std::memcpy(env.rdram.data() + kSemaParamAddr, semaParam, sizeof(semaParam));
-            setRegU32(env.ctx, 4, kSemaParamAddr);
-            CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
-            const int32_t semaId = getRegS32(env.ctx, 2);
-            t.IsTrue(semaId > 0, "CreateSema should return a positive semaphore id");
-
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, IOP_SID_LOTR_SOUND);
-            setRegU32(env.ctx, 6, 0u);
-            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should succeed for LotR sound SID");
-
-            writeGuestU32(env.rdram.data(), kSendAddr, 3u);
-            std::memset(env.rdram.data() + kRecvAddr, 0xAA, 0x2000u);
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, 0u);
-            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
-            setRegU32(env.ctx, 7, kSendAddr);
-            setRegU32(env.ctx, 8, 0x2000u);
-            setRegU32(env.ctx, 9, kRecvAddr);
-            setRegU32(env.ctx, 10, 0x2000u);
-            setRegU32(env.ctx, 11, kEndFunc);
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, static_cast<uint32_t>(semaId));
-            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should succeed for LotR sound RPC");
-            t.Equals(g_lotrSoundCallbackHits.load(), 1u,
-                     "LotR SOUND_JP callback should consume the HLE response");
-            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 0u), 0u,
-                     "LotR sound response should report no active stream records");
-            t.IsTrue(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr + 4u) != 0u,
-                     "LotR sound response should advance the IOP update counter");
-
-            setRegU32(env.ctx, 4, static_cast<uint32_t>(semaId));
-            PollSema(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), semaId, "LotR sound callback completion should signal the sema");
+            t.IsTrue(result.handled, "LIBSD SID should be handled by the IOP audio service");
+            t.Equals(result.resultAddress, kRecvAddr, "LIBSD should return the audio backend receive buffer");
+            t.IsFalse(result.signalNowaitCompletion, "LIBSD should not request special nowait signaling");
+            for (uint32_t index = 0u; index < 16u; ++index)
+            {
+                t.Equals(env.rdram[kRecvAddr + index], static_cast<uint8_t>(0xA5),
+                         "LIBSD should preserve the backend-owned response buffer");
+            }
         });
 
-        tc.Run("bind before register creates placeholder then remaps", [](TestCase &t)
+        tc.Run("hybrid bind before register waits then remaps", [](TestCase &t)
         {
             TestEnv env;
 
@@ -568,11 +487,9 @@ void register_ps2_sif_rpc_tests()
             t.Equals(getRegS32(env.ctx, 2), KE_OK, "initial bind without registered server should still succeed");
 
             const SifRpcClientData clientBeforeRegister = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
-            t.IsTrue(clientBeforeRegister.server != 0u, "bind should allocate placeholder server when sid is missing");
-            t.IsTrue(clientBeforeRegister.server >= 0x01F10000u && clientBeforeRegister.server < 0x01F20000u,
-                     "placeholder server should come from rpc server pool");
-            t.Equals(clientBeforeRegister.buf, 0u, "placeholder server starts with empty buf");
-            t.Equals(clientBeforeRegister.cbuf, 0u, "placeholder server starts with empty cbuf");
+            t.Equals(clientBeforeRegister.server, 0u, "bind must wait until a hybrid backend owns the SID");
+            t.Equals(clientBeforeRegister.buf, 0u, "unbound client starts with empty buf");
+            t.Equals(clientBeforeRegister.cbuf, 0u, "unbound client starts with empty cbuf");
 
             setRegU32(env.ctx, 4, kQdAddr);
             setRegU32(env.ctx, 5, 0x44u);
@@ -595,7 +512,7 @@ void register_ps2_sif_rpc_tests()
             t.Equals(clientAfterRegister.server, kSdAddr, "register should remap pre-bound clients to concrete server descriptor");
             t.Equals(clientAfterRegister.buf, kServerBufAddr, "register should update client buf from server descriptor");
             t.Equals(clientAfterRegister.cbuf, kServerCbufAddr, "register should update client cbuf from server descriptor");
-            t.IsTrue(clientAfterRegister.server != clientBeforeRegister.server, "client server pointer should switch from placeholder to real server");
+            t.IsTrue(clientAfterRegister.server != clientBeforeRegister.server, "client server pointer should switch from unbound to real server");
 
             setRegU32(env.ctx, 4, kSdAddr);
             setRegU32(env.ctx, 5, kQdAddr);
@@ -631,378 +548,6 @@ void register_ps2_sif_rpc_tests()
             setRegU32(env.ctx, 4, kQdAddr);
             SifRemoveRpcQueue(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegU32Result(env.ctx, 2), 0u, "removing the same queue twice should return 0");
-        });
-
-        tc.Run("snddrv state RPC returns stable buffers and signals sema", [](TestCase &t)
-        {
-            TestEnv env;
-
-            constexpr uint32_t kClientAddr = 0x00028000u;
-            constexpr uint32_t kSemaParamAddr = 0x00028100u;
-            constexpr uint32_t kRecvAddr = 0x00028200u;
-            constexpr uint32_t kStateSid = 1u;
-            constexpr uint32_t kGetStatusFno = 0x12u;
-            constexpr uint32_t kGetAddrTableFno = 0x13u;
-            constexpr uint32_t kSid = kStateSid;
-
-            PS2SoundDriverCompatLayout layout{};
-            layout.stateSid = kStateSid;
-            layout.getStatusFno = kGetStatusFno;
-            layout.getAddrTableFno = kGetAddrTableFno;
-            ps2_syscalls::setSoundDriverCompatLayout(layout);
-
-            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
-
-            const uint32_t semaParam[6] = {
-                0u, // count (unused by runtime decode)
-                1u, // max_count
-                0u, // init_count
-                0u, // wait_threads
-                0u, // attr
-                0u  // option
-            };
-            std::memcpy(env.rdram.data() + kSemaParamAddr, semaParam, sizeof(semaParam));
-
-            setRegU32(env.ctx, 4, kSemaParamAddr);
-            CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
-            const int32_t semaId = getRegS32(env.ctx, 2);
-            t.IsTrue(semaId > 0, "CreateSema should return a positive semaphore id");
-
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kSid);
-            setRegU32(env.ctx, 6, 0u);
-            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should succeed for snddrv state sid");
-
-            setRegU32(env.ctx, 4, static_cast<uint32_t>(semaId));
-            PollSema(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_SEMA_ZERO, "semaphore should start at zero before nowait rpc");
-
-            std::memset(env.rdram.data() + kRecvAddr, 0, 16u);
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kGetStatusFno);
-            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
-            setRegU32(env.ctx, 7, 0u);
-            setRegU32(env.ctx, 8, 0u);
-            setRegU32(env.ctx, 9, kRecvAddr);
-            setRegU32(env.ctx, 10, 16u);
-            setRegU32(env.ctx, 11, 0u);
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, static_cast<uint32_t>(semaId));
-            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc(sound status) should succeed");
-            const uint32_t statusAddr = readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr);
-            t.IsTrue(statusAddr != 0u, "rpc 0x12 should return a nonzero sound-status pointer");
-
-            setRegU32(env.ctx, 4, static_cast<uint32_t>(semaId));
-            PollSema(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), semaId, "nowait rpc should signal completion sema");
-
-            std::memset(env.rdram.data() + kRecvAddr, 0, 16u);
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kGetAddrTableFno);
-            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
-            setRegU32(env.ctx, 7, 0u);
-            setRegU32(env.ctx, 8, 0u);
-            setRegU32(env.ctx, 9, kRecvAddr);
-            setRegU32(env.ctx, 10, 16u);
-            setRegU32(env.ctx, 11, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, static_cast<uint32_t>(semaId));
-            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc(sound addr table) should succeed");
-            const uint32_t addrTableAddr = readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr);
-            t.IsTrue(addrTableAddr != 0u, "rpc 0x13 should return a nonzero address-table pointer");
-            t.IsTrue(addrTableAddr != statusAddr, "sound-status and address-table pointers should be distinct");
-
-            setRegU32(env.ctx, 4, static_cast<uint32_t>(semaId));
-            PollSema(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), semaId, "each nowait rpc should signal completion sema");
-
-            std::memset(env.rdram.data() + kRecvAddr, 0, 16u);
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kGetStatusFno);
-            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
-            setRegU32(env.ctx, 7, 0u);
-            setRegU32(env.ctx, 8, 0u);
-            setRegU32(env.ctx, 9, kRecvAddr);
-            setRegU32(env.ctx, 10, 16u);
-            setRegU32(env.ctx, 11, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, static_cast<uint32_t>(semaId));
-            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr), statusAddr,
-                     "sound-status pointer should remain stable across repeated rpc 0x12 calls");
-        });
-
-        tc.Run("snddrv state RPC returns low guest sound-driver addresses", [](TestCase &t)
-        {
-            TestEnv env;
-
-            constexpr uint32_t kClientAddr = 0x00028300u;
-            constexpr uint32_t kSemaParamAddr = 0x00028400u;
-            constexpr uint32_t kRecvAddr = 0x00028500u;
-            constexpr uint32_t kStateSid = 1u;
-            constexpr uint32_t kGetStatusFno = 0x12u;
-            constexpr uint32_t kGetAddrTableFno = 0x13u;
-            constexpr uint32_t kSid = kStateSid;
-
-            PS2SoundDriverCompatLayout layout{};
-            layout.stateSid = kStateSid;
-            layout.getStatusFno = kGetStatusFno;
-            layout.getAddrTableFno = kGetAddrTableFno;
-            ps2_syscalls::setSoundDriverCompatLayout(layout);
-
-            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
-
-            const uint32_t semaParam[6] = {0u, 1u, 0u, 0u, 0u, 0u};
-            std::memcpy(env.rdram.data() + kSemaParamAddr, semaParam, sizeof(semaParam));
-
-            setRegU32(env.ctx, 4, kSemaParamAddr);
-            CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
-            const int32_t semaId = getRegS32(env.ctx, 2);
-            t.IsTrue(semaId > 0, "CreateSema should return a positive semaphore id");
-
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kSid);
-            setRegU32(env.ctx, 6, 0u);
-            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should succeed for snddrv state sid");
-
-            SifRpcClientData client = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
-            client.hdr.sema_id = semaId;
-            writeGuestStruct(env.rdram.data(), kClientAddr, client);
-
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kGetStatusFno);
-            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
-            setRegU32(env.ctx, 7, 0u);
-            setRegU32(env.ctx, 8, 0u);
-            setRegU32(env.ctx, 9, kRecvAddr);
-            setRegU32(env.ctx, 10, 16u);
-            setRegU32(env.ctx, 11, 0u);
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, static_cast<uint32_t>(semaId));
-            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            const uint32_t statusAddr = readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr);
-            t.IsTrue(statusAddr > 0u && statusAddr < 0x00200000u,
-                     "rpc 0x12 should return a low guest address like an IOP pointer");
-
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kGetAddrTableFno);
-            setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
-            setRegU32(env.ctx, 7, 0u);
-            setRegU32(env.ctx, 8, 0u);
-            setRegU32(env.ctx, 9, kRecvAddr);
-            setRegU32(env.ctx, 10, 16u);
-            setRegU32(env.ctx, 11, 0u);
-            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            const uint32_t addrTableAddr = readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr);
-            t.IsTrue(addrTableAddr > 0u && addrTableAddr < 0x00200000u,
-                     "rpc 0x13 should return a low guest address like an IOP pointer");
-
-            const uint32_t hdBaseAddr = readGuestStruct<uint32_t>(env.rdram.data(), addrTableAddr + 0u);
-            const uint32_t sqBaseAddr = readGuestStruct<uint32_t>(env.rdram.data(), addrTableAddr + 4u);
-            const uint32_t dataBaseAddr = readGuestStruct<uint32_t>(env.rdram.data(), addrTableAddr + 8u);
-            t.IsTrue(hdBaseAddr > 0u && hdBaseAddr < 0x00200000u,
-                     "sound-driver hd base should stay in low guest address space");
-            t.IsTrue(sqBaseAddr > hdBaseAddr && sqBaseAddr < 0x00200000u,
-                     "sound-driver sq base should be a later low guest address");
-            t.IsTrue(dataBaseAddr > sqBaseAddr && dataBaseAddr < 0x00200000u,
-                     "sound-driver data base should be a later low guest address");
-        });
-
-        tc.Run("snddrv HLE dispatches all configured subcommand semantics", [](TestCase &t)
-        {
-            TestEnv env;
-            uint8_t *rdram = env.rdram.data();
-
-            constexpr uint32_t kStreamState = 0x00050000u;
-            constexpr uint32_t kAllocTbl = 0x00050100u;
-            constexpr uint32_t kStopFlag = 0x00050200u;
-            constexpr uint32_t kSend = 0x00050300u;
-            constexpr uint32_t kRecv = 0x00050400u;
-
-            std::memset(rdram + kStreamState, 0, 16u);
-            std::memset(rdram + kAllocTbl, 0, 16u * sizeof(uint32_t));
-            std::memset(rdram + kStopFlag, 0, 16u);
-            std::memset(rdram + kSend, 0, 16u);
-            std::memset(rdram + kRecv, 0, 16u);
-
-            constexpr uint32_t kSid = 0x80000701u; // fake service id
-            PS2SoundDriverCompatLayout layout{};
-            layout.commandSid = kSid;
-            layout.stateSid = kSid;
-            layout.submitFno = 0x1u;
-            layout.getStatusFno = 0x12u;
-            layout.getAddrTableFno = 0x13u;
-            layout.streamOpenFno = 0xE620u;
-            layout.channelConfigFno = 0x30u;
-            layout.stopFno = 0x40u;
-            layout.streamStateAddr = kStreamState;
-            layout.streamReadyValue = 3u;
-            layout.channelAllocFlagTableAddr = kAllocTbl;
-            layout.stopCompletionFlagAddr = kStopFlag;
-            ps2_syscalls::setSoundDriverCompatLayout(layout);
-
-            auto call = [&](uint32_t fno, uint32_t sendBuf, uint32_t sendSize,
-                            uint32_t recvBuf, uint32_t recvSize)
-            {
-                uint32_t rp = 0xdeadbeefu;
-                bool now = false;
-                const bool r = ps2_syscalls::handleSoundDriverRpcService(
-                    rdram, &env.runtime, kSid, fno, sendBuf, sendSize, recvBuf, recvSize, rp, now);
-                return std::make_tuple(r, rp, now);
-            };
-
-            // streamOpen
-            std::memset(rdram + kRecv, 0, 16u);
-            {
-                const auto [r, rp, now] = call(layout.streamOpenFno, 0u, 0u, kRecv, 16u);
-                t.IsTrue(r, "streamOpen should be handled");
-                t.Equals(readGuestStruct<uint32_t>(rdram, kStreamState), 3u,
-                         "streamOpen should write streamReadyValue to streamStateAddr");
-                t.Equals(readGuestStruct<uint32_t>(rdram, kRecv), 0u,
-                         "streamOpen should write 0 to recv buffer");
-                t.IsTrue(now, "streamOpen should signal nowait completion");
-                (void)rp;
-            }
-
-            // channelConfig
-            {
-                constexpr uint32_t k = 5u;
-                writeGuestU32(rdram, kSend, k);
-                std::memset(rdram + kRecv, 0, 16u);
-                const auto [r, rp, now] = call(layout.channelConfigFno, kSend, 4u, kRecv, 16u);
-                t.IsTrue(r, "channelConfig should be handled");
-                t.Equals(readGuestStruct<uint32_t>(rdram, kAllocTbl + k * sizeof(uint32_t)), 1u,
-                         "channelConfig should mark the requested channel allocated");
-                t.Equals(readGuestStruct<uint32_t>(rdram, kRecv), 0u,
-                         "channelConfig should write 0 to recv buffer");
-                (void)rp;
-                (void)now;
-            }
-
-            // stop
-            {
-                std::memset(rdram + kRecv, 0, 16u);
-                std::memset(rdram + kStopFlag, 0, 16u);
-                const auto [r, rp, now] = call(layout.stopFno, 0u, 0u, kRecv, 16u);
-                t.IsTrue(r, "stop should be handled");
-                t.Equals(readGuestStruct<uint32_t>(rdram, kStopFlag), 1u,
-                         "stop should write 1 to stopCompletionFlagAddr");
-                t.Equals(readGuestStruct<uint32_t>(rdram, kRecv), 0u,
-                         "stop should write 0 to recv buffer");
-                (void)rp;
-                (void)now;
-            }
-
-            // getStatus
-            uint32_t statusVal = 0u;
-            {
-                std::memset(rdram + kRecv, 0, 16u);
-                const auto [r, rp, now] = call(layout.getStatusFno, 0u, 0u, kRecv, 16u);
-                statusVal = readGuestStruct<uint32_t>(rdram, kRecv);
-                t.IsTrue(r, "getStatus should be handled");
-                t.IsTrue(statusVal != 0u, "getStatus should return a nonzero status address");
-                (void)rp;
-                (void)now;
-            }
-
-            // getAddrTable
-            uint32_t addrTableVal = 0u;
-            {
-                std::memset(rdram + kRecv, 0, 16u);
-                const auto [r, rp, now] = call(layout.getAddrTableFno, 0u, 0u, kRecv, 16u);
-                addrTableVal = readGuestStruct<uint32_t>(rdram, kRecv);
-                t.IsTrue(r, "getAddrTable should be handled");
-                t.IsTrue(addrTableVal != 0u, "getAddrTable should return a nonzero addr-table address");
-                t.IsTrue(addrTableVal != statusVal, "status and addr-table addresses should be distinct");
-                (void)rp;
-                (void)now;
-            }
-
-            // unknown fno.
-            // Asserts the handler-local recv[0] write. In the real SifCallRpc path this
-            // benign status is not guest-visible (handler returns false, so recv
-            // finalization overwrites it) -- this locks the handler contract, not guest state.
-            {
-                std::memset(rdram + kRecv, 0, 16u);
-                const auto [r, rp, now] = call(0xABCDu, 0u, 0u, kRecv, 16u);
-                t.IsTrue(!r, "unknown fno on a served SID should not be treated as handled");
-                t.Equals(readGuestStruct<uint32_t>(rdram, kRecv), 0xffffff9bu,
-                         "unknown fno should write the benign status value to recv (handler-local; overwritten by the outer recv finalization in the real SifCallRpc path)");
-                (void)rp;
-                (void)now;
-            }
-        });
-
-        tc.Run("snddrv HLE unconfigured layout is inert and games route independently", [](TestCase &t)
-        {
-            TestEnv env; // TestEnv already clears the layout in its constructor
-            uint8_t *rdram = env.rdram.data();
-
-            constexpr uint32_t kRecv = 0x00051000u;
-            writeGuestU32(rdram, kRecv, 0x11111111u);
-
-            uint32_t rp = 0xdeadbeefu;
-            bool now = false;
-            bool r = ps2_syscalls::handleSoundDriverRpcService(
-                rdram, &env.runtime, 0x80000701u, 0x40u, 0u, 0u, kRecv, 16u, rp, now);
-            t.IsTrue(!r, "unconfigured layout should never claim an RPC");
-            t.Equals(readGuestStruct<uint32_t>(rdram, kRecv), 0x11111111u,
-                     "unconfigured layout should not touch guest memory");
-
-            // Game A
-            constexpr uint32_t kSidA = 0x80000701u;
-            constexpr uint32_t kStreamOpenFnoA = 0xE620u;
-            constexpr uint32_t kStreamStateA = 0x00051100u;
-            std::memset(rdram + kStreamStateA, 0, 16u);
-
-            PS2SoundDriverCompatLayout layoutA{};
-            layoutA.commandSid = kSidA;
-            layoutA.stateSid = kSidA;
-            layoutA.streamOpenFno = kStreamOpenFnoA;
-            layoutA.streamStateAddr = kStreamStateA;
-            layoutA.streamReadyValue = 3u;
-            ps2_syscalls::setSoundDriverCompatLayout(layoutA);
-
-            rp = 0xdeadbeefu;
-            now = false;
-            r = ps2_syscalls::handleSoundDriverRpcService(
-                rdram, &env.runtime, kSidA, kStreamOpenFnoA, 0u, 0u, 0u, 0u, rp, now);
-            t.IsTrue(r, "game A streamOpen should be handled");
-            t.Equals(readGuestStruct<uint32_t>(rdram, kStreamStateA), 3u,
-                     "game A streamStateAddr should be updated with game A's ready value");
-
-            ps2_syscalls::clearSoundDriverCompatLayout();
-
-            // Game B, distinct sid/fno numbers.
-            constexpr uint32_t kSidB = 0x12340000u;
-            constexpr uint32_t kStreamOpenFnoB = 0x77u;
-            constexpr uint32_t kStreamStateB = 0x00051200u;
-            std::memset(rdram + kStreamStateB, 0, 16u);
-
-            PS2SoundDriverCompatLayout layoutB{};
-            layoutB.commandSid = kSidB;
-            layoutB.stateSid = kSidB;
-            layoutB.streamOpenFno = kStreamOpenFnoB;
-            layoutB.streamStateAddr = kStreamStateB;
-            layoutB.streamReadyValue = 9u;
-            ps2_syscalls::setSoundDriverCompatLayout(layoutB);
-
-            rp = 0xdeadbeefu;
-            now = false;
-            r = ps2_syscalls::handleSoundDriverRpcService(
-                rdram, &env.runtime, kSidB, kStreamOpenFnoB, 0u, 0u, 0u, 0u, rp, now);
-            t.IsTrue(r, "game B streamOpen should be handled");
-            t.Equals(readGuestStruct<uint32_t>(rdram, kStreamStateB), 9u,
-                     "game B streamStateAddr should be updated with game B's ready value");
-
-            // With the single global slot holding game B, game A's sid/fno is not served.
-            rp = 0xdeadbeefu;
-            now = false;
-            r = ps2_syscalls::handleSoundDriverRpcService(
-                rdram, &env.runtime, kSidA, kStreamOpenFnoA, 0u, 0u, 0u, 0u, rp, now);
-            t.IsTrue(!r, "game A's sid/fno should not be served once game B's layout is active");
         });
 
         tc.Run("SifCallRpc falls back to stack ABI when register pack is implausible", [](TestCase &t)
@@ -1081,56 +626,5 @@ void register_ps2_sif_rpc_tests()
                      "recv payload should match stack-selected transfer size");
         });
 
-        tc.Run("SifCallRpc prefers stack ABI for DTX URPC when both packs look plausible", [](TestCase &t)
-        {
-            TestEnv env;
-            setRecvxDtxCompatLayout();
-
-            constexpr uint32_t kClientAddr = 0x0002B000u;
-            constexpr uint32_t kDtxSid = 0x7D000000u;
-            constexpr uint32_t kSendAddr = 0x0002B100u;
-            constexpr uint32_t kRecvStackAddr = 0x0002B200u;
-            constexpr uint32_t kRecvRegAddr = 0x0002B300u;
-
-            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
-
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, kDtxSid);
-            setRegU32(env.ctx, 6, 0u);
-            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should succeed for DTX sid");
-
-            writeGuestU32(env.rdram.data(), kSendAddr + 0x00u, 1u);        // mode
-            writeGuestU32(env.rdram.data(), kSendAddr + 0x04u, 0x1E21440u); // wk addr
-            writeGuestU32(env.rdram.data(), kSendAddr + 0x08u, 0x100u);      // wk size
-            writeGuestU32(env.rdram.data(), kRecvStackAddr, 0u);
-            writeGuestU32(env.rdram.data(), kRecvRegAddr, 0u);
-
-            setRegU32(env.ctx, 29, K_STACK_ADDR);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 12u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, kRecvStackAddr);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, 4u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x1Cu, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x20u, 0u);
-            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, 0u);
-
-            setRegU32(env.ctx, 4, kClientAddr);
-            setRegU32(env.ctx, 5, 0x422u); // DTX URPC command 34 (SJUNI create)
-            setRegU32(env.ctx, 6, 0u);
-            setRegU32(env.ctx, 7, kSendAddr);
-            // Plausible but intentionally wrong register-side packed args.
-            setRegU32(env.ctx, 8, 4u);
-            setRegU32(env.ctx, 9, kRecvRegAddr);
-            setRegU32(env.ctx, 10, 12u);
-            setRegU32(env.ctx, 11, 0u);
-
-            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifCallRpc should succeed for DTX URPC");
-
-            const uint32_t stackHandle = readGuestStruct<uint32_t>(env.rdram.data(), kRecvStackAddr);
-            const uint32_t regHandle = readGuestStruct<uint32_t>(env.rdram.data(), kRecvRegAddr);
-            t.IsTrue(stackHandle != 0u, "DTX handle should be written to stack-selected recv buffer");
-            t.Equals(regHandle, 0u, "register recv buffer should remain untouched when stack ABI is preferred");
-        });
     });
 }

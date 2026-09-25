@@ -7,7 +7,6 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
-#include "runtime/ps2_iop_cpu.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -18,12 +17,15 @@
 #include "Kernel/Syscalls/Thread.h"
 #include "Kernel/Syscalls/Interrupt.h"
 #include "ps2_host_backend.h"
+#include "ps2_iop_host.h"
+#include "ps2x/iop/iop_subsystem.h"
 #include "runtime/ps2_diag.h"
 #include "runtime/ps2_guestwatch.h"
 #include "recomp_debug_ipc.h"
 #include "recomp_debug_writer.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <fstream>
 #include <algorithm>
 #include <array>
@@ -505,6 +507,48 @@ namespace
     };
 
     thread_local DispatchHistorySlot g_dispatchHistorySlots[kDispatchHistorySlots];
+
+    bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open())
+        {
+            return false;
+        }
+
+        static const std::array<uint32_t, 256> table = []
+        {
+            std::array<uint32_t, 256> values{};
+            for (uint32_t i = 0; i < values.size(); ++i)
+            {
+                uint32_t value = i;
+                for (uint32_t bit = 0; bit < 8; ++bit)
+                {
+                    value = (value & 1u) ? (0xEDB88320u ^ (value >> 1u)) : (value >> 1u);
+                }
+                values[i] = value;
+            }
+            return values;
+        }();
+
+        uint32_t crc = 0xFFFFFFFFu;
+        std::array<uint8_t, 16 * 1024> buffer{};
+        while (file.good())
+        {
+            file.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize count = file.gcount();
+            for (std::streamsize i = 0; i < count; ++i)
+            {
+                crc = table[(crc ^ buffer[static_cast<size_t>(i)]) & 0xFFu] ^ (crc >> 8u);
+            }
+        }
+        if (file.bad())
+        {
+            return false;
+        }
+        crcOut = ~crc;
+        return true;
+    }
 
     // Used when no guest thread is current: host workers, the watchdog, and
     // anything dispatching before the scheduler is bound. This is the
@@ -1367,9 +1411,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
 PS2Runtime::PS2Runtime()
 {
-    // m_iopHost/m_iopSubsystem construction deferred to Phase 7 (ps2xIOP
-    // bridge) -- PS2IopHostAdapter/ps2x::iop::IopSubsystem are forward-declared
-    // only in ps2_runtime.h with no definition anywhere in the tree yet.
+    m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
+    m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
 
     // Assign rather than memset: R5900Context's constructor zeroes itself and
@@ -1450,8 +1494,6 @@ PS2Runtime::~PS2Runtime()
     {
         requestStop();
         // Fiber pool is cleaned up by scheduler_shutdown() in run().
-        // m_iopHost/m_iopSubsystem reset deferred to Phase 7 -- those members
-        // don't exist yet, only the forward-declared types (ps2_runtime.h).
 #if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
@@ -1486,6 +1528,62 @@ PS2Runtime::~PS2Runtime()
     }
 }
 
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->loadModule(path, arguments, argumentSize);
+}
+
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
+}
+
+bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->stopModule(moduleId, result);
+}
+
+ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const
+{
+    return m_iopSubsystem->selectRpcAbi(request);
+}
+
+bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
+{
+    return m_iopSubsystem->canBindRpc(sid);
+}
+
+ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
+{
+    auto scope = m_iopHost->enterCall(ctx, rdram);
+    request.callToken = scope.token();
+    return m_iopSubsystem->handleRpc(request);
+}
+
+void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
+{
+    auto scope = m_iopHost->enterCall(nullptr, rdram);
+    m_iopSubsystem->onSifTransfer(transfer);
+}
+
+void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+{
+    m_iopSubsystem->runEeCycles(eeCycles);
+}
+
+void PS2Runtime::resetIop()
+{
+    m_iopSubsystem->reset();
+}
+
+ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
+{
+    return m_iopSubsystem->debugSnapshot();
+}
+
 namespace
 {
     // Counts nonzero bytes in a buffer. Called once per MSCAL (~30/frame) over
@@ -1508,6 +1606,36 @@ void PS2Runtime::probeVu1MemoryOccupancy()
                                 countNonzeroBytes(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE));
     ps2_pipeline_stats::noteMax(ps2_pipeline_stats::g_vu1DataNonzero,
                                 countNonzeroBytes(m_memory.getVU1Data(), PS2_VU1_DATA_SIZE));
+}
+
+uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
+{
+    return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
+}
+
+bool PS2Runtime::freeIopMemory(uint32_t address)
+{
+    return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
+}
+
+bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
+{
+    return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
+}
+
+bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
+{
+    return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
+}
+
+bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
+{
+    return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
+}
+
+bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+{
+    return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
 }
 
 bool PS2Runtime::syncCoreSubsystems()
@@ -1585,8 +1713,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
-    m_iop.init(rdram);
-    m_iop.reset();
+    resetIop();
     m_vu0.reset();
     m_vu1.reset();
 
@@ -1866,7 +1993,30 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
 
     m_loadedModules.push_back(module);
 
-    ps2_game_overrides::applyMatching(*this, elfPath, m_cpuContext.pc);
+    uint32_t elfCrc32 = 0u;
+    const bool elfCrc32Valid = computeFileCrc32(elfPath, elfCrc32);
+    if (!elfCrc32Valid)
+    {
+        std::cerr << "[ps2xIOP] failed to compute ELF CRC32 for '" << elfPath << "'" << std::endl;
+    }
+    ps2x::iop::GameIdentity identity;
+    identity.elfName = module.name;
+    identity.entryPoint = m_cpuContext.pc;
+    identity.crc32 = elfCrc32;
+    std::string romError;
+    if (!m_romDevice.configure(identity, &romError))
+    {
+        std::cerr << "[ROM0] failed to configure profile: " << romError << std::endl;
+        return false;
+    }
+
+    m_iopSubsystem->reset();
+
+    ps2_game_overrides::applyMatching(*this,
+                                      elfPath,
+                                      m_cpuContext.pc,
+                                      elfCrc32,
+                                      elfCrc32Valid);
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
@@ -2524,7 +2674,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
-            return true;
+            // if you need the app to keep open to open debug pannel change this to false
+            return false;
         }
 
         return false;
@@ -3583,7 +3734,7 @@ void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
-    ps2_syscalls::resetSoundDriverRpcState();
+    resetIop();
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetMpegStubState();
     initializeEeKernelState(m_memory.getRDRAM());
@@ -3773,14 +3924,6 @@ void PS2Runtime::run()
             std::cerr << std::dec << " (log capacity " << kOrderLogSize << ")"
                       << std::endl;
         }
-    }
-
-    // Optional R3000A IOP-core self-test (env PS2_IOP_CPU_SELFTEST=1): runs a
-    // hand-assembled program in (still-zeroed) IOP RAM before the guest starts.
-    if (const char *st = std::getenv("PS2_IOP_CPU_SELFTEST"); st && *st && *st != '0')
-    {
-        IopCpu iopCpu(&m_memory);
-        iopCpu.selfTest();
     }
 
     // A blank image to use as a framebuffer
@@ -6744,6 +6887,7 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+
             }
         });
 

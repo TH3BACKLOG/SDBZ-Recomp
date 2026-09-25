@@ -364,12 +364,6 @@ namespace
         ctx->pc = 0u;
     }
 
-    std::atomic<uint32_t> gMpegStreamCallbackCount{0u};
-    std::atomic<uint32_t> gMpegStreamCallbackMpeg{0u};
-    std::atomic<uint32_t> gMpegStreamCallbackType{0u};
-    std::atomic<uint32_t> gMpegStreamCallbackDataAddr{0u};
-    std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
-    std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
 
     void testRecordMpegStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {

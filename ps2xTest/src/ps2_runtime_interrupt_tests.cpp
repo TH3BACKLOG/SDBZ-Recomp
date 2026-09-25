@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
+#include "runtime/ee_scheduler.h"
 #include "Stubs/DMA.h"
 #include "Syscalls/Interrupt.h"
 #include "runtime/ps2_gs_gpu.h"

@@ -467,11 +467,8 @@ namespace ps2_game_overrides
         return runtime.replaceFunction(address, resolved.value());
     }
 
-    void applyMatching(PS2Runtime &runtime, const std::string &elfPath, uint32_t entry)
+    void applyMatching(PS2Runtime &runtime, const std::string &elfPath, uint32_t entry, uint32_t crc32, bool crc32Valid)
     {
-        ps2_syscalls::clearSoundDriverCompatLayout();
-        ps2_syscalls::clearDtxCompatLayout();
-
         std::vector<Descriptor> descriptors;
         {
             std::lock_guard<std::mutex> lock(registryMutex());
@@ -483,9 +480,11 @@ namespace ps2_game_overrides
         // loop over an empty vector already does nothing.
 
         const std::string elfName = basenameFromPath(elfPath);
-        uint32_t fileCrc32 = 0u;
-        bool fileCrcComputed = false;
-        bool fileCrcValid = false;
+        // A caller that already has the ELF CRC (PS2Runtime::loadELF) passes it in;
+        // otherwise it is computed lazily below the first time a descriptor needs it.
+        uint32_t fileCrc32 = crc32;
+        bool fileCrcComputed = crc32Valid;
+        bool fileCrcValid = crc32Valid;
 
         size_t appliedCount = 0;
         for (const Descriptor &descriptor : descriptors)
@@ -552,63 +551,6 @@ namespace ps2_game_overrides
 
 namespace
 {
-    void applyRecvxSoundDriverCompat(PS2Runtime &runtime)
-    {
-        (void)runtime;
-
-        // Trying to explain a bit of Resident Evil Code: Veronica X sound-driver guest globals.
-        // Update these guest addresses/callback PCs when porting the override to another build:
-        // - checksum tables back the SE/MIDI status values mirrored through the snddrv RPC stubs
-        // - busyFlagAddr is the guest-side "work in progress" word cleared on completion
-        // - completion/clearBusy callbacks are guest PCs reached when async snddrv work finishes
-        PS2SoundDriverCompatLayout layout{};
-        layout.primarySeCheckAddr = 0x01E0EF10u;
-        layout.primaryMidiCheckAddr = 0x01E0EF20u;
-        layout.fallbackSeCheckAddr = 0x01E1EF10u;
-        layout.fallbackMidiCheckAddr = 0x01E1EF20u;
-        layout.busyFlagAddr = 0x01E212C8u;
-        layout.completionCallbacks = {0x002EAC20u, 0x002EAC30u, 0x002FAC20u, 0x002FAC30u};
-        layout.clearBusyCallbacks = {0x002EAC30u, 0x002FAC30u};
-
-        // SID + subcommand (fno) numbers RE:CVX's sound driver speaks; carried per-game
-        // so its getStatus RPC provisions the status/addr-table pool the
-        // sceSifGetOtherData checksum backfill depends on. The submit path (SID 0 /
-        // fno 0, never a live service) is intentionally left unconfigured.
-        layout.stateSid = 1u;
-        layout.getStatusFno = 0x12u;
-        layout.getAddrTableFno = 0x13u;
-        ps2_syscalls::setSoundDriverCompatLayout(layout);
-    }
-
-    void applyRecvxDtxCompat(PS2Runtime &runtime)
-    {
-        (void)runtime;
-
-        // Trying to explain abit of Resident Evil Code: Veronica X DTX guest layout.
-        // Update these guest values when porting the middleware override to another build:
-        // - rpcSid identifies the DTX RPC service the guest binds/registers
-        // - urpc object/table addresses back the SJX/PS2RNA/SJRMT command tables
-        // - dispatcherFuncAddr is the guest-side DTX RPC handler used for URPC dispatch
-        PS2DtxCompatLayout layout{};
-        layout.rpcSid = 0x7D000000u;
-        layout.urpcObjBase = 0x01F18000u;
-        layout.urpcObjLimit = 0x01F1FF00u;
-        layout.urpcObjStride = 0x20u;
-        layout.urpcFnTableBase = 0x0034FED0u;
-        layout.urpcObjTableBase = 0x0034FFD0u;
-        layout.dispatcherFuncAddr = 0x002FABC0u;
-        ps2_syscalls::setDtxCompatLayout(layout);
-    }
-
-    void applyLotrSoundRpcCompat(PS2Runtime &runtime)
-    {
-        (void)runtime;
-
-        PS2SoundDriverCompatLayout layout{};
-        layout.completionCallbacks = {0x001FFD70u, 0u, 0u, 0u};
-        ps2_syscalls::setSoundDriverCompatLayout(layout);
-    }
-
     // Kernel store-word/eret thunk at 0x17F5D0 — recompiler truncated it to one
     // instruction (mfc0) with no pc advance, livelocking the dispatch loop.
     // Real body (recovered from raw ELF bytes + sibling wrapper thunks at
@@ -9473,9 +9415,6 @@ namespace
                   << std::endl;
     }
 
-    PS2_REGISTER_GAME_OVERRIDE("RECVX sound-driver compat", "slus_201.84", 0u, 0u, &applyRecvxSoundDriverCompat);
-    PS2_REGISTER_GAME_OVERRIDE("RECVX DTX compat", "slus_201.84", 0u, 0u, &applyRecvxDtxCompat);
-    PS2_REGISTER_GAME_OVERRIDE("LotR sound RPC compat", "SLUS_205.78", 0u, 0u, &applyLotrSoundRpcCompat);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ kernel thunk fixes", "SLUS_214.42", 0u, 0u, &applySdbzKernelThunkFixes);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ loadfile signature-gate seed", "SLUS_214.42", 0u, 0u, &applySdbzLoadfileSeed);
     PS2_REGISTER_GAME_OVERRIDE("SDBZ frame-trace measurement", "SLUS_214.42", 0u, 0u, &applySdbzFrameTrace);

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <functional>
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -31,10 +32,12 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu.h"
-#include "runtime/ps2_iop.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_rom_device.h"
+#include "runtime/ps2_vfs.h"
+#include "ps2x/iop/iop_types.h"
 
 namespace ps2x::iop
 {
@@ -481,6 +484,17 @@ public:
     bool loadELF(const std::string &elfPath);
     void run();
 
+    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
+    [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
+    uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
+    bool freeIopMemory(uint32_t address);
+    bool readIopMemory(uint32_t address, void *destination, size_t size) const;
+    bool writeIopMemory(uint32_t address, const void *source, size_t size);
+    bool zeroIopMemory(uint32_t address, size_t size);
+    bool isIopMemoryRange(uint32_t address, size_t size) const;
+
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
                              DebugUiCallback drawCallback,
@@ -638,12 +652,14 @@ public:
     inline VU1Interpreter &vu1() { return m_vu1; }
     inline const VU1Interpreter &vu1() const { return m_vu1; }
 
-    inline ps2_iop &iop() { return m_iop; }
-    inline const ps2_iop &iop() const { return m_iop; }
     inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
     inline PSPadBackend &padBackend() { return m_padBackend; }
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
+    inline PS2RomDevice &romDevice() { return m_romDevice; }
+    inline const PS2RomDevice &romDevice() const { return m_romDevice; }
+    inline PS2Vfs &vfs() { return m_vfs; }
+    inline const PS2Vfs &vfs() const { return m_vfs; }
 
 private:
     struct GuestHeapBlock
@@ -666,18 +682,26 @@ private:
     void coalesceGuestHeapLocked();
 
     void HandleIntegerOverflow(R5900Context *ctx);
+    [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
+    [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
+    [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
+    void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
+    void advanceIopEeCycles(uint64_t eeCycles) noexcept;
+    void resetIop();
 
-    // ps2x::iop bridge methods (selectIopRpcAbi/handleIopRpc/notifyIopSifTransfer/resetIop)
-    // deferred to Phase 7 — ps2_iop_host.cpp/PS2IopTransport don't exist in this tree yet.
+    friend class PS2IopTransport;
     friend class EeScheduler;
 
 private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
-    ps2_iop m_iop;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
+    std::unique_ptr<PS2IopHostAdapter> m_iopHost;
+    std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
+    PS2RomDevice m_romDevice;
+    PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;

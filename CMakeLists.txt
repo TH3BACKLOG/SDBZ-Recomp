@@ -99,10 +99,10 @@ if(PS2X_BUILD_RECOMP)
 endif()
 
 if(PS2X_BUILD_RUNTIME)
-    # ps2xIOP (upstream #170): self-contained static lib of IOP HLE service
-    # modules. Built but NOT yet linked into ps2_runtime -- our own R3000
-    # interpreter (ps2_iop_cpu.cpp) still owns the IOP path. This exists so
-    # cri_dtx/sdrdrv/tsnddrv can be ported across module by module.
+    # ps2xIOP (upstream #170/#244): the IOP emulator (R3000A + real IRX
+    # execution) and HLE fallbacks, linked into ps2_runtime as ps2_iop. It
+    # replaced our embedded ps2_iop*.cpp path on 2026-09-24 (those files are
+    # kept on disk, unbuilt, for reference).
     add_subdirectory("ps2xIOP")
     # ps2_runtime cannot compile without the recomp output (generated headers
     # + src/runner/), which is deliberately untracked (no game code in git).

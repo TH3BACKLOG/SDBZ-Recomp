@@ -573,9 +573,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
 
-            // Values visible to the VU program for this MSCAL.
-            // DobieStation semantics: ITOP = ITOPS; TOP = current TOPS;
-            // then TOPS/DBF are prepared for the next buffer.
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
             vif1_regs.top = runTop;
@@ -689,8 +686,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MPG)
         {
             uint32_t destAddr = (uint32_t)imm * 8u;
-            // VIF MPG semantics: NUM==0 means 256 instructions (2048 bytes).
-            // MPG payload is instruction-packed and should not be QW-aligned.
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)

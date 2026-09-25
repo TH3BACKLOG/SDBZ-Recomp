@@ -5,6 +5,11 @@ project(ps2xTest LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(gs_cache)
+endif()
+
 # Static library with test logic (no main), used by ps2xStudio
 add_library(ps2_test_function_table OBJECT
     src/test_function_table.cpp
@@ -51,6 +56,10 @@ target_link_libraries(ps2_test_lib PRIVATE
     ps2_runtime
     ps2_iop
 )
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ps2_test_lib PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 add_executable(ps2x_tests
     src/main.cpp

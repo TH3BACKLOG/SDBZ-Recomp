@@ -1,26 +1,11 @@
 #include "Common.h"
 #include "RPC.h"
-#include <cstdlib>
+#include "../../ps2_iop_transport.h"
 
 namespace ps2_syscalls
 {
     namespace
     {
-        constexpr uint32_t kSoundDriverStatusSize = 0x42u;
-        constexpr uint32_t kSoundDriverSeInfoOffset = 0x00u;
-        constexpr uint32_t kSoundDriverMidiInfoOffset = 0x0Cu;
-        constexpr uint32_t kSoundDriverMidiSumOffset = 0x1Eu;
-        constexpr uint32_t kSoundDriverSeSumOffset = 0x26u;
-        constexpr uint32_t kSoundDriverAddrTableEntries = 16u;
-        constexpr uint32_t kSoundDriverHdRegionSize = 0x4000u;
-        constexpr uint32_t kSoundDriverSqRegionSize = 0x18000u;
-        constexpr uint32_t kSoundDriverDataRegionSize = 0x40000u;
-        constexpr uint32_t kSoundDriverStatusAlignment = 0x100u;
-        constexpr uint32_t kSoundDriverAddrTableAlignment = 0x100u;
-        constexpr uint32_t kSoundDriverStorageAlignment = 0x1000u;
-        constexpr uint32_t kSoundDriverGuestPoolBase = 0x00120000u;
-        constexpr uint32_t kSoundDriverGuestPoolLimit = 0x00200000u;
-
         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
         {
             SifRpcDebugEvent event{};
@@ -43,1203 +28,116 @@ namespace ps2_syscalls
             pushSifRpcDebugEventLocked(event);
         }
 
-        void resetDtxRpcStateUnlocked()
+        void fillRpcDebugPreview(const uint8_t *rdram, uint32_t addr, uint32_t size, uint8_t *preview, uint32_t &previewSize)
         {
-            g_dtx_remote_by_id.clear();
-            g_dtx_transfer_by_id.clear();
-            g_dtx_sjx_by_handle.clear();
-            g_dtx_ps2rna_by_handle.clear();
-            g_dtx_sjrmt_by_handle.clear();
-            g_dtx_next_urpc_obj = g_dtxCompatLayout.urpcObjBase;
-        }
-
-        bool readGuestU16(const uint8_t *rdram, uint32_t addr, uint16_t &out)
-        {
-            const uint8_t *ptr = getConstMemPtr(rdram, addr);
-            if (!ptr)
-            {
-                out = 0u;
-                return false;
-            }
-            std::memcpy(&out, ptr, sizeof(out));
-            return true;
-        }
-
-        bool readGuestS16(const uint8_t *rdram, uint32_t addr, int16_t &out)
-        {
-            const uint8_t *ptr = getConstMemPtr(rdram, addr);
-            if (!ptr)
-            {
-                out = 0;
-                return false;
-            }
-            std::memcpy(&out, ptr, sizeof(out));
-            return true;
-        }
-
-        bool writeGuestU16(uint8_t *rdram, uint32_t addr, uint16_t value)
-        {
-            uint8_t *ptr = getMemPtr(rdram, addr);
-            if (!ptr)
-            {
-                return false;
-            }
-            std::memcpy(ptr, &value, sizeof(value));
-            return true;
-        }
-
-        bool writeGuestS16(uint8_t *rdram, uint32_t addr, int16_t value)
-        {
-            uint8_t *ptr = getMemPtr(rdram, addr);
-            if (!ptr)
-            {
-                return false;
-            }
-            std::memcpy(ptr, &value, sizeof(value));
-            return true;
-        }
-
-        bool readGuestU32(const uint8_t *rdram, uint32_t addr, uint32_t &out)
-        {
-            const uint8_t *ptr = getConstMemPtr(rdram, addr);
-            if (!ptr)
-            {
-                out = 0u;
-                return false;
-            }
-            std::memcpy(&out, ptr, sizeof(out));
-            return true;
-        }
-
-        bool writeGuestU32(uint8_t *rdram, uint32_t addr, uint32_t value)
-        {
-            uint8_t *ptr = getMemPtr(rdram, addr);
-            if (!ptr)
-            {
-                return false;
-            }
-            std::memcpy(ptr, &value, sizeof(value));
-            return true;
-        }
-
-        // ---- SIF SET_SREG (cid 0x80000001) round-trip bridge -----------------
-        // The EE writes a soft-register destined for the IOP; on real hardware an
-        // IRX driver replies by writing the EE-side libsifcmd _sif_sreg[] mirror,
-        // which EE code then polls (e.g. Freekstyle's audio-init wait loop). With
-        // no IOP CPU yet, echo the written value straight into that EE mirror so
-        // the poll loops progress. The mirror base is game-specific (the address
-        // of libsifcmd's _sif_sreg[]); it is supplied via the env var
-        // PS2_SIF_EE_SREG_BASE (hex, 0/unset = disabled, the default). This is a
-        // deliberate temporary bridge that running the real IRX modules replaces.
-        uint32_t eeSregMirrorBase()
-        {
-            static const uint32_t base = []() -> uint32_t {
-                const char *s = std::getenv("PS2_SIF_EE_SREG_BASE");
-                if (!s || !*s)
-                {
-                    return 0u;
-                }
-                return static_cast<uint32_t>(std::strtoul(s, nullptr, 0));
-            }();
-            return base;
-        }
-
-        // Locate the 24-byte SET_SREG packet among the candidate argument
-        // registers (calling conventions vary per game) and read {index, value}
-        // from packet+0x10 / packet+0x14.
-        bool decodeSetSregPacket(const uint8_t *rdram,
-                                 const uint32_t *candidates, size_t count,
-                                 uint32_t &index, uint32_t &value)
-        {
-            for (size_t i = 0; i < count; ++i)
-            {
-                const uint32_t cand = candidates[i];
-                if (cand < 0x1000u || cand >= PS2_RAM_SIZE)
-                {
-                    continue; // not a plausible RAM pointer
-                }
-                uint32_t idx = 0u;
-                if (!readGuestU32(rdram, cand + 0x10u, idx) || idx >= 0x40u)
-                {
-                    continue; // sreg indices are 0..31
-                }
-                uint32_t val = 0u;
-                readGuestU32(rdram, cand + 0x14u, val);
-                index = idx;
-                value = val;
-                return true;
-            }
-            return false;
-        }
-
-        void handleSifSetSreg(uint8_t *rdram, uint32_t a1, uint32_t a2, uint32_t a3)
-        {
-            const uint32_t base = eeSregMirrorBase();
-            if (base == 0u)
-            {
-                return; // disabled unless a mirror base is configured
-            }
-            uint32_t index = 0u;
-            uint32_t value = 0u;
-            const uint32_t cands[3] = {a2, a1, a3};
-            if (!decodeSetSregPacket(rdram, cands, 3, index, value))
-            {
-                return;
-            }
-            writeGuestU32(rdram, base + index * 4u, value);
-
-            static int logCount = 0;
-            if (logCount < 32)
-            {
-                std::cerr << "[sif:set_sreg] index=0x" << std::hex << index
-                          << " value=0x" << value
-                          << " -> EEmirror[0x" << (base + index * 4u) << "]"
-                          << std::dec << std::endl;
-                ++logCount;
-            }
-        }
-
-        bool normalizeGuestLinearAddr(uint32_t addr, uint32_t &out)
-        {
-            uint32_t offset = 0u;
-            bool scratch = false;
-            if (!ps2ResolveGuestPointer(addr, offset, scratch) || scratch)
-            {
-                out = 0u;
-                return false;
-            }
-            out = offset;
-            return true;
-        }
-
-        bool hasAnyNonZero(const uint8_t *ptr, size_t bytes)
-        {
-            if (!ptr)
-            {
-                return false;
-            }
-            for (size_t i = 0; i < bytes; ++i)
-            {
-                if (ptr[i] != 0u)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        uint32_t alignUp(uint32_t value, uint32_t alignment)
-        {
-            if (alignment == 0u)
-            {
-                return value;
-            }
-            return (value + (alignment - 1u)) & ~(alignment - 1u);
-        }
-
-        void resetSoundDriverRpcStateUnlocked()
-        {
-            const PS2SoundDriverCompatLayout compat = g_soundDriverCompatLayout;
-            g_soundDriverRpcState = {};
-            g_soundDriverCompatLayout = compat;
-        }
-
-        void adoptSoundDriverRuntimeUnlocked(PS2Runtime *runtime)
-        {
-            const uintptr_t runtimeCookie = reinterpret_cast<uintptr_t>(runtime);
-            if (g_soundDriverRpcState.ownerRuntime != runtimeCookie)
-            {
-                resetSoundDriverRpcStateUnlocked();
-                g_soundDriverRpcState.ownerRuntime = runtimeCookie;
-            }
-        }
-
-        bool checkSoundDriverMemoryUnlocked(uint8_t *rdram, PS2Runtime *runtime)
-        {
-            if (!rdram || !runtime)
-            {
-                return false;
-            }
-
-            adoptSoundDriverRuntimeUnlocked(runtime);
-
-            if (g_soundDriverRpcState.statusAddr == 0u)
-            {
-                const uint32_t statusAddr = alignUp(kSoundDriverGuestPoolBase, kSoundDriverStatusAlignment);
-                const uint32_t addrTableAddr =
-                    alignUp(statusAddr + kSoundDriverStatusSize, kSoundDriverAddrTableAlignment);
-                const uint32_t hdBaseAddr =
-                    alignUp(addrTableAddr + (kSoundDriverAddrTableEntries * sizeof(uint32_t)), kSoundDriverStorageAlignment);
-                const uint32_t sqBaseAddr = alignUp(hdBaseAddr + kSoundDriverHdRegionSize, kSoundDriverStorageAlignment);
-                const uint32_t dataBaseAddr = alignUp(sqBaseAddr + kSoundDriverSqRegionSize, kSoundDriverStorageAlignment);
-                const uint32_t storageEnd = dataBaseAddr + kSoundDriverDataRegionSize;
-                if (storageEnd > kSoundDriverGuestPoolLimit)
-                {
-                    return false;
-                }
-
-                g_soundDriverRpcState.statusAddr = statusAddr;
-                g_soundDriverRpcState.addrTableAddr = addrTableAddr;
-                g_soundDriverRpcState.hdBaseAddr = hdBaseAddr;
-                g_soundDriverRpcState.sqBaseAddr = sqBaseAddr;
-                g_soundDriverRpcState.dataBaseAddr = dataBaseAddr;
-                g_soundDriverRpcState.storageBaseAddr = hdBaseAddr;
-                g_soundDriverRpcState.storageSize =
-                    (dataBaseAddr + kSoundDriverDataRegionSize) - hdBaseAddr;
-            }
-
-            if (g_soundDriverRpcState.statusAddr == 0u ||
-                g_soundDriverRpcState.addrTableAddr == 0u ||
-                g_soundDriverRpcState.storageBaseAddr == 0u)
-            {
-                return false;
-            }
-
-            if (!g_soundDriverRpcState.initialized)
-            {
-                rpcZeroRdram(rdram, g_soundDriverRpcState.statusAddr, kSoundDriverStatusSize);
-                rpcZeroRdram(rdram,
-                             g_soundDriverRpcState.addrTableAddr,
-                             kSoundDriverAddrTableEntries * sizeof(uint32_t));
-                rpcZeroRdram(rdram, g_soundDriverRpcState.storageBaseAddr, g_soundDriverRpcState.storageSize);
-                (void)writeGuestU32(rdram, g_soundDriverRpcState.addrTableAddr + (0u * sizeof(uint32_t)), g_soundDriverRpcState.hdBaseAddr);
-                (void)writeGuestU32(rdram, g_soundDriverRpcState.addrTableAddr + (1u * sizeof(uint32_t)), g_soundDriverRpcState.sqBaseAddr);
-                (void)writeGuestU32(rdram, g_soundDriverRpcState.addrTableAddr + (2u * sizeof(uint32_t)), g_soundDriverRpcState.dataBaseAddr);
-                g_soundDriverRpcState.initialized = true;
-            }
-
-            return true;
-        }
-
-        int16_t soundDriverCheckValue(const uint8_t *rdram, uint32_t primaryBase, uint32_t fallbackBase, uint32_t index, uint32_t count)
-        {
-            if (index >= count)
-            {
-                return 0;
-            }
-
-            int16_t value = 0;
-            if (readGuestS16(rdram, primaryBase + (index * sizeof(int16_t)), value) && value != 0)
-            {
-                return value;
-            }
-
-            (void)readGuestS16(rdram, fallbackBase + (index * sizeof(int16_t)), value);
-            return value;
-        }
-
-        bool selectSoundDriverCompatChecks(const uint8_t *rdram, uint32_t &seBase, uint32_t &midiBase)
-        {
-            const PS2SoundDriverCompatLayout &compat = g_soundDriverCompatLayout;
-            if (!compat.hasChecksumTables())
-            {
-                return false;
-            }
-
-            seBase = compat.primarySeCheckAddr;
-            midiBase = compat.primaryMidiCheckAddr;
-
-            const uint8_t *selectedSe = getConstMemPtr(rdram, seBase);
-            const uint8_t *selectedMidi = getConstMemPtr(rdram, midiBase);
-            const bool primaryLooksLive =
-                hasAnyNonZero(selectedSe, 5u * sizeof(int16_t)) ||
-                hasAnyNonZero(selectedMidi, 4u * sizeof(int16_t));
-
-            if ((!selectedSe || !selectedMidi) || !primaryLooksLive)
-            {
-                const uint8_t *fallbackSe = getConstMemPtr(rdram, compat.fallbackSeCheckAddr);
-                const uint8_t *fallbackMidi = getConstMemPtr(rdram, compat.fallbackMidiCheckAddr);
-                const bool fallbackLooksLive =
-                    hasAnyNonZero(fallbackSe, 5u * sizeof(int16_t)) ||
-                    hasAnyNonZero(fallbackMidi, 4u * sizeof(int16_t));
-                if (fallbackLooksLive)
-                {
-                    seBase = compat.fallbackSeCheckAddr;
-                    midiBase = compat.fallbackMidiCheckAddr;
-                    return true;
-                }
-            }
-
-            return selectedSe != nullptr && selectedMidi != nullptr;
-        }
-
-        void backfillSoundDriverStatusFromCompatUnlocked(uint8_t *rdram)
-        {
-            if (!rdram || g_soundDriverRpcState.statusAddr == 0u || !g_soundDriverCompatLayout.hasChecksumTables())
+            previewSize = 0u;
+            if (!rdram || !addr || !preview || size == 0u)
             {
                 return;
             }
 
-            uint32_t seBase = 0u;
-            uint32_t midiBase = 0u;
-            if (!selectSoundDriverCompatChecks(rdram, seBase, midiBase))
+            const uint32_t count = std::min<uint32_t>(size, static_cast<uint32_t>(kSifRpcDebugPreviewBytes));
+            for (uint32_t i = 0; i < count; ++i)
             {
-                return;
-            }
-
-            const uint8_t *selectedSe = getConstMemPtr(rdram, seBase);
-            const uint8_t *selectedMidi = getConstMemPtr(rdram, midiBase);
-            uint8_t *status = getMemPtr(rdram, g_soundDriverRpcState.statusAddr);
-            if (!selectedSe || !selectedMidi || !status)
-            {
-                return;
-            }
-
-            auto backfillZeroS16Slots = [&](uint32_t statusOffset, const uint8_t *compatBase, uint32_t slotCount)
-            {
-                for (uint32_t slot = 0u; slot < slotCount; ++slot)
+                const uint8_t *ptr = getConstMemPtr(rdram, addr + i);
+                if (!ptr)
                 {
-                    int16_t liveValue = 0;
-                    if (!readGuestS16(rdram,
-                                      g_soundDriverRpcState.statusAddr + statusOffset + (slot * sizeof(int16_t)),
-                                      liveValue))
-                    {
-                        continue;
-                    }
-
-                    if (liveValue != 0)
-                    {
-                        continue;
-                    }
-
-                    int16_t compatValue = 0;
-                    std::memcpy(&compatValue, compatBase + (slot * sizeof(int16_t)), sizeof(compatValue));
-                    if (compatValue == 0)
-                    {
-                        continue;
-                    }
-
-                    (void)writeGuestS16(rdram,
-                                        g_soundDriverRpcState.statusAddr + statusOffset + (slot * sizeof(int16_t)),
-                                        compatValue);
+                    break;
                 }
+                preview[i] = *ptr;
+                ++previewSize;
+            }
+        }
+
+        std::string formatRpcTraceBytes(const uint8_t *bytes, uint32_t count)
+        {
+            std::string out;
+            if (!bytes || count == 0u)
+            {
+                return out;
+            }
+
+            char item[4] = {};
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                std::snprintf(item, sizeof(item), "%02X", bytes[i]);
+                if (!out.empty())
+                {
+                    out.push_back(' ');
+                }
+                out += item;
+            }
+            return out;
+        }
+
+#ifndef PS2X_ENABLE_IOP_RPC_TRACE
+#define PS2X_ENABLE_IOP_RPC_TRACE 1
+#endif
+
+#if PS2X_ENABLE_IOP_RPC_TRACE
+        std::string loadedIopModuleTraceSummary()
+        {
+            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
+            std::string out;
+            uint32_t count = 0u;
+            for (const auto &entry : g_sif_modules_by_id)
+            {
+                const SifModuleRecord &module = entry.second;
+                if (!module.loaded)
+                {
+                    continue;
+                }
+
+                if (!out.empty())
+                {
+                    out += "; ";
+                }
+                out += module.pathKey.empty() ? module.path : module.pathKey;
+                ++count;
+                if (count >= 6u)
+                {
+                    break;
+                }
+            }
+            return out;
+        }
+
+        void logUnhandledRpcTrace(const SifRpcDebugEvent &event)
+        {
+            static std::unordered_set<uint64_t> loggedSignatures;
+            if (std::strcmp(event.op ? event.op : "", "CallRpc") != 0)
+            {
+                return;
+            }
+
+            uint64_t signature = 1469598103934665603ull;
+            auto mixSignature = [&](uint32_t value)
+            {
+                signature ^= static_cast<uint64_t>(value);
+                signature *= 1099511628211ull;
             };
-
-            backfillZeroS16Slots(kSoundDriverSeSumOffset, selectedSe, 5u);
-            backfillZeroS16Slots(kSoundDriverMidiSumOffset, selectedMidi, 4u);
-        }
-
-        size_t soundDriverCommandLength(uint8_t command)
-        {
-            const uint8_t hi = static_cast<uint8_t>(command & 0xF0u);
-            switch (hi)
-            {
-            case 0x00u:
-            {
-                size_t len = 4u;
-                if ((command & 0x01u) != 0u)
-                {
-                    ++len;
-                }
-                if ((command & 0x02u) != 0u)
-                {
-                    ++len;
-                }
-                if ((command & 0x04u) != 0u)
-                {
-                    len += 2u;
-                }
-                return len;
-            }
-            case 0x10u:
-                return (command == 0x11u) ? 3u : 1u;
-            case 0x20u:
-                if (command == 0x22u || command == 0x23u || command == 0x24u || command == 0x25u)
-                {
-                    return 3u;
-                }
-                if (command == 0x26u)
-                {
-                    return 4u;
-                }
-                if (command == 0x20u)
-                {
-                    return 5u;
-                }
-                if (command == 0x27u || command == 0x28u || command == 0x29u || command == 0x2Cu || command == 0x2Du)
-                {
-                    return 8u;
-                }
-                return 2u;
-            case 0x40u:
-                if (command == 0x47u || command == 0x48u || command == 0x49u || command == 0x4Au ||
-                    command == 0x41u || command == 0x42u)
-                {
-                    return 2u;
-                }
-                if (command == 0x4Bu)
-                {
-                    return 3u;
-                }
-                if (command == 0x45u || command == 0x4Cu)
-                {
-                    return 4u;
-                }
-                if (command == 0x44u)
-                {
-                    return 6u;
-                }
-                if (command == 0x4Du || command == 0x4Eu)
-                {
-                    return 3u;
-                }
-                if (command == 0x4Fu)
-                {
-                    return 6u;
-                }
-                return 1u;
-            case 0x50u:
-            case 0x60u:
-                if (command == 0x51u || command == 0x52u || command == 0x53u || command == 0x54u)
-                {
-                    return 8u;
-                }
-                return 2u;
-            default:
-                return 0u;
-            }
-        }
-
-        void applySoundDriverCommandUnlocked(uint8_t *rdram, const uint8_t *cmd)
-        {
-            if (!rdram || !cmd || g_soundDriverRpcState.statusAddr == 0u)
+            mixSignature(event.sid);
+            mixSignature(event.rpcNum);
+            mixSignature(event.sendSize);
+            mixSignature(event.recvSize);
+            if (!loggedSignatures.insert(signature).second || loggedSignatures.size() > 128u)
             {
                 return;
             }
 
-            const uint8_t op = cmd[0];
-            switch (op)
-            {
-            case 0x20u: // SdrBgmReq
-            {
-                const uint32_t port = cmd[1] & 0x0Fu;
-                uint16_t midiInfo = 0u;
-                (void)readGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
-                midiInfo = static_cast<uint16_t>(midiInfo | static_cast<uint16_t>(1u << port));
-                (void)writeGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
-                break;
-            }
-            case 0x21u: // SdrBgmStop
-            {
-                const uint32_t port = cmd[1] & 0x0Fu;
-                uint16_t midiInfo = 0u;
-                (void)readGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
-                midiInfo = static_cast<uint16_t>(midiInfo & ~static_cast<uint16_t>(1u << port));
-                (void)writeGuestU16(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverMidiInfoOffset, midiInfo);
-                break;
-            }
-            case 0x28u: // SdrHDDataSet
-            {
-                const uint32_t port = cmd[1] & 0x0Fu;
-                const PS2SoundDriverCompatLayout &compat = g_soundDriverCompatLayout;
-                if (compat.primaryMidiCheckAddr != 0u || compat.fallbackMidiCheckAddr != 0u)
-                {
-                    const int16_t checksum =
-                        soundDriverCheckValue(rdram, compat.primaryMidiCheckAddr, compat.fallbackMidiCheckAddr, port, 4u);
-                    (void)writeGuestS16(rdram,
-                                        g_soundDriverRpcState.statusAddr + kSoundDriverMidiSumOffset + (port * sizeof(int16_t)),
-                                        checksum);
-                }
-                break;
-            }
-            case 0x29u: // SdrHDDataSet2
-            {
-                const uint32_t port = cmd[1] & 0x0Fu;
-                const PS2SoundDriverCompatLayout &compat = g_soundDriverCompatLayout;
-                if (compat.primarySeCheckAddr != 0u || compat.fallbackSeCheckAddr != 0u)
-                {
-                    const int16_t checksum =
-                        soundDriverCheckValue(rdram, compat.primarySeCheckAddr, compat.fallbackSeCheckAddr, port, 5u);
-                    (void)writeGuestS16(rdram,
-                                        g_soundDriverRpcState.statusAddr + kSoundDriverSeSumOffset + (port * sizeof(int16_t)),
-                                        checksum);
-                }
-                break;
-            }
-            case 0x10u: // SdrSeAllStop
-                rpcZeroRdram(rdram, g_soundDriverRpcState.statusAddr + kSoundDriverSeInfoOffset, 6u * sizeof(uint16_t));
-                break;
-            default:
-                break;
-            }
+            const std::string modules = loadedIopModuleTraceSummary();
+            std::cerr << "[IOP/RPC trace:unhandled]"
+                      << " sid=0x" << std::hex << event.sid
+                      << " rpc=0x" << event.rpcNum
+                      << " pc=0x" << event.pc
+                      << " ra=0x" << event.ra
+                      << " send=0x" << event.sendBuf << "/" << std::dec << event.sendSize
+                      << " recv=0x" << std::hex << event.recvBuf << "/" << std::dec << event.recvSize
+                      << " sendBytes=[" << formatRpcTraceBytes(event.sendPreview, event.sendPreviewSize) << "]"
+                      << " loadedModules=[" << modules << "]"
+                      << std::dec << std::endl;
         }
-
-        void handleSoundDriverCommandBuffer(uint8_t *rdram, PS2Runtime *runtime, uint32_t sendBuf, uint32_t sendSize)
-        {
-            if (!rdram || !runtime || !sendBuf || sendSize == 0u)
-            {
-                return;
-            }
-
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            if (!checkSoundDriverMemoryUnlocked(rdram, runtime))
-            {
-                return;
-            }
-
-            const uint8_t *packet = getConstMemPtr(rdram, sendBuf);
-            if (!packet)
-            {
-                return;
-            }
-
-            for (uint32_t offset = 0u; offset < sendSize;)
-            {
-                const uint8_t op = packet[offset];
-                if (op == 0xFFu)
-                {
-                    break;
-                }
-
-                const size_t len = soundDriverCommandLength(op);
-                if (len == 0u || (offset + len) > sendSize)
-                {
-                    break;
-                }
-
-                applySoundDriverCommandUnlocked(rdram, packet + offset);
-                offset += static_cast<uint32_t>(len);
-            }
-        }
-
-        bool handleSoundDriverRpcServiceImpl(uint8_t *rdram, PS2Runtime *runtime,
-                                             uint32_t sid, uint32_t rpcNum,
-                                             uint32_t sendBuf, uint32_t sendSize,
-                                             uint32_t recvBuf, uint32_t recvSize,
-                                             uint32_t &resultPtr,
-                                             bool &signalNowaitCompletion)
-        {
-            resultPtr = 0u;
-            signalNowaitCompletion = false;
-
-            if (!runtime || !rdram)
-            {
-                return false;
-            }
-
-            PS2SoundDriverCompatLayout compat{};
-            {
-                std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                compat = g_soundDriverCompatLayout;
-            }
-
-            if (compat.commandSid == 0u && compat.stateSid == 0u)
-            {
-                return false;
-            }
-
-            if (!compat.servesSid(sid))
-            {
-                return false;
-            }
-
-            if (compat.submitFno != 0u && rpcNum == compat.submitFno)
-            {
-                handleSoundDriverCommandBuffer(rdram, runtime, sendBuf, sendSize);
-                return true;
-            }
-
-            if ((compat.getStatusFno != 0u && rpcNum == compat.getStatusFno) ||
-                (compat.getAddrTableFno != 0u && rpcNum == compat.getAddrTableFno))
-            {
-                uint32_t responseWord = 0u;
-                {
-                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                    if (!checkSoundDriverMemoryUnlocked(rdram, runtime))
-                    {
-                        return false;
-                    }
-                    responseWord =
-                        (rpcNum == compat.getStatusFno) ? g_soundDriverRpcState.statusAddr
-                                                        : g_soundDriverRpcState.addrTableAddr;
-                }
-
-                if (recvBuf && recvSize >= sizeof(uint32_t))
-                {
-                    (void)writeGuestU32(rdram, recvBuf, responseWord);
-                    if (recvSize > sizeof(uint32_t))
-                    {
-                        rpcZeroRdram(rdram, recvBuf + sizeof(uint32_t), recvSize - sizeof(uint32_t));
-                    }
-                    resultPtr = recvBuf;
-                }
-
-                signalNowaitCompletion = true;
-                return true;
-            }
-
-            if (compat.streamOpenFno != 0u && rpcNum == compat.streamOpenFno)
-            {
-                {
-                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                    if (compat.streamStateAddr != 0u)
-                    {
-                        (void)writeGuestU32(rdram, compat.streamStateAddr, compat.streamReadyValue);
-                    }
-                }
-
-                if (recvBuf && recvSize >= sizeof(uint32_t))
-                {
-                    (void)writeGuestU32(rdram, recvBuf, 0u);
-                    resultPtr = recvBuf;
-                }
-
-                signalNowaitCompletion = true;
-                return true;
-            }
-
-            if (compat.channelConfigFno != 0u && rpcNum == compat.channelConfigFno)
-            {
-                uint32_t channel = 0u;
-                if (sendBuf != 0u)
-                {
-                    (void)readGuestU32(rdram, sendBuf, channel);
-                }
-
-                {
-                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                    if (compat.channelAllocFlagTableAddr != 0u && channel < 16u)
-                    {
-                        (void)writeGuestU32(rdram, compat.channelAllocFlagTableAddr + channel * sizeof(uint32_t), 1u);
-                    }
-                }
-
-                if (recvBuf && recvSize >= sizeof(uint32_t))
-                {
-                    (void)writeGuestU32(rdram, recvBuf, 0u);
-                    resultPtr = recvBuf;
-                }
-
-                signalNowaitCompletion = true;
-                return true;
-            }
-
-            if (compat.stopFno != 0u && rpcNum == compat.stopFno)
-            {
-                {
-                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                    if (compat.stopCompletionFlagAddr != 0u)
-                    {
-                        (void)writeGuestU32(rdram, compat.stopCompletionFlagAddr, 1u);
-                    }
-                }
-
-                if (recvBuf && recvSize >= sizeof(uint32_t))
-                {
-                    (void)writeGuestU32(rdram, recvBuf, 0u);
-                    resultPtr = recvBuf;
-                }
-
-                signalNowaitCompletion = true;
-                return true;
-            }
-
-            if (recvBuf && recvSize >= sizeof(uint32_t))
-            {
-                (void)writeGuestU32(rdram, recvBuf, compat.benignStatusValue);
-            }
-
-            return false;
-        }
-
-    } // namespace
-
-    bool handleSoundDriverRpcService(uint8_t *rdram, PS2Runtime *runtime,
-                                     uint32_t sid, uint32_t rpcNum,
-                                     uint32_t sendBuf, uint32_t sendSize,
-                                     uint32_t recvBuf, uint32_t recvSize,
-                                     uint32_t &resultPtr,
-                                     bool &signalNowaitCompletion)
-    {
-        return handleSoundDriverRpcServiceImpl(rdram, runtime,
-                                               sid, rpcNum,
-                                               sendBuf, sendSize,
-                                               recvBuf, recvSize,
-                                               resultPtr,
-                                               signalNowaitCompletion);
-    }
-
-    namespace
-    {
-
-        const char *dtxUrpcCommandName(uint32_t command)
-        {
-            switch (command)
-            {
-            case 0u:
-                return "SJX_CREATE";
-            case 1u:
-                return "SJX_DESTROY";
-            case 2u:
-                return "SJX_RESET";
-            case 3u:
-                return "SJX_REINIT";
-            case 8u:
-                return "PS2RNA_CREATE";
-            case 9u:
-                return "PS2RNA_DESTROY";
-            case 10u:
-                return "PS2RNA_REINIT";
-            case 32u:
-                return "SJRMT_RBF_CREATE";
-            case 33u:
-                return "SJRMT_MEM_CREATE";
-            case 34u:
-                return "SJRMT_UNI_CREATE";
-            case 35u:
-                return "SJRMT_DESTROY";
-            case 36u:
-                return "SJRMT_GET_UUID";
-            case 37u:
-                return "SJRMT_RESET";
-            case 38u:
-                return "SJRMT_GET_CHUNK";
-            case 39u:
-                return "SJRMT_UNGET_CHUNK";
-            case 40u:
-                return "SJRMT_PUT_CHUNK";
-            case 41u:
-                return "SJRMT_GET_NUM_DATA";
-            case 42u:
-                return "SJRMT_IS_GET_CHUNK";
-            case 43u:
-                return "SJRMT_INIT";
-            case 44u:
-                return "SJRMT_FINISH";
-            default:
-                return "UNKNOWN";
-            }
-        }
-
-        const char *dtxStreamName(uint32_t streamId)
-        {
-            switch (streamId)
-            {
-            case 0u:
-                return "room";
-            case 1u:
-                return "data";
-            default:
-                return "other";
-            }
-        }
-
-        bool dtxMatchesTransfer(const DtxTransferState &state, uint32_t srcAddr, uint32_t dstAddr, uint32_t sizeBytes)
-        {
-            (void)dstAddr;
-            return state.eeWorkAddr != 0u &&
-                   state.wkSize >= 64u &&
-                   state.eeWorkAddr == srcAddr &&
-                   state.wkSize == sizeBytes;
-        }
-
-        bool dtxHasReadableRange(const uint8_t *rdram, uint32_t addr, uint32_t len)
-        {
-            if (len == 0u)
-            {
-                return true;
-            }
-            if (addr > (addr + len - 1u))
-            {
-                return false;
-            }
-            return getConstMemPtr(rdram, addr) && getConstMemPtr(rdram, addr + len - 1u);
-        }
-
-        bool dtxReadValidCommandCount(const uint8_t *rdram, uint32_t workAddr, uint32_t workSize,
-                                      uint32_t &commandCount)
-        {
-            constexpr uint32_t kDtxHeaderSize = 16u;
-            constexpr uint32_t kDtxCommandSize = 16u;
-
-            commandCount = 0u;
-            if (workSize < 64u || !readGuestU32(rdram, workAddr, commandCount))
-            {
-                return false;
-            }
-            if (commandCount == 0u || commandCount > 128u)
-            {
-                return false;
-            }
-
-            const uint64_t commandBytes = static_cast<uint64_t>(commandCount) * kDtxCommandSize;
-            const uint64_t requiredBytes = kDtxHeaderSize + commandBytes + sizeof(uint32_t);
-            return requiredBytes <= workSize;
-        }
-
-        bool dtxLooksLikeSjxPayloadLocked(const uint8_t *rdram, uint32_t workAddr, uint32_t workSize)
-        {
-            constexpr uint32_t kSjxHeaderSize = 16u;
-            constexpr uint32_t kSjxCommandSize = 16u;
-
-            uint32_t commandCount = 0u;
-            if (!dtxReadValidCommandCount(rdram, workAddr, workSize, commandCount))
-            {
-                return false;
-            }
-
-            for (uint32_t i = 0; i < commandCount; ++i)
-            {
-                const uint32_t cmdAddr = workAddr + kSjxHeaderSize + (i * kSjxCommandSize);
-                const uint8_t *cmdPtr = getConstMemPtr(rdram, cmdAddr);
-                if (!cmdPtr)
-                {
-                    break;
-                }
-
-                const uint8_t cmdNo = cmdPtr[0];
-                const uint8_t cmdLine = cmdPtr[1];
-                uint16_t cmdXid = 0u;
-                uint32_t sjxHandle = 0u;
-                uint32_t chunkDataAddr = 0u;
-                uint32_t chunkLen = 0u;
-                std::memcpy(&cmdXid, cmdPtr + 2u, sizeof(cmdXid));
-                std::memcpy(&sjxHandle, cmdPtr + 4u, sizeof(sjxHandle));
-                std::memcpy(&chunkDataAddr, cmdPtr + 8u, sizeof(chunkDataAddr));
-                std::memcpy(&chunkLen, cmdPtr + 12u, sizeof(chunkLen));
-
-                if (cmdNo != 0u || chunkLen == 0u || !dtxHasReadableRange(rdram, chunkDataAddr, chunkLen))
-                {
-                    continue;
-                }
-
-                auto sjxIt = g_dtx_sjx_by_handle.find(sjxHandle);
-                if (sjxIt == g_dtx_sjx_by_handle.end())
-                {
-                    continue;
-                }
-
-                const DtxSjxState &sjx = sjxIt->second;
-                if (sjx.xid != 0u && sjx.xid != cmdXid)
-                {
-                    continue;
-                }
-                if (cmdLine != sjx.line)
-                {
-                    continue;
-                }
-                if (g_dtx_sjrmt_by_handle.find(sjx.dstSjHandle) == g_dtx_sjrmt_by_handle.end())
-                {
-                    continue;
-                }
-
-                return true;
-            }
-
-            return false;
-        }
-
-        bool dtxLooksLikePs2RnaPayloadLocked(const uint8_t *rdram, uint32_t workAddr, uint32_t workSize)
-        {
-            constexpr uint32_t kPs2RnaHeaderSize = 16u;
-            constexpr uint32_t kPs2RnaCommandSize = 16u;
-
-            uint32_t commandCount = 0u;
-            if (!dtxReadValidCommandCount(rdram, workAddr, workSize, commandCount))
-            {
-                return false;
-            }
-
-            for (uint32_t i = 0; i < commandCount; ++i)
-            {
-                const uint32_t cmdAddr = workAddr + kPs2RnaHeaderSize + (i * kPs2RnaCommandSize);
-                const uint8_t *cmdPtr = getConstMemPtr(rdram, cmdAddr);
-                if (!cmdPtr)
-                {
-                    break;
-                }
-
-                uint16_t cmdNo = 0u;
-                uint32_t rnaHandle = 0u;
-                std::memcpy(&cmdNo, cmdPtr, sizeof(cmdNo));
-                std::memcpy(&rnaHandle, cmdPtr + 4u, sizeof(rnaHandle));
-
-                if (cmdNo <= 5u && g_dtx_ps2rna_by_handle.find(rnaHandle) != g_dtx_ps2rna_by_handle.end())
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        bool dtxInferTransferFromPayloadLocked(const uint8_t *rdram, uint32_t srcAddr, uint32_t dstAddr,
-                                               uint32_t sizeBytes, DtxTransferState &out)
-        {
-            if (g_dtx_transfer_by_id.empty())
-            {
-                return false;
-            }
-
-            if (dtxLooksLikeSjxPayloadLocked(rdram, srcAddr, sizeBytes))
-            {
-                out = {};
-                out.dtxId = 0u;
-                out.eeWorkAddr = srcAddr;
-                out.iopWorkAddr = dstAddr;
-                out.wkSize = sizeBytes;
-                return true;
-            }
-
-            if (dtxLooksLikePs2RnaPayloadLocked(rdram, srcAddr, sizeBytes))
-            {
-                out = {};
-                out.dtxId = 1u;
-                out.eeWorkAddr = srcAddr;
-                out.iopWorkAddr = dstAddr;
-                out.wkSize = sizeBytes;
-                return true;
-            }
-
-            return false;
-        }
-
-        bool dtxCopyBytes(uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t len)
-        {
-            for (uint32_t i = 0; i < len; ++i)
-            {
-                const uint8_t *src = getConstMemPtr(rdram, srcAddr + i);
-                uint8_t *dst = getMemPtr(rdram, dstAddr + i);
-                if (!src || !dst)
-                {
-                    return false;
-                }
-                *dst = *src;
-            }
-            return true;
-        }
-
-        void dtxAppendToSjrmtData(uint8_t *rdram, DtxSjrmtState &state, uint32_t srcDataAddr, uint32_t requestedLen)
-        {
-            if (!rdram)
-            {
-                return;
-            }
-
-            const uint32_t cap = (state.wkSize == 0u) ? 0x4000u : state.wkSize;
-            if (cap == 0u || state.wkAddr == 0u || state.roomBytes == 0u || requestedLen == 0u)
-            {
-                return;
-            }
-
-            const uint32_t requestedCopyLen = std::min(requestedLen, state.roomBytes);
-            uint32_t copiedLen = 0u;
-            for (uint32_t i = 0; i < requestedCopyLen; ++i)
-            {
-                const uint32_t writeOffset = (state.writePos + i) % cap;
-                if (!dtxCopyBytes(rdram, state.wkAddr + writeOffset, srcDataAddr + i, 1u))
-                {
-                    break;
-                }
-                ++copiedLen;
-            }
-
-            state.writePos = (state.writePos + copiedLen) % cap;
-            state.roomBytes -= copiedLen;
-            state.dataBytes = std::min(cap, state.dataBytes + copiedLen);
-        }
-
-        void dtxConsumeSjrmtDataLocked(DtxSjrmtState &state)
-        {
-            const uint32_t cap = (state.wkSize == 0u) ? 0x4000u : state.wkSize;
-            if (cap == 0u || state.dataBytes == 0u)
-            {
-                return;
-            }
-
-            const uint32_t consumed = std::min(cap, state.dataBytes);
-            state.readPos = (state.readPos + consumed) % cap;
-            state.dataBytes -= consumed;
-            state.roomBytes = std::min(cap, state.roomBytes + consumed);
-        }
-
-        void dtxConsumeActivePs2RnaStreamsLocked()
-        {
-            for (const auto &entry : g_dtx_ps2rna_by_handle)
-            {
-                const DtxPs2RnaState &rna = entry.second;
-                if (!rna.playEnabled)
-                {
-                    continue;
-                }
-
-                auto consumeHandle = [&](uint32_t sjHandle)
-                {
-                    if (sjHandle == 0u)
-                    {
-                        return;
-                    }
-
-                    auto it = g_dtx_sjrmt_by_handle.find(sjHandle);
-                    if (it == g_dtx_sjrmt_by_handle.end())
-                    {
-                        return;
-                    }
-
-                    dtxConsumeSjrmtDataLocked(it->second);
-                };
-
-                consumeHandle(rna.sjHandle0);
-                consumeHandle(rna.sjHandle1);
-            }
-        }
-
-        void dtxApplySjxPayload(uint8_t *rdram, const DtxTransferState &transfer)
-        {
-            if (!rdram || transfer.eeWorkAddr == 0u || transfer.wkSize < 64u)
-            {
-                return;
-            }
-
-            uint32_t commandCount = 0u;
-            if (!readGuestU32(rdram, transfer.eeWorkAddr, commandCount))
-            {
-                return;
-            }
-
-            commandCount = std::min(commandCount, 128u);
-            if (commandCount == 0u)
-            {
-                return;
-            }
-
-            constexpr uint32_t kSjxHeaderSize = 16u;
-            constexpr uint32_t kSjxCommandSize = 16u;
-
-            std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-            for (uint32_t i = 0; i < commandCount; ++i)
-            {
-                const uint32_t cmdAddr = transfer.eeWorkAddr + kSjxHeaderSize + (i * kSjxCommandSize);
-                uint8_t *cmdPtr = getMemPtr(rdram, cmdAddr);
-                if (!cmdPtr)
-                {
-                    break;
-                }
-
-                const uint8_t cmdNo = cmdPtr[0];
-                const uint8_t cmdLine = cmdPtr[1];
-                uint16_t cmdXid = 0u;
-                uint32_t sjxHandle = 0u;
-                uint32_t chunkDataAddr = 0u;
-                uint32_t chunkLen = 0u;
-                std::memcpy(&cmdXid, cmdPtr + 2u, sizeof(cmdXid));
-                std::memcpy(&sjxHandle, cmdPtr + 4u, sizeof(sjxHandle));
-                std::memcpy(&chunkDataAddr, cmdPtr + 8u, sizeof(chunkDataAddr));
-                std::memcpy(&chunkLen, cmdPtr + 12u, sizeof(chunkLen));
-
-                if (cmdNo != 0u || chunkLen == 0u)
-                {
-                    continue;
-                }
-
-                auto sjxIt = g_dtx_sjx_by_handle.find(sjxHandle);
-                if (sjxIt == g_dtx_sjx_by_handle.end())
-                {
-                    continue;
-                }
-
-                DtxSjxState &sjx = sjxIt->second;
-                if (sjx.xid != 0u && sjx.xid != cmdXid)
-                {
-                    continue;
-                }
-
-                auto sjrmtIt = g_dtx_sjrmt_by_handle.find(sjx.dstSjHandle);
-                if (sjrmtIt == g_dtx_sjrmt_by_handle.end())
-                {
-                    continue;
-                }
-
-                if (cmdLine == sjx.line)
-                {
-                    dtxAppendToSjrmtData(rdram, sjrmtIt->second, chunkDataAddr, chunkLen);
-
-                    // The IOP side consumes data from the remote SJ stream and returns the
-                    // chunk to the EE-side room queue. Rewriting the ack packet to line 0
-                    // makes the EE sjx_rcvcbf recycle the chunk instead of requeueing it
-                    // as playable data forever.
-                    cmdPtr[1] = 0u;
-                }
-            }
-
-            dtxConsumeActivePs2RnaStreamsLocked();
-        }
-
-        void dtxApplyPs2RnaPayload(uint8_t *rdram, const DtxTransferState &transfer)
-        {
-            if (!rdram || transfer.eeWorkAddr == 0u || transfer.wkSize < 64u)
-            {
-                return;
-            }
-
-            uint32_t commandCount = 0u;
-            if (!readGuestU32(rdram, transfer.eeWorkAddr, commandCount))
-            {
-                return;
-            }
-
-            commandCount = std::min(commandCount, 128u);
-            if (commandCount == 0u)
-            {
-                return;
-            }
-
-            constexpr uint32_t kPs2RnaHeaderSize = 16u;
-            constexpr uint32_t kPs2RnaCommandSize = 16u;
-
-            std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-            for (uint32_t i = 0; i < commandCount; ++i)
-            {
-                const uint32_t cmdAddr = transfer.eeWorkAddr + kPs2RnaHeaderSize + (i * kPs2RnaCommandSize);
-                const uint8_t *cmdPtr = getConstMemPtr(rdram, cmdAddr);
-                if (!cmdPtr)
-                {
-                    break;
-                }
-
-                uint16_t cmdNo = 0u;
-                uint32_t rnaHandle = 0u;
-                uint32_t arg1 = 0u;
-                uint32_t arg2 = 0u;
-                std::memcpy(&cmdNo, cmdPtr + 0u, sizeof(cmdNo));
-                std::memcpy(&rnaHandle, cmdPtr + 4u, sizeof(rnaHandle));
-                std::memcpy(&arg1, cmdPtr + 8u, sizeof(arg1));
-                std::memcpy(&arg2, cmdPtr + 12u, sizeof(arg2));
-
-                auto it = g_dtx_ps2rna_by_handle.find(rnaHandle);
-                if (it == g_dtx_ps2rna_by_handle.end())
-                {
-                    continue;
-                }
-
-                DtxPs2RnaState &state = it->second;
-                switch (cmdNo)
-                {
-                case 0u: // IOPRNA_CMD_START
-                    state.playEnabled = true;
-                    break;
-                case 1u: // IOPRNA_CMD_STOP
-                    state.playEnabled = false;
-                    break;
-                case 2u: // IOPRNA_CMD_SETPSW
-                    state.playEnabled = (arg1 != 0u);
-                    break;
-                case 3u: // IOPRNA_CMD_SETNCH
-                    state.channelCount = arg1;
-                    break;
-                case 4u: // IOPRNA_CMD_SETSFREQ
-                    state.sampleFreq = arg1;
-                    break;
-                case 5u: // IOPRNA_CMD_SETVOL
-                    state.volume = arg2;
-                    break;
-                default:
-                    break;
-                }
-            }
-
-            dtxConsumeActivePs2RnaStreamsLocked();
-        }
+#endif
 
         bool signalRpcCompletionSema(PS2Runtime *runtime, uint32_t semaId)
         {
@@ -1252,214 +150,27 @@ namespace ps2_syscalls
 
     } // namespace
 
-    void noteDtxSifDmaTransfer(uint8_t *rdram, uint32_t srcAddr, uint32_t dstAddr, uint32_t sizeBytes)
-    {
-        if (!rdram || sizeBytes < 64u)
-        {
-            return;
-        }
-
-        uint32_t normalizedSrc = 0u;
-        uint32_t normalizedDst = 0u;
-        if (!normalizeGuestLinearAddr(srcAddr, normalizedSrc) ||
-            !normalizeGuestLinearAddr(dstAddr, normalizedDst))
-        {
-            return;
-        }
-
-        DtxTransferState matched{};
-        bool found = false;
-        bool inferredPayload = false;
-        {
-            std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-            if (!g_dtxCompatLayout.isConfigured())
-            {
-                return;
-            }
-            for (const auto &entry : g_dtx_transfer_by_id)
-            {
-                if (dtxMatchesTransfer(entry.second, normalizedSrc, normalizedDst, sizeBytes))
-                {
-                    matched = entry.second;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found && dtxInferTransferFromPayloadLocked(rdram, normalizedSrc, normalizedDst, sizeBytes, matched))
-            {
-                found = true;
-                inferredPayload = true;
-            }
-        }
-
-        if (!found)
-        {
-            const uint8_t *missPtr = getConstMemPtr(rdram, normalizedSrc);
-
-            static uint32_t dtxMissLogCount = 0u;
-            if (dtxMissLogCount < 64u)
-            {
-                uint32_t knownTransfers = 0u;
-                uint32_t sampleDtxId = 0u;
-                uint32_t sampleSrc = 0u;
-                uint32_t sampleSize = 0u;
-
-                {
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    knownTransfers = static_cast<uint32_t>(g_dtx_transfer_by_id.size());
-                    if (!g_dtx_transfer_by_id.empty())
-                    {
-                        const auto &sample = *g_dtx_transfer_by_id.begin();
-                        sampleDtxId = sample.second.dtxId;
-                        sampleSrc = sample.second.eeWorkAddr;
-                        sampleSize = sample.second.wkSize;
-                    }
-                }
-
-                if (missPtr)
-                {
-                    RUNTIME_LOG("[sceSifSetDma:DTX_MISS_DUMP] src=0x" << std::hex << normalizedSrc
-                                                                      << " dst=0x" << normalizedDst
-                                                                      << " size=0x" << sizeBytes
-                                                                      << " known=" << std::dec << knownTransfers
-                                                                      << " sampleDtxId=0x" << std::hex << sampleDtxId
-                                                                      << " sampleSrc=0x" << sampleSrc
-                                                                      << " sampleSize=0x" << sampleSize
-                                                                      << " first="
-                                                                      << std::setw(2) << std::setfill('0') << static_cast<int>(missPtr[0]) << " "
-                                                                      << std::setw(2) << static_cast<int>(missPtr[1]) << " "
-                                                                      << std::setw(2) << static_cast<int>(missPtr[2]) << " "
-                                                                      << std::setw(2) << static_cast<int>(missPtr[3]) << " "
-                                                                      << std::setw(2) << static_cast<int>(missPtr[4]) << " "
-                                                                      << std::setw(2) << static_cast<int>(missPtr[5]) << " "
-                                                                      << std::setw(2) << static_cast<int>(missPtr[6]) << " "
-                                                                      << std::setw(2) << static_cast<int>(missPtr[7])
-                                                                      << std::setfill(' ')
-                                                                      << std::dec << std::endl);
-                }
-
-                ++dtxMissLogCount;
-            }
-
-            return;
-        }
-
-        const uint32_t footerTicketAddr = matched.eeWorkAddr + matched.wkSize - sizeof(uint32_t);
-        uint32_t ticketNo = 0u;
-        if (!readGuestU32(rdram, footerTicketAddr, ticketNo))
-        {
-            return;
-        }
-
-        (void)writeGuestU32(rdram, footerTicketAddr, ticketNo + 1u);
-
-        if (matched.dtxId == 0u)
-        {
-            dtxApplySjxPayload(rdram, matched);
-        }
-        else if (matched.dtxId == 1u)
-        {
-            dtxApplyPs2RnaPayload(rdram, matched);
-        }
-
-        static uint32_t dtxAckLogCount = 0u;
-        if (dtxAckLogCount < 32u)
-        {
-            RUNTIME_LOG("[sceSifSetDma:DTX_ACK] dtxId=0x" << std::hex << matched.dtxId
-                                                          << " ee=0x" << matched.eeWorkAddr
-                                                          << " iop=0x" << matched.iopWorkAddr
-                                                          << " size=0x" << matched.wkSize
-                                                          << " ticket=0x" << ticketNo
-                                                          << "->0x" << (ticketNo + 1u));
-            if (inferredPayload)
-            {
-                RUNTIME_LOG(" inferred=1");
-            }
-            if (matched.dtxId == 0u)
-            {
-                uint32_t totalData = 0u;
-                std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                for (const auto &entry : g_dtx_sjrmt_by_handle)
-                {
-                    totalData += entry.second.dataBytes;
-                }
-                RUNTIME_LOG(" sjrmtData=0x" << totalData);
-            }
-            RUNTIME_LOG(std::dec << std::endl);
-            ++dtxAckLogCount;
-        }
-    }
-
-    void resetSoundDriverRpcState()
-    {
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        resetSoundDriverRpcStateUnlocked();
-    }
-
-    void setSoundDriverCompatLayout(const PS2SoundDriverCompatLayout &layout)
-    {
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        g_soundDriverCompatLayout = layout;
-    }
-
-    void clearSoundDriverCompatLayout()
-    {
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        g_soundDriverCompatLayout = {};
-    }
-
-    void setDtxCompatLayout(const PS2DtxCompatLayout &layout)
-    {
-        std::scoped_lock lock(g_rpc_mutex, g_dtx_rpc_mutex);
-        g_dtxCompatLayout = layout;
-        resetDtxRpcStateUnlocked();
-    }
-
-    void clearDtxCompatLayout()
-    {
-        std::scoped_lock lock(g_rpc_mutex, g_dtx_rpc_mutex);
-        g_dtxCompatLayout = {};
-        resetDtxRpcStateUnlocked();
-    }
-
-    void prepareSoundDriverStatusTransfer(uint8_t *rdram, uint32_t srcAddr, uint32_t size)
-    {
-        std::lock_guard<std::mutex> lock(g_rpc_mutex);
-        if (srcAddr != g_soundDriverRpcState.statusAddr || size != kSoundDriverStatusSize)
-        {
-            return;
-        }
-
-        backfillSoundDriverStatusFromCompatUnlocked(rdram);
-    }
-
-    void finalizeSoundDriverStatusTransfer(uint8_t *rdram, uint32_t srcAddr, uint32_t dstAddr, uint32_t size)
-    {
-        (void)rdram;
-        (void)srcAddr;
-        (void)dstAddr;
-        (void)size;
-    }
-
     void SifStopModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int32_t moduleId = static_cast<int32_t>(getRegU32(ctx, 4)); // $a0
         const uint32_t resultAddr = getRegU32(ctx, 7);                    // $a3 (int* result, optional)
 
+        int32_t moduleResult = -1;
+        const bool stoppedByEmulator = runtime->stopIopModule(moduleId, &moduleResult);
         uint32_t refsLeft = 0;
         const bool knownModule = trackSifModuleStop(moduleId, &refsLeft);
-        const int32_t ret = knownModule ? 0 : -1;
+        const int32_t ret = (stoppedByEmulator || knownModule) ? 0 : -1;
 
         if (resultAddr != 0)
         {
             int32_t *hostResult = reinterpret_cast<int32_t *>(getMemPtr(rdram, resultAddr));
             if (hostResult)
             {
-                *hostResult = knownModule ? 0 : -1;
+                *hostResult = stoppedByEmulator ? moduleResult : (knownModule ? 0 : -1);
             }
         }
 
-        if (knownModule)
+        if (stoppedByEmulator || knownModule)
         {
             std::string modulePath;
             {
@@ -1470,7 +181,7 @@ namespace ps2_syscalls
                     modulePath = it->second.path;
                 }
             }
-            logSifModuleAction("stop", moduleId, modulePath, refsLeft);
+            logSifModuleAction(stoppedByEmulator ? "stop-emulated" : "stop", moduleId, modulePath, refsLeft);
         }
 
         setReturnS32(ctx, ret);
@@ -1478,7 +189,9 @@ namespace ps2_syscalls
 
     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t pathAddr = getRegU32(ctx, 4); // $a0
+        const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0
+        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
+        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
         const std::string modulePath = readGuestCStringBounded(rdram, pathAddr, kMaxSifModulePathBytes);
         if (modulePath.empty())
         {
@@ -1486,34 +199,35 @@ namespace ps2_syscalls
             return;
         }
 
-        const int32_t moduleId = trackSifModuleLoad(modulePath);
-        if (moduleId <= 0)
+        std::vector<uint8_t> arguments;
+        constexpr uint32_t kMaxIopModuleArguments = 64u * 1024u;
+        if (!copyGuestBytesBounded(rdram, argumentAddr, argumentSize, kMaxIopModuleArguments, arguments))
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        uint32_t refs = 0;
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
-            {
-                refs = it->second.refCount;
-            }
+            setReturnS32(ctx, -1);
+            return;
         }
-        logSifModuleAction("load", moduleId, modulePath, refs);
 
-        setReturnS32(ctx, moduleId);
+        const auto loaded = runtime->loadIopModule(modulePath, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
+        if (!loaded.handled || loaded.moduleId <= 0)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        trackSifModuleLoadExternal(modulePath, loaded.moduleId);
+        logSifModuleAction("load-emulated", loaded.moduleId, modulePath, 1u);
+        setReturnS32(ctx, loaded.moduleId);
     }
 
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        std::scoped_lock lock(g_rpc_mutex, g_dtx_rpc_mutex);
-        if (runtime)
-        {
-            runtime->iop().init(rdram);
-        }
+        std::lock_guard<std::mutex> lock(g_rpc_mutex);
         if (!g_rpc_initialized)
         {
             g_rpc_servers.clear();
@@ -1527,15 +241,8 @@ namespace ps2_syscalls
             {
                 g_sif_rpc_debug_history[i] = SifRpcDebugEvent{};
             }
-            resetDtxRpcStateUnlocked();
-            g_soundDriverRpcState.initialized = false;
             g_rpc_initialized = true;
             RUNTIME_LOG("[SifInitRpc] Initialized");
-        }
-        else
-        {
-            resetDtxRpcStateUnlocked();
-            g_soundDriverRpcState.initialized = false;
         }
 
         SifRpcDebugEvent event = makeRpcDebugEvent("InitRpc", ctx, runtime);
@@ -1549,18 +256,6 @@ namespace ps2_syscalls
         uint32_t clientPtr = getRegU32(ctx, 4);
         uint32_t rpcId = getRegU32(ctx, 5);
         uint32_t mode = getRegU32(ctx, 6);
-
-        // BUG-009 diagnostic: unconditional entry log, not gated behind the
-        // gameBindWaitSema>0 branch below, so we can tell whether SifBindRpc
-        // is reached at all for these clients (2026-07-30).
-        {
-            static std::atomic<uint32_t> s_bindEntryLogs{0u};
-            if (s_bindEntryLogs.fetch_add(1u, std::memory_order_relaxed) < 32u)
-            {
-                std::cerr << "[SifBindRpc:ENTRY] client=0x" << std::hex << clientPtr
-                          << " sid=0x" << rpcId << " mode=0x" << mode << std::dec << std::endl;
-            }
-        }
 
         t_SifRpcClientData *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
 
@@ -1576,12 +271,6 @@ namespace ps2_syscalls
             setReturnS32(ctx, -1);
             return;
         }
-
-        // The game's libsifrpc client registers the semaphore it will WaitSema on
-        // into client->hdr.sema_id BEFORE issuing the bind. Capture it now, before
-        // we overwrite the field below — that sid is the one we must SignalSema so
-        // the game's own bind-reply wait (WaitSema@0x174ce0) wakes and boot proceeds.
-        const int32_t gameBindWaitSema = client->hdr.sema_id;
 
         client->command = 0;
         client->buf = 0;
@@ -1606,9 +295,12 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr)
+        if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
         {
-            // Allocate a dummy server so bind loops can proceed.
+            // EE-side servers and HLE routes need a descriptor in guest RAM.
+            // With an emulated IOP, only publish it after the IRX has actually
+            // registered the SID; cd->server == nullptr is the SDK's retry
+            // signal while the IOP server thread is still starting.
             serverPtr = rpcAllocServerAddr(rdram);
             if (serverPtr)
             {
@@ -1637,27 +329,6 @@ namespace ps2_syscalls
             client->cbuf = 0;
         }
 
-        // BUG-009: rpc_handle_valid (0x178de8) polls client->hdr.pkt_addr and,
-        // once nonzero, dereferences it expecting a real SifRpcCallPkt with a
-        // matching rpc_id at +24 and a ready bit at +16 (layout confirmed in
-        // SIF.cpp against this game's DMA traffic: w[4]=ready, w[6]=rpc_id).
-        // The bind above clobbers pkt_addr to 0 and never sets it back, so the
-        // game's post-bind poll spins forever. Stamp a real bind-reply packet
-        // from the existing scratch pool before waking the game's wait sema.
-        {
-            uint32_t bindReplyPkt = rpcAllocPacketAddr(rdram);
-            if (bindReplyPkt)
-            {
-                if (uint32_t *pktWords = reinterpret_cast<uint32_t *>(getMemPtr(rdram, bindReplyPkt)))
-                {
-                    pktWords[4] = 1u;                 // ready bit (+0x10)
-                    pktWords[6] = client->hdr.rpc_id;  // rpc_id echo (+0x18)
-                    pktWords[7] = clientPtr;           // owning client (+0x1C)
-                }
-                client->hdr.pkt_addr = bindReplyPkt;
-            }
-        }
-
         SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx, runtime);
         event.clientPtr = clientPtr;
         event.serverPtr = serverPtr;
@@ -1666,172 +337,140 @@ namespace ps2_syscalls
         event.result = 0;
         pushSifRpcDebugEvent(event);
         setReturnS32(ctx, 0);
-
-        // The HLE bind above completed synchronously, but the game's own libsifrpc
-        // client still parks on the sema it registered (client->hdr.sema_id, captured
-        // before the clobber), expecting a SIF command interrupt to deliver the reply
-        // + SignalSema. No such interrupt fires in the recomp runtime (sceSifCmdIntrHdlr
-        // is a stub), so deliver the wake here via the same validated path SifCallRpc's
-        // Nowait completion uses. Bounded log so we can confirm which sid was signalled.
-        if (gameBindWaitSema > 0)
-        {
-            const bool signalled = signalRpcCompletionSema(runtime, static_cast<uint32_t>(gameBindWaitSema));
-            static std::atomic<uint32_t> s_bindSignalLogs{0u};
-            if (s_bindSignalLogs.fetch_add(1u, std::memory_order_relaxed) < 16u)
-            {
-                std::cerr << "[SifBindRpc:SIGNAL] client=0x" << std::hex << clientPtr
-                          << " sid=0x" << rpcId << std::dec
-                          << " waitSema=" << gameBindWaitSema
-                          << " signalled=" << (signalled ? 1 : 0) << std::endl;
-            }
-        }
     }
 
     void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
 
-        uint32_t clientPtr = getRegU32(ctx, 4);
-        uint32_t rpcNum = getRegU32(ctx, 5);
-        uint32_t mode = getRegU32(ctx, 6);
-        uint32_t sendBuf = getRegU32(ctx, 7);
-        uint32_t sendSize = 0;
-        uint32_t recvBuf = 0;
-        uint32_t recvSize = 0;
-        uint32_t endFunc = 0;
-        uint32_t endParam = 0;
+        const uint32_t clientPtr = getRegU32(ctx, 4);
+        const uint32_t rpcNum = getRegU32(ctx, 5);
+        const uint32_t mode = getRegU32(ctx, 6);
+        const uint32_t sendBuf = getRegU32(ctx, 7);
+        const uint32_t stackPointer = getRegU32(ctx, 29);
 
-        // Decode both extended-reg convention (EE default) and standard O32 stack convention,
-        // picking REG whenever plausible, to avoid zero-collision on the stack.
-        uint32_t sp = getRegU32(ctx, 29);
+        const uint32_t sendSizeRegisters = getRegU32(ctx, 8);
+        const uint32_t receiveBufferRegisters = getRegU32(ctx, 9);
+        const uint32_t receiveSizeRegisters = getRegU32(ctx, 10);
+        const uint32_t endFunctionRegisters = getRegU32(ctx, 11);
+        uint32_t endParameterRegisters = 0u;
+        (void)readStackU32(rdram, stackPointer, 0x0u, endParameterRegisters);
 
-        uint32_t sendSizeReg = getRegU32(ctx, 8);
-        uint32_t recvBufReg = getRegU32(ctx, 9);
-        uint32_t recvSizeReg = getRegU32(ctx, 10);
-        uint32_t endFuncReg = getRegU32(ctx, 11);
-        uint32_t endParamReg = 0;
-        (void)readStackU32(rdram, sp, 0x0, endParamReg);
+        uint32_t sendSizeStack = 0u;
+        uint32_t receiveBufferStack = 0u;
+        uint32_t receiveSizeStack = 0u;
+        uint32_t endFunctionStack = 0u;
+        uint32_t endParameterStack = 0u;
+        (void)readStackU32(rdram, stackPointer, 0x10u, sendSizeStack);
+        (void)readStackU32(rdram, stackPointer, 0x14u, receiveBufferStack);
+        (void)readStackU32(rdram, stackPointer, 0x18u, receiveSizeStack);
+        (void)readStackU32(rdram, stackPointer, 0x1Cu, endFunctionStack);
+        (void)readStackU32(rdram, stackPointer, 0x20u, endParameterStack);
 
-        uint32_t sendSizeStk = 0;
-        uint32_t recvBufStk = 0;
-        uint32_t recvSizeStk = 0;
-        uint32_t endFuncStk = 0;
-        uint32_t endParamStk = 0;
-        (void)readStackU32(rdram, sp, 0x10, sendSizeStk);
-        (void)readStackU32(rdram, sp, 0x14, recvBufStk);
-        (void)readStackU32(rdram, sp, 0x18, recvSizeStk);
-        (void)readStackU32(rdram, sp, 0x1C, endFuncStk);
-        (void)readStackU32(rdram, sp, 0x20, endParamStk);
-
-        auto looksLikeGuestPtr = [&](uint32_t v) -> bool
+        const auto looksLikeGuestPointer = [](uint32_t value)
         {
-            if (v == 0)
+            if (value == 0u)
+            {
                 return true;
-            const uint32_t norm = v & 0x1FFFFFFFu;
-            return norm >= 0x10000u && norm < PS2_RAM_SIZE;
+            }
+            const uint32_t normalized = value & 0x1FFFFFFFu;
+            return normalized >= 0x10000u && normalized < PS2_RAM_SIZE;
         };
-
-        auto looksLikeSize = [&](uint32_t v) -> bool
+        const auto looksLikeSize = [](uint32_t value)
         {
-            return v <= 0x2000000u;
+            return value <= 0x02000000u;
         };
-
-        auto looksLikeFunc = [&](uint32_t v) -> bool
+        const auto plausiblePack = [&](uint32_t sendSize,
+                                       uint32_t receiveBuffer,
+                                       uint32_t receiveSize,
+                                       uint32_t endFunction)
         {
-            return v == 0 || looksLikeGuestPtr(v);
+            return looksLikeSize(sendSize) &&
+                   looksLikeGuestPointer(receiveBuffer) &&
+                   looksLikeSize(receiveSize) &&
+                   (endFunction == 0u || looksLikeGuestPointer(endFunction));
         };
 
-        auto plausiblePack = [&](uint32_t sendSz, uint32_t rbuf, uint32_t rsz, uint32_t endFn) -> bool
-        {
-            return looksLikeSize(sendSz) && looksLikeGuestPtr(rbuf) && looksLikeSize(rsz) && looksLikeFunc(endFn);
-        };
+        const bool registerPackPlausible =
+            plausiblePack(sendSizeRegisters,
+                          receiveBufferRegisters,
+                          receiveSizeRegisters,
+                          endFunctionRegisters);
+        const bool stackPackPlausible =
+            plausiblePack(sendSizeStack,
+                          receiveBufferStack,
+                          receiveSizeStack,
+                          endFunctionStack);
 
-        const bool regPackPlausible = plausiblePack(sendSizeReg, recvBufReg, recvSizeReg, endFuncReg);
-        const bool stackPackPlausible = plausiblePack(sendSizeStk, recvBufStk, recvSizeStk, endFuncStk);
-
-        uint32_t boundSidHint = 0u;
+        uint32_t sidHint = 0u;
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            auto it = g_rpc_clients.find(clientPtr);
-            if (it != g_rpc_clients.end())
+            const auto clientIt = g_rpc_clients.find(clientPtr);
+            if (clientIt != g_rpc_clients.end())
             {
-                boundSidHint = it->second.sid;
-            }
-        }
-        PS2DtxCompatLayout dtxCompat{};
-        {
-            std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-            dtxCompat = g_dtxCompatLayout;
-        }
-
-        auto looksLikeDtxCreatePack = [&](uint32_t sendSz, uint32_t rbuf, uint32_t rsz) -> bool
-        {
-            return rbuf != 0u && rsz >= 4u && rsz <= 0x40u &&
-                   sendSz >= 12u && sendSz <= 0x1000u;
-        };
-
-        const bool isDtxCreate34Call = dtxCompat.isConfigured() &&
-                                       (boundSidHint == dtxCompat.rpcSid) &&
-                                       (rpcNum == 0x422u);
-        const bool forceStackForDtxCreate34 =
-            isDtxCreate34Call &&
-            stackPackPlausible &&
-            looksLikeDtxCreatePack(sendSizeStk, recvBufStk, recvSizeStk) &&
-            !looksLikeDtxCreatePack(sendSizeReg, recvBufReg, recvSizeReg);
-
-        bool useRegConvention = true;
-        if (forceStackForDtxCreate34)
-        {
-            useRegConvention = false;
-        }
-        else if (!regPackPlausible && stackPackPlausible)
-        {
-            const bool regHasValidCallback = (endFuncReg != 0u) && looksLikeFunc(endFuncReg);
-            const bool stackHasValidCallback = (endFuncStk != 0u) && looksLikeFunc(endFuncStk);
-            if (!(regHasValidCallback && !stackHasValidCallback))
-            {
-                useRegConvention = false;
+                sidHint = clientIt->second.sid;
             }
         }
 
-        sendSize = useRegConvention ? sendSizeReg : sendSizeStk;
-        recvBuf = useRegConvention ? recvBufReg : recvBufStk;
-        recvSize = useRegConvention ? recvSizeReg : recvSizeStk;
-        endFunc = useRegConvention ? endFuncReg : endFuncStk;
-        endParam = useRegConvention ? endParamReg : endParamStk;
-
-        const bool isDtxLikeRpc = dtxCompat.isConfigured() &&
-                                  ((boundSidHint == dtxCompat.rpcSid) || ((rpcNum & 0xFF00u) == 0x0400u));
-        static uint32_t dtxAbiLogCount = 0u;
-        if (isDtxLikeRpc && dtxAbiLogCount < 96u)
+        ps2x::iop::RpcAbi selectedAbi = ps2x::iop::RpcAbi::RuntimeDefault;
         {
-            RUNTIME_LOG("[SifCallRpc:ABI] client=0x" << std::hex << clientPtr
-                                                     << " rpc=0x" << rpcNum
-                                                     << " sidHint=0x" << boundSidHint
-                                                     << " useReg=" << (useRegConvention ? 1 : 0)
-                                                     << " reg=(" << sendSizeReg << "," << recvBufReg << "," << recvSizeReg << "," << endFuncReg << "," << endParamReg << ")"
-                                                     << " stk=(" << sendSizeStk << "," << recvBufStk << "," << recvSizeStk << "," << endFuncStk << "," << endParamStk << ")"
-                                                     << " plausible=(" << (regPackPlausible ? 1 : 0) << "," << (stackPackPlausible ? 1 : 0) << ")"
-                                                     << " force34=" << (forceStackForDtxCreate34 ? 1 : 0)
-                                                     << std::dec << std::endl);
-            ++dtxAbiLogCount;
+            ps2x::iop::RpcAbiRequest request{};
+            request.boundSid = sidHint;
+            request.function = rpcNum;
+            request.registers = {
+                sendSizeRegisters,
+                receiveBufferRegisters,
+                receiveSizeRegisters,
+                endFunctionRegisters,
+                endParameterRegisters,
+                registerPackPlausible,
+            };
+            request.stack = {
+                sendSizeStack,
+                receiveBufferStack,
+                receiveSizeStack,
+                endFunctionStack,
+                endParameterStack,
+                stackPackPlausible,
+            };
+            selectedAbi = PS2IopTransport::selectRpcAbi(runtime, request);
         }
 
-        t_SifRpcClientData *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
+        bool useRegisterConvention = selectedAbi != ps2x::iop::RpcAbi::Stack;
+        if (selectedAbi == ps2x::iop::RpcAbi::RuntimeDefault && !registerPackPlausible && stackPackPlausible)
+        {
+            const bool registersHaveCallback = endFunctionRegisters != 0u && looksLikeGuestPointer(endFunctionRegisters);
+            const bool stackHasCallback = endFunctionStack != 0u && looksLikeGuestPointer(endFunctionStack);
+            if (!(registersHaveCallback && !stackHasCallback))
+            {
+                useRegisterConvention = false;
+            }
+        }
+        else if (selectedAbi == ps2x::iop::RpcAbi::Registers)
+        {
+            useRegisterConvention = true;
+        }
 
+        const uint32_t sendSize = useRegisterConvention ? sendSizeRegisters : sendSizeStack;
+        const uint32_t receiveBuffer = useRegisterConvention ? receiveBufferRegisters : receiveBufferStack;
+        const uint32_t receiveSize = useRegisterConvention ? receiveSizeRegisters : receiveSizeStack;
+        const uint32_t endFunction = useRegisterConvention ? endFunctionRegisters : endFunctionStack;
+        const uint32_t endParameter = useRegisterConvention ? endParameterRegisters : endParameterStack;
+
+        auto *client = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, clientPtr));
         if (!client)
         {
             SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx, runtime);
             event.clientPtr = clientPtr;
+            event.sid = sidHint;
             event.rpcNum = rpcNum;
-            event.sid = boundSidHint;
             event.mode = mode;
             event.sendBuf = sendBuf;
             event.sendSize = sendSize;
-            event.recvBuf = recvBuf;
-            event.recvSize = recvSize;
-            event.endFunc = endFunc;
-            event.endParam = endParam;
+            event.recvBuf = receiveBuffer;
+            event.recvSize = receiveSize;
+            event.endFunc = endFunction;
+            event.endParam = endParameter;
             event.flags = kSifRpcDebugFlagMissingClient | ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u);
             event.result = -1;
             pushSifRpcDebugEvent(event);
@@ -1840,892 +479,227 @@ namespace ps2_syscalls
         }
 
         client->command = rpcNum;
-        client->end_function = endFunc;
-        client->end_param = endParam;
+        client->end_function = endFunction;
+        client->end_param = endParameter;
         client->hdr.mode = mode;
 
+        uint32_t sid = 0u;
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            g_rpc_clients[clientPtr].busy = true;
-            g_rpc_clients[clientPtr].last_rpc = rpcNum;
-            uint32_t sid = g_rpc_clients[clientPtr].sid;
-            if (sid)
+            auto &state = g_rpc_clients[clientPtr];
+            state.busy = true;
+            state.last_rpc = rpcNum;
+            sid = state.sid;
+            if (sid != 0u)
             {
-                auto it = g_rpc_servers.find(sid);
-                if (it != g_rpc_servers.end())
+                const auto serverIt = g_rpc_servers.find(sid);
+                if (serverIt != g_rpc_servers.end() &&
+                    serverIt->second.sd_ptr != 0u)
                 {
-                    uint32_t mappedServer = it->second.sd_ptr;
-                    if (mappedServer && client->server != mappedServer)
-                    {
-                        client->server = mappedServer;
-                    }
+                    client->server = serverIt->second.sd_ptr;
                 }
             }
         }
 
-        uint32_t sid = 0;
+        const uint32_t serverPtr = client->server;
+        auto *server = serverPtr
+                           ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
+                           : nullptr;
+        if (server)
         {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            auto it = g_rpc_clients.find(clientPtr);
-            if (it != g_rpc_clients.end())
+            server->client = clientPtr;
+            server->pkt_addr = client->hdr.pkt_addr;
+            server->rpc_number = rpcNum;
+            server->size = static_cast<int>(sendSize);
+            server->recvbuf = receiveBuffer;
+            server->rsize = static_cast<int>(receiveSize);
+            server->rmode = ((mode & kSifRpcModeNowait) && endFunction == 0u) ? 0 : 1;
+            server->rid = 0;
+
+            if (server->buf != 0u && sendBuf != 0u && sendSize != 0u)
             {
-                sid = it->second.sid;
+                rpcCopyToRdram(rdram, server->buf, sendBuf, sendSize);
             }
         }
 
-        uint32_t serverPtr = client->server;
-        t_SifRpcServerData *sd = serverPtr ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr)) : nullptr;
-
-        if (sd)
+        ps2x::iop::RpcResult iopResult{};
+        uint32_t completionSemaphore = static_cast<uint32_t>(client->hdr.sema_id);
+        if (completionSemaphore == 0xFFFFFFFFu || completionSemaphore == 0u)
         {
-            sd->client = clientPtr;
-            sd->pkt_addr = client->hdr.pkt_addr;
-            sd->rpc_number = rpcNum;
-            sd->size = static_cast<int>(sendSize);
-            sd->recvbuf = recvBuf;
-            sd->rsize = static_cast<int>(recvSize);
-            sd->rmode = ((mode & kSifRpcModeNowait) && endFunc == 0) ? 0 : 1;
-            sd->rid = 0;
+            completionSemaphore = endParameter;
         }
 
-        if (sd && sd->buf && sendBuf && sendSize > 0)
         {
-            rpcCopyToRdram(rdram, sd->buf, sendBuf, sendSize);
+            ps2x::iop::RpcRequest request{};
+            request.clientAddress = clientPtr;
+            request.serverAddress = serverPtr;
+            request.serverFunction = server ? server->func : 0u;
+            request.serverBuffer = server ? server->buf : 0u;
+            request.sid = sid;
+            request.function = rpcNum;
+            request.mode = mode;
+            request.send = {sendBuf, sendSize};
+            request.receive = {receiveBuffer, receiveSize};
+            request.endFunction = endFunction;
+            request.endParameter = endParameter;
+
+            iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+
+            if (iopResult.signalNowaitCompletion &&
+                (mode & kSifRpcModeNowait) != 0u)
+            {
+                (void)signalRpcCompletionSema(runtime, completionSemaphore);
+            }
+            if (iopResult.signalCompletion)
+            {
+                (void)signalRpcCompletionSema(runtime, completionSemaphore);
+            }
         }
 
-        uint32_t resultPtr = 0;
-        bool handled = false;
-        bool handledByIop = false;
-        bool callbackInvokedForDebug = false;
-
-        auto readRpcU32 = [&](uint32_t addr, uint32_t &out) -> bool
+        uint32_t guestFunction = iopResult.guestFunction;
+        uint32_t guestA0 = iopResult.guestArguments[0];
+        uint32_t guestA1 = iopResult.guestArguments[1];
+        uint32_t guestA2 = iopResult.guestArguments[2];
+        uint32_t guestA3 = iopResult.guestArguments[3];
+        uint32_t guestDefaultResult = iopResult.guestDefaultResultAddress;
+        if (guestFunction == 0u && server && server->func != 0u &&
+            iopResult.serverDispatchPolicy != ps2x::iop::ServerDispatchPolicy::Suppress)
         {
-            if (!addr)
+            guestFunction = server->func;
+            guestA0 = rpcNum;
+            guestA1 = server->buf;
+            guestA2 = sendSize;
+            guestDefaultResult = server->buf != 0u ? server->buf : receiveBuffer;
+        }
+        const bool serverDispatched = guestFunction != 0u && runtime->hasFunction(guestFunction);
+
+        auto finishCall = [=](const R5900Context *guestResult, R5900Context &parent)
+        {
+            bool handled = iopResult.handled;
+            uint32_t resultPointer = iopResult.resultAddress;
+            bool copiedFallback = false;
+            bool zeroedFallback = false;
+            if (guestResult)
             {
-                return false;
+                handled = true;
+                resultPointer = getRegU32(guestResult, 2);
+                if (resultPointer == 0u)
+                {
+                    resultPointer = guestDefaultResult;
+                }
             }
-            const uint8_t *ptr = getConstMemPtr(rdram, addr);
-            if (!ptr)
+
+            if (receiveBuffer != 0u && receiveSize != 0u)
             {
-                return false;
+                if (handled && resultPointer != 0u && resultPointer != receiveBuffer)
+                {
+                    rpcCopyToRdram(rdram, receiveBuffer, resultPointer, receiveSize);
+                }
+                else if (!handled && sendBuf != 0u && sendSize != 0u && sendBuf != receiveBuffer)
+                {
+                    rpcCopyToRdram(rdram, receiveBuffer, sendBuf, std::min(sendSize, receiveSize));
+                    copiedFallback = true;
+                }
+                else if (!handled)
+                {
+                    rpcZeroRdram(rdram, receiveBuffer, receiveSize);
+                    zeroedFallback = true;
+                }
             }
-            std::memcpy(&out, ptr, sizeof(out));
-            return true;
+
+            auto completeClient = [=](R5900Context &base, bool callbackCompleted)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                    g_rpc_clients[clientPtr].busy = false;
+                }
+                SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", &base, runtime);
+                event.clientPtr = clientPtr;
+                event.serverPtr = serverPtr;
+                event.sid = sid;
+                event.rpcNum = rpcNum;
+                event.mode = mode;
+                event.sendBuf = sendBuf;
+                event.sendSize = sendSize;
+                event.recvBuf = receiveBuffer;
+                event.recvSize = receiveSize;
+                event.resultPtr = resultPointer;
+                event.endFunc = endFunction;
+                event.endParam = endParameter;
+                event.semaId = completionSemaphore;
+                event.flags =
+                    ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u) |
+                    (iopResult.handled ? kSifRpcDebugFlagHandledByHle : 0u) |
+                    (callbackCompleted ? kSifRpcDebugFlagCallback : 0u) |
+                    (serverDispatched ? kSifRpcDebugFlagServerDispatch : 0u) |
+                    (!handled ? kSifRpcDebugFlagUnhandled : 0u) |
+                    (copiedFallback ? kSifRpcDebugFlagFallbackCopy : 0u) |
+                    (zeroedFallback ? kSifRpcDebugFlagFallbackZero : 0u);
+                fillRpcDebugPreview(rdram, sendBuf, sendSize, event.sendPreview, event.sendPreviewSize);
+                fillRpcDebugPreview(rdram, receiveBuffer, receiveSize, event.recvPreview, event.recvPreviewSize);
+                event.result = 0;
+#if PS2X_ENABLE_IOP_RPC_TRACE
+                if ((event.flags & kSifRpcDebugFlagUnhandled) != 0u)
+                {
+                    logUnhandledRpcTrace(event);
+                }
+#endif
+                pushSifRpcDebugEvent(event);
+            };
+
+            setReturnS32(&parent, 0);
+            if (endFunction == 0u || iopResult.callbackPolicy == ps2x::iop::CallbackPolicy::Suppress)
+            {
+                completeClient(parent, endFunction != 0u);
+                return;
+            }
+
+            uint32_t callbackFunction = endFunction;
+            if (!runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
+                runtime->hasFunction(callbackFunction - 0x10000u))
+            {
+                callbackFunction -= 0x10000u;
+            }
+            if (!runtime->hasFunction(callbackFunction))
+            {
+                (void)signalRpcCompletionSema(runtime, completionSemaphore);
+                completeClient(parent, false);
+                return;
+            }
+
+            GuestInvocation callback{};
+            callback.kind = GuestInvocationKind::RpcCallback;
+            callback.context = parent;
+            callback.context.pc = callbackFunction;
+            SET_GPR_U32(&callback.context, 4, endParameter);
+            SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+            SET_GPR_U32(&callback.context, 31, 0u);
+            callback.onComplete = [completeClient](const R5900Context &, R5900Context &base)
+            {
+                completeClient(base, true);
+            };
+            runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 
-        auto writeRpcU32 = [&](uint32_t addr, uint32_t value) -> bool
+        if (serverDispatched)
         {
-            if (!addr)
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.context = *ctx;
+            invocation.context.pc = guestFunction;
+            SET_GPR_U32(&invocation.context, 4, guestA0);
+            SET_GPR_U32(&invocation.context, 5, guestA1);
+            SET_GPR_U32(&invocation.context, 6, guestA2);
+            SET_GPR_U32(&invocation.context, 7, guestA3);
+            SET_GPR_U32(&invocation.context, 29, runtime->eeScheduler().invocationStackTop());
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            invocation.onComplete = [finishCall](const R5900Context &completed, R5900Context &parent)
             {
-                return false;
-            }
-            uint8_t *ptr = getMemPtr(rdram, addr);
-            if (!ptr)
-            {
-                return false;
-            }
-            std::memcpy(ptr, &value, sizeof(value));
-            return true;
-        };
-
-        if (!handled && runtime)
-        {
-            runtime->iop().init(rdram);
-            uint32_t iopResultPtr = 0u;
-            bool iopSignalNowaitCompletion = false;
-            if (runtime->iop().handleRPC(runtime,
-                                         sid, rpcNum,
-                                         sendBuf, sendSize,
-                                         recvBuf, recvSize,
-                                         iopResultPtr,
-                                         iopSignalNowaitCompletion))
-            {
-                handled = true;
-                handledByIop = true;
-                resultPtr = iopResultPtr;
-                if (iopSignalNowaitCompletion && (mode & kSifRpcModeNowait) != 0u)
-                {
-                    uint32_t semaId = static_cast<uint32_t>(client->hdr.sema_id);
-                    if (semaId == 0xFFFFFFFFu || semaId == 0u)
-                    {
-                        semaId = endParam;
-                    }
-                    (void)signalRpcCompletionSema(runtime, semaId);
-                }
-            }
+                finishCall(&completed, parent);
+            };
+            runtime->eeScheduler().invokeCurrent(std::move(invocation));
         }
-
-        const bool isDtxUrpc = dtxCompat.isUrpcRpc(sid, rpcNum);
-        uint32_t dtxUrpcCommand = isDtxUrpc ? (rpcNum & 0xFFu) : 0u;
-        uint32_t dtxUrpcFn = 0;
-        uint32_t dtxUrpcObj = 0;
-        uint32_t dtxUrpcSend0 = 0;
-        bool dtxUrpcDispatchAttempted = false;
-        bool dtxUrpcFallbackEmulated = false;
-        bool dtxUrpcFallbackCreate34 = false;
-        bool hasUrpcHandler = false;
-        if (isDtxUrpc)
-        {
-            if (sendBuf && sendSize >= sizeof(uint32_t))
-            {
-                (void)readRpcU32(sendBuf, dtxUrpcSend0);
-            }
-            if (dtxCompat.hasUrpcTables() && dtxUrpcCommand < 64u)
-            {
-                (void)readRpcU32(dtxCompat.urpcFnTableBase + (dtxUrpcCommand * 4u), dtxUrpcFn);
-                (void)readRpcU32(dtxCompat.urpcObjTableBase + (dtxUrpcCommand * 4u), dtxUrpcObj);
-            }
-            hasUrpcHandler = (dtxUrpcCommand < 64u) && (dtxUrpcFn != 0u);
-        }
-        const bool allowServerDispatch = !isDtxUrpc || hasUrpcHandler;
-        const bool isDtxSid = dtxCompat.isConfigured() && sid == dtxCompat.rpcSid;
-
-        if (sd && sd->func && (!isDtxSid || isDtxUrpc) && allowServerDispatch)
-        {
-            dtxUrpcDispatchAttempted = dtxUrpcDispatchAttempted || isDtxUrpc;
-            handled = rpcInvokeFunction(rdram, ctx, runtime, sd->func, rpcNum, sd->buf, sendSize, 0, &resultPtr);
-            if (handled && resultPtr == 0 && sd->buf)
-            {
-                resultPtr = sd->buf;
-            }
-            if (handled && resultPtr == 0 && recvBuf)
-            {
-                resultPtr = recvBuf;
-            }
-        }
-
-        if (!handled && isDtxUrpc && sendBuf && sendSize > 0)
-        {
-            // Only dispatch through dtx_rpc_func when a URPC handler is registered in the table.
-            // If the slot is empty, defer to the fallback emulation below.
-            if (hasUrpcHandler && dtxCompat.dispatcherFuncAddr != 0u)
-            {
-                dtxUrpcDispatchAttempted = true;
-                handled = rpcInvokeFunction(rdram, ctx, runtime, dtxCompat.dispatcherFuncAddr, rpcNum, sendBuf, sendSize, 0, &resultPtr);
-                if (handled && resultPtr == 0)
-                {
-                    resultPtr = sendBuf;
-                }
-            }
-        }
-
-        if (!handled && isDtxSid)
-        {
-            if (rpcNum == 2 && recvBuf && recvSize >= sizeof(uint32_t))
-            {
-                uint32_t dtxId = 0;
-                uint32_t eeWorkAddr = 0u;
-                uint32_t iopWorkAddr = 0u;
-                uint32_t wkSize = 0u;
-                if (sendBuf && sendSize >= sizeof(uint32_t))
-                {
-                    (void)readRpcU32(sendBuf + 0u, dtxId);
-                }
-                if (sendBuf && sendSize >= (4u * sizeof(uint32_t)))
-                {
-                    (void)readRpcU32(sendBuf + 4u, eeWorkAddr);
-                    (void)readRpcU32(sendBuf + 8u, iopWorkAddr);
-                    (void)readRpcU32(sendBuf + 12u, wkSize);
-                }
-
-                uint32_t normalizedEeWorkAddr = 0u;
-                uint32_t normalizedIopWorkAddr = 0u;
-                (void)normalizeGuestLinearAddr(eeWorkAddr, normalizedEeWorkAddr);
-                (void)normalizeGuestLinearAddr(iopWorkAddr, normalizedIopWorkAddr);
-
-                uint32_t remoteHandle = 0;
-                {
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_remote_by_id.find(dtxId);
-                    if (it != g_dtx_remote_by_id.end())
-                    {
-                        remoteHandle = it->second;
-                    }
-                    if (!remoteHandle)
-                    {
-                        remoteHandle = rpcAllocServerAddr(rdram);
-                        if (!remoteHandle)
-                        {
-                            remoteHandle = rpcAllocPacketAddr(rdram);
-                        }
-                        if (!remoteHandle)
-                        {
-                            remoteHandle = kRpcServerPoolBase + ((dtxId & 0xFFu) * kRpcServerStride);
-                        }
-                        g_dtx_remote_by_id[dtxId] = remoteHandle;
-                    }
-
-                    DtxTransferState state{};
-                    state.dtxId = dtxId;
-                    state.remoteHandle = remoteHandle;
-                    state.eeWorkAddr = normalizedEeWorkAddr;
-                    state.iopWorkAddr = normalizedIopWorkAddr;
-                    state.wkSize = wkSize;
-                    g_dtx_transfer_by_id[dtxId] = state;
-                }
-
-                (void)writeRpcU32(recvBuf, remoteHandle);
-                if (recvSize > sizeof(uint32_t))
-                {
-                    rpcZeroRdram(rdram, recvBuf + sizeof(uint32_t), recvSize - sizeof(uint32_t));
-                }
-                static uint32_t dtxCreateLogCount = 0;
-                if (dtxCreateLogCount < 64u)
-                {
-                    RUNTIME_LOG("[SifCallRpc:DTX_CREATE] dtxId=0x" << std::hex << dtxId
-                                                                   << " remote=0x" << remoteHandle
-                                                                   << " recvBuf=0x" << recvBuf
-                                                                   << " recvSize=0x" << recvSize
-                                                                   << std::dec << std::endl);
-                    ++dtxCreateLogCount;
-                }
-                handled = true;
-                resultPtr = recvBuf;
-            }
-            else if (rpcNum == 3)
-            {
-                uint32_t remoteHandle = 0;
-                if (sendBuf && sendSize >= sizeof(uint32_t) && readRpcU32(sendBuf, remoteHandle) && remoteHandle)
-                {
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    for (auto it = g_dtx_remote_by_id.begin(); it != g_dtx_remote_by_id.end(); ++it)
-                    {
-                        if (it->second == remoteHandle)
-                        {
-                            g_dtx_transfer_by_id.erase(it->first);
-                            g_dtx_remote_by_id.erase(it);
-                            break;
-                        }
-                    }
-                }
-                if (recvBuf && recvSize > 0)
-                {
-                    rpcZeroRdram(rdram, recvBuf, recvSize);
-                }
-                handled = true;
-                resultPtr = recvBuf;
-            }
-            else if (rpcNum >= 0x400 && rpcNum < 0x500)
-            {
-                dtxUrpcFallbackEmulated = true;
-                const uint32_t urpcCommand = rpcNum & 0xFFu;
-                uint32_t outWords[4] = {1u, 0u, 0u, 0u};
-                uint32_t outWordCount = 1u;
-
-                auto readSendWord = [&](uint32_t index, uint32_t &out) -> bool
-                {
-                    const uint64_t byteOffset = static_cast<uint64_t>(index) * sizeof(uint32_t);
-                    if (!sendBuf || sendSize < (byteOffset + sizeof(uint32_t)))
-                    {
-                        return false;
-                    }
-                    return readRpcU32(sendBuf + static_cast<uint32_t>(byteOffset), out);
-                };
-
-                switch (urpcCommand)
-                {
-                case 0u: // SJX_CREATE
-                {
-                    uint32_t srcSjHandle = 0u;
-                    uint32_t dstSjHandle = 0u;
-                    uint32_t line = 0u;
-                    uint32_t eeObjAddr = 0u;
-                    (void)readSendWord(0u, srcSjHandle);
-                    (void)readSendWord(1u, dstSjHandle);
-                    (void)readSendWord(2u, line);
-                    (void)readSendWord(3u, eeObjAddr);
-
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    const uint32_t handle = dtxAllocUrpcHandleLocked();
-                    DtxSjxState state{};
-                    state.handle = handle;
-                    state.srcSjHandle = srcSjHandle;
-                    state.dstSjHandle = dstSjHandle;
-                    state.line = line;
-                    state.eeObjAddr = eeObjAddr;
-                    g_dtx_sjx_by_handle[handle] = state;
-                    outWords[0] = handle ? handle : 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 1u: // SJX_DESTROY
-                {
-                    uint32_t handle = 0u;
-                    (void)readSendWord(0u, handle);
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    g_dtx_sjx_by_handle.erase(handle);
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 2u: // SJX_RESET
-                {
-                    uint32_t handle = 0u;
-                    uint32_t xid = 0u;
-                    (void)readSendWord(0u, handle);
-                    (void)readSendWord(1u, xid);
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjx_by_handle.find(handle);
-                    if (it != g_dtx_sjx_by_handle.end())
-                    {
-                        it->second.xid = static_cast<uint16_t>(xid & 0xFFFFu);
-                    }
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 8u: // PS2RNA_CREATE
-                {
-                    uint32_t maxChannels = 0u;
-                    uint32_t sjHandle0 = 0u;
-                    uint32_t sjHandle1 = 0u;
-                    (void)readSendWord(0u, maxChannels);
-                    (void)readSendWord(2u, sjHandle0);
-                    (void)readSendWord(3u, sjHandle1);
-
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    const uint32_t handle = dtxAllocUrpcHandleLocked();
-                    DtxPs2RnaState state{};
-                    state.handle = handle;
-                    state.maxChannels = maxChannels;
-                    state.sjHandle0 = sjHandle0;
-                    state.sjHandle1 = sjHandle1;
-                    state.channelCount = maxChannels;
-                    g_dtx_ps2rna_by_handle[handle] = state;
-                    outWords[0] = handle ? handle : 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 9u: // PS2RNA_DESTROY
-                {
-                    uint32_t handle = 0u;
-                    (void)readSendWord(0u, handle);
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    g_dtx_ps2rna_by_handle.erase(handle);
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 32u: // SJRMT_RBF_CREATE
-                case 33u: // SJRMT_MEM_CREATE
-                case 34u: // SJRMT_UNI_CREATE
-                {
-                    uint32_t arg0 = 0;
-                    uint32_t arg1 = 0;
-                    uint32_t arg2 = 0;
-                    (void)readSendWord(0u, arg0);
-                    (void)readSendWord(1u, arg1);
-                    (void)readSendWord(2u, arg2);
-
-                    uint32_t mode = 0;
-                    uint32_t wkAddr = 0;
-                    uint32_t wkSize = 0;
-                    if (urpcCommand == 34u)
-                    {
-                        mode = arg0;
-                        wkAddr = arg1;
-                        wkSize = arg2;
-                        dtxUrpcFallbackCreate34 = true;
-                    }
-                    else if (urpcCommand == 33u)
-                    {
-                        wkAddr = arg0;
-                        wkSize = arg1;
-                    }
-                    else
-                    {
-                        wkAddr = arg0;
-                        wkSize = (arg1 != 0u) ? arg1 : arg2;
-                    }
-
-                    wkSize = dtxNormalizeSjrmtCapacity(wkSize);
-
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    const uint32_t handle = dtxAllocUrpcHandleLocked();
-                    DtxSjrmtState state{};
-                    state.handle = handle;
-                    state.mode = mode;
-                    state.wkAddr = wkAddr;
-                    state.wkSize = wkSize;
-                    state.readPos = 0u;
-                    state.writePos = 0u;
-                    state.roomBytes = wkSize;
-                    state.dataBytes = 0u;
-                    state.uuid0 = 0x53524D54u; // "SRMT"
-                    state.uuid1 = handle;
-                    state.uuid2 = wkAddr;
-                    state.uuid3 = wkSize;
-                    g_dtx_sjrmt_by_handle[handle] = state;
-
-                    outWords[0] = handle ? handle : 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 35u: // SJRMT_DESTROY
-                {
-                    uint32_t handle = 0;
-                    (void)readSendWord(0u, handle);
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    g_dtx_sjrmt_by_handle.erase(handle);
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 36u: // SJRMT_GET_UUID
-                {
-                    uint32_t handle = 0;
-                    (void)readSendWord(0u, handle);
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(handle);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        outWords[0] = it->second.uuid0;
-                        outWords[1] = it->second.uuid1;
-                        outWords[2] = it->second.uuid2;
-                        outWords[3] = it->second.uuid3;
-                    }
-                    else
-                    {
-                        outWords[0] = 0u;
-                        outWords[1] = 0u;
-                        outWords[2] = 0u;
-                        outWords[3] = 0u;
-                    }
-                    outWordCount = 4u;
-                    break;
-                }
-                case 37u: // SJRMT_RESET
-                {
-                    uint32_t handle = 0;
-                    (void)readSendWord(0u, handle);
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(handle);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        const uint32_t cap = (it->second.wkSize == 0u) ? 0x4000u : it->second.wkSize;
-                        it->second.readPos = 0u;
-                        it->second.writePos = 0u;
-                        it->second.roomBytes = cap;
-                        it->second.dataBytes = 0u;
-                    }
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 38u: // SJRMT_GET_CHUNK
-                {
-                    uint32_t handle = 0;
-                    uint32_t streamId = 0;
-                    uint32_t nbyte = 0;
-                    (void)readSendWord(0u, handle);
-                    (void)readSendWord(1u, streamId);
-                    (void)readSendWord(2u, nbyte);
-
-                    uint32_t ptr = 0u;
-                    uint32_t len = 0u;
-
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(handle);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        DtxSjrmtState &state = it->second;
-                        const uint32_t cap = (state.wkSize == 0u) ? 0x4000u : state.wkSize;
-
-                        if (streamId == 0u)
-                        {
-                            len = std::min(nbyte, state.roomBytes);
-                            ptr = state.wkAddr + (cap ? (state.writePos % cap) : 0u);
-                            if (cap != 0u)
-                            {
-                                state.writePos = (state.writePos + len) % cap;
-                            }
-                            state.roomBytes -= len;
-                        }
-                        else if (streamId == 1u)
-                        {
-                            len = std::min(nbyte, state.dataBytes);
-                            ptr = state.wkAddr + (cap ? (state.readPos % cap) : 0u);
-                            if (cap != 0u)
-                            {
-                                state.readPos = (state.readPos + len) % cap;
-                            }
-                            state.dataBytes -= len;
-                        }
-                    }
-
-                    outWords[0] = ptr;
-                    outWords[1] = len;
-                    outWordCount = 2u;
-                    break;
-                }
-                case 39u: // SJRMT_UNGET_CHUNK
-                {
-                    uint32_t handle = 0;
-                    uint32_t streamId = 0;
-                    uint32_t len = 0;
-                    (void)readSendWord(0u, handle);
-                    (void)readSendWord(1u, streamId);
-                    (void)readSendWord(3u, len);
-
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(handle);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        DtxSjrmtState &state = it->second;
-                        const uint32_t cap = (state.wkSize == 0u) ? 0x4000u : state.wkSize;
-                        if (streamId == 0u)
-                        {
-                            const uint32_t delta = (cap == 0u) ? 0u : (len % cap);
-                            if (cap != 0u)
-                            {
-                                state.writePos = (state.writePos + cap - delta) % cap;
-                            }
-                            state.roomBytes = std::min(cap, state.roomBytes + len);
-                        }
-                        else if (streamId == 1u)
-                        {
-                            const uint32_t delta = (cap == 0u) ? 0u : (len % cap);
-                            if (cap != 0u)
-                            {
-                                state.readPos = (state.readPos + cap - delta) % cap;
-                            }
-                            state.dataBytes = std::min(cap, state.dataBytes + len);
-                        }
-                    }
-
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 40u: // SJRMT_PUT_CHUNK
-                {
-                    uint32_t handle = 0;
-                    uint32_t streamId = 0;
-                    uint32_t len = 0;
-                    (void)readSendWord(0u, handle);
-                    (void)readSendWord(1u, streamId);
-                    (void)readSendWord(3u, len);
-
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(handle);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        DtxSjrmtState &state = it->second;
-                        const uint32_t cap = (state.wkSize == 0u) ? 0x4000u : state.wkSize;
-                        if (streamId == 0u)
-                        {
-                            state.roomBytes = std::min(cap, state.roomBytes + len);
-                        }
-                        else if (streamId == 1u)
-                        {
-                            state.dataBytes = std::min(cap, state.dataBytes + len);
-                        }
-                    }
-
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                case 41u: // SJRMT_GET_NUM_DATA
-                {
-                    uint32_t handle = 0;
-                    uint32_t streamId = 0;
-                    (void)readSendWord(0u, handle);
-                    (void)readSendWord(1u, streamId);
-
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(handle);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        outWords[0] = (streamId == 0u) ? it->second.roomBytes : it->second.dataBytes;
-                    }
-                    else
-                    {
-                        outWords[0] = 0u;
-                    }
-                    outWordCount = 1u;
-                    break;
-                }
-                case 42u: // SJRMT_IS_GET_CHUNK
-                {
-                    uint32_t handle = 0;
-                    uint32_t streamId = 0;
-                    uint32_t nbyte = 0;
-                    (void)readSendWord(0u, handle);
-                    (void)readSendWord(1u, streamId);
-                    (void)readSendWord(2u, nbyte);
-
-                    uint32_t available = 0u;
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(handle);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        available = (streamId == 0u) ? it->second.roomBytes : it->second.dataBytes;
-                    }
-                    outWords[0] = (available >= nbyte) ? 1u : 0u;
-                    outWords[1] = available;
-                    outWordCount = 2u;
-                    break;
-                }
-                case 43u: // SJRMT_INIT
-                case 44u: // SJRMT_FINISH
-                {
-                    outWords[0] = 1u;
-                    outWordCount = 1u;
-                    break;
-                }
-                default:
-                {
-                    uint32_t urpcRet = 1u;
-                    if (sendBuf && sendSize >= sizeof(uint32_t))
-                    {
-                        (void)readRpcU32(sendBuf, urpcRet);
-                    }
-                    if (urpcCommand == 0u)
-                    {
-                        std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                        urpcRet = dtxAllocUrpcHandleLocked();
-                    }
-                    if (urpcRet == 0u)
-                    {
-                        urpcRet = 1u;
-                    }
-                    outWords[0] = urpcRet;
-                    outWordCount = 1u;
-                    break;
-                }
-                }
-
-                if (recvBuf && recvSize > 0u)
-                {
-                    const uint32_t recvWordCapacity = static_cast<uint32_t>(recvSize / sizeof(uint32_t));
-                    const uint32_t wordsToWrite = std::min(outWordCount, recvWordCapacity);
-                    for (uint32_t i = 0; i < wordsToWrite; ++i)
-                    {
-                        (void)writeRpcU32(recvBuf + (i * sizeof(uint32_t)), outWords[i]);
-                    }
-
-                    // SJRMT_IsGetChunk callers read rbuf[1] even when nout==1.
-                    if (urpcCommand == 42u && outWordCount > 1u)
-                    {
-                        (void)writeRpcU32(recvBuf + sizeof(uint32_t), outWords[1]);
-                    }
-
-                    if (recvSize > (wordsToWrite * sizeof(uint32_t)))
-                    {
-                        rpcZeroRdram(rdram, recvBuf + (wordsToWrite * sizeof(uint32_t)),
-                                     recvSize - (wordsToWrite * sizeof(uint32_t)));
-                    }
-                }
-
-                handled = true;
-                resultPtr = recvBuf;
-            }
-        }
-
-        if (recvBuf && recvSize > 0)
-        {
-            if (handled && resultPtr && resultPtr != recvBuf)
-            {
-                rpcCopyToRdram(rdram, recvBuf, resultPtr, recvSize);
-            }
-            else if (!handled && sendBuf && sendSize > 0 && sendBuf != recvBuf)
-            {
-                size_t copySize = (sendSize < recvSize) ? sendSize : recvSize;
-                rpcCopyToRdram(rdram, recvBuf, sendBuf, copySize);
-            }
-            else if (!handled)
-            {
-                rpcZeroRdram(rdram, recvBuf, recvSize);
-            }
-        }
-
-        if (isDtxUrpc)
-        {
-            static int dtxUrpcLogCount = 0;
-            if (dtxUrpcLogCount < 64)
-            {
-                uint32_t dtxUrpcRecv0 = 0;
-                if (recvBuf && recvSize >= sizeof(uint32_t))
-                {
-                    (void)readRpcU32(recvBuf, dtxUrpcRecv0);
-                }
-                RUNTIME_LOG("[SifCallRpc:DTX] rpcNum=0x" << std::hex << rpcNum
-                                                         << " cmd=0x" << dtxUrpcCommand
-                                                         << " name=" << dtxUrpcCommandName(dtxUrpcCommand)
-                                                         << " fn=0x" << dtxUrpcFn
-                                                         << " obj=0x" << dtxUrpcObj
-                                                         << " send0=0x" << dtxUrpcSend0
-                                                         << " recv0=0x" << dtxUrpcRecv0
-                                                         << " resultPtr=0x" << resultPtr
-                                                         << " handled=" << std::dec << (handled ? 1 : 0)
-                                                         << " dispatch=" << (dtxUrpcDispatchAttempted ? 1 : 0)
-                                                         << " emu=" << (dtxUrpcFallbackEmulated ? 1 : 0)
-                                                         << " emu34=" << (dtxUrpcFallbackCreate34 ? 1 : 0)
-                                                         << std::endl);
-
-                if (dtxUrpcCommand >= 37u && dtxUrpcCommand <= 42u)
-                {
-                    std::lock_guard<std::mutex> lock(g_dtx_rpc_mutex);
-                    auto it = g_dtx_sjrmt_by_handle.find(dtxUrpcSend0);
-                    if (it != g_dtx_sjrmt_by_handle.end())
-                    {
-                        const DtxSjrmtState &state = it->second;
-                        RUNTIME_LOG("[SifCallRpc:DTX_SJRMT] handle=0x" << std::hex << dtxUrpcSend0
-                                                                       << " cmd=" << dtxUrpcCommandName(dtxUrpcCommand)
-                                                                       << " wk=0x" << state.wkAddr
-                                                                       << " size=0x" << state.wkSize
-                                                                       << " read=0x" << state.readPos
-                                                                       << " write=0x" << state.writePos
-                                                                       << std::dec
-                                                                       << " room=" << state.roomBytes
-                                                                       << " data=" << state.dataBytes);
-                        if ((dtxUrpcCommand == 38u || dtxUrpcCommand == 42u) && sendBuf && sendSize >= 12u)
-                        {
-                            uint32_t streamId = 0u;
-                            uint32_t nbyte = 0u;
-                            (void)readRpcU32(sendBuf + 4u, streamId);
-                            (void)readRpcU32(sendBuf + 8u, nbyte);
-                            RUNTIME_LOG(" stream=" << dtxStreamName(streamId)
-                                                   << " req=" << nbyte);
-                        }
-                        RUNTIME_LOG(std::endl);
-                    }
-                }
-                ++dtxUrpcLogCount;
-            }
-        }
-
-        if (endFunc)
-        {
-            PS2SoundDriverCompatLayout soundCompat{};
-            {
-                std::lock_guard<std::mutex> lock(g_rpc_mutex);
-                soundCompat = g_soundDriverCompatLayout;
-            }
-
-            const bool hleCompletedEndCallback = handledByIop && soundCompat.matchesCompletionCallback(endFunc);
-            bool callbackInvoked = hleCompletedEndCallback;
-            callbackInvokedForDebug = hleCompletedEndCallback;
-
-            if (!hleCompletedEndCallback)
-            {
-                callbackInvoked = rpcInvokeFunction(rdram, ctx, runtime, endFunc, endParam, 0, 0, 0, nullptr);
-                callbackInvokedForDebug = callbackInvoked;
-
-                if (!callbackInvoked && endFunc >= 0x10000u)
-                {
-                    const uint32_t normalizedEndFunc = endFunc - 0x10000u;
-                    if (runtime->hasFunction(normalizedEndFunc))
-                    {
-                        callbackInvoked = rpcInvokeFunction(rdram, ctx, runtime, normalizedEndFunc, endParam, 0, 0, 0, nullptr);
-                        callbackInvokedForDebug = callbackInvokedForDebug || callbackInvoked;
-                    }
-                }
-            }
-
-            if (soundCompat.matchesCompletionCallback(endFunc))
-            {
-                uint32_t semaId = static_cast<uint32_t>(client->hdr.sema_id);
-                if (semaId == 0xFFFFFFFFu || semaId == 0u)
-                {
-                    semaId = endParam;
-                }
-                (void)signalRpcCompletionSema(runtime, semaId);
-                if (rdram && soundCompat.busyFlagAddr != 0u && soundCompat.matchesClearBusyCallback(endFunc))
-                {
-                    if (uint32_t *busy = reinterpret_cast<uint32_t *>(getMemPtr(rdram, soundCompat.busyFlagAddr)))
-                    {
-                        *busy = 0u;
-                    }
-                }
-            }
-
-            if (!callbackInvoked)
-            {
-                uint32_t semaId = static_cast<uint32_t>(client->hdr.sema_id);
-                if (semaId == 0xFFFFFFFFu || semaId == 0u)
-                {
-                    semaId = endParam;
-                }
-                const bool fallbackSignaledSema = signalRpcCompletionSema(runtime, semaId);
-
-                static uint32_t unresolvedEndFuncWarnCount = 0;
-                if (unresolvedEndFuncWarnCount < 32u)
-                {
-                    std::cerr << "[SifCallRpc] unresolved end callback endFunc=0x" << std::hex << endFunc
-                              << " semaId=0x" << semaId
-                              << " fallbackSignal=" << std::dec << (fallbackSignaledSema ? 1 : 0)
-                              << std::endl;
-                    ++unresolvedEndFuncWarnCount;
-                }
-            }
-        }
-
-        // BUG-009: rpc_handle_valid (0x178de8) polls client->hdr.pkt_addr and,
-        // once nonzero, dereferences it expecting a real SifRpcCallPkt with a
-        // matching rpc_id at +24 and a ready bit at +16 (layout confirmed in
-        // SIF.cpp against this game's DMA traffic: w[4]=ready, w[6]=rpc_id).
-        // This HLE path completes the call synchronously but never wrote that
-        // packet back, so every poll saw pkt_addr==0 and failed instantly.
-        // Stamp a real completion packet from the existing scratch pool so the
-        // client header points at genuine data, not a fabricated result.
-        {
-            uint32_t completionPkt = rpcAllocPacketAddr(rdram);
-            if (completionPkt)
-            {
-                if (uint32_t *pktWords = reinterpret_cast<uint32_t *>(getMemPtr(rdram, completionPkt)))
-                {
-                    pktWords[4] = 1u;                        // ready bit (+0x10)
-                    pktWords[6] = client->hdr.rpc_id;         // rpc_id echo (+0x18)
-                    pktWords[7] = clientPtr;                  // owning client (+0x1C)
-                }
-                client->hdr.pkt_addr = completionPkt;
-            }
-        }
-
-        static int logCount = 0;
-        if (logCount < 10)
-        {
-            RUNTIME_LOG("[SifCallRpc] client=0x" << std::hex << clientPtr
-                                                 << " sid=0x" << sid
-                                                 << " rpcNum=0x" << rpcNum
-                                                 << " mode=0x" << mode
-                                                 << " sendBuf=0x" << sendBuf
-                                                 << " recvBuf=0x" << recvBuf
-                                                 << " recvSize=0x" << recvSize
-                                                 << " size=" << std::dec << sendSize << std::endl);
-            ++logCount;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_rpc_mutex);
-            g_rpc_clients[clientPtr].busy = false;
-        }
-
-        SifRpcDebugEvent event = makeRpcDebugEvent("CallRpc", ctx, runtime);
-        event.clientPtr = clientPtr;
-        event.serverPtr = serverPtr;
-        event.sid = sid;
-        event.rpcNum = rpcNum;
-        event.mode = mode;
-        event.sendBuf = sendBuf;
-        event.sendSize = sendSize;
-        event.recvBuf = recvBuf;
-        event.recvSize = recvSize;
-        event.resultPtr = resultPtr;
-        event.endFunc = endFunc;
-        event.endParam = endParam;
-        event.semaId = client ? static_cast<uint32_t>(client->hdr.sema_id) : 0u;
-        event.flags = ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u) |
-                      (handledByIop ? kSifRpcDebugFlagHandledByHle : 0u) |
-                      (callbackInvokedForDebug ? kSifRpcDebugFlagCallback : 0u) |
-                      ((sd && sd->func) ? kSifRpcDebugFlagServerDispatch : 0u) |
-                      ((isDtxSid || isDtxUrpc) ? kSifRpcDebugFlagDtx : 0u);
-        event.result = 0;
-        pushSifRpcDebugEvent(event);
-
-        setReturnS32(ctx, 0);
+        finishCall(nullptr, *ctx);
     }
 
     void SifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3010,13 +984,6 @@ namespace ps2_syscalls
         if (sizeExtra > 0 && srcExtra && destExtra)
         {
             rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
-        }
-
-        // SIF_CMD_SET_SREG: drive the EE-side sreg mirror so EE poll loops that
-        // await an IOP reply can progress (see handleSifSetSreg).
-        if (cid == 0x80000001u)
-        {
-            handleSifSetSreg(rdram, packetAddr, packetSize, srcExtra);
         }
 
         static int logCount = 0;

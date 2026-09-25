@@ -17,6 +17,7 @@ option(PS2X_FIBER_PTHREAD "Build the pthread fiber backend on a non-Vita host (f
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" OFF)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
+option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
 option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
@@ -453,16 +454,11 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp
-    src/lib/ps2_iop.cpp
-    src/lib/ps2_iop_audio.cpp
-    src/lib/ps2_iop_cpu.cpp
-    src/lib/ps2_iop_irx_loader.cpp
-    src/lib/ps2_iop_dbcman.cpp
-    src/lib/ps2_iop_mcman.cpp
-    src/lib/ps2_iop_sdrdrv.cpp
-    src/lib/ps2_iop_cl.cpp
+    src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_rom_device.cpp
+    src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
@@ -483,6 +479,16 @@ endif()
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1
+    )
+endif()
+
+if(PS2X_ENABLE_IOP_RPC_TRACE)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=0
     )
 endif()
 
@@ -613,7 +619,7 @@ target_include_directories(ps2_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 
 # EeScheduler.cpp (and the rest of ps2_runtime) uses std::thread/std::mutex/
 # std::atomic, which require pthread on Linux. Link explicitly so the
@@ -649,17 +655,6 @@ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
 endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
-
-# ---- iop_harness: headless standalone driver for the embedded IOP + real
-# ARKD_DVD.IRX (no EE game boot). Links ps2_runtime (which contains the loader
-# and ps2_iop_runArkdService). Not built for Vita. See src/tools/iop_harness.cpp.
-if(NOT PS2X_IS_VITA)
-    add_executable(iop_harness src/tools/iop_harness.cpp)
-    target_link_libraries(iop_harness PRIVATE ps2_runtime)
-    if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
-        ps2x_stage_ffmpeg_runtime_dlls(iop_harness)
-    endif()
-endif()
 
 if(PS2X_IS_VITA)
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1") 

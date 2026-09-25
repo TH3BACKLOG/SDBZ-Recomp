@@ -11,8 +11,6 @@
 
 std::string translatePs2Path(const char *ps2Path);
 
-inline std::mutex g_sys_fd_mutex;
-
 namespace ps2_syscalls
 {
 #define PS2_DECLARE_SYSCALL(name) void name(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -29,11 +27,6 @@ namespace ps2_syscalls
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
     void initializeGuestKernelState(uint8_t *rdram, PS2Runtime *runtime);
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId);
-    void resetSoundDriverRpcState();
-    void setSoundDriverCompatLayout(const PS2SoundDriverCompatLayout &layout);
-    void clearSoundDriverCompatLayout();
-    void setDtxCompatLayout(const PS2DtxCompatLayout &layout);
-    void clearDtxCompatLayout();
     uint64_t GetCurrentVSyncTick(PS2Runtime *runtime);
     void WaitVSyncTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, int fixedResult = -1);
 }
