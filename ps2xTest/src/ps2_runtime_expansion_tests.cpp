@@ -272,6 +272,54 @@ namespace
     }
 
     constexpr uint32_t kAsyncCounterAddr = 0x2400u;
+    std::atomic<uint32_t> gGuestJumpTargetCount{0u};
+
+    void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
+    {
+        gGuestJumpTargetCount.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    std::atomic<uint32_t> gMpegStreamCallbackCount{0u};
+    std::atomic<uint32_t> gMpegStreamCallbackMpeg{0u};
+    std::atomic<uint32_t> gMpegStreamCallbackType{0u};
+    std::atomic<uint32_t> gMpegStreamCallbackDataAddr{0u};
+    std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
+    std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
+    constexpr uint32_t kMpegCallbackStopPc = 0x00124FF0u;
+    std::atomic<int32_t> gMpegWaitResult{-999};
+    std::atomic<uint32_t> gMpegWaitStage{0u};
+    std::atomic<uint32_t> gMpegNoDuplicateStage{0u};
+    std::atomic<uint32_t> gMpegNoDuplicateProducerStage{0u};
+
+    constexpr uint32_t kMpegWaitMainPc = 0x00125000u;
+    constexpr uint32_t kMpegWaitResumePc = 0x00125010u;
+    constexpr uint32_t kMpegWaitProducerPc = 0x00125020u;
+    constexpr uint32_t kMpegWaitHandle = 0x00123000u;
+    constexpr uint32_t kMpegWaitImage = 0x00130000u;
+    constexpr uint32_t kMpegNoDuplicateMainPc = 0x00125030u;
+    constexpr uint32_t kMpegNoDuplicateResumePc = 0x00125040u;
+    constexpr uint32_t kMpegNoDuplicateProducerPc = 0x00125050u;
+    constexpr uint32_t kMpegNoDuplicateHandle = 0x00124000u;
+    constexpr uint32_t kMpegNoDuplicateImage = 0x00131000u;
+    constexpr uint32_t kIpuInitMainPc = 0x00125100u;
+    constexpr uint32_t kIpuInitResumePc = 0x00125104u;
+    constexpr uint32_t kIpuSetD4Pc = 0x00126428u;
+    std::atomic<uint32_t> gIpuSetD4Hits{0u};
+    std::atomic<uint32_t> gIpuSetD4Argument{0u};
+    std::atomic<int32_t> gIpuInitResult{-999};
+
+    void testIpuSetD4(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gIpuSetD4Hits.fetch_add(1u, std::memory_order_acq_rel);
+        gIpuSetD4Argument.store(::getRegU32(ctx, 4), std::memory_order_release);
+        ctx->pc = 0u;
+    }
+
+    void testIpuInitMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = kIpuInitResumePc;
+        ps2_stubs::sceIpuInit(rdram, ctx, runtime);
+    }
 
     void testWaitForAsyncCounter(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
     {
@@ -651,6 +699,32 @@ void register_ps2_runtime_expansion_tests()
                      "unchanged callee PC should be converted to call fallthrough");
             t.Equals(::getRegU32(&ctx, 2), 0x00FACE42u,
                      "callee should still execute normally");
+        });
+
+        tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3400u, &testGuestJumpTargetHandler);
+            gGuestJumpTargetCount.store(0u, std::memory_order_relaxed);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool continuedInCaller = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3400u,
+                0x2000u,
+                0u,
+                PS2Runtime::GuestBranchKind::IndirectJump,
+                "test-jr");
+
+            t.IsFalse(continuedInCaller,
+                      "jump should stop the current generated wrapper");
+            t.Equals(gGuestJumpTargetCount.load(std::memory_order_relaxed), 0u,
+                     "jump target must not execute on a nested host stack frame");
+            t.Equals(ctx.pc, 0x3400u,
+                     "central dispatcher should receive the exact jump target");
         });
 
         tc.Run("dispatchGuestBranch call returns false when callee transfers elsewhere", [](TestCase &t)

@@ -5,11 +5,12 @@
 #include "runtime/ps2_diag.h"
 #include "Kernel/Ipu/ps2_ipu_core.h"
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
+#include <chrono>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -276,35 +277,55 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    constexpr uint32_t kEeTimerBase[4] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+    constexpr std::array<uint32_t, 4> kEeTimerBases = {
+        0x10000000u,
+        0x10000800u,
+        0x10001000u,
+        0x10001800u,
+    };
+    constexpr uint32_t kEeTimerCountOffset = 0x00u;
     constexpr uint32_t kEeTimerModeOffset = 0x10u;
     constexpr uint32_t kEeTimerCompareOffset = 0x20u;
     constexpr uint32_t kEeTimerHoldOffset = 0x30u;
+    constexpr uint32_t kEeTimerModeClksMask = 0x3u;
+    constexpr uint32_t kEeTimerModeConfigMask = 0x3FFu;
+    constexpr uint32_t kEeTimerModeStatusMask = 0xC00u;
+    constexpr uint32_t kEeTimerModeZret = 1u << 6;
     constexpr uint32_t kEeTimerModeCue = 1u << 7;
-    // BUSCLK-gated tick rate. T0/T1 have a HBLANK clock-select option (MODE.CLKS) that this
-    // model does not distinguish; all four timers use the same CUE-gated rate as the
-    // pre-existing Timer0 fix, which is sufficient to unstick guest CUE-gated wait loops.
-    constexpr uint64_t kEeTimerTicksPerSecond = 15720ull;
-    constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
+    constexpr uint32_t kEeTimerModeCmpe = 1u << 8;
+    constexpr uint32_t kEeTimerModeOvfe = 1u << 9;
+    constexpr uint32_t kEeTimerModeEquf = 1u << 10;
+    constexpr uint32_t kEeTimerModeOvff = 1u << 11;
+    constexpr uint64_t kEeClockHz = 294912000ull;
+    constexpr std::array<uint64_t, 4> kEeTimerClockHz = {
+        147456000ull,
+        9216000ull,
+        576000ull,
+        15734ull,
+    };
 
-    inline int eeTimerIndexForAddress(uint32_t address)
+    inline bool decodeEeTimerRegister(uint32_t address, size_t &timerIndex, uint32_t &offset)
     {
-        for (int i = 0; i < 4; ++i)
+        for (size_t index = 0; index < kEeTimerBases.size(); ++index)
         {
-            const uint32_t base = kEeTimerBase[i];
-            if (address == base || address == base + kEeTimerModeOffset ||
-                address == base + kEeTimerCompareOffset || address == base + kEeTimerHoldOffset)
+            const uint32_t candidateOffset = address - kEeTimerBases[index];
+            if (candidateOffset == kEeTimerCountOffset ||
+                candidateOffset == kEeTimerModeOffset ||
+                candidateOffset == kEeTimerCompareOffset ||
+                (index < 2u && candidateOffset == kEeTimerHoldOffset))
             {
-                return i;
+                timerIndex = index;
+                offset = candidateOffset;
+                return true;
             }
         }
-        return -1;
+        return false;
     }
 
-    inline uint64_t steadyClockNs()
+    constexpr uint64_t ticksUntilMatch(uint32_t count, uint32_t target)
     {
-        using namespace std::chrono;
-        return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+        const uint32_t distance = (target - count) & 0xFFFFu;
+        return distance == 0u ? 0x10000ull : static_cast<uint64_t>(distance);
     }
 
     struct DmaTagView
@@ -446,11 +467,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
-    for (int i = 0; i < 4; ++i)
-    {
-        m_timerLastHostNs[i] = 0;
-        m_timerFractionNs[i] = 0;
-    }
+    resetEeTimers();
 
     try
     {
@@ -677,40 +694,121 @@ bool PS2Memory::iopSelfTest()
     return ok;
 }
 
-void PS2Memory::updateEeTimerCounter(unsigned timerIndex)
+void PS2Memory::resetEeTimers() noexcept
 {
-    const uint32_t countAddr = kEeTimerBase[timerIndex];
-    const uint32_t modeAddr = countAddr + kEeTimerModeOffset;
+    m_eeTimers = {};
+}
 
-    const uint64_t nowNs = steadyClockNs();
-    if (m_timerLastHostNs[timerIndex] == 0u)
+uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+{
+    if (eeCycles == 0u)
     {
-        m_timerLastHostNs[timerIndex] = nowNs;
-        return;
+        return 0u;
     }
 
-    const uint32_t mode = m_ioRegisters.count(modeAddr) ? m_ioRegisters[modeAddr] : 0u;
-    if ((mode & kEeTimerModeCue) == 0u)
+    uint32_t interruptMask = 0u;
+    for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
-        m_timerLastHostNs[timerIndex] = nowNs;
-        m_timerFractionNs[timerIndex] = 0u;
-        return;
-    }
+        EeTimer &timer = m_eeTimers[index];
+        if ((timer.mode & kEeTimerModeCue) == 0u)
+        {
+            continue;
+        }
 
-    const uint64_t elapsedNs = nowNs - m_timerLastHostNs[timerIndex];
-    m_timerLastHostNs[timerIndex] = nowNs;
-    if (elapsedNs == 0u)
-    {
-        return;
-    }
+        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+        const uint64_t remainingCycles = eeCycles % kEeClockHz;
+        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+        timer.clockRemainder = scaled % kEeClockHz;
+        if (ticks == 0u)
+        {
+            continue;
+        }
 
-    const uint64_t scaled = elapsedNs * kEeTimerTicksPerSecond + m_timerFractionNs[timerIndex];
-    const uint64_t ticks = scaled / kNanosecondsPerSecond;
-    m_timerFractionNs[timerIndex] = scaled % kNanosecondsPerSecond;
-    if (ticks != 0u)
-    {
-        m_ioRegisters[countAddr] = m_ioRegisters[countAddr] + static_cast<uint32_t>(ticks);
+        const uint32_t oldCount = timer.count & 0xFFFFu;
+        const uint32_t compare = timer.compare & 0xFFFFu;
+        const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
+        const uint64_t overflowDistance = 0x10000ull - oldCount;
+        const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
+        const bool compareReached = ticks >= compareDistance;
+        bool overflowReached = false;
+
+        if (zeroReturn)
+        {
+            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+            if (compareReached)
+            {
+                const uint64_t remaining = ticks - compareDistance;
+                timer.count = compare == 0u
+                                  ? static_cast<uint32_t>(remaining & 0xFFFFu)
+                                  : static_cast<uint32_t>(remaining % compare);
+            }
+            else
+            {
+                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+            }
+        }
+        else
+        {
+            overflowReached = ticks >= overflowDistance;
+            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+        }
+
+        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+        {
+            timer.mode |= kEeTimerModeEquf;
+            interruptMask |= 1u << index;
+        }
+        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+        {
+            timer.mode |= kEeTimerModeOvff;
+            interruptMask |= 1u << index;
+        }
     }
+    return interruptMask;
+}
+
+uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    uint64_t nearest = std::numeric_limits<uint64_t>::max();
+    for (const EeTimer &timer : m_eeTimers)
+    {
+        if ((timer.mode & kEeTimerModeCue) == 0u)
+        {
+            continue;
+        }
+
+        const uint32_t count = timer.count & 0xFFFFu;
+        const uint32_t compare = timer.compare & 0xFFFFu;
+        const uint64_t compareDistance = ticksUntilMatch(count, compare);
+        const uint64_t overflowDistance = 0x10000ull - count;
+        uint64_t eventTicks = std::numeric_limits<uint64_t>::max();
+
+        if ((timer.mode & kEeTimerModeCmpe) != 0u &&
+            (timer.mode & kEeTimerModeEquf) == 0u)
+        {
+            eventTicks = compareDistance;
+        }
+        const bool overflowCanOccur = (timer.mode & kEeTimerModeZret) == 0u ||
+                                      overflowDistance <= compareDistance;
+        if (overflowCanOccur &&
+            (timer.mode & kEeTimerModeOvfe) != 0u &&
+            (timer.mode & kEeTimerModeOvff) == 0u)
+        {
+            eventTicks = std::min(eventTicks, overflowDistance);
+        }
+        if (eventTicks == std::numeric_limits<uint64_t>::max())
+        {
+            continue;
+        }
+
+        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+        nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+    }
+    return nearest;
 }
 
 bool PS2Memory::isScratchpad(uint32_t address) const
@@ -1332,23 +1430,36 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
-    if (const int timerIndex = eeTimerIndexForAddress(address); timerIndex >= 0)
+    size_t timerIndex = 0u;
+    uint32_t timerOffset = 0u;
+    if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
-        const uint32_t countAddr = kEeTimerBase[timerIndex];
-        if (address == countAddr)
+        EeTimer &timer = m_eeTimers[timerIndex];
+        switch (timerOffset)
         {
-            m_ioRegisters[address] = value;
-            m_timerLastHostNs[timerIndex] = steadyClockNs();
-            m_timerFractionNs[timerIndex] = 0u;
-            return true;
+        case kEeTimerCountOffset:
+            timer.count = value & 0xFFFFu;
+            timer.clockRemainder = 0u;
+            break;
+        case kEeTimerModeOffset:
+        {
+            const uint32_t previousMode = timer.mode;
+            const uint32_t status = (previousMode & kEeTimerModeStatusMask) &~(value & kEeTimerModeStatusMask);
+            timer.mode = (value & kEeTimerModeConfigMask) | status;
+            if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
+            {
+                timer.clockRemainder = 0u;
+            }
+            break;
         }
-
-        updateEeTimerCounter(static_cast<unsigned>(timerIndex));
-        m_ioRegisters[address] = value;
-        m_timerLastHostNs[timerIndex] = steadyClockNs();
-        if (address == countAddr + kEeTimerModeOffset)
-        {
-            m_timerFractionNs[timerIndex] = 0u;
+        case kEeTimerCompareOffset:
+            timer.compare = value & 0xFFFFu;
+            break;
+        case kEeTimerHoldOffset:
+            timer.hold = value & 0xFFFFu;
+            break;
+        default:
+            return false;
         }
         return true;
     }
@@ -2702,6 +2813,26 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    size_t timerIndex = 0u;
+    uint32_t timerOffset = 0u;
+    if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+    {
+        const EeTimer &timer = m_eeTimers[timerIndex];
+        switch (timerOffset)
+        {
+        case kEeTimerCountOffset:
+            return timer.count & 0xFFFFu;
+        case kEeTimerModeOffset:
+            return timer.mode & (kEeTimerModeConfigMask | kEeTimerModeStatusMask);
+        case kEeTimerCompareOffset:
+            return timer.compare & 0xFFFFu;
+        case kEeTimerHoldOffset:
+            return timer.hold & 0xFFFFu;
+        default:
+            return 0u;
+        }
+    }
+
     if (isGsPrivReg(address))
     {
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
@@ -2727,16 +2858,6 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     }
     if (address >= 0x10000000 && address < 0x10010000)
     {
-        if (const int timerIndex = eeTimerIndexForAddress(address); timerIndex >= 0)
-        {
-            if (address == kEeTimerBase[timerIndex])
-            {
-                updateEeTimerCounter(static_cast<unsigned>(timerIndex));
-            }
-            auto timerIt = m_ioRegisters.find(address);
-            return timerIt != m_ioRegisters.end() ? timerIt->second : 0u;
-        }
-
         // IPU channels answer from the engine: their STR bit is real, and a
         // streaming IPU_FROM stays started until the guest clears it.
         if (address >= 0x1000B000u && address < 0x1000B500u &&

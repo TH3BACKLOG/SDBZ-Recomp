@@ -301,6 +301,7 @@ public:
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
     // EE executor and therefore need no host synchronization.
+    void setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_t gp);
     int createThread(const EeThreadCreateParams &params);
     int deleteThread(int id, uint32_t &ownedStack);
     int startThread(int id, uint32_t arg, const R5900Context &caller, bool interruptSafe);
@@ -557,6 +558,7 @@ private:
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
+    uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     // 2026-09-22 -- atomic because this is genuinely touched cross-thread:
