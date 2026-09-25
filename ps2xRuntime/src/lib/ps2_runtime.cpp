@@ -1372,7 +1372,9 @@ PS2Runtime::PS2Runtime()
     // only in ps2_runtime.h with no definition anywhere in the tree yet.
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
 
-    std::memset(&m_cpuContext, 0, sizeof(m_cpuContext));
+    // Assign rather than memset: R5900Context's constructor zeroes itself and
+    // then applies the COP0 reset values, which a memset here would discard.
+    m_cpuContext = R5900Context{};
 
     // R0 is always zero in MIPS
     m_cpuContext.r[0] = _mm_set1_epi32(0);
