@@ -100,12 +100,6 @@ extern "C" uint64_t ps2x_guest_intr_disable_sections();
 extern "C" uint64_t ps2x_guest_intr_disable_redundant();
 extern "C" uint64_t ps2x_guest_intr_disable_stray();
 
-// Stage 5.17 sreg probe: how many times the IOP actually issued SIF_CMD
-// SET_SREG. Defined in Kernel/Stubs/SIF.cpp -- declared here rather than in a
-// header, per the .cpp-pair rule (a header touch rebuilds all ~4,520 runner
-// TUs).
-extern "C" uint64_t ps2x_iop_setsreg_calls();
-
 // ---------------------------------------------------------------------------
 // Probe sink (Phase B, 2026-07-26)
 // ---------------------------------------------------------------------------
@@ -8922,8 +8916,7 @@ namespace
             << " getCalls=" << g_sregGetCalls.load(std::memory_order_relaxed)
             << " setCalls=" << g_sregSetCalls.load(std::memory_order_relaxed)
             << " gate13block=" << g_sregGate13Blocking.load(std::memory_order_relaxed)
-            << " gate13pass=" << g_sregGate13Passing.load(std::memory_order_relaxed)
-            << " iopSetSreg=" << ps2x_iop_setsreg_calls();
+            << " gate13pass=" << g_sregGate13Passing.load(std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lock(g_sregMutex);
