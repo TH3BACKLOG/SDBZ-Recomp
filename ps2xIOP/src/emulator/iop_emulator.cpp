@@ -123,6 +123,7 @@ namespace ps2x::iop::detail
             cdvd.reset();
             intrman.reset();
             timrman.reset();
+            vblank.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
@@ -456,6 +457,18 @@ namespace ps2x::iop::detail
             }
             cpu.gpr[31] = kCallReturnSentinel;
             runCpu(cpu, budget);
+            if (cpu.pc != kCallReturnSentinel)
+            {
+                // The call did not return; its CpuState is discarded here. Never silent.
+                static uint32_t s_abandonLogs = 0u;
+                if (s_abandonLogs++ < 32u)
+                {
+                    std::ostringstream warn;
+                    warn << "[IOP] WARN guest call abandoned fn=0x" << std::hex << address << " pc=0x" << cpu.pc
+                         << std::dec << " budget=" << budget << (cpu.yielded ? " reason=yield" : " reason=budget");
+                    log(LogLevel::Warning, warn.str());
+                }
+            }
             return cpu.gpr[2];
         }
 
@@ -563,6 +576,7 @@ namespace ps2x::iop::detail
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
+                    vblank.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -572,6 +586,7 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        nextWake = vblank.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -624,7 +639,13 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            // Module start runs to completion before LoadModule returns on real
+            // hardware; don't cap it at the default 2M-instruction call budget.
+            static constexpr uint32_t kModuleStartBudget = 400'000'000u;
+            const uint64_t startInstructions = totalInstructions;
+            const uint32_t startResult =
+                callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp, kModuleStartBudget);
+            const uint64_t startUsed = totalInstructions - startInstructions;
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;
@@ -636,7 +657,7 @@ namespace ps2x::iop::detail
             out << "[IOP] loaded IRX id=" << result.moduleId
                 << " entry=0x" << std::hex << modules[result.moduleId].entry
                 << " base=0x" << modules[result.moduleId].base
-                << " start=" << std::dec << result.startResult;
+                << " start=" << std::dec << result.startResult << " instr=" << startUsed;
             log(LogLevel::Info, out.str());
             return result;
         }

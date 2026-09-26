@@ -1703,8 +1703,32 @@ namespace
         ctx->pc = GPR_U32(ctx, 31);
     }
 
+    // 2026-09-25 (upstream #244 sync): the SDBZ SDK re-implements sceSifBindRpc
+    // (0x178A08) and sceSifCallRpc (0x178BE8) in guest code, building SIF command
+    // packets (cid 0x80000009 / 0x8000000A) that our old ps2_iop echo layer
+    // answered. That layer is gone; ps2xIOP only answers through the runtime's
+    // SifBindRpc/SifCallRpc (RPC.cpp). Both guest functions keep the standard SDK
+    // ABI, so hand them straight to the runtime implementations.
+    void sdbzGuestSifBindRpc178A08(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        // Resume point first: the handler may throw to run a guest callback.
+        ctx->pc = ra;
+        ps2_syscalls::SifBindRpc(rdram, ctx, runtime);
+    }
+
+    void sdbzGuestSifCallRpc178BE8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        // Resume point first: the handler may throw to run a guest callback.
+        ctx->pc = ra;
+        ps2_syscalls::SifCallRpc(rdram, ctx, runtime);
+    }
+
     void applySdbzKernelThunkFixes(PS2Runtime &runtime)
     {
+        runtime.replaceFunction(0x00178A08u, &sdbzGuestSifBindRpc178A08);
+        runtime.replaceFunction(0x00178BE8u, &sdbzGuestSifCallRpc178BE8);
         runtime.replaceFunction(0x0017F5D0u, &sdbzKernelStoreWordEret);
         runtime.replaceFunction(0x00104BF0u, &sdbzRegisterHandler104BF0);
         runtime.replaceFunction(0x00178DE8u, &sdbzDiagRpcHandleValid178DE8);

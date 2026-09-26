@@ -2,6 +2,7 @@
 #include "ps2_host_backend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -123,6 +124,26 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+    }
+
+    // Unattended-run aid (default off): PS2X_PAD_AUTOPRESS=N pulses Cross, then
+    // Circle, then Start for a few frames every N pad frames, so "press a button"
+    // prompts do not park a run nobody is watching.
+    static const uint32_t s_autoPeriod = []() -> uint32_t
+    {
+        const char *s = std::getenv("PS2X_PAD_AUTOPRESS");
+        return (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 0u;
+    }();
+    if (s_autoPeriod >= 16u)
+    {
+        static std::atomic<uint32_t> s_autoFrame{0u};
+        const uint32_t frame = s_autoFrame.fetch_add(1u, std::memory_order_relaxed);
+        const uint32_t phase = frame % s_autoPeriod;
+        if (phase < 6u)
+        {
+            constexpr uint16_t kCycle[3] = {PAD_CROSS, PAD_CIRCLE, PAD_START};
+            clearBit(kCycle[(frame / s_autoPeriod) % 3u]);
+        }
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

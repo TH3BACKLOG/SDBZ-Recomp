@@ -4,6 +4,7 @@
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <cstdio>
 #include <string>
 
 namespace ps2x::iop::detail
@@ -31,8 +32,45 @@ namespace ps2x::iop::detail
         switch (ordinal)
         {
         case 4: // printf
-            logString("[IOP printf] ", a0);
+        {
+            // Expand %s/%d/%x/%u/%c from a1..a3 then the stack (o32: args at sp+16..).
+            const std::string fmt = m_memory.readString(a0, 2048u);
+            std::string out;
+            uint32_t argIndex = 0u;
+            const auto nextArg = [&]() -> uint32_t
+            {
+                const uint32_t i = argIndex++;
+                return i < 3u ? cpu.gpr[5u + i] : m_memory.read32(cpu.gpr[29] + 16u + (i - 3u) * 4u);
+            };
+            for (size_t i = 0u; i < fmt.size(); ++i)
+            {
+                if (fmt[i] != '%' || i + 1u >= fmt.size())
+                {
+                    out += fmt[i];
+                    continue;
+                }
+                size_t j = i + 1u;
+                while (j < fmt.size() && (fmt[j] == '0' || fmt[j] == 'l' || (fmt[j] >= '1' && fmt[j] <= '9') || fmt[j] == '.' || fmt[j] == '-'))
+                    ++j;
+                if (j >= fmt.size())
+                    break;
+                char buf[16];
+                switch (fmt[j])
+                {
+                case 's': out += m_memory.readString(nextArg(), 256u); break;
+                case 'd': case 'i': out += std::to_string(static_cast<int32_t>(nextArg())); break;
+                case 'u': out += std::to_string(nextArg()); break;
+                case 'x': case 'X': std::snprintf(buf, sizeof(buf), "%x", nextArg()); out += buf; break;
+                case 'c': out += static_cast<char>(nextArg() & 0xFFu); break;
+                case '%': out += '%'; break;
+                default: out += fmt.substr(i, j - i + 1u); break;
+                }
+                i = j;
+            }
+            m_host.log(LogLevel::Info, "[IOP printf] " + out);
+            setV0(static_cast<uint32_t>(out.size()));
             return true;
+        }
         case 5: // getchar
         case 10:
             setV0(0xFFFFFFFFu);

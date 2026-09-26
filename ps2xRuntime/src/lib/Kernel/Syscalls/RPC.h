@@ -8,6 +8,10 @@ namespace ps2_syscalls
     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    bool isGuestHleSystemSid(uint32_t sid);
+    uint32_t sdbzSifIopCmdBuffer(PS2Runtime *runtime);
+    bool sdbzBiosHleRpc(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t rpcNum, uint32_t sendBuf,
+                        uint32_t sendSize, uint32_t recvBuf, uint32_t recvSize);
     void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

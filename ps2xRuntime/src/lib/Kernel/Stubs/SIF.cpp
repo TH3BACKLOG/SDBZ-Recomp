@@ -10,6 +10,13 @@
 #include <limits>
 #include <vector>
 
+namespace ps2_syscalls
+{
+    // SdbzBiosHle.cpp
+    bool sdbzGuestSifCmdHandler(uint8_t *rdram, uint32_t commandId, uint32_t &function, uint32_t &argument);
+    bool sdbzGuestSifCmdInline(uint8_t *rdram, uint32_t commandId, const void *packet, size_t packetSize);
+}
+
 namespace ps2_stubs
 {
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -239,9 +246,17 @@ namespace ps2_stubs
         {
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             const auto handler = g_sifCmdHandlers.find(commandId);
-            if (handler == g_sifCmdHandlers.end() || handler->second.function == 0u)
+            if (handler != g_sifCmdHandlers.end())
+                registered = handler->second;
+        }
+        // Games with their own guest libsifcmd never register through the stub
+        // above; fall back to the handler in the guest's own table.
+        if (registered.function == 0u)
+        {
+            if (ps2_syscalls::sdbzGuestSifCmdInline(rdram, commandId, packet, packetSize))
+                return true;
+            if (!ps2_syscalls::sdbzGuestSifCmdHandler(rdram, commandId, registered.function, registered.argument))
                 return false;
-            registered = handler->second;
         }
 
         if (!runtime->hasFunction(registered.function))

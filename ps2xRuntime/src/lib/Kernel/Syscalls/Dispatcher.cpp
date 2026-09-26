@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "Dispatcher.h"
 #include "System.h"
+#include "RPC.h"
 
 namespace ps2_syscalls
 {
@@ -362,6 +363,19 @@ namespace ps2_syscalls
                 {
                     std::cerr << "[syscall:0x7A] a0=0x" << std::hex << getRegU32(ctx, 4)
                               << " -> 0xFFFFFFFF (complete)" << std::dec << std::endl;
+                }
+            }
+            {
+                const uint32_t reg = getRegU32(ctx, 4);
+                if (reg == 0x80000000u || reg == 0x80000001u)
+                {
+                    // SDBZ builds SIF cmd packets and DMAs them to this IOP-side buffer.
+                    const uint32_t buf = sdbzSifIopCmdBuffer(runtime);
+                    if (buf != 0u)
+                    {
+                        setReturnU32(ctx, buf);
+                        return true;
+                    }
                 }
             }
             setReturnU32(ctx, 0xFFFFFFFFu);

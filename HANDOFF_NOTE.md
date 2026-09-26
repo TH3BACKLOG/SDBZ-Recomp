@@ -1,3 +1,29 @@
+# Handoff note -- 2026-09-26 session end (upstream-sync boot stabilization)
+
+Branch `sync/upstream-2026-09-24` (rollback `origin/work/laptop-session-0519` = 4fdccc2c; backup `F:\sdbz_sync\sdbz_recomp_9-24-26.7z`).
+
+## Where it stands
+- Upstream #203/#244 built and run. Game no longer hangs at the IOP reboot; ALL IRXs (SIO2MAN, MCMAN, MCSERV, LIBSD, CRI_ADXI, ARKD_DVD, PADMAN) load under ps2xIOP.
+- Current blocker: at t~10s the guest JALRs a NULL vtable slot (0x1abc6c, obj->vtbl[3]) -> pc=0, everything idles. Preceded by IOP printf `file not found! : %s` from ARKD (name not expanded). Hypothesis only: ARKD's CD file lookup on ps2xIOP's virtual ISO failed.
+- Baseline to beat: title screen at t~580s on the old stack.
+
+## Uncommitted work (all syntax-checked with cl /Zs, last build had everything up to the 0x7A fix)
+- `Kernel/Syscalls/SdbzBiosHle.cpp` (NEW): EE-side IOPHEAP/LOADFILE/cdvd 0x59x HLE for SDBZ's guest-level SIF client.
+- `RPC.cpp/.h`, `Dispatcher.cpp` (0x7A cmd buffer), `game_overrides.cpp` (0x178A08/0x178BE8 -> runtime SifBind/Call), `ps2_runtime.cpp` (loadIopModule log).
+- NEW since last build: `[iop:cdvd] SearchFile` log in `ps2xIOP/src/emulator/imports/iop_cdvd.cpp`; per-SID `[iop:bind]` log in RPC.cpp.
+
+## Next steps
+1. `& "F:\SDBZ Recompuild.ps1" RelWithDebInfo`, then `launch_recomp.ps1 -Determinism 1 -RunSeconds 60 -NoDebugger -Exe ...RelWithDebInfo\ps2EntryRunner.exe`.
+2. Decode log (`iconv -f UTF-16LE -t UTF-8 run_log.txt | tr -d ''`), check `exeWritten` is fresh. Grep `[iop:cdvd]`, `[iop:bind]`, `file not found`.
+3. If a path is NOT FOUND: compare with cdRoot layout / ps2xIOP virtual ISO (separate from our CD.cpp). Check whether SIDs 0x500-0x503 ever bind.
+4. Commit uncommitted work (trailer Co-Authored-By: Claude Sonnet 5), decide on pushing the branch (unanswered).
+5. Classify unit-test failures vs `work/laptop-session-0519` baseline (test_results_sync*.txt).
+
+## Older open items
+VuCap round-trip capture; training-mode captures at PS2X_VUCAP_AT=220,280,340; 11 tracked recovered/*.cpp are public; check whether remote main history holds generated files. (See the 09-23 Part 161 notes below, kept for reference.)
+
+---
+
 # Handoff note -- 2026-09-23 session end (Part 161, preliminary)
 
 ## Headline

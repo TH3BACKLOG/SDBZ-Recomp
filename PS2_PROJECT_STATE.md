@@ -21586,6 +21586,10 @@ funcmap: `GS_DispatchPending 0x00102870-0x00102a54` owns `0x102894`.
 - **Fix (game_overrides.cpp only, allowed layer):** added `runtime.registerFunction(0x00180D30u, &fn_180D30_0x180d30)` alongside the existing four gap-fill registrations, plus `#include "fn_forward_decls.h"` so the symbol resolves.
 - **Status: BUILD PENDING.** User runs `& "F:\SDBZ Recomp\build.ps1"`, then the Active Runner Command, then grep `run_log.txt` (UTF-16, `-Encoding unicode`) for `0x180d30` — confirm the missing-target line is gone and note the next target/progress. This is a boot-path cleanup, **distinct from the live 5.3.2 `$ra=0x1` writer blocker** (see tracker) — closing it removes noise but is not expected to resolve the stack-clobber.
 
+## Current Status (2026-09-26) - upstream sync #203/#244 built+run; IRXs load under ps2xIOP; blocker = null vtable call at 0x1abc6c ~t=10s after ARKD "file not found"
+
+- Guest SIF client (0x178A08/0x178BE8) now routed to runtime; SdbzBiosHle.cpp serves IOPHEAP/LOADFILE/cdvd 0x59x EE-side; syscall 0x7A returns IOP cmd buffer (fixes IOP-reboot loop). Details: HANDOFF_NOTE.md, memory project_upstream_sync_2026_09_24.
+
 ## Current Status (2026-07-22) — ✅ 5.1 DERAIL CLEARED (built+run); live blocker moved to 5.3: AudioSysInit ARKD `func=0x2` RPC never completes
 
 Built exe (`build/ps2xRuntime/Debug/ps2EntryRunner.exe`, 2026-07-21 06:11) run via `launch_recomp.ps1`,

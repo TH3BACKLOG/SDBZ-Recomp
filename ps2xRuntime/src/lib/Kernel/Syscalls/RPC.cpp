@@ -1,3 +1,5 @@
+#include <map>
+#include <mutex>
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
@@ -295,7 +297,7 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
+        if (!serverPtr && (PS2IopTransport::canBindRpc(runtime, rpcId) || isGuestHleSystemSid(rpcId)))
         {
             // EE-side servers and HLE routes need a descriptor in guest RAM.
             // With an emulated IOP, only publish it after the IRX has actually
@@ -312,6 +314,18 @@ namespace ps2_syscalls
                 }
                 std::lock_guard<std::mutex> lock(g_rpc_mutex);
                 g_rpc_servers[rpcId] = {rpcId, serverPtr};
+            }
+        }
+
+        {
+            static std::mutex s_bindLogMutex;
+            static std::map<uint64_t, uint32_t> s_bindLogSeen;
+            std::lock_guard<std::mutex> bindLogLock(s_bindLogMutex);
+            uint32_t &bindLogCount = s_bindLogSeen[(static_cast<uint64_t>(rpcId) << 1) | (serverPtr ? 1u : 0u)];
+            if (bindLogCount++ < 3u)
+            {
+                std::cerr << "[iop:bind] sid=0x" << std::hex << rpcId << " client=0x" << clientPtr << std::dec
+                          << " server=" << (serverPtr ? "bound" : "NONE") << std::endl;
             }
         }
 
@@ -544,6 +558,13 @@ namespace ps2_syscalls
             request.endParameter = endParameter;
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            if (!iopResult.handled &&
+                sdbzBiosHleRpc(rdram, runtime, sid, rpcNum, sendBuf, sendSize, receiveBuffer, receiveSize))
+            {
+                iopResult.handled = true;
+                iopResult.resultAddress = receiveBuffer;
+                iopResult.signalCompletion = true;
+            }
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)

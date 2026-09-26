@@ -242,21 +242,26 @@ inline std::filesystem::path g_host_cwd;
 inline std::filesystem::path g_cdrom_cwd;
 inline std::string g_ps2_cwd_device = "host0";
 
+// Runtime kernel pools, packed just below the main-stack reservation
+// (0x01FBFFF0). The guest heap ends at kRpcPacketPoolBase (kGuestHeapHardLimit
+// in ps2_runtime.cpp must match). Was 0x01F00000, which capped the heap ~1 MB
+// short of what games ask for with InitHeap(-1).
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
+static constexpr uint32_t kRpcPacketPoolBase = 0x01F8C000;
 static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
+static constexpr uint32_t kRpcServerPoolBase = 0x01F9C000;
 static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcServerStride = 0x80;
 static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
 
-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
+static constexpr uint32_t kTlsPoolBase = 0x01FAC000;
 static constexpr uint32_t kTlsPoolBytes = 0x00010000;
 static constexpr uint32_t kTlsBlockSize = 0x100;
 static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
 
-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
+static constexpr uint32_t kBootModePoolBase = 0x01FBC000;
+static_assert(kBootModePoolBase + 0x1000u <= 0x01FBFFF0u, "kernel pools overlap the main-stack reservation");
 static constexpr uint32_t kBootModePoolBytes = 0x00001000;
 
 static constexpr uint32_t kSifRpcModeNowait = 0x01;

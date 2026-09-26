@@ -292,12 +292,17 @@ namespace ps2x::iop::detail
             }
         }
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
+        // Handlers run to completion inline, so give them far more than the
+        // default 2M-instruction call budget: ARKD_DVD's init RPC decrypts its
+        // 98 KB TOC byte-by-byte and was being cut off mid-way.
+        constexpr uint32_t kRpcHandlerBudget = 400'000'000u;
+        uint32_t returnPointer = executor.executeGuestFunctionWithBudget(server.function,
+                                                                         request.function,
+                                                                         server.buffer,
+                                                                         request.send.size,
+                                                                         0u,
+                                                                         server.gp,
+                                                                         kRpcHandlerBudget);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)

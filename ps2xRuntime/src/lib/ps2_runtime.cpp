@@ -372,7 +372,10 @@ namespace
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // Guest heap ends where the runtime's kernel pools begin (Helpers/State.h,
+    // kRpcPacketPoolBase). SDBZ's crt0 asks InitHeap(-1) = "up to the main
+    // stack"; the old 0x01F00000 cap withheld ~1 MB and starved fight loading.
+    constexpr uint32_t kGuestHeapHardLimit = 0x01F8C000u;
 
     // -----------------------------------------------------------------------
     // Async callback stack pool: [kAsyncCallbackStackFloor, kAsyncCallbackStackTop)
@@ -1531,7 +1534,14 @@ PS2Runtime::~PS2Runtime()
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
-    return m_iopSubsystem->loadModule(path, arguments, argumentSize);
+    const auto result = m_iopSubsystem->loadModule(path, arguments, argumentSize);
+    static std::atomic<uint32_t> s_loadLogs{0u};
+    if (s_loadLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+    {
+        std::cerr << "[iop:load] path='" << std::string(path) << "' handled=" << result.handled
+                  << " moduleId=" << result.moduleId << " start=" << result.startResult << std::endl;
+    }
+    return result;
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)

@@ -120,7 +120,14 @@ namespace ps2x::iop
         if (!parsed)
             return {true, -1, -1};
 
-        if (parsed.device != Ps2PathDevice::Rom0)
+        // The SIO2 bus is not emulated, so a disc copy of the SIO2/memory-card
+        // driver chain can only fail card detection (MCSERV GetInfo -> -11).
+        // Serve those from the HLE mcserv (virtual card) even when the game
+        // ships its own IRX.
+        const std::string leafKey = ps2PathLeafKey(path);
+        const bool preferHle = leafKey == "sio2man" || leafKey == "xsio2man" || leafKey == "mcman" ||
+                               leafKey == "xmcman" || leafKey == "mcserv" || leafKey == "xmcserv";
+        if (parsed.device != Ps2PathDevice::Rom0 && !preferHle)
         {
             ModuleLoadResult physical = m_impl->emulator.loadModule(path, arguments, argumentSize);
             if (physical.moduleId > 0)
