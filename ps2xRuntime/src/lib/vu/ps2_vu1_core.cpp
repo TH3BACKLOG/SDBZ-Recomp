@@ -7,6 +7,7 @@
 #include "Kernel/VuCap/VuCapRecorder.h"
 
 #include <algorithm>
+#include <bit>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -128,24 +129,12 @@ void VU1Interpreter::reset()
 
 float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
 {
-    return normalizeOperand(vf[bc & 3u]);
+    return vuNormalizeOperand(vf[bc & 3u]);
 }
 
 float VU1Interpreter::normalizeOperand(float value) const
 {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t exponent = (bits >> 23) & 0xFFu;
-    if (exponent == 0u)
-    {
-        bits &= 0x80000000u;
-    }
-    else if (exponent == 0xFFu)
-    {
-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
-    }
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
+    return vuNormalizeOperand(value);
 }
 
 float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
@@ -254,7 +243,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
 
     const auto operand = [this](float value)
     {
-        return static_cast<long double>(normalizeOperand(value));
+        return static_cast<long double>(vuNormalizeOperand(value));
     };
     const auto vs = [&](uint32_t lane)
     {
@@ -479,27 +468,27 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
         static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
         static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
         const uint8_t leftComponent = op == 0x2Eu ? crossLeft[component] : static_cast<uint8_t>(component);
-        const float left = normalizeOperand(m_state.vf[fs][leftComponent]);
+        const float left = vuNormalizeOperand(m_state.vf[fs][leftComponent]);
         float right = 0.0f;
         if ((op >= 0x08u && op <= 0x0Fu) || (special >= 0x08u && special <= 0x0Fu))
         {
-            right = normalizeOperand(m_state.vf[ft][(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]);
+            right = vuNormalizeOperand(m_state.vf[ft][(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]);
         }
         else if (op == 0x21u || op == 0x25u || special == 0x21u || special == 0x25u)
         {
-            right = normalizeOperand(m_state.q);
+            right = vuNormalizeOperand(m_state.q);
         }
         else if (op == 0x23u || op == 0x27u || special == 0x23u || special == 0x27u)
         {
-            right = normalizeOperand(m_state.i);
+            right = vuNormalizeOperand(m_state.i);
         }
         else if (op == 0x2Eu)
         {
-            right = normalizeOperand(m_state.vf[ft][crossRight[component]]);
+            right = vuNormalizeOperand(m_state.vf[ft][crossRight[component]]);
         }
         else
         {
-            right = normalizeOperand(m_state.vf[ft][component]);
+            right = vuNormalizeOperand(m_state.vf[ft][component]);
         }
 
         float product = left * right;
@@ -1082,25 +1071,19 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
     {
         if (!usage)
             continue;
+        // Visit only the set bits. Lane bit b is component 3-b (laneForComponent).
         for (uint32_t index = 0; index < usage->vfReadCount; ++index)
         {
             const VfAccess &access = usage->vfRead[index];
-            for (uint32_t component = 0; component < 4u; ++component)
-            {
-                if ((access.lanes & laneForComponent(component)) != 0u)
-                    ready = std::max(ready, m_vfReady[access.reg][component]);
-            }
+            const auto &regReady = m_vfReady[access.reg];
+            for (uint32_t lanes = access.lanes & 0xFu; lanes != 0u; lanes &= lanes - 1u)
+                ready = std::max(ready, regReady[3u - static_cast<uint32_t>(std::countr_zero(lanes))]);
         }
-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
-        {
-            if ((usage->viRead & (1u << reg)) != 0u)
-                ready = std::max(ready, m_viReady[reg]);
-        }
-        for (uint32_t component = 0; component < 4u; ++component)
-        {
-            if ((usage->accRead & laneForComponent(component)) != 0u)
-                ready = std::max(ready, m_accReady[component]);
-        }
+        static_assert(std::tuple_size_v<decltype(m_viReady)> == 16u, "viRead is a 16-bit mask");
+        for (uint32_t regs = usage->viRead & 0xFFFEu; regs != 0u; regs &= regs - 1u)
+            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(regs))]);
+        for (uint32_t lanes = usage->accRead & 0xFu; lanes != 0u; lanes &= lanes - 1u)
+            ready = std::max(ready, m_accReady[3u - static_cast<uint32_t>(std::countr_zero(lanes))]);
     }
 
     if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)
@@ -1787,7 +1770,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             execUpper(decoded.upper);
             float immediate = 0.0f;
             std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
-            m_state.i = normalizeOperand(immediate);
+            m_state.i = vuNormalizeOperand(immediate);
         }
         else if (decoded.upperVfShadowReg != 0u)
         {

@@ -36,15 +36,15 @@ void VU1Interpreter::execUpper(uint32_t instr)
     float normalizedAcc[4];
     for (uint32_t component = 0; component < 4u; ++component)
     {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+        normalizedVs[component] = vuNormalizeOperand(m_state.vf[fs][component]);
+        normalizedVt[component] = vuNormalizeOperand(m_state.vf[ft][component]);
+        normalizedAcc[component] = vuNormalizeOperand(m_state.acc[component]);
     }
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
-    const float q = normalizeOperand(m_state.q);
-    const float i = normalizeOperand(m_state.i);
+    const float q = vuNormalizeOperand(m_state.q);
+    const float i = vuNormalizeOperand(m_state.i);
     float result[4];
 
     // Upper opcode decoding (bits 5:0 of upper word)

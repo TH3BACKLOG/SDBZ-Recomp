@@ -2,6 +2,7 @@
 #define PS2_VU1_DETAIL_H
 
 #include <cstdint>
+#include <cstring>
 
 // Instruction field extraction helpers
 static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
@@ -24,6 +25,22 @@ static inline int16_t IMM15(uint32_t i)
     uint32_t hi4 = (i >> 21) & 0xF;
     uint32_t raw = (hi4 << 11) | lo11;
     return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+}
+
+// VU operand normalization: denormals read as signed zero, Inf/NaN as signed
+// max-normal. Same logic as VU1Interpreter::normalizeOperand, but inline so the
+// upper/lower TUs don't pay a cross-TU call per operand (no LTO in this build).
+static inline float vuNormalizeOperand(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    if (exponent == 0u)
+        bits &= 0x80000000u;
+    else if (exponent == 0xFFu)
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 #endif
