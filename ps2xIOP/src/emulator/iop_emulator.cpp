@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <span>
@@ -762,7 +763,29 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        // EeScheduler::accountCycles() calls this on every guest checkpoint,
+        // usually with a handful of EE cycles. Running the full IOP service
+        // loop for 1-2 IOP cycles each time was 13.5% of the game thread
+        // (09-27 host profile, all in IopKernel::nextWakeCycle). Bank the EE
+        // cycles and run the IOP in batches instead. 2048 EE = 256 IOP cycles,
+        // well under 0.1% of a frame. PS2X_IOP_BATCH (EE cycles) overrides;
+        // 8 restores the old per-checkpoint behaviour.
+        static const uint64_t kBatchEe = []
+        {
+            if (const char *v = std::getenv("PS2X_IOP_BATCH"))
+            {
+                const long long n = std::atoll(v);
+                if (n >= 8)
+                    return static_cast<uint64_t>(n);
+            }
+            return uint64_t{2048};
+        }();
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+        if (total < kBatchEe)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)
