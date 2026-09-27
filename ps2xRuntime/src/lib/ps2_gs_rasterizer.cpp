@@ -2355,6 +2355,13 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         case GS_PSM_T4HH:
             ps2diag_fbstat::t_lastTexIndex = out;
 
+            // Perf (09-27): everything below up to the CLUT lookup is probe
+            // bookkeeping -- several locked RMWs per texel, 4x under bilinear.
+            // Skip it entirely when the diag gate is off.
+            if (!ps2_diag::enabled())
+                return applyTexa(texa, tex.psm,
+                                 gs->ReadClutCache(tex.cpsm, static_cast<u8>(out), tex.csa));
+
             // [boxtex] -- Stage 5.11 run 22. Every paletted format, not just
             // T8: if suspect #16 is live the box may be arriving as T4, and
             // gating on T8 here would hide exactly that.
@@ -3028,8 +3035,13 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
 
-    const uint64_t meshdumpTick = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
-    ps2diag_meshdump::dumpTriangle(meshdumpTick, v0, v1, v2, ctx, prim.tme != 0, prim.fst != 0);
+    // Perf (09-27): only pay for the hit counter / vsync-tick query when a dump
+    // is requested or the diag gate is on.
+    if (ps2_diag::enabled() || ps2diag_meshdump::outPath())
+    {
+        const uint64_t meshdumpTick = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+        ps2diag_meshdump::dumpTriangle(meshdumpTick, v0, v1, v2, ctx, prim.tme != 0, prim.fst != 0);
+    }
 
     int ofx = ctx.xyoffset.ofx >> 4;
     int ofy = ctx.xyoffset.ofy >> 4;

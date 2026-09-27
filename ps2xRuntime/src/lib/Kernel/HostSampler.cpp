@@ -332,6 +332,12 @@ void samplerMain(int intervalMs, double reportAfterSec)
     const auto started = std::chrono::steady_clock::now();
     auto lastRefresh = started - std::chrono::seconds(10);
 
+    // PS2X_PROFILE_START=<sec>: discard samples before this point so the
+    // report covers one scene (e.g. a fight) instead of boot + menus.
+    double startSec = 0.0;
+    if (const char *st = std::getenv("PS2X_PROFILE_START"))
+        startSec = (std::max)(0.0, std::atof(st));
+
     while (!g_stop.load(std::memory_order_relaxed))
     {
         const auto now = std::chrono::steady_clock::now();
@@ -371,6 +377,9 @@ void samplerMain(int intervalMs, double reportAfterSec)
             t.lastCpu100ns = cpu;
             if (delta == 0)
                 continue; // thread was parked this interval -- not a CPU sample
+            if (startSec > 0.0 &&
+                std::chrono::duration<double>(now - started).count() < startSec)
+                continue;
 
             ThreadSamples &s = g_samples[kv.first];
             s.totalWeight += delta;
