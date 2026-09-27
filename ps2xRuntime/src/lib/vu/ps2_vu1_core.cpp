@@ -30,17 +30,37 @@ namespace
     // runner TU through ps2_runtime.h. One slot per Unit; `owner` guards against
     // a second interpreter of the same unit (tests) reusing a stale hint -- a
     // mismatch just forces a full scan, which then re-claims the slot.
+    // pipeReady[] holds the same bound per pipeline, so a due cycle only scans
+    // the pipelines that actually have something due. A stale-low value only
+    // costs a rescan; every enqueue lowers its pipeline's entry.
+    enum CommitPipe : uint32_t
+    {
+        kPipeFlag,
+        kPipeFdiv,
+        kPipeEfu,
+        kPipeStore,
+        kPipeVf,
+        kPipeVi,
+        kPipeAcc,
+        kPipeCount
+    };
+
     struct CommitHint
     {
         const void *owner = nullptr;
         uint64_t nextReady = 0;
+        uint64_t pipeReady[kPipeCount]{};
     };
     CommitHint g_commitHint[2];
 
-    inline void lowerCommitHint(const void *owner, uint32_t unit, uint64_t readyCycle)
+    inline void lowerCommitHint(const void *owner, uint32_t unit, CommitPipe pipe, uint64_t readyCycle)
     {
         CommitHint &hint = g_commitHint[unit & 1u];
-        if (hint.owner == owner && readyCycle < hint.nextReady)
+        if (hint.owner != owner)
+            return;
+        if (readyCycle < hint.pipeReady[pipe])
+            hint.pipeReady[pipe] = readyCycle;
+        if (readyCycle < hint.nextReady)
             hint.nextReady = readyCycle;
     }
 }
@@ -547,7 +567,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     entry->valid = true;
     entry->issueCycle = m_cycle;
     entry->readyCycle = m_cycle + kFmacLatency;
-    lowerCommitHint(this, static_cast<uint32_t>(m_unit), entry->readyCycle);
+    lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry->readyCycle);
     entry->mac = mac;
     entry->status = status;
     entry->extraSticky = extraSticky;
@@ -587,7 +607,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle);
             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
             entry.writesSticky = true;
             return;
@@ -607,7 +627,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -632,7 +652,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -647,7 +667,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
     value = normalizeResult(value, ignoredFlags);
     m_fdiv.valid = true;
     m_fdiv.readyCycle = m_cycle + latency;
-    lowerCommitHint(this, static_cast<uint32_t>(m_unit), m_fdiv.readyCycle);
+    lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFdiv, m_fdiv.readyCycle);
     m_fdiv.value = value;
     m_fdiv.statusDi = statusDi & 0x30u;
 }
@@ -662,7 +682,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
         {
             entry.valid = true;
             entry.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeEfu, entry.readyCycle);
             entry.value = value;
             // EFU throughput is one cycle shorter than result visibility.
             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
@@ -680,7 +700,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
         {
             store.valid = true;
             store.readyCycle = m_cycle + 1u;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), store.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeStore, store.readyCycle);
             store.address = address;
             store.laneMask = laneMask;
             std::copy(words, words + 4, store.words.begin());
@@ -702,7 +722,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), write.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeVf, write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.laneMask = laneMask;
@@ -729,7 +749,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), write.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeVi, write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.value = value;
@@ -751,7 +771,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), write.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeAcc, write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.laneMask = laneMask;
             std::copy(value, value + 4, write.value.begin());
@@ -769,142 +789,185 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 void VU1Interpreter::commitReadyPipelines()
 {
     CommitHint &hint = g_commitHint[static_cast<uint32_t>(m_unit) & 1u];
-    if (hint.owner == this && m_cycle < hint.nextReady)
+    const bool fullScan = hint.owner != this;
+    if (!fullScan && m_cycle < hint.nextReady)
         return;
 
-    // Full scan. Track the earliest readyCycle left pending so the next calls
-    // can early-out; every enqueue site lowers it via lowerCommitHint().
-    uint64_t nextReady = std::numeric_limits<uint64_t>::max();
+    // Scan only the pipelines whose earliest pending readyCycle is due (all of
+    // them when the hint belongs to another interpreter), and recompute that
+    // pipeline's bound. Every enqueue site lowers it via lowerCommitHint().
+    constexpr uint64_t kNone = std::numeric_limits<uint64_t>::max();
+    const auto due = [&](CommitPipe pipe)
+    {
+        return fullScan || hint.pipeReady[pipe] <= m_cycle;
+    };
+    uint64_t pipeNext = kNone;
     const auto keep = [&](uint64_t readyCycle)
     {
-        if (readyCycle < nextReady)
-            nextReady = readyCycle;
+        if (readyCycle < pipeNext)
+            pipeNext = readyCycle;
+    };
+    const auto finish = [&](CommitPipe pipe)
+    {
+        hint.pipeReady[pipe] = pipeNext;
+        pipeNext = kNone;
     };
 
-    for (FlagPipelineEntry &entry : m_flagPipeline)
+    if (due(kPipeFlag))
     {
-        if (!entry.valid)
-            continue;
-        if (entry.readyCycle > m_cycle)
+        for (FlagPipelineEntry &entry : m_flagPipeline)
         {
-            keep(entry.readyCycle);
-            continue;
-        }
+            if (!entry.valid)
+                continue;
+            if (entry.readyCycle > m_cycle)
+            {
+                keep(entry.readyCycle);
+                continue;
+            }
 
-        if (entry.writesMac)
-            m_state.mac = entry.mac;
-        if (entry.writesStatus)
-        {
-            const uint32_t current = entry.status & 0xFu;
-            m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
-        }
-        if (entry.writesSticky)
-        {
-            m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
-        }
-        if (entry.writesClip)
-            m_state.clip = entry.clip;
-        entry = {};
-    }
-
-    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
-        keep(m_fdiv.readyCycle);
-    else if (m_fdiv.valid)
-    {
-        m_state.q = m_fdiv.value;
-        const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
-        m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
-        m_fdiv = {};
-    }
-
-    for (ScalarPipelineEntry &entry : m_efu)
-    {
-        if (entry.valid && entry.readyCycle > m_cycle)
-            keep(entry.readyCycle);
-        else if (entry.valid)
-        {
-            m_state.p = entry.value;
+            if (entry.writesMac)
+                m_state.mac = entry.mac;
+            if (entry.writesStatus)
+            {
+                const uint32_t current = entry.status & 0xFu;
+                m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+            }
+            if (entry.writesSticky)
+            {
+                m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
+            }
+            if (entry.writesClip)
+                m_state.clip = entry.clip;
             entry = {};
         }
+        finish(kPipeFlag);
     }
 
-    for (PendingStore &store : m_storePipeline)
+    if (due(kPipeFdiv))
     {
-        if (!store.valid)
-            continue;
-        if (store.readyCycle > m_cycle)
+        if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
+            keep(m_fdiv.readyCycle);
+        else if (m_fdiv.valid)
         {
-            keep(store.readyCycle);
-            continue;
+            m_state.q = m_fdiv.value;
+            const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+            m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+            m_fdiv = {};
         }
-        if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+        finish(kPipeFdiv);
+    }
+
+    if (due(kPipeEfu))
+    {
+        for (ScalarPipelineEntry &entry : m_efu)
         {
-            uint32_t oldWords[4]{};
-            std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
+            if (entry.valid && entry.readyCycle > m_cycle)
+                keep(entry.readyCycle);
+            else if (entry.valid)
+            {
+                m_state.p = entry.value;
+                entry = {};
+            }
+        }
+        finish(kPipeEfu);
+    }
+
+    if (due(kPipeStore))
+    {
+        for (PendingStore &store : m_storePipeline)
+        {
+            if (!store.valid)
+                continue;
+            if (store.readyCycle > m_cycle)
+            {
+                keep(store.readyCycle);
+                continue;
+            }
+            if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+            {
+                uint32_t oldWords[4]{};
+                std::memcpy(oldWords, m_activeVuData + store.address, sizeof(oldWords));
+                for (uint32_t component = 0; component < 4u; ++component)
+                {
+                    if ((store.laneMask & laneForComponent(component)) != 0u)
+                        oldWords[component] = store.words[component];
+                }
+                std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+            }
+            store = {};
+        }
+        finish(kPipeStore);
+    }
+
+    if (due(kPipeVf))
+    {
+        for (PendingVfWrite &write : m_vfWritePipeline)
+        {
+            if (!write.valid)
+                continue;
+            if (write.readyCycle > m_cycle)
+            {
+                keep(write.readyCycle);
+                continue;
+            }
             for (uint32_t component = 0; component < 4u; ++component)
             {
-                if ((store.laneMask & laneForComponent(component)) != 0u)
-                    oldWords[component] = store.words[component];
+                if ((write.laneMask & laneForComponent(component)) != 0u &&
+                    m_vfLatestWrite[write.reg][component] == write.sequence)
+                {
+                    m_state.vf[write.reg][component] = write.value[component];
+                }
             }
-            std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+            write = {};
         }
-        store = {};
+        finish(kPipeVf);
     }
 
-    for (PendingVfWrite &write : m_vfWritePipeline)
+    if (due(kPipeVi))
     {
-        if (!write.valid)
-            continue;
-        if (write.readyCycle > m_cycle)
+        for (PendingViWrite &write : m_viWritePipeline)
         {
-            keep(write.readyCycle);
-            continue;
-        }
-        for (uint32_t component = 0; component < 4u; ++component)
-        {
-            if ((write.laneMask & laneForComponent(component)) != 0u &&
-                m_vfLatestWrite[write.reg][component] == write.sequence)
+            if (!write.valid)
+                continue;
+            if (write.readyCycle > m_cycle)
             {
-                m_state.vf[write.reg][component] = write.value[component];
+                keep(write.readyCycle);
+                continue;
             }
+            if (m_viLatestWrite[write.reg] == write.sequence)
+                m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+            write = {};
         }
-        write = {};
+        finish(kPipeVi);
     }
 
-    for (PendingViWrite &write : m_viWritePipeline)
+    if (due(kPipeAcc))
     {
-        if (!write.valid)
-            continue;
-        if (write.readyCycle > m_cycle)
+        for (PendingAccWrite &write : m_accWritePipeline)
         {
-            keep(write.readyCycle);
-            continue;
-        }
-        if (m_viLatestWrite[write.reg] == write.sequence)
-            m_state.vi[write.reg] = static_cast<int16_t>(write.value);
-        write = {};
-    }
-
-    for (PendingAccWrite &write : m_accWritePipeline)
-    {
-        if (!write.valid)
-            continue;
-        if (write.readyCycle > m_cycle)
-        {
-            keep(write.readyCycle);
-            continue;
-        }
-        for (uint32_t component = 0; component < 4u; ++component)
-        {
-            if ((write.laneMask & laneForComponent(component)) != 0u &&
-                m_accLatestWrite[component] == write.sequence)
+            if (!write.valid)
+                continue;
+            if (write.readyCycle > m_cycle)
             {
-                m_state.acc[component] = write.value[component];
+                keep(write.readyCycle);
+                continue;
             }
+            for (uint32_t component = 0; component < 4u; ++component)
+            {
+                if ((write.laneMask & laneForComponent(component)) != 0u &&
+                    m_accLatestWrite[component] == write.sequence)
+                {
+                    m_state.acc[component] = write.value[component];
+                }
+            }
+            write = {};
         }
-        write = {};
+        finish(kPipeAcc);
     }
 
+    uint64_t nextReady = kNone;
+    for (uint64_t ready : hint.pipeReady)
+        nextReady = std::min(nextReady, ready);
     hint.owner = this;
     hint.nextReady = nextReady;
 }
