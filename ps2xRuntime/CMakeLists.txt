@@ -467,6 +467,19 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+# The VU interpreter is ~33% of fight CPU. RelWithDebInfo's /Ob1 inlines only
+# functions marked `inline`, so every small helper (normalizeOperand,
+# broadcast, applyDest, ...) became a real call. Allow full inlining for these
+# three TUs only; ps2_runtime is not a unity target, so nothing else rebuilds.
+if(MSVC)
+    set_source_files_properties(
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:RelWithDebInfo>:/Ob2>"
+    )
+endif()
+
 # RecompDebugger IPC writer -- publishes live CPU/GS/pad/thread state into the
 # Local\RecompDebugState shared-memory segment the standalone RecompDebugger.exe
 # reads. Windows-only (uses CreateFileMappingA); a no-op inline shim in
