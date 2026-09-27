@@ -2747,6 +2747,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // entered with a correct $ra and the slot is overwritten in between. The
     // frame-trace slots added for 0x398D40 in game_overrides.cpp carry the
     // entry/exit comparison now, paid only by that one function.
+    // 2026-09-27 -- see the pc==entryPc block below. One register read into a
+    // local; unlike the removed 09-10 snapshot it never touches shared memory.
+    const uint32_t spAtEntry = GPR_U32(ctx, 29);
+
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -2773,6 +2777,34 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (ctx->pc == entryPc)
     {
+        // 2026-09-27 -- recursive-preemption stack drift (the t=5 boot crash,
+        // ex-"rung 4.7"). pc == entryPc normally means an HLE/stub target that
+        // returned without writing pc. But on RECURSION it is ambiguous: F ->
+        // G -> F where the inner dispatch of F hits a checkpoint leaves
+        // ctx->pc == F while unwinding, and this outer F-dispatch used to read
+        // that as "F returned" and continue the caller with F's and G's
+        // frames still pushed. Measured: sp 0x110 low (= 0x1c2af0's 0x50 +
+        // 0x2ae0e0's 0xc0), the next epilogue reloads $ra from a stale slot,
+        // pc -> 0. A real return restores $sp; a pending inner call does not.
+        // So only treat it as a return when $sp is back where it started;
+        // otherwise keep unwinding and let the scheduler resume the pending
+        // call to F with the exact $sp/$ra the inner jal left.
+        if (GPR_U32(ctx, 29) != spAtEntry)
+        {
+            static std::atomic<uint32_t> s_recursivePreemptLogs{0u};
+            const uint32_t n = s_recursivePreemptLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 16u)
+            {
+                std::cerr << "[dispatch:recursive-preempt] #" << std::dec << n
+                          << " target=0x" << std::hex << targetPc
+                          << " from=0x" << sourcePc
+                          << " spAtEntry=0x" << spAtEntry
+                          << " spNow=0x" << GPR_U32(ctx, 29)
+                          << " ra=0x" << GPR_U32(ctx, 31)
+                          << std::dec << std::endl;
+            }
+            return false;
+        }
         ctx->pc = fallthroughPc;
     }
 
