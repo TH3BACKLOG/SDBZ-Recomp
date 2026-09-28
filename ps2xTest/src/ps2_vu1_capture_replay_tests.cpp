@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -297,6 +298,10 @@ namespace
         uint32_t curRun = 0;
         uint32_t runsDone = 0;
         bool haveKickRun = false;
+
+        // Benchmark: host time and VU cycles spent inside vu1.execute/resume only.
+        double vuSeconds = 0.0;
+        uint64_t vuCycles = 0;
 
         Category unmatched{"run with no MSCAL/MSCNT from our VIF1 (S1)"};
         Category extraKicks{"our VIF1 produced extra MSCAL/MSCNT (S1)"};
@@ -572,12 +577,16 @@ namespace
             vu1.state().tBitEnabled = (st.fbrst & (1u << 11)) != 0u;
 
             inRun = true;
+            const uint64_t cyclesBefore = vu1.state().cycles;
+            const auto timeBefore = std::chrono::steady_clock::now();
             if (pr.cont)
                 vu1.resume(mem.getVU1Code(), PS2_VU1_CODE_SIZE, mem.getVU1Data(), PS2_VU1_DATA_SIZE,
                            gs, &mem, top & 0x3FFu, itop & 0x3FFu, 65536u);
             else
                 vu1.execute(mem.getVU1Code(), PS2_VU1_CODE_SIZE, mem.getVU1Data(), PS2_VU1_DATA_SIZE,
                             gs, &mem, (tpc & 0x7FFu) * 8u, top & 0x3FFu, itop & 0x3FFu, 65536u);
+            vuSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - timeBefore).count();
+            vuCycles += vu1.state().cycles - cyclesBefore;
             inRun = false;
             kickRun = run;
             haveKickRun = true;
@@ -742,6 +751,7 @@ void register_ps2_vu1_capture_replay_tests()
             rp.corruptMicro = envInt("PS2X_VUCAP_CORRUPT_MICRO", -1);
             rp.rep.both("capture %s, mode %s, report %s", path.c_str(), rp.resync ? "resync" : "free", outPath.c_str());
 
+            const auto wallStart = std::chrono::steady_clock::now();
             uint8_t type = 0;
             std::vector<uint8_t> payload;
             bool torn = false;
@@ -875,6 +885,11 @@ void register_ps2_vu1_capture_replay_tests()
             }
             if (failing == 0)
                 rp.rep.both("  0 mismatches");
+            const double wallSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count();
+            rp.rep.both("bench: vu1 %.1f ms, %llu vu cycles, %.2f ns/cycle, %.1f us/run; replay wall %.1f ms",
+                        rp.vuSeconds * 1e3, static_cast<unsigned long long>(rp.vuCycles),
+                        rp.vuCycles ? rp.vuSeconds * 1e9 / static_cast<double>(rp.vuCycles) : 0.0,
+                        rp.runsDone ? rp.vuSeconds * 1e6 / rp.runsDone : 0.0, wallSeconds * 1e3);
             if (rp.rep.fp)
                 std::fclose(rp.rep.fp);
 
