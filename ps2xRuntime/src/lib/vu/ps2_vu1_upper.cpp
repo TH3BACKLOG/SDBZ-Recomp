@@ -24,6 +24,11 @@ namespace
 void VU1Interpreter::execUpper(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
+    // NOP (special codes 0x2F / 0x30, i.e. low 11 bits 0x2FF / 0x33C) does
+    // nothing; skip the 14 operand normalisations below (perf 09-28).
+    const uint32_t low11 = instr & 0x7FFu;
+    if (low11 == 0x2FFu || low11 == 0x33Cu)
+        return;
     uint8_t dest = DEST(instr);
     uint8_t ft = FT(instr);
     uint8_t fs = FS(instr);
