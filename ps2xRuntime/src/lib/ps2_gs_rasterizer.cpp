@@ -1440,7 +1440,11 @@ namespace
     {
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        // Inline round-half-away-from-zero instead of a CRT lround call per
+        // channel. Exact vs lround for v >= 0 (the double add can't round);
+        // v < 0 clamps to 0 either way.
+        const float v = top + (bottom - top) * fy;
+        return clampU8(static_cast<int>(static_cast<double>(v) + 0.5));
     }
 }
 
