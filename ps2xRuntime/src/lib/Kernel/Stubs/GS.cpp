@@ -4,6 +4,8 @@
 #include "runtime/ps2_gs_common.h"
 #include "runtime/ee_scheduler.h"
 
+void ps2xGsThreadSync(uint32_t reason); // ps2_gif_arbiter.cpp
+
 namespace ps2_stubs
 {
     namespace
@@ -123,6 +125,7 @@ namespace ps2_stubs
                 return;
             }
 
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
@@ -934,6 +937,7 @@ namespace ps2_stubs
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
 
+        ps2xGsThreadSync(3u); // GS thread: drain queued packets first
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
         runtime->guestFree(pktAddr);
 
@@ -968,6 +972,7 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
+        ps2xGsThreadSync(4u); // GS thread: drain queued packets first
         applyGsRegPairs(runtime, pairs, 8u);
         setReturnS32(ctx, 0);
     }
@@ -1357,6 +1362,7 @@ namespace ps2_stubs
         }
         if (which == 0u)
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
             if (hasSeededGsClearPacket(db.clear0))
@@ -1368,6 +1374,7 @@ namespace ps2_stubs
         }
         else
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
             if (hasSeededGsClearPacket(db.clear1))
@@ -1396,10 +1403,12 @@ namespace ps2_stubs
         applyGsDispEnv(runtime, db.disp[which]);
         if (which == 0u)
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
         }
         else
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
         }
 

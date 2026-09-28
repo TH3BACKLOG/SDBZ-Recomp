@@ -39,6 +39,12 @@
 #include <sstream>
 #include <vector>
 
+// GS thread, ps2_gif_arbiter.cpp.
+bool ps2xGsThreadEnabled();
+void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes);
+void ps2xGsThreadSync(uint32_t reason);
+void ps2xGsThreadStop();
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -71,6 +77,9 @@ extern "C" void ps2x_fmv_host_shutdown(void);
 // header-cost reason as above. Must be called on the thread that polls raylib
 // input, i.e. right after EndDrawing().
 extern "C" void ps2x_pad_push_frame(uint8_t *rdram);
+extern "C" void ps2x_gs_present_begin(); // ps2_gif_arbiter.cpp
+extern "C" void ps2x_gs_present_end();
+extern "C" int ps2x_gs_thread_latches();
 
 // Defined in game_overrides.cpp. Emits [frametrace:calls] for any traced slot
 // whose call count moved since the previous watchdog second -- the first time a
@@ -1325,7 +1334,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        if (!ps2x_gs_thread_latches()) // GS thread latches at its vblank marker
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -1496,6 +1506,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        ps2xGsThreadStop();
         // Fiber pool is cleaned up by scheduler_shutdown() in run().
 #if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
@@ -1664,7 +1675,12 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs(), this);
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    {
+                                        if (ps2xGsThreadEnabled())
+                                            ps2xGsThreadSubmit(&m_gs, data, size);
+                                        else
+                                            m_gs.processGIFPacket(data, size);
+                                    });
     m_memory.setGifArbiter(&m_gifArbiter);
     vucap::setStateSource(&m_vu1.state());
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
@@ -3593,6 +3609,7 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
+    ps2xGsThreadSync(5u); // the native chains below call m_gs directly
     if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
@@ -7010,7 +7027,9 @@ void PS2Runtime::run()
 
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        ps2x_gs_present_begin(); // GS thread steps aside so we get the GS lock
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+        ps2x_gs_present_end();
 
         // [STEP 6] Frame recorder: separately env-gated via PS2X_REC (not
         // PS2X_DIAG). Dumps a PNG only when the presented frame's hash

@@ -12,6 +12,8 @@
 //   PS2X_GSBENCH_BMP  write the FRAME context-0 buffer after the last replay
 //                     ("fbp,fbw,w,h,path", e.g. "0x70,8,512,448,gsdump/b.bmp")
 //   PS2X_PROFILE=1    sample with the host sampler (PS2X_PROFILE_MS=1 for 1 ms)
+//   PS2X_GSBENCH_THREAD=1  submit through the GS thread queue (as in game) and
+//                     wait for it at the end of each replay
 #include "runtime/ps2_gs_gpu.h"
 
 #include <algorithm>
@@ -25,6 +27,9 @@
 
 extern "C" void ps2x_host_sampler_start(void);
 extern "C" void ps2x_host_sampler_stop(void);
+void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes);
+void ps2xGsThreadSync(uint32_t reason);
+void ps2xGsThreadStop();
 
 namespace
 {
@@ -137,6 +142,11 @@ int main(int argc, char **argv)
     std::printf("[gsbench] %s: %zu transfers, %u bytes, vram seed %s\n", gsrPath.c_str(),
                 transfers.size(), payloadSize, haveSeed ? "yes" : "no (zeroed)");
 
+    const char *threadEnv = std::getenv("PS2X_GSBENCH_THREAD");
+    const bool threaded = threadEnv && threadEnv[0] == '1';
+    if (threaded)
+        std::printf("[gsbench] threaded: packets go through the GS thread queue\n");
+
     std::vector<uint8_t> vram(kVramSize);
     std::vector<double> times;
     ps2x_host_sampler_start();
@@ -152,7 +162,14 @@ int main(int argc, char **argv)
         const auto t0 = std::chrono::steady_clock::now();
         for (const GsrTransfer &t : transfers)
             if (t.size != 0u)
-                gs.processGIFPacket(payload + t.offset, t.size);
+            {
+                if (threaded)
+                    ps2xGsThreadSubmit(&gs, payload + t.offset, t.size);
+                else
+                    gs.processGIFPacket(payload + t.offset, t.size);
+            }
+        if (threaded)
+            ps2xGsThreadSync(0u);
         times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 
         if (r == repeat - 1)
@@ -173,6 +190,7 @@ int main(int argc, char **argv)
         }
     }
     ps2x_host_sampler_stop();
+    ps2xGsThreadStop();
 
     std::vector<double> sorted = times;
     std::sort(sorted.begin(), sorted.end());

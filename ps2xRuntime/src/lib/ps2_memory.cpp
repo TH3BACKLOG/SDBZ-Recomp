@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+void ps2xGsThreadSync(uint32_t reason); // ps2_gif_arbiter.cpp
+
 // ---- [chainord] -- Stage 5.11 run 33 ------------------------------------
 // PCSX2 ground truth (2026-08-09, game paused on the memory-card dialog):
 // the guest's own VIF1 source chain is laid out strictly ascending, one
@@ -234,6 +236,31 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+
+    // GS runs on its own thread (ps2_gif_arbiter.cpp). SIGLBLID is written by
+    // the GS, so wait for queued packets before the game touches it.
+    //
+    // CSR does NOT wait by default. The GS only sets SIGNAL/FINISH (bits 0-1),
+    // and SDBZ never reads those: its CSR reads are FIELD (bit 13, set by the
+    // scheduler) in 0x102870 / 0x104c00 and the revision byte in 0x171fd8;
+    // its writes clear FINISH (0x102870/0x102a60/0x1030c0) or reset. Waiting
+    // on every CSR read cost ~47 ms per frame (1 read per frame, 09-27 run).
+    // PS2X_GS_THREAD_CSR_SYNC=1 restores the wait.
+    inline void syncGsThreadForPrivReg(uint32_t regOff)
+    {
+        static const bool csrSync = []
+        {
+            const char *v = std::getenv("PS2X_GS_THREAD_CSR_SYNC");
+            return v && v[0] == '1';
+        }();
+        if (regOff == kGsCsrRegOffset)
+        {
+            if (csrSync)
+                ps2xGsThreadSync(1u);
+        }
+        else if (regOff == 0x1080u)
+            ps2xGsThreadSync(2u);
+    }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -1041,6 +1068,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             uint64_t val = gs_regs.csr.load();
@@ -1088,6 +1116,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             return gs_regs.csr.load();
@@ -1269,6 +1298,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1329,6 +1359,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -1493,6 +1524,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         m_ioRegisters[address] = value;
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
@@ -2909,6 +2941,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);

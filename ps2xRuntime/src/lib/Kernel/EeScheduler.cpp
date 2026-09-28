@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cstdint>
 
+void ps2xGsThreadVblank(); // ps2_gif_arbiter.cpp
+
 // 2026-09-03 part 55 -- DISPATCH: which threads actually get the CPU.
 //
 // The 400s run leaves thread 6 RUNNING at priority 1 while threads 1, 4 and 5
@@ -4581,6 +4583,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        ps2xGsThreadVblank(); // keep the GS thread at most one frame behind
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

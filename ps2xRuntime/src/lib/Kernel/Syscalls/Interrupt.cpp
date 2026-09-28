@@ -309,6 +309,10 @@ namespace ps2_syscalls
     // very interrupt that would unpark it (stage 5.17). Same no-header rule.
     extern "C" int ps2x_guest_idle();
 
+    // Nonzero while the EE waits on the GS thread (ps2_gif_arbiter.cpp). The EE
+    // is blocked, not frozen, so it must not trigger the stall fallback.
+    extern "C" int ps2x_ee_waiting_on_gs();
+
     // Delivered vblank ticks (stage 5.6.2). gif/s ~3 against an expected ~60
     // has two readings -- the guest renders one frame per ~20 vblanks, or the
     // vblank tick itself is not arriving at 60Hz -- and nothing measured so far
@@ -422,6 +426,12 @@ namespace ps2_syscalls
                 if (progress != lastProgressSeen)
                 {
                     lastProgressSeen = progress;
+                    stalledPolls = 0;
+                }
+                else if (ps2x_ee_waiting_on_gs() != 0)
+                {
+                    // A stall tick here would land mid guest code (the EE
+                    // resumes where it blocked) and break determinism.
                     stalledPolls = 0;
                 }
                 else
