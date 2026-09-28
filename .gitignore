@@ -37,6 +37,11 @@ android/.gradle/
 # entrypoint, upstream-authored) and is deliberately still tracked.
 ps2xRuntime/src/runner/*
 
+# Same for the VU1 micro programs: build_scripts/vu1_recomp.py translates the
+# game's VU1 microcode (dumped from its micro memory) into C++ and embeds the
+# code bytes in the lookup table. Game code; regenerate locally.
+ps2xRuntime/src/lib/Kernel/Vu1Recomp/generated/*
+
 # Auto-generated from a regex scan of game_overrides.cpp on every build; 4.2 MB
 # of declarations naming every guest function. Regenerated, never hand-edited.
 ps2xRuntime/include/fn_forward_decls.h

@@ -19,6 +19,10 @@ param(
     [int]$Repeat = 5,
     [string]$Label = '',
     [switch]$Build,
+    # Also run each capture once with PS2X_VU1_RECOMP=2 (recompiled program and
+    # interpreter side by side; full state, memory, packets and cycle counts
+    # compared). Any mismatch fails the gate.
+    [switch]$Verify,
     [string]$Config = 'RelWithDebInfo'
 )
 
@@ -71,6 +75,21 @@ try {
         '{0,-28} vu1 median {1,8:N1} ms  (min {2:N1}, max {3:N1})  {4:N2} ns/cycle  runs {5}  gate {6}' -f `
             (Split-Path $capPath -Leaf), $median, $sorted[0], $sorted[-1], $ns, $runs, $(if ($pass) { 'PASS' } else { 'FAIL' })
         if ($mismatch) { Get-Content $report | Select-Object -Last 15 }
+
+        if ($Verify) {
+            $env:PS2X_VUCAP = $capPath
+            $env:PS2X_VUCAP_OUT = $report
+            $env:PS2X_VU1_RECOMP = '2'
+            $vout = & $exe 2>&1 | ForEach-Object { "$_" }
+            Remove-Item Env:PS2X_VUCAP, Env:PS2X_VUCAP_OUT, Env:PS2X_VU1_RECOMP -ErrorAction SilentlyContinue
+            $mis = @($vout | Where-Object { $_ -match '\[vu1recomp\] MISMATCH' })
+            $ran = @($vout | Where-Object { $_ -match '\[vu1recomp\] verify: [0-9]+ runs' })
+            $vpass = ($mis.Count -eq 0) -and ($ran.Count -gt 0)
+            $detail = if ($ran.Count -eq 0) { 'never ran: no compiled program hit' } else { $ran[-1] -replace '.*verify: ', '' }
+            '{0,-28} recomp verify {1}  ({2})' -f (Split-Path $capPath -Leaf), $(if ($vpass) { 'PASS' } else { 'FAIL' }), $detail
+            $mis | Select-Object -First 5
+            if (-not $vpass) { $allPass = $false; $pass = $false }
+        }
 
         if (-not (Test-Path $history)) { 'date,commit,label,capture,repeat,median_ms,min_ms,max_ms,ns_per_cycle,runs,gate' | Set-Content $history }
         '{0},{1}{2},{3},{4},{5},{6:F1},{7:F1},{8:F1},{9:F3},{10},{11}' -f (Get-Date -Format s), $commit, $dirty, $Label,

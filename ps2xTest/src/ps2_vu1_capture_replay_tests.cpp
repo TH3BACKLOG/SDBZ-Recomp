@@ -49,7 +49,9 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -547,6 +549,35 @@ namespace
             }
 
             const uint32_t ourMicro = crc32(mem.getVU1Code(), kVu1Size);
+            // PS2X_VU1_DUMPDIR: write each distinct micro image once (<crc>.bin)
+            // and every (image, entry pc, MSCAL/MSCNT) seen to entries.csv. Input
+            // for the VU1 program recompiler (build_scripts/vu1_recomp.py).
+            if (static const char *dumpDir = std::getenv("PS2X_VU1_DUMPDIR"); dumpDir && *dumpDir)
+            {
+                static std::set<uint32_t> dumpedImages;
+                static std::set<std::pair<uint32_t, uint32_t>> dumpedEntries;
+                const uint32_t entryPc = pr.cont ? vu1.state().pc : pr.startPC;
+                if (dumpedImages.insert(ourMicro).second)
+                {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/%08x.bin", dumpDir, ourMicro);
+                    if (FILE *f = std::fopen(path, "wb"))
+                    {
+                        std::fwrite(mem.getVU1Code(), 1, kVu1Size, f);
+                        std::fclose(f);
+                    }
+                }
+                if (dumpedEntries.insert({ourMicro, entryPc | (pr.cont ? 0x80000000u : 0u)}).second)
+                {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/entries.csv", dumpDir);
+                    if (FILE *f = std::fopen(path, "a"))
+                    {
+                        std::fprintf(f, "%08x,%u,%d\n", ourMicro, entryPc, pr.cont ? 1 : 0);
+                        std::fclose(f);
+                    }
+                }
+            }
             if (ourMicro != microCrcV)
             {
                 if (note(microCrc, run))

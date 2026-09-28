@@ -5,6 +5,7 @@
 #include "runtime/ps2_pipeline_stats.h"
 #include "ps2_vu1_detail.h"
 #include "Kernel/VuCap/VuCapRecorder.h"
+#include "Kernel/Vu1Recomp/vu1_recomp.h"
 
 #include <algorithm>
 #include <bit>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <vector>
 #include <ps2_log.h>
 
 namespace
@@ -75,6 +77,91 @@ namespace
     inline uint32_t slotOf(const Array &pipeline, const typename Array::value_type &entry)
     {
         return static_cast<uint32_t>(&entry - pipeline.data());
+    }
+
+    // Recompiled VU1 program for the current micro memory, looked up again
+    // only when the code generation changes (MPG upload).
+    struct RecompLookup
+    {
+        const void *owner = nullptr;
+        uint64_t generation = ~0ull;
+        vu1rc::Program programs[4]{};
+        uint32_t count = 0;
+        uint32_t crc = 0; // image CRC, computed on first need (logs/dumps)
+        bool crcValid = false;
+    };
+    RecompLookup g_recompLookup;
+
+    uint32_t recompImageCrc(const uint8_t *code, uint32_t size)
+    {
+        if (!g_recompLookup.crcValid)
+        {
+            g_recompLookup.crc = vu1rc::imageCrc(code, size);
+            g_recompLookup.crcValid = true;
+        }
+        return g_recompLookup.crc;
+    }
+
+    // A run the recompiler could not take: image not compiled, or a compiled
+    // image entered at a pc it was not compiled for. Logged once per
+    // (image, pc). With PS2X_VU1_DUMPDIR set, the image and entry are written
+    // in the replay tool's format, as input for build_scripts/vu1_recomp.py.
+    void noteUncompiledVu1Program(uint32_t crc, const uint8_t *code, uint32_t size, uint32_t pc, bool knownImage)
+    {
+        static std::vector<uint64_t> seen;
+        const uint64_t key = (static_cast<uint64_t>(crc) << 32) | pc;
+        if (std::find(seen.begin(), seen.end(), key) != seen.end())
+            return;
+        seen.push_back(key);
+        if (seen.size() <= 64u)
+            std::fprintf(stderr, "[vu1recomp] not compiled: image %08x entry pc=0x%x%s\n", crc, pc,
+                         knownImage ? " (image known, entry new)" : "");
+        static const char *dumpDir = std::getenv("PS2X_VU1_DUMPDIR");
+        if (!dumpDir || !*dumpDir)
+            return;
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/%08x.bin", dumpDir, crc);
+        if (!knownImage && !std::filesystem::exists(path))
+        {
+            if (FILE *f = std::fopen(path, "wb"))
+            {
+                std::fwrite(code, 1, size, f);
+                std::fclose(f);
+            }
+        }
+        std::snprintf(path, sizeof(path), "%s/entries.csv", dumpDir);
+        if (FILE *f = std::fopen(path, "a"))
+        {
+            std::fprintf(f, "%08x,%u,%d\n", crc, pc, pc != 0u ? 1 : 0);
+            std::fclose(f);
+        }
+    }
+
+    // PS2X_VU1_RECOMP=2: the recompiled result of this run, compared with the
+    // interpreter's at the end of run().
+    struct RecompVerify
+    {
+        bool pending = false;
+        VU1State state{};
+        std::vector<uint8_t> mem;
+        std::vector<std::vector<uint8_t>> kicks;      // recompiled program's PATH1 packets
+        std::vector<std::vector<uint8_t>> interpKicks; // interpreter's, captured in finishXgkick
+        uint64_t cycles = 0;
+        uint32_t workingClip = 0;
+        uint32_t end = 0;
+        uint32_t startPc = 0;
+        uint64_t runs = 0;
+        uint64_t mismatches = 0;
+    };
+    RecompVerify g_recompVerify;
+
+    bool sameBits(const void *a, const void *b, size_t n) { return std::memcmp(a, b, n) == 0; }
+
+    uint32_t vu1rcBits(float f)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        return bits;
     }
 }
 
@@ -1075,6 +1162,9 @@ void VU1Interpreter::finishXgkick()
     if (vucap::hot())
         vucap::kick(m_xgkick.sourceAddress, m_xgkick.packet.data(), m_xgkick.totalBytes);
 
+    if (g_recompVerify.pending)
+        g_recompVerify.interpKicks.emplace_back(m_xgkick.packet.data(), m_xgkick.packet.data() + m_xgkick.totalBytes);
+
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
@@ -1781,6 +1871,120 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
+
+    // Recompiled micro program (Kernel/Vu1Recomp, build_scripts/vu1_recomp.py).
+    // Only from a clean start: every pipeline empty, no branch or halt in
+    // flight, VF0 as the interpreter leaves it after each pair.
+    const int recompMode = vu1rc::mode();
+    g_recompVerify.pending = false;
+    if (recompMode != 0 && m_unit == Unit::VU1 && memory && vuCode == memory->getVU1Code() &&
+        dataSize >= 16u && (dataSize & (dataSize - 1u)) == 0u && !m_stopRequested &&
+        !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot &&
+        m_state.vf[0][0] == 0.0f && m_state.vf[0][1] == 0.0f && m_state.vf[0][2] == 0.0f &&
+        m_state.vf[0][3] == 1.0f && m_state.vi[0] == 0 && !pipelinesPending())
+    {
+        const uint64_t generation = memory->getVU1CodeGeneration();
+        if (g_recompLookup.owner != this || g_recompLookup.generation != generation)
+        {
+            g_recompLookup.owner = this;
+            g_recompLookup.generation = generation;
+            g_recompLookup.count = vu1rc::find(vuCode, codeSize, g_recompLookup.programs, 4u);
+            g_recompLookup.crcValid = false;
+        }
+        if (g_recompLookup.count == 0u)
+            noteUncompiledVu1Program(recompImageCrc(vuCode, codeSize), vuCode, codeSize, m_state.pc, false);
+        if (g_recompLookup.count != 0u)
+        {
+            const bool verify = recompMode == 2;
+            VU1State savedState{};
+            std::vector<uint8_t> savedMem;
+            if (verify)
+            {
+                savedState = m_state;
+                savedMem.assign(vuData, vuData + dataSize);
+                g_recompVerify.kicks.clear();
+                g_recompVerify.interpKicks.clear();
+            }
+
+            vu1rc::Ctx ctx;
+            ctx.st = &m_state;
+            ctx.mem = vuData;
+            ctx.memSize = dataSize;
+            ctx.kickBuf = m_xgkick.packet.data();
+            ctx.budget = maxCycles;
+            ctx.self = this;
+            if (verify)
+            {
+                ctx.submitKick = [](void *, uint32_t, const uint8_t *pkt, uint32_t bytes)
+                {
+                    g_recompVerify.kicks.emplace_back(pkt, pkt + bytes);
+                };
+            }
+            else
+            {
+                ctx.submitKick = [](void *self, uint32_t srcAddr, const uint8_t *pkt, uint32_t bytes)
+                {
+                    VU1Interpreter &vu = *static_cast<VU1Interpreter *>(self);
+                    ps2_pipeline_stats::g_xgkicks.fetch_add(1, std::memory_order_relaxed);
+                    ps2_pipeline_stats::g_xgkickBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    if (vucap::hot())
+                        vucap::kick(srcAddr, pkt, bytes);
+                    if (vu.m_activeMemory)
+                        vu.m_activeMemory->submitGifPacket(GifPathId::Path1, pkt, bytes);
+                    else if (vu.m_activeGs)
+                        vu.m_activeGs->processGIFPacket(pkt, bytes);
+                };
+            }
+            ctx.workingClip = m_workingClip;
+            ctx.bkValid = m_viBranchBackupValid;
+            ctx.bkReg = m_viBranchBackupReg;
+            ctx.bkVal = m_viBranchBackupValue;
+            const uint32_t startPc = m_state.pc;
+
+            bool ran = false;
+            for (uint32_t k = 0; k < g_recompLookup.count && !ran; ++k)
+                ran = g_recompLookup.programs[k](ctx);
+            if (!ran)
+                noteUncompiledVu1Program(recompImageCrc(vuCode, codeSize), vuCode, codeSize, startPc, true);
+            if (ran)
+            {
+                if (!verify)
+                {
+                    m_cycle += ctx.cycles;
+                    m_state.cycles = m_cycle;
+                    m_workingClip = ctx.workingClip;
+                    m_viBranchBackupValid = ctx.bkValid;
+                    m_viBranchBackupReg = ctx.bkReg;
+                    m_viBranchBackupValue = ctx.bkVal;
+                    ps2_pipeline_stats::g_vu1Instrs.fetch_add(ctx.retired, std::memory_order_relaxed);
+                    if (ctx.end == vu1rc::kEndEbit)
+                        ps2_pipeline_stats::g_vu1EndEbit.fetch_add(1, std::memory_order_relaxed);
+                    else if (ctx.end == vu1rc::kEndCycleLimit)
+                        ps2_pipeline_stats::g_vu1EndCycleLimit.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        m_stopRequested = true;
+                    if (useVuRounding && previousRoundingMode != -1)
+                        std::fesetround(previousRoundingMode);
+                    return;
+                }
+
+                // Keep the recompiled result, restore the inputs, and let the
+                // interpreter run the same program; compared at the end.
+                g_recompVerify.pending = true;
+                g_recompVerify.state = m_state;
+                g_recompVerify.state.cycles = m_cycle + ctx.cycles;
+                g_recompVerify.mem.assign(vuData, vuData + dataSize);
+                g_recompVerify.cycles = ctx.cycles;
+                g_recompVerify.workingClip = ctx.workingClip;
+                g_recompVerify.end = ctx.end;
+                g_recompVerify.startPc = startPc;
+                m_state = savedState;
+                std::memcpy(vuData, savedMem.data(), dataSize);
+            }
+        }
+    }
+    const uint64_t verifyStartCycle = m_cycle;
+
     uint64_t retired = 0;
     bool programEnded = false;
     bool endedByRange = false;
@@ -2008,6 +2212,76 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     }
 
     m_state.cycles = m_cycle;
+
+    if (g_recompVerify.pending)
+    {
+        RecompVerify &v = g_recompVerify;
+        v.pending = false;
+        ++v.runs;
+        char diff[1024];
+        diff[0] = '\0';
+        const VU1State &a = v.state;
+        const VU1State &b = m_state;
+        auto note = [&](const char *what)
+        {
+            if (diff[0] == '\0')
+                std::snprintf(diff, sizeof(diff), "%s", what);
+        };
+        for (uint32_t reg = 0; reg < 32u && diff[0] == '\0'; ++reg)
+            if (!sameBits(a.vf[reg], b.vf[reg], sizeof(a.vf[reg])))
+                std::snprintf(diff, sizeof(diff), "vf%u recomp=%08x,%08x,%08x,%08x interp=%08x,%08x,%08x,%08x", reg,
+                              vu1rcBits(a.vf[reg][0]), vu1rcBits(a.vf[reg][1]), vu1rcBits(a.vf[reg][2]), vu1rcBits(a.vf[reg][3]),
+                              vu1rcBits(b.vf[reg][0]), vu1rcBits(b.vf[reg][1]), vu1rcBits(b.vf[reg][2]), vu1rcBits(b.vf[reg][3]));
+        for (uint32_t reg = 0; reg < 16u && diff[0] == '\0'; ++reg)
+            if (a.vi[reg] != b.vi[reg])
+                std::snprintf(diff, sizeof(diff), "vi%u recomp=%d interp=%d", reg, a.vi[reg], b.vi[reg]);
+        if (!sameBits(a.acc, b.acc, sizeof(a.acc)))
+            note("acc");
+        if (!sameBits(&a.q, &b.q, 4))
+            note("q");
+        if (!sameBits(&a.p, &b.p, 4))
+            note("p");
+        if (!sameBits(&a.i, &b.i, 4))
+            note("i");
+        if (a.r != b.r)
+            note("r");
+        if (a.pc != b.pc)
+            std::snprintf(diff + std::strlen(diff), 64, "%spc recomp=%x interp=%x", diff[0] ? "; " : "", a.pc, b.pc);
+        if (a.mac != b.mac)
+            std::snprintf(diff + std::strlen(diff), 64, "%smac recomp=%x interp=%x", diff[0] ? "; " : "", a.mac, b.mac);
+        if (a.status != b.status)
+            std::snprintf(diff + std::strlen(diff), 64, "%sstatus recomp=%x interp=%x", diff[0] ? "; " : "", a.status, b.status);
+        if (a.clip != b.clip)
+            std::snprintf(diff + std::strlen(diff), 64, "%sclip recomp=%x interp=%x", diff[0] ? "; " : "", a.clip, b.clip);
+        if (v.cycles != m_cycle - verifyStartCycle)
+            std::snprintf(diff + std::strlen(diff), 80, "%scycles recomp=%llu interp=%llu", diff[0] ? "; " : "",
+                          static_cast<unsigned long long>(v.cycles), static_cast<unsigned long long>(m_cycle - verifyStartCycle));
+        if (v.workingClip != m_workingClip)
+            note("workingClip");
+        if (v.end != vu1rc::kEndEbit || !programEnded)
+            note("end reason");
+        if (!sameBits(v.mem.data(), vuData, std::min<size_t>(v.mem.size(), dataSize)))
+        {
+            size_t at = 0;
+            while (at < v.mem.size() && v.mem[at] == vuData[at])
+                ++at;
+            std::snprintf(diff + std::strlen(diff), 64, "%smem @%zx", diff[0] ? "; " : "", at);
+        }
+        if (v.kicks != v.interpKicks)
+            std::snprintf(diff + std::strlen(diff), 64, "%skicks recomp=%zu interp=%zu", diff[0] ? "; " : "",
+                          v.kicks.size(), v.interpKicks.size());
+        if (diff[0] != '\0')
+        {
+            ++v.mismatches;
+            if (v.mismatches <= 40u)
+                std::fprintf(stderr, "[vu1recomp] MISMATCH run %llu start pc=0x%x: %s\n",
+                             static_cast<unsigned long long>(v.runs), v.startPc, diff);
+        }
+        if ((v.runs % 2000u) == 0u)
+            std::fprintf(stderr, "[vu1recomp] verify: %llu runs, %llu mismatches\n",
+                         static_cast<unsigned long long>(v.runs), static_cast<unsigned long long>(v.mismatches));
+    }
+
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }
