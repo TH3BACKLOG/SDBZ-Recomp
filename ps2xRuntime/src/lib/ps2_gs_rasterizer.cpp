@@ -19,6 +19,55 @@
 
 using namespace GSInternal;
 
+// Per-pixel VRAM access without std::function (perf 09-27). GS::ReadVram /
+// WriteVram go through std::function tables declared in ps2_gs_gpu.h (which we
+// cannot edit); every pixel paid for that indirection twice or three times.
+// Same PSM -> GSMem mapping as GS::GS(); unknown PSMs map to the Null access.
+namespace
+{
+using RasterReadFn = u32 (*)(u8 *, u32, u32, u32, u32);
+using RasterWriteFn = void (*)(u8 *, u32, u32, u32, u32, u32);
+struct RasterVramFns
+{
+    RasterReadFn read[64];
+    RasterWriteFn write[64];
+    RasterVramFns()
+    {
+        using namespace GSMem;
+        for (int i = 0; i < 64; ++i)
+        {
+            read[i] = ReadPixelNull;
+            write[i] = WritePixelNull;
+        }
+        read[GS_PSM_CT32] = ReadPixelCT32;   write[GS_PSM_CT32] = WritePixelCT32;
+        read[GS_PSM_CT24] = ReadPixelCT24;   write[GS_PSM_CT24] = WritePixelCT24;
+        read[GS_PSM_CT16] = ReadPixelCT16;   write[GS_PSM_CT16] = WritePixelCT16;
+        read[GS_PSM_CT16S] = ReadPixelCT16S; write[GS_PSM_CT16S] = WritePixelCT16S;
+        read[GS_PSM_T8] = ReadPixelP8;       write[GS_PSM_T8] = WritePixelP8;
+        read[GS_PSM_T8H] = ReadPixelP8H;     write[GS_PSM_T8H] = WritePixelP8H;
+        read[GS_PSM_T4] = ReadPixelP4;       write[GS_PSM_T4] = WritePixelP4;
+        read[GS_PSM_T4HH] = ReadPixelP4HH;   write[GS_PSM_T4HH] = WritePixelP4HH;
+        read[GS_PSM_T4HL] = ReadPixelP4HL;   write[GS_PSM_T4HL] = WritePixelP4HL;
+        read[GS_PSM_Z32] = ReadPixelZ32;     write[GS_PSM_Z32] = WritePixelZ32;
+        read[GS_PSM_Z24] = ReadPixelZ24;     write[GS_PSM_Z24] = WritePixelZ24;
+        read[GS_PSM_Z16] = ReadPixelZ16;     write[GS_PSM_Z16] = WritePixelZ16;
+        read[GS_PSM_Z16S] = ReadPixelZ16S;   write[GS_PSM_Z16S] = WritePixelZ16S;
+    }
+};
+const RasterVramFns g_rasterVram;
+
+// Call sites pass gs->m_vram (private; GSRasterizer is a friend, this is not).
+inline u32 rasterReadVram(u8 *vram, u32 psm, u32 base, u32 bw, u32 x, u32 y)
+{
+    return g_rasterVram.read[psm & 0x3Fu](vram, base, bw, x, y);
+}
+
+inline void rasterWriteVram(u8 *vram, u32 psm, u32 base, u32 bw, u32 x, u32 y, u32 value)
+{
+    g_rasterVram.write[psm & 0x3Fu](vram, base, bw, x, y, value);
+}
+}
+
 // [drawpath] run 32: origin path of the GIF packet currently being dispatched.
 // Defined in ps2_gif_arbiter.cpp; declared here rather than in a header so no
 // generated TU is rebuilt.
@@ -1742,7 +1791,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     u32 fbrgba = 0;
     if (frmw)
     {
-        fbrgba = gs->ReadVram(fpsm, fbp, fbw, x, y);
+        fbrgba = rasterReadVram(gs->m_vram, fpsm, fbp, fbw, x, y);
 
         if (bitsPerPixel(fpsm) == 16)
         {
@@ -1763,10 +1812,10 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         zpass = true;
         break;
     case 2:
-        zpass = z >= gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z >= rasterReadVram(gs->m_vram, zpsm, zbp, fbw, x, y);
         break;
     case 3:
-        zpass = z > gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z > rasterReadVram(gs->m_vram, zpsm, zbp, fbw, x, y);
         break;
     }
 
@@ -2303,11 +2352,11 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
-    gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
+    rasterWriteVram(gs->m_vram, fpsm, fbp, fbw, x, y, pixel);
 
     if (!zmask)
     {
-        gs->WriteVram(zpsm, zbp, fbw, x, y, z);
+        rasterWriteVram(gs->m_vram, zpsm, zbp, fbw, x, y, z);
     }
 }
 
@@ -2434,7 +2483,7 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
                 if ((n & 63u) == 0u)
                 {
                     g_tfChk.fetch_add(1, std::memory_order_relaxed);
-                    const u32 direct = gs->ReadVram(tex.psm, tex.tbp0, tex.tbw,
+                    const u32 direct = rasterReadVram(gs->m_vram, tex.psm, tex.tbp0, tex.tbw,
                                                     static_cast<u32>(sampleU),
                                                     static_cast<u32>(sampleV)) & 0xFu;
                     if (direct != (out & 0xFu))
