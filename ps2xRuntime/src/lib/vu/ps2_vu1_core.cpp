@@ -120,6 +120,24 @@ VU1Interpreter::VU1Interpreter(Unit unit)
     reset();
 }
 
+// Clears XGKICK state but not its 64 KB packet buffer: `m_xgkick = {}` built
+// and copied a zeroed 64 KB temporary on every XGKICK and every program start
+// (the memmove in the 09-27 fight profile). Bytes are always copied into the
+// buffer before they are read, so stale contents are never seen.
+// (Template so the private XgkickPipeline type is deduced, not named.)
+template <class Xgkick>
+static void resetXgkickKeepBuffer(Xgkick &x)
+{
+    x.sourceAddress = 0;
+    x.totalBytes = 0;
+    x.copiedBytes = 0;
+    x.currentTagEnd = 0;
+    x.cycleCredit = 0;
+    x.issueCycle = 0;
+    x.active = false;
+    x.currentTagEop = false;
+}
+
 void VU1Interpreter::resetScheduler()
 {
     m_flagPipeline = {};
@@ -129,7 +147,7 @@ void VU1Interpreter::resetScheduler()
     m_vfWritePipeline = {};
     m_viWritePipeline = {};
     m_accWritePipeline = {};
-    m_xgkick = {};
+    resetXgkickKeepBuffer(m_xgkick);
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -1070,7 +1088,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    resetXgkickKeepBuffer(m_xgkick);
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
@@ -1810,11 +1828,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             }
         }
 
+        // VF and ACC reads always stall until the register is ready
+        // (calculatePairReadyCycle), so nothing can see a VF/ACC result early.
+        // Writing them straight into m_state after the pair is therefore the
+        // same as queueing them, and much cheaper. m_vfReady/m_accReady (set in
+        // markPairWrites) still give the stall timing.
+        constexpr bool kImmediateVfAcc = true;
         const VfAccess upperWrite = decoded.upperUsage.vfWrite;
         const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
-        const bool hasUpperWrite = upperWrite.reg != 0u;
-        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+        const bool hasUpperWrite = !kImmediateVfAcc && upperWrite.reg != 0u;
+        const bool hasLowerWrite = !kImmediateVfAcc && lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
         const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+        const bool queueAcc = !kImmediateVfAcc && decoded.upperUsage.accWrite != 0u;
         float oldUpperVf[4]{};
         float newUpperVf[4]{};
         float oldLowerVf[4]{};
@@ -1825,7 +1850,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
         if (hasDistinctLowerWrite)
             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
-        if (decoded.upperUsage.accWrite != 0u)
+        if (queueAcc)
             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
 
         if (decoded.iBit)
@@ -1881,7 +1906,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                          : decoded.lowerUsage.latency;
             queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
         }
-        if (decoded.upperUsage.accWrite != 0u)
+        if (queueAcc)
         {
             std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
             std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
