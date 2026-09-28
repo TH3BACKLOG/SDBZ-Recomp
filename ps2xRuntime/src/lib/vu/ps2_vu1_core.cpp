@@ -1213,11 +1213,10 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
         }
     }
 
-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
-    {
-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
-    }
+    // Visit only the set bits (VI0 excluded), same order as the old 1..15 scan.
+    for (uint32_t regs = decoded.lowerUsage.viWrite & 0xFFFEu; regs != 0u; regs &= regs - 1u)
+        m_viReady[static_cast<uint32_t>(std::countr_zero(regs))] =
+            m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
     for (uint32_t component = 0; component < 4u; ++component)
     {
         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
@@ -1818,14 +1817,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         uint8_t writtenVi = 0u;
         int32_t oldVi = 0;
-        for (uint32_t reg = 1; reg < 16u; ++reg)
+        if (const uint32_t viRegs = decoded.lowerUsage.viWrite & 0xFFFEu; viRegs != 0u)
         {
-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-            {
-                writtenVi = static_cast<uint8_t>(reg);
-                oldVi = m_state.vi[reg];
-                break;
-            }
+            // Lowest written VI, as the old 1..15 scan picked.
+            writtenVi = static_cast<uint8_t>(std::countr_zero(viRegs));
+            oldVi = m_state.vi[writtenVi];
         }
 
         // VF and ACC reads always stall until the register is ready
