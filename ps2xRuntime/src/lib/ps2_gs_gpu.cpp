@@ -18,6 +18,9 @@
 #include <string>
 #include <vector>
 
+// Texture page cache slots (defined next to GS::ReadTexturePageCache).
+static void texPageCacheNewPrimitive();
+
 // Defined in ps2_gs_rasterizer.cpp -- see the [fbdest] block in the present
 // probe below. Declared here rather than in a header so a diagnostic counter
 // never triggers a full 30,000-TU rebuild.
@@ -5865,6 +5868,7 @@ void GS::vertexKick(bool drawing)
             }
         }
 
+        texPageCacheNewPrimitive();
         m_rasterizer.drawPrimitive(this);
         recordDrawDebugEventUnlocked(needed);
     }
@@ -6509,6 +6513,79 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
     return static_cast<uint32_t>(toCopy);
 }
 
+// ---- texture page cache slots (perf 09-27) --------------------------------
+// The GS object holds one cached page (m_texture_page_cache, in a header we
+// cannot touch). A triangle that spans a page edge, or a bilinear sample that
+// straddles one, switched pages per texel and re-decoded a whole 8-16 KB page
+// each time (ReadBlockToLinearBuffer8 in the fight profile).
+//
+// Page data now lives in kTexPageSlots slots here. Validity matches the old
+// single page at primitive boundaries:
+//   - the most recently used page (MRU) stays valid across primitives until
+//     TEXFLUSH clears m_texture_page_cache.valid, exactly as before;
+//   - any other slot is reused only inside the primitive that loaded it
+//     (epoch bumps at every drawPrimitive), where the old code would have
+//     reloaded the same VRAM bytes.
+// Only the GS thread (or the bench, single threaded) reads textures.
+namespace
+{
+constexpr uint32_t kTexPageSlots = 8u;
+struct TexPageSlot
+{
+    u32 block = 0;
+    u32 psm = 0;
+    uint64_t epoch = 0;
+    std::array<u8, 16 * 1024> buf{};
+};
+struct TexPageSlots
+{
+    const void *owner = nullptr;
+    uint64_t epoch = 1;
+    int mru = -1;
+    uint32_t nextVictim = 0;
+    TexPageSlot slot[kTexPageSlots];
+};
+TexPageSlots g_texPages;
+
+void loadTexturePage(u8 *dst, const u8 *vram, u32 psm, u32 base_block)
+{
+    switch (psm)
+    {
+    case GS_PSM_CT32:
+        GSMem::ReadPageToLinearBufferCT32(dst, 256, vram, base_block);
+        break;
+    case GS_PSM_Z32:
+        GSMem::ReadPageToLinearBufferZ32(dst, 256, vram, base_block);
+        break;
+    case GS_PSM_CT16:
+        GSMem::ReadPageToLinearBufferCT16(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_CT16S:
+        GSMem::ReadPageToLinearBufferCT16S(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_Z16:
+        GSMem::ReadPageToLinearBufferZ16(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_Z16S:
+        GSMem::ReadPageToLinearBufferZ16S(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_T8:
+        GSMem::ReadPageToLinearBufferP8(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_T4:
+        GSMem::ReadPageToLinearBufferP4(dst, 128, vram, base_block);
+        break;
+    default:
+        break;
+    }
+}
+}
+
+static void texPageCacheNewPrimitive()
+{
+    ++g_texPages.epoch;
+}
+
 u32 GS::ReadTexturePageCache(u32 psm, u32 tbp0, u32 tbw, u32 u, u32 v)
 {
     // we fill these as 32bit since they are aliases
@@ -6582,18 +6659,53 @@ u32 GS::ReadTexturePageCache(u32 psm, u32 tbp0, u32 tbw, u32 u, u32 v)
     const u32 page_id = (v >> page_height2) * pages_per_row + (u >> page_width2);
     const u32 block_id = (tbp0 + page_id * 32u) & 0x3FFF;
 
-    const bool needs_reload =
-        !m_texture_page_cache.valid ||
-        m_texture_page_cache.base_block != block_id ||
-        m_texture_page_cache.psm != psm;
-
-    if (needs_reload)
+    TexPageSlots &pages = g_texPages;
+    if (pages.owner != this)
     {
-        ReloadTexturePageCache(psm, block_id);
+        // Another GS (the bench builds one per replay): nothing cached is ours.
+        pages.owner = this;
+        pages.mru = -1;
+        ++pages.epoch;
+    }
+
+    const bool mruHit =
+        m_texture_page_cache.valid && pages.mru >= 0 &&
+        m_texture_page_cache.base_block == block_id &&
+        m_texture_page_cache.psm == psm;
+    if (!mruHit)
+    {
+        if (!m_texture_page_cache.valid)
+            pages.mru = -1; // TEXFLUSH: the MRU page is stale too
+        int hit = -1;
+        for (uint32_t i = 0; i < kTexPageSlots; ++i)
+        {
+            const TexPageSlot &s = pages.slot[i];
+            if (s.epoch == pages.epoch && s.block == block_id && s.psm == psm)
+            {
+                hit = static_cast<int>(i);
+                break;
+            }
+        }
+        if (hit < 0)
+        {
+            uint32_t victim = pages.nextVictim++ % kTexPageSlots;
+            if (static_cast<int>(victim) == pages.mru)
+                victim = pages.nextVictim++ % kTexPageSlots;
+            TexPageSlot &s = pages.slot[victim];
+            loadTexturePage(s.buf.data(), m_vram, psm, block_id);
+            s.block = block_id;
+            s.psm = psm;
+            s.epoch = pages.epoch;
+            hit = static_cast<int>(victim);
+        }
+        pages.mru = hit;
+        m_texture_page_cache.base_block = block_id;
+        m_texture_page_cache.psm = psm;
+        m_texture_page_cache.valid = true;
     }
 
     const u32 off = (v & (page_height - 1)) * pitch + (u & (page_width - 1)) * bytes_per_pixel;
-    const u8* ptr = &m_texture_page_cache.buffer[off];
+    const u8* ptr = &pages.slot[pages.mru].buf[off];
 
     switch (bytes_per_pixel)
     {

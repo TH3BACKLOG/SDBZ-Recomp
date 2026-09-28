@@ -52,6 +52,15 @@ try {
         if ($out -notmatch 'bench: gs median ([\d.]+) ms \(min ([\d.]+), max ([\d.]+)\)') { $out; throw "no bench line for $path" }
         $median = [double]$Matches[1]; $min = [double]$Matches[2]; $max = [double]$Matches[3]
         '{0,-24} gs median {1,8:N1} ms  (min {2:N1}, max {3:N1})' -f (Split-Path $path -Leaf), $median, $min, $max
+        # VRAM hash gate: first run saves the baseline; later runs must match it.
+        # Delete the .vramhash file on purpose when a change is meant to alter output.
+        if ($out -match 'bench: vram hash ([0-9a-f]+)') {
+            $hash = $Matches[1]
+            $hashFile = Join-Path $histDir ((Split-Path $path -Leaf) + '.vramhash')
+            if (-not (Test-Path $hashFile)) { $hash | Set-Content $hashFile; "vram hash $hash (baseline saved)" }
+            elseif ((Get-Content $hashFile -Raw).Trim() -eq $hash) { "vram hash $hash gate PASS" }
+            else { "vram hash $hash gate FAIL (baseline $((Get-Content $hashFile -Raw).Trim()))" }
+        }
         if ($Bmp) { ($out -split "`n" | Select-String 'bmp') -join '' }
 
         if (-not (Test-Path $history)) { 'date,commit,label,dump,repeat,median_ms,min_ms,max_ms' | Set-Content $history }

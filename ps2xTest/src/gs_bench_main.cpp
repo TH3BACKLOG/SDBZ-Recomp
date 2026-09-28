@@ -174,6 +174,11 @@ int main(int argc, char **argv)
 
         if (r == repeat - 1)
         {
+            // Correctness gate: gs_bench.ps1 compares this against a saved baseline.
+            uint64_t h = 1469598103934665603ull;
+            for (const uint8_t b : vram)
+                h = (h ^ b) * 1099511628211ull;
+            std::printf("bench: vram hash %016llx\n", static_cast<unsigned long long>(h));
             if (const char *spec = std::getenv("PS2X_GSBENCH_BMP"))
             {
                 unsigned fbp = 0, fbw = 0, w = 0, h = 0;
