@@ -16,6 +16,8 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <thread>
+#include "ThreadNaming.h"
 
 using namespace GSInternal;
 
@@ -1497,8 +1499,73 @@ namespace
     }
 }
 
+#include "ps2_gs_raster_mt.inl"
+
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    if (gsmt::threadCount() > 0)
+    {
+        // Threaded path (ps2_gs_raster_mt.inl). The GS state this function and
+        // drawSprite change is updated here, on the GS thread, as before.
+        const auto &ctx = gs->activeContext();
+        if (gs->m_hasPreferredDisplaySource && ctx.frame.fbp == gs->m_preferredDisplayDestFbp)
+            gs->m_hasPreferredDisplaySource = false;
+
+        const auto prim = gs->m_registers.prim;
+        if (prim.prim == GS_PRIM_SPRITE)
+        {
+            // drawSprite's display-copy detection, same tests.
+            const GSVertex &v0 = gs->m_vtxQueue[0];
+            const GSVertex &v1 = gs->m_vtxQueue[1];
+            const int ofx = ctx.xyoffset.ofx >> 4;
+            const int ofy = ctx.xyoffset.ofy >> 4;
+            int x0 = static_cast<int>(v0.x) - ofx;
+            int y0 = static_cast<int>(v0.y) - ofy;
+            int x1 = static_cast<int>(v1.x) - ofx;
+            int y1 = static_cast<int>(v1.y) - ofy;
+            if (x0 > x1)
+                std::swap(x0, x1);
+            if (y0 > y1)
+                std::swap(y0, y1);
+            const int ux0 = x0;
+            const int uy0 = y0;
+            const int ux1 = ux0 + std::max(1, x1 - x0) - 1;
+            const int uy1 = uy0 + std::max(1, y1 - y0) - 1;
+            const bool outside = ux1 < ctx.scissor.x0 || ux0 > ctx.scissor.x1 ||
+                                 uy1 < ctx.scissor.y0 || uy0 > ctx.scissor.y1;
+            const uint64_t alphaReg = ctx.alpha.data;
+            const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
+            const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
+            if (!outside && prim.tme && prim.abe && prim.fst && prim.ctxt &&
+                ctx.frame.fbp != ctx.tex0.tbp0 && alphaMode == 0x64u &&
+                (alphaFix == 0x60u || alphaFix == 0x80u) &&
+                ux0 <= 0 && uy0 <= 0 && ux1 >= 639 && uy1 >= 447)
+            {
+                GSFrameReg copy{};
+                copy.fbp = ctx.tex0.tbp0;
+                copy.fbw = ctx.tex0.tbw;
+                copy.psm = ctx.tex0.psm;
+                gs->m_preferredDisplaySourceFrame = std::move(copy);
+                gs->m_preferredDisplayDestFbp = ctx.frame.fbp;
+                gs->m_hasPreferredDisplaySource = true;
+            }
+        }
+
+        gsmt::Job job;
+        job.v[0] = gs->m_vtxQueue[0];
+        job.v[1] = gs->m_vtxQueue[1];
+        job.v[2] = gs->m_vtxQueue[2];
+        job.ctx = ctx;
+        job.prim = prim;
+        job.pabe = gs->m_registers.pabe;
+        job.colclamp = gs->m_registers.colclamp;
+        job.texa = gs->m_registers.texa;
+        job.vram = gs->m_vram;
+        job.clut = nullptr;
+        gsmt::submit(job, gs->m_clut_cache.data(), gs);
+        return;
+    }
+
     const auto &ctx = gs->activeContext();
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);

@@ -28,6 +28,7 @@
 extern "C" void ps2x_host_sampler_start(void);
 extern "C" void ps2x_host_sampler_stop(void);
 void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes);
+void ps2xGsRasterFlush(); // ps2_gs_raster_mt.inl
 void ps2xGsThreadSync(uint32_t reason);
 void ps2xGsThreadStop();
 
@@ -170,6 +171,7 @@ int main(int argc, char **argv)
             }
         if (threaded)
             ps2xGsThreadSync(0u);
+        ps2xGsRasterFlush(); // raster threads finish before the clock stops
         times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 
         if (r == repeat - 1)

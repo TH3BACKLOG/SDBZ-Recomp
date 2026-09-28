@@ -470,12 +470,16 @@ add_library(ps2_runtime STATIC
 # The VU interpreter is ~33% of fight CPU. RelWithDebInfo's /Ob1 inlines only
 # functions marked `inline`, so every small helper (normalizeOperand,
 # broadcast, applyDest, ...) became a real call. Allow full inlining for these
-# three TUs only; ps2_runtime is not a unity target, so nothing else rebuilds.
+# three TUs and the GS rasterizer path only; ps2_runtime is not a unity
+# target, so nothing else rebuilds.
 if(MSVC)
     set_source_files_properties(
         src/lib/vu/ps2_vu1_core.cpp
         src/lib/vu/ps2_vu1_upper.cpp
         src/lib/vu/ps2_vu1_lower.cpp
+        src/lib/ps2_gs_rasterizer.cpp
+        src/lib/ps2_gs_gpu.cpp
+        src/lib/ps2_gs_memory.cpp
         PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:RelWithDebInfo>:/Ob2>"
     )
 endif()

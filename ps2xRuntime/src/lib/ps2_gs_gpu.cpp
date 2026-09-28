@@ -18,6 +18,14 @@
 #include <string>
 #include <vector>
 
+// Threaded rasterizer (ps2_gs_raster_mt.inl): wait for, or tell it about, VRAM
+// accesses made outside it. Declared here, not in a header.
+void ps2xGsRasterFlush();
+void ps2xGsRasterReset();
+void ps2xGsRasterSyncRect(uint32_t baseBlock, uint32_t bw, uint32_t psm,
+                          uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool write);
+void ps2xGsRasterClutChanged();
+
 // Texture page cache slots (defined next to GS::ReadTexturePageCache).
 static void texPageCacheNewPrimitive();
 
@@ -1554,6 +1562,7 @@ GS::GS()
 
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs, PS2Runtime *runtime)
 {
+    ps2xGsRasterReset();
     m_vram = vram;
     m_vramSize = vramSize;
     m_privRegs = privRegs;
@@ -1564,6 +1573,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs, PS2Runtim
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ps2xGsRasterReset();
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_pendingImageBytes = 0;
@@ -1596,6 +1606,7 @@ void GS::snapshotVRAM()
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_vram || m_vramSize == 0)
         return;
+    ps2xGsRasterFlush();
     std::lock_guard<std::mutex> lock(m_snapshotMutex);
     m_displaySnapshot.resize(m_vramSize);
     std::memcpy(m_displaySnapshot.data(), m_vram, m_vramSize);
@@ -1922,6 +1933,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     {
         return false;
     }
+    ps2xGsRasterFlush();
 
     outPixels.resize(kHostFrameWidth * kHostFrameHeight * 4u);
     auto failCopy = [&outPixels]() -> bool
@@ -2060,6 +2072,7 @@ void GS::latchHostPresentationFrame()
 
 void GS::latchHostPresentationFrameUnlocked()
 {
+    ps2xGsRasterFlush();
     // [present] probe (PS2X_DIAG=1). Stage 5.7: the rasterizer is demonstrably
     // busy (GSRasterizer::writePixel dominates the EE thread) yet the screen is
     // black, so the open question is whether DISPFB/DISPLAY point at the pages
@@ -5544,6 +5557,7 @@ void GS::performLocalToLocalTransfer()
 {
     if (!m_vram)
         return;
+    ps2xGsRasterReset(); // writes VRAM: wait, then drop cached texture pages
 
     const GSBitBltBufReg bitbltbuf = m_registers.bitbltbuf;
     const GSTrxReg trxreg = m_registers.trxreg;
@@ -5961,6 +5975,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     {
         return;
     }
+    ps2xGsRasterSyncRect(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, true);
 
     if (rrw == 0 || rrh == 0)
     {
@@ -6423,6 +6438,7 @@ void GS::performLocalToHostToBuffer()
 
     if (!m_vram)
         return;
+    ps2xGsRasterFlush();
 
     const auto bitbltbuf = m_registers.bitbltbuf;
     const auto trxreg = m_registers.trxreg;
@@ -6490,12 +6506,14 @@ void GS::performLocalToHostToBuffer()
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ps2xGsRasterReset();
     return clearFramebufferRect(this, m_registers.ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ps2xGsRasterReset();
     return clearFramebufferRect(this, activeContext(), rgba);
 }
 
@@ -6961,6 +6979,13 @@ void GS::ReloadClutCache(u32 psm, u32 cpsm, u32 cbp, u8 csm, u8 csa, u8 cld)
     {
         return;
     }
+
+    // CSM1 reads at most 16x16 entries at cbp (buffer width 1).
+    if (csm == 0)
+        ps2xGsRasterSyncRect(cbp, 1u, cpsm, 0u, 0u, 16u, 16u, false);
+    else
+        ps2xGsRasterFlush();
+    ps2xGsRasterClutChanged();
 
     switch (csm)
     {
