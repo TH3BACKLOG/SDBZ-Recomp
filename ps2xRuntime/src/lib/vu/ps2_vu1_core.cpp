@@ -50,18 +50,31 @@ namespace
         const void *owner = nullptr;
         uint64_t nextReady = 0;
         uint64_t pipeReady[kPipeCount]{};
+        // Superset of the slots holding a pending entry, per pipeline. Entries
+        // invalidated elsewhere (flush/reset) may leave a stale bit; the scan
+        // still checks `valid`, so a stale bit costs one probe, never a commit.
+        uint32_t live[kPipeCount]{};
     };
     CommitHint g_commitHint[2];
 
-    inline void lowerCommitHint(const void *owner, uint32_t unit, CommitPipe pipe, uint64_t readyCycle)
+    inline void lowerCommitHint(const void *owner, uint32_t unit, CommitPipe pipe, uint64_t readyCycle,
+                                uint32_t slot)
     {
         CommitHint &hint = g_commitHint[unit & 1u];
         if (hint.owner != owner)
             return;
+        hint.live[pipe] |= 1u << slot;
         if (readyCycle < hint.pipeReady[pipe])
             hint.pipeReady[pipe] = readyCycle;
         if (readyCycle < hint.nextReady)
             hint.nextReady = readyCycle;
+    }
+
+    // Slot index of an entry within its pipeline array.
+    template <typename Array>
+    inline uint32_t slotOf(const Array &pipeline, const typename Array::value_type &entry)
+    {
+        return static_cast<uint32_t>(&entry - pipeline.data());
     }
 }
 
@@ -228,17 +241,174 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
     applyDest(m_state.acc, result, dest);
 }
 
+namespace
+{
+    // Shape of an FMAC upper op for the exact (long double) result, decoded
+    // once per instruction instead of per lane. The regular (op < 0x3C) and
+    // special (op >= 0x3C) tables share codes; only 0x2E differs (OPMSUB
+    // subtracts from ACC, OPMULA does not).
+    enum FmacExactKind : uint8_t
+    {
+        kFmacNone,
+        kFmacAdd,   // a + b
+        kFmacSub,   // a - b
+        kFmacMadd,  // acc + a * b
+        kFmacMsub,  // acc - a * b
+        kFmacMul,   // a * b
+        kFmacOpmsub, // acc - vs[l] * vt[r]
+        kFmacOpmula, // vs[l] * vt[r]
+    };
+
+    // Fast classification: when the float result's exponent is far from both
+    // ends of the range, the exact result is a normal non-zero number with the
+    // same sign (the float result is within a few ulps of it, and cancellation
+    // in MADD/MSUB either gives an exact zero or keeps the sign). Then the
+    // exact path would leave the value alone and only report the sign flag, so
+    // it can be skipped. The margin (2^-100 .. 2^100) is far wider than needed.
+    constexpr uint32_t kSafeExpLo = 127u - 100u;
+    constexpr uint32_t kSafeExpHi = 127u + 100u;
+
+    inline bool fastNormalFlags(float value, uint8_t &flags)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t exp = (bits >> 23) & 0xFFu;
+        if (exp < kSafeExpLo || exp > kSafeExpHi)
+            return false;
+        flags = (bits >> 31) != 0u ? 0x2u : 0u;
+        return true;
+    }
+    enum FmacExactRight : uint8_t
+    {
+        kRightBc,   // vt[bc]
+        kRightQ,
+        kRightI,
+        kRightLane, // vt[component]
+    };
+    struct FmacExactForm
+    {
+        FmacExactKind kind = kFmacNone;
+        FmacExactRight right = kRightLane;
+        uint8_t bc = 0u;
+        uint8_t fs = 0u;
+        uint8_t ft = 0u;
+    };
+
+    FmacExactForm decodeFmacExactForm(uint32_t upper)
+    {
+        FmacExactForm form;
+        const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+        const bool isSpecial = op >= 0x3Cu;
+        const uint8_t code = isSpecial
+                                 ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu))
+                                 : op;
+        form.fs = FS(upper);
+        form.ft = FT(upper);
+        form.bc = static_cast<uint8_t>(code & 3u);
+
+        if (code <= 0x0Fu || (code >= 0x18u && code <= 0x1Bu))
+        {
+            form.right = kRightBc;
+            if (code <= 0x03u)
+                form.kind = kFmacAdd;
+            else if (code <= 0x07u)
+                form.kind = kFmacSub;
+            else if (code <= 0x0Bu)
+                form.kind = kFmacMadd;
+            else if (code <= 0x0Fu)
+                form.kind = kFmacMsub;
+            else
+                form.kind = kFmacMul;
+            return form;
+        }
+
+        switch (code)
+        {
+        case 0x1Cu: form.kind = kFmacMul;  form.right = kRightQ; break;
+        case 0x1Eu: form.kind = kFmacMul;  form.right = kRightI; break;
+        case 0x20u: form.kind = kFmacAdd;  form.right = kRightQ; break;
+        case 0x21u: form.kind = kFmacMadd; form.right = kRightQ; break;
+        case 0x22u: form.kind = kFmacAdd;  form.right = kRightI; break;
+        case 0x23u: form.kind = kFmacMadd; form.right = kRightI; break;
+        case 0x24u: form.kind = kFmacSub;  form.right = kRightQ; break;
+        case 0x25u: form.kind = kFmacMsub; form.right = kRightQ; break;
+        case 0x26u: form.kind = kFmacSub;  form.right = kRightI; break;
+        case 0x27u: form.kind = kFmacMsub; form.right = kRightI; break;
+        case 0x28u: form.kind = kFmacAdd;  break;
+        case 0x29u: form.kind = kFmacMadd; break;
+        case 0x2Au: form.kind = kFmacMul;  break;
+        case 0x2Cu: form.kind = kFmacSub;  break;
+        case 0x2Du: form.kind = kFmacMsub; break;
+        case 0x2Eu: form.kind = isSpecial ? kFmacOpmula : kFmacOpmsub; break;
+        default: break;
+        }
+        return form;
+    }
+
+    bool evalFmacExactForm(const FmacExactForm &form, const VU1State &state,
+                           uint32_t component, long double &result)
+    {
+        const auto operand = [](float value)
+        {
+            return static_cast<long double>(vuNormalizeOperand(value));
+        };
+        const auto vs = [&](uint32_t lane) { return operand(state.vf[form.fs][lane]); };
+        const auto vt = [&](uint32_t lane) { return operand(state.vf[form.ft][lane]); };
+        const auto acc = [&](uint32_t lane) { return operand(state.acc[lane]); };
+
+        if (form.kind == kFmacOpmsub || form.kind == kFmacOpmula)
+        {
+            static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
+            static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
+            if (component == 3u)
+                result = 0.0L;
+            else if (form.kind == kFmacOpmsub)
+                result = acc(component) - vs(left[component]) * vt(right[component]);
+            else
+                result = vs(left[component]) * vt(right[component]);
+            return true;
+        }
+
+        long double b = 0.0L;
+        switch (form.right)
+        {
+        case kRightBc: b = vt(form.bc); break;
+        case kRightQ: b = operand(state.q); break;
+        case kRightI: b = operand(state.i); break;
+        case kRightLane: b = vt(component); break;
+        }
+
+        switch (form.kind)
+        {
+        case kFmacAdd: result = vs(component) + b; return true;
+        case kFmacSub: result = vs(component) - b; return true;
+        case kFmacMadd: result = acc(component) + vs(component) * b; return true;
+        case kFmacMsub: result = acc(component) - vs(component) * b; return true;
+        case kFmacMul: result = vs(component) * b; return true;
+        default: return false;
+        }
+    }
+}
+
 void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
                                          uint8_t laneFlags[4])
 {
+    const FmacExactForm form = decodeFmacExactForm(m_currentUpperInstruction);
     for (uint32_t component = 0; component < 4u; ++component)
     {
         laneFlags[component] = 0u;
         if ((dest & laneForComponent(component)) == 0u)
             continue;
 
+        // OPMULA/OPMSUB w is an exact zero whatever the float lane holds.
+        const bool opmW = component == 3u &&
+                          (form.kind == kFmacOpmsub || form.kind == kFmacOpmula);
+        if (form.kind != kFmacNone && !opmW &&
+            fastNormalFlags(result[component], laneFlags[component]))
+            continue;
+
         long double exactResult = 0.0L;
-        if (calculateFmacExactResult(component, exactResult))
+        if (evalFmacExactForm(form, m_state, component, exactResult))
         {
             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
             continue;
@@ -253,184 +423,8 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
 bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
                                                long double &result) const
 {
-    const uint32_t upper = m_currentUpperInstruction;
-    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
-    const uint8_t special = op >= 0x3Cu
-                                ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu))
-                                : 0xFFu;
-    const uint8_t fs = FS(upper);
-    const uint8_t ft = FT(upper);
-
-    const auto operand = [this](float value)
-    {
-        return static_cast<long double>(vuNormalizeOperand(value));
-    };
-    const auto vs = [&](uint32_t lane)
-    {
-        return operand(m_state.vf[fs][lane]);
-    };
-    const auto vt = [&](uint32_t lane)
-    {
-        return operand(m_state.vf[ft][lane]);
-    };
-    const auto acc = [&](uint32_t lane)
-    {
-        return operand(m_state.acc[lane]);
-    };
-
-    const long double q = operand(m_state.q);
-    const long double i = operand(m_state.i);
-
-    if (op < 0x3Cu)
-    {
-        if (op <= 0x03u)
-            result = vs(component) + vt(op & 3u);
-        else if (op <= 0x07u)
-            result = vs(component) - vt(op & 3u);
-        else if (op <= 0x0Bu)
-            result = acc(component) + vs(component) * vt(op & 3u);
-        else if (op <= 0x0Fu)
-            result = acc(component) - vs(component) * vt(op & 3u);
-        else if (op >= 0x18u && op <= 0x1Bu)
-            result = vs(component) * vt(op & 3u);
-        else
-        {
-            switch (op)
-            {
-            case 0x1Cu:
-                result = vs(component) * q;
-                break;
-            case 0x1Eu:
-                result = vs(component) * i;
-                break;
-            case 0x20u:
-                result = vs(component) + q;
-                break;
-            case 0x21u:
-                result = acc(component) + vs(component) * q;
-                break;
-            case 0x22u:
-                result = vs(component) + i;
-                break;
-            case 0x23u:
-                result = acc(component) + vs(component) * i;
-                break;
-            case 0x24u:
-                result = vs(component) - q;
-                break;
-            case 0x25u:
-                result = acc(component) - vs(component) * q;
-                break;
-            case 0x26u:
-                result = vs(component) - i;
-                break;
-            case 0x27u:
-                result = acc(component) - vs(component) * i;
-                break;
-            case 0x28u:
-                result = vs(component) + vt(component);
-                break;
-            case 0x29u:
-                result = acc(component) + vs(component) * vt(component);
-                break;
-            case 0x2Au:
-                result = vs(component) * vt(component);
-                break;
-            case 0x2Cu:
-                result = vs(component) - vt(component);
-                break;
-            case 0x2Du:
-                result = acc(component) - vs(component) * vt(component);
-                break;
-            case 0x2Eu:
-            {
-                static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
-                static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
-                result = component == 3u
-                             ? 0.0L
-                             : acc(component) - vs(left[component]) * vt(right[component]);
-                break;
-            }
-            default:
-                return false;
-            }
-        }
-        return true;
-    }
-
-    if (special <= 0x03u)
-        result = vs(component) + vt(special & 3u);
-    else if (special <= 0x07u)
-        result = vs(component) - vt(special & 3u);
-    else if (special <= 0x0Bu)
-        result = acc(component) + vs(component) * vt(special & 3u);
-    else if (special <= 0x0Fu)
-        result = acc(component) - vs(component) * vt(special & 3u);
-    else if (special >= 0x18u && special <= 0x1Bu)
-        result = vs(component) * vt(special & 3u);
-    else
-    {
-        switch (special)
-        {
-        case 0x1Cu:
-            result = vs(component) * q;
-            break;
-        case 0x1Eu:
-            result = vs(component) * i;
-            break;
-        case 0x20u:
-            result = vs(component) + q;
-            break;
-        case 0x21u:
-            result = acc(component) + vs(component) * q;
-            break;
-        case 0x22u:
-            result = vs(component) + i;
-            break;
-        case 0x23u:
-            result = acc(component) + vs(component) * i;
-            break;
-        case 0x24u:
-            result = vs(component) - q;
-            break;
-        case 0x25u:
-            result = acc(component) - vs(component) * q;
-            break;
-        case 0x26u:
-            result = vs(component) - i;
-            break;
-        case 0x27u:
-            result = acc(component) - vs(component) * i;
-            break;
-        case 0x28u:
-            result = vs(component) + vt(component);
-            break;
-        case 0x29u:
-            result = acc(component) + vs(component) * vt(component);
-            break;
-        case 0x2Au:
-            result = vs(component) * vt(component);
-            break;
-        case 0x2Cu:
-            result = vs(component) - vt(component);
-            break;
-        case 0x2Du:
-            result = acc(component) - vs(component) * vt(component);
-            break;
-        case 0x2Eu:
-        {
-            static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
-            static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
-            result = component == 3u
-                         ? 0.0L
-                         : vs(left[component]) * vt(right[component]);
-            break;
-        }
-        default:
-            return false;
-        }
-    }
-    return true;
+    return evalFmacExactForm(decodeFmacExactForm(m_currentUpperInstruction), m_state,
+                             component, result);
 }
 
 uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
@@ -465,53 +459,39 @@ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
 
 uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
 {
-    uint32_t extraSticky = 0u;
-    const uint32_t upper = m_currentUpperInstruction;
-    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
-    const uint8_t special = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : 0xFFu;
-    const bool productSum =
-        (op >= 0x08u && op <= 0x0Fu) ||
-        op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
-        op == 0x29u || op == 0x2Du || op == 0x2Eu ||
-        (special >= 0x08u && special <= 0x0Fu) ||
-        special == 0x21u || special == 0x23u || special == 0x25u ||
-        special == 0x27u || special == 0x29u || special == 0x2Du;
-    if (!productSum)
+    // Only product-sum ops (MADD/MSUB families, OPMSUB) have a product whose
+    // conditions go to the sticky flags; OPMULA is a plain product.
+    const FmacExactForm form = decodeFmacExactForm(m_currentUpperInstruction);
+    if (form.kind != kFmacMadd && form.kind != kFmacMsub && form.kind != kFmacOpmsub)
         return 0u;
 
-    const uint8_t fs = FS(upper);
-    const uint8_t ft = FT(upper);
+    uint32_t extraSticky = 0u;
+    const float *vs = m_state.vf[form.fs];
+    const float *vt = m_state.vf[form.ft];
     for (uint32_t component = 0; component < 4u; ++component)
     {
         if ((dest & laneForComponent(component)) == 0u)
             continue;
         static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
         static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
-        const uint8_t leftComponent = op == 0x2Eu ? crossLeft[component] : static_cast<uint8_t>(component);
-        const float left = vuNormalizeOperand(m_state.vf[fs][leftComponent]);
+        const bool cross = form.kind == kFmacOpmsub;
+        const float left = vuNormalizeOperand(vs[cross ? crossLeft[component] : component]);
         float right = 0.0f;
-        if ((op >= 0x08u && op <= 0x0Fu) || (special >= 0x08u && special <= 0x0Fu))
+        switch (form.right)
         {
-            right = vuNormalizeOperand(m_state.vf[ft][(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]);
-        }
-        else if (op == 0x21u || op == 0x25u || special == 0x21u || special == 0x25u)
-        {
-            right = vuNormalizeOperand(m_state.q);
-        }
-        else if (op == 0x23u || op == 0x27u || special == 0x23u || special == 0x27u)
-        {
-            right = vuNormalizeOperand(m_state.i);
-        }
-        else if (op == 0x2Eu)
-        {
-            right = vuNormalizeOperand(m_state.vf[ft][crossRight[component]]);
-        }
-        else
-        {
-            right = vuNormalizeOperand(m_state.vf[ft][component]);
+        case kRightBc: right = vuNormalizeOperand(vt[form.bc]); break;
+        case kRightQ: right = vuNormalizeOperand(m_state.q); break;
+        case kRightI: right = vuNormalizeOperand(m_state.i); break;
+        case kRightLane: right = vuNormalizeOperand(vt[cross ? crossRight[component] : component]); break;
         }
 
         float product = left * right;
+        uint8_t fastFlags = 0u;
+        if (fastNormalFlags(product, fastFlags))
+        {
+            extraSticky |= fastFlags;
+            continue;
+        }
         const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
         // Product-sum instructions report Z/S/U/O from the add/subtract result
@@ -567,7 +547,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     entry->valid = true;
     entry->issueCycle = m_cycle;
     entry->readyCycle = m_cycle + kFmacLatency;
-    lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry->readyCycle);
+    lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry->readyCycle, slotOf(m_flagPipeline, *entry));
     entry->mac = mac;
     entry->status = status;
     entry->extraSticky = extraSticky;
@@ -607,7 +587,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle, slotOf(m_flagPipeline, entry));
             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
             entry.writesSticky = true;
             return;
@@ -627,7 +607,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle, slotOf(m_flagPipeline, entry));
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -652,7 +632,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFlag, entry.readyCycle, slotOf(m_flagPipeline, entry));
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -667,7 +647,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
     value = normalizeResult(value, ignoredFlags);
     m_fdiv.valid = true;
     m_fdiv.readyCycle = m_cycle + latency;
-    lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFdiv, m_fdiv.readyCycle);
+    lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeFdiv, m_fdiv.readyCycle, 0u);
     m_fdiv.value = value;
     m_fdiv.statusDi = statusDi & 0x30u;
 }
@@ -682,7 +662,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
         {
             entry.valid = true;
             entry.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeEfu, entry.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeEfu, entry.readyCycle, slotOf(m_efu, entry));
             entry.value = value;
             // EFU throughput is one cycle shorter than result visibility.
             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
@@ -700,7 +680,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
         {
             store.valid = true;
             store.readyCycle = m_cycle + 1u;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeStore, store.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeStore, store.readyCycle, slotOf(m_storePipeline, store));
             store.address = address;
             store.laneMask = laneMask;
             std::copy(words, words + 4, store.words.begin());
@@ -722,7 +702,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeVf, write.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeVf, write.readyCycle, slotOf(m_vfWritePipeline, write));
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.laneMask = laneMask;
@@ -749,7 +729,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeVi, write.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeVi, write.readyCycle, slotOf(m_viWritePipeline, write));
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.value = value;
@@ -771,7 +751,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
-            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeAcc, write.readyCycle);
+            lowerCommitHint(this, static_cast<uint32_t>(m_unit), kPipeAcc, write.readyCycle, slotOf(m_accWritePipeline, write));
             write.sequence = ++m_nextWriteSequence;
             write.laneMask = laneMask;
             std::copy(value, value + 4, write.value.begin());
@@ -802,26 +782,38 @@ void VU1Interpreter::commitReadyPipelines()
         return fullScan || hint.pipeReady[pipe] <= m_cycle;
     };
     uint64_t pipeNext = kNone;
-    const auto keep = [&](uint64_t readyCycle)
+    uint32_t pipeLive = 0u;
+    const auto keep = [&](uint64_t readyCycle, uint32_t slot)
     {
+        pipeLive |= 1u << slot;
         if (readyCycle < pipeNext)
             pipeNext = readyCycle;
     };
     const auto finish = [&](CommitPipe pipe)
     {
         hint.pipeReady[pipe] = pipeNext;
+        hint.live[pipe] = pipeLive;
         pipeNext = kNone;
+        pipeLive = 0u;
+    };
+    // Slots to visit, in ascending order (same order as the old full scan, so
+    // same-cycle flag entries still apply lowest-slot first).
+    const auto slots = [&](CommitPipe pipe, size_t count) -> uint32_t
+    {
+        return fullScan ? static_cast<uint32_t>((1ull << count) - 1ull) : hint.live[pipe];
     };
 
     if (due(kPipeFlag))
     {
-        for (FlagPipelineEntry &entry : m_flagPipeline)
+        for (uint32_t m = slots(kPipeFlag, m_flagPipeline.size()); m != 0u; m &= m - 1u)
         {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(m));
+            FlagPipelineEntry &entry = m_flagPipeline[slot];
             if (!entry.valid)
                 continue;
             if (entry.readyCycle > m_cycle)
             {
-                keep(entry.readyCycle);
+                keep(entry.readyCycle, slot);
                 continue;
             }
 
@@ -846,7 +838,7 @@ void VU1Interpreter::commitReadyPipelines()
     if (due(kPipeFdiv))
     {
         if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
-            keep(m_fdiv.readyCycle);
+            keep(m_fdiv.readyCycle, 0u);
         else if (m_fdiv.valid)
         {
             m_state.q = m_fdiv.value;
@@ -862,7 +854,7 @@ void VU1Interpreter::commitReadyPipelines()
         for (ScalarPipelineEntry &entry : m_efu)
         {
             if (entry.valid && entry.readyCycle > m_cycle)
-                keep(entry.readyCycle);
+                keep(entry.readyCycle, slotOf(m_efu, entry));
             else if (entry.valid)
             {
                 m_state.p = entry.value;
@@ -874,13 +866,15 @@ void VU1Interpreter::commitReadyPipelines()
 
     if (due(kPipeStore))
     {
-        for (PendingStore &store : m_storePipeline)
+        for (uint32_t m = slots(kPipeStore, m_storePipeline.size()); m != 0u; m &= m - 1u)
         {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(m));
+            PendingStore &store = m_storePipeline[slot];
             if (!store.valid)
                 continue;
             if (store.readyCycle > m_cycle)
             {
-                keep(store.readyCycle);
+                keep(store.readyCycle, slot);
                 continue;
             }
             if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
@@ -901,13 +895,15 @@ void VU1Interpreter::commitReadyPipelines()
 
     if (due(kPipeVf))
     {
-        for (PendingVfWrite &write : m_vfWritePipeline)
+        for (uint32_t m = slots(kPipeVf, m_vfWritePipeline.size()); m != 0u; m &= m - 1u)
         {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(m));
+            PendingVfWrite &write = m_vfWritePipeline[slot];
             if (!write.valid)
                 continue;
             if (write.readyCycle > m_cycle)
             {
-                keep(write.readyCycle);
+                keep(write.readyCycle, slot);
                 continue;
             }
             for (uint32_t component = 0; component < 4u; ++component)
@@ -925,13 +921,15 @@ void VU1Interpreter::commitReadyPipelines()
 
     if (due(kPipeVi))
     {
-        for (PendingViWrite &write : m_viWritePipeline)
+        for (uint32_t m = slots(kPipeVi, m_viWritePipeline.size()); m != 0u; m &= m - 1u)
         {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(m));
+            PendingViWrite &write = m_viWritePipeline[slot];
             if (!write.valid)
                 continue;
             if (write.readyCycle > m_cycle)
             {
-                keep(write.readyCycle);
+                keep(write.readyCycle, slot);
                 continue;
             }
             if (m_viLatestWrite[write.reg] == write.sequence)
@@ -943,13 +941,15 @@ void VU1Interpreter::commitReadyPipelines()
 
     if (due(kPipeAcc))
     {
-        for (PendingAccWrite &write : m_accWritePipeline)
+        for (uint32_t m = slots(kPipeAcc, m_accWritePipeline.size()); m != 0u; m &= m - 1u)
         {
+            const uint32_t slot = static_cast<uint32_t>(std::countr_zero(m));
+            PendingAccWrite &write = m_accWritePipeline[slot];
             if (!write.valid)
                 continue;
             if (write.readyCycle > m_cycle)
             {
-                keep(write.readyCycle);
+                keep(write.readyCycle, slot);
                 continue;
             }
             for (uint32_t component = 0; component < 4u; ++component)
