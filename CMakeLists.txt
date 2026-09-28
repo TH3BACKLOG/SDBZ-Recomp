@@ -19,6 +19,14 @@ option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)
 option(PS2X_BUILD_TEST "Build ps2xTest" ON)
 option(PS2X_BUILD_STUDIO "Build ps2xStudio" ON)
 
+if(ANDROID)
+    message(STATUS "Android target detected, building runtime only")
+    set(PS2X_BUILD_RECOMP OFF)
+    set(PS2X_BUILD_ANALYZER OFF)
+    set(PS2X_BUILD_TEST OFF)
+    set(PS2X_BUILD_STUDIO OFF)
+endif()
+
 # Sanitizer flags must apply to EVERY target that links ps2_runtime (including
 # ps2x_tests in a sibling directory), so they are set here at the root rather
 # than inside ps2xRuntime/. PS2X_SANITIZE=thread additionally requires
@@ -91,12 +99,21 @@ if(PS2X_BUILD_RECOMP)
 endif()
 
 if(PS2X_BUILD_RUNTIME)
-    # ps2xIOP (upstream #170): self-contained static lib of IOP HLE service
-    # modules. Built but NOT yet linked into ps2_runtime -- our own R3000
-    # interpreter (ps2_iop_cpu.cpp) still owns the IOP path. This exists so
-    # cri_dtx/sdrdrv/tsnddrv can be ported across module by module.
+    # ps2xIOP (upstream #170/#244): the IOP emulator (R3000A + real IRX
+    # execution) and HLE fallbacks, linked into ps2_runtime as ps2_iop. It
+    # replaced our embedded ps2_iop*.cpp path on 2026-09-24 (those files are
+    # kept on disk, unbuilt, for reference).
     add_subdirectory("ps2xIOP")
-    add_subdirectory("ps2xRuntime")
+    # ps2_runtime cannot compile without the recomp output (generated headers
+    # + src/runner/), which is deliberately untracked (no game code in git).
+    # Skip LOUDLY rather than fail so CI still builds everything else. Green
+    # CI does NOT mean the runtime compiles.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ps2xRuntime/include/fn_forward_decls.h"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ps2xRuntime/include/ps2_recompiled_functions.h")
+        add_subdirectory("ps2xRuntime")
+    else()
+        message(WARNING "SKIPPED: ps2xRuntime (no recomp output — generated headers/runner sources absent; run ps2_recomp + build.ps1 locally)")
+    endif()
 endif()
 
 if(PS2X_BUILD_ANALYZER)
@@ -104,9 +121,19 @@ if(PS2X_BUILD_ANALYZER)
 endif()
 
 if(PS2X_BUILD_TEST)
-    add_subdirectory("ps2xTest")
+    if(TARGET ps2_runtime)
+        add_subdirectory("ps2xTest")
+    else()
+        message(WARNING "SKIPPED: ps2xTest (requires ps2_runtime, which was skipped)")
+    endif()
 endif()
 
 if(PS2X_BUILD_STUDIO)
-    add_subdirectory("ps2xStudio")
+    # StudioState::RunDiagnostics() calls test-registration functions from
+    # ps2_test_lib, so Studio cannot link when ps2xTest was skipped.
+    if(TARGET ps2_test_lib)
+        add_subdirectory("ps2xStudio")
+    else()
+        message(WARNING "SKIPPED: ps2xStudio (requires ps2_test_lib, which was skipped)")
+    endif()
 endif()

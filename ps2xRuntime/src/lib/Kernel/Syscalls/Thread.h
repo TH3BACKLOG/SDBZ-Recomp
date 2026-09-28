@@ -6,10 +6,11 @@
 namespace ps2_syscalls
 {
     // Plain-data snapshot of one PS2 thread's scheduler state, safe to copy
-    // out from under g_thread_map_mutex without exposing ThreadInfo (which
-    // holds a std::mutex/condition_variable) to callers outside Kernel/.
-    // Restored 2026-07-14 for the RecompDebugger revival (was dropped along
-    // with the rest of the debug IPC layer when the repo was flattened).
+    // out of EeScheduler's mutex-guarded EeKernelSnapshot without exposing
+    // GuestThread (which holds live invocation state) to callers outside
+    // Kernel/. Restored 2026-07-14 for the RecompDebugger revival (was
+    // dropped along with the rest of the debug IPC layer when the repo was
+    // flattened); re-pointed at EeScheduler in Phase 3c-3b.
     struct ThreadDebugSnapshot
     {
         int tid = 0;
@@ -22,9 +23,9 @@ namespace ps2_syscalls
         int currentPriority = 0;
     };
 
-    // Snapshots g_threads under g_thread_map_mutex. Safe to call from any
-    // thread; used by the debug IPC layer once per video frame.
-    std::vector<ThreadDebugSnapshot> getThreadDebugSnapshot();
+    // Snapshots the EeScheduler's published thread table. Safe to call from
+    // any thread; used by the debug IPC layer once per video frame.
+    std::vector<ThreadDebugSnapshot> getThreadDebugSnapshot(PS2Runtime *runtime);
 
     void FlushCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void iFlushCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

@@ -1,15 +1,11 @@
 #include "Common.h"
 #include <cstdlib>
+#include <chrono>
+#include <cstdint>
 #include "Thread.h"
-#include "ps2_scheduler_internal.h"
+#include "runtime/ee_scheduler.h"
 
 // Phase C -- EE thread visibility.
-//
-// Until now EE thread creation was COMPLETELY INVISIBLE: the only CreateThread
-// lines anywhere in run_log.txt were [iop:import] ones. We have been running
-// guest fibers on guest stacks for weeks with no record of where those stacks
-// are, which is exactly why the "foreign prologue running with sp inside
-// 0x178be8's live frame" question could never be settled by measurement.
 //
 // Defined in game_overrides.cpp. Declared extern here rather than in a header:
 // touching a .h forces a full 30h+ rebuild (skill SS3 prohibition 3).
@@ -24,6 +20,67 @@ extern "C" void ps2x_probe_kv(const char *name, int n,
 // .cpp rule as ps2x_probe_kv: a header edit costs a full rebuild.
 extern "C" uint32_t ps2x_on_irq_handler_stack();
 
+// Defined in Kernel/EeScheduler.cpp (Phase 3d, replacing ps2sched's
+// thread_local g_currentThreadId). Same extern-in-.cpp rule as above.
+extern "C" int ps2x_guest_current_thread_id();
+
+// ---------------------------------------------------------------------------
+// 2026-09-03 part 56 -- probe budgets that cannot go blind on the stall.
+//
+// The 09-03 00:44 run raised CHGPRI/THLIFE from 400/600 to 6000 and BOTH still
+// saturated at guest progress 0xe80793 (~15.2M), while the stall did not begin
+// until roughly t=336s at progress ~36M. A first-N cap spends its whole budget
+// on the healthy phase, so raising it only moves the blind spot -- it never
+// reaches the window we need (feedback_capped_probes_false_negatives). That is
+// why the 6000-record CHGPRI census shows thread 6 exactly ONCE (its creation
+// priority 0x19) even though the watchdog caught ChangeThreadPriority(6, 1)
+// live at t=394s: the probe was already blind by then.
+//
+// Replaced with two overlapping budgets:
+//   * "early"  -- the first `warm` records, unconditional, for the boot history.
+//   * "steady" -- after that, at most `perSec` records per wall second, forever.
+//
+// A run of any length therefore carries records from every second of it at a
+// bounded cost, and `n` (the TRUE call count, incremented even when the record
+// is thinned) is emitted so a thinned stream can never be misread as a low call
+// rate -- the failure mode a plain cap has.
+class ProbeBudget
+{
+public:
+    ProbeBudget(unsigned warm, unsigned perSec) : m_warm(warm), m_perSec(perSec) {}
+
+    bool allow()
+    {
+        ++m_calls;
+        if (m_calls <= m_warm)
+        {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_windowStart >= std::chrono::seconds(1))
+        {
+            m_windowStart = now;
+            m_inWindow = 0;
+        }
+        if (m_inWindow >= m_perSec)
+        {
+            return false;
+        }
+        ++m_inWindow;
+        return true;
+    }
+
+    uint64_t calls() const { return m_calls; }
+
+private:
+    unsigned m_warm;
+    unsigned m_perSec;
+    uint64_t m_calls = 0;
+    unsigned m_inWindow = 0;
+    std::chrono::steady_clock::time_point m_windowStart{};
+};
+
+
 // ---------------------------------------------------------------------------
 // Phase C -- stack-bounds guard.
 //
@@ -32,10 +89,10 @@ extern "C" uint32_t ps2x_on_irq_handler_stack();
 // det=0 run put it 0 progress ticks and 1 record ahead of the dispatch miss,
 // i.e. it reports the damage at the same instant the damage is consumed.
 //
-// This guard fires on the violation instead: the first moment a fiber's sp
+// This guard fires on the violation instead: the first moment a thread's sp
 // leaves the stack range its own StartThread handed it. Kept in a file-scope
-// map keyed by tid rather than as a FiberContext field, because FiberContext
-// lives in a header and headers are off-limits.
+// map keyed by tid rather than as a scheduler-owned field, because the
+// scheduler state lives in a header and headers are off-limits.
 namespace
 {
     struct GuestStackRange
@@ -97,7 +154,37 @@ extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
     if (ps2x_on_irq_handler_stack() != 0u)
         return 0;
 
-    const int tid = g_currentThreadId;
+    // ...except the guard above is DEAD CODE and has been since it was written.
+    // `tls_on_irq_handler_stack` is only ever incremented by Interrupt.cpp's
+    // `IrqHandlerStackScope`, and that type is declared and never instantiated
+    // -- grep it: five hits, all inside its own definition. So the counter is
+    // permanently 0 and the early-out never fires.
+    //
+    // Measured cost, run of 2026-09-10 (first run with tid 1 registered):
+    // 32,768+ STACKOOB violations, cap [cap] line at 16, and all 16 surviving
+    // records identical -- pc=0x178068, sp=0xffff0, blamed on thid=0x1.
+    // 0xffff0 is the async callback pool's stackTop, exactly as printed by the
+    // one `[async-stack] reserved [0xfc000, 0x100000) stackTop=0xffff0` line of
+    // that boot. Every one of those 32,768 is the false positive the dead guard
+    // was supposed to suppress, and they drowned the probe before it could say
+    // anything about the frame this instrument was added to watch.
+    //
+    // Fixed by address band rather than by arming the scope. Arming it means
+    // touching all four invocation dispatch sites in EeScheduler.cpp, and the
+    // band test is exact: ps2_runtime.cpp:318-336 documents the pool invariant
+    // as "guest thread stacks are game-chosen addresses >= 0x00100000
+    // [and the pool] is disjoint from ALL guest memory by construction". A $sp
+    // below that ceiling is kernel-reserved by definition and can never be a
+    // guest thread's own stack, so this cannot mask a real violation.
+    //
+    // Not a header include: ps2_runtime.h is pulled in by ~4,520 generated TUs
+    // and Thread.cpp does not currently include it. Mirrored constant, with the
+    // definition site named so the two stay findable together.
+    constexpr uint32_t kKernelReservedStackCeiling = 0x00100000u; // == kAsyncCallbackStackTop, ps2xRuntime/include/ps2_runtime.h:432
+    if (sp < kKernelReservedStackCeiling)
+        return 0;
+
+    const int tid = ps2x_guest_current_thread_id();
     GuestStackRange r;
     {
         std::lock_guard<std::mutex> lock(g_stackRangeMutex);
@@ -137,17 +224,16 @@ extern "C" int ps2x_stack_check(uint32_t pc, uint32_t sp, uint32_t site)
     return 1;
 }
 
-namespace ps2sched { void force_reschedule(); }
-
 // Stage 5.17 -- equal-priority yield inside ReferThreadStatus, env-gated OFF.
 //
 // The guest's cross-thread handshake sub_11E690 sets [0x441924]=1, boosts the
 // worker to its OWN priority via 29h, then spins on 0x30 ReferThreadStatus until
-// the worker ACKs. Our 29h already calls force_reschedule() (below, ~line 1131),
-// so the FIRST handoff works. But once the worker blocks inside the pump and
-// later becomes Ready again, nothing can hand it the slot back: maybe_yield()
-// and yield_point() step 3 both select a STRICTLY higher-priority head, and 0x30
-// -- the only syscall inside the spin -- has no yield at all. Measured cost in
+// the worker ACKs. Our 29h (ChangeThreadPriority, below) already reschedules
+// natively on a self-boost -- see ChangeThreadPriority's own comment -- so the
+// FIRST handoff works. But once the worker blocks inside the pump and later
+// becomes Ready again, nothing can hand it the slot back: EeScheduler's own
+// checkpoint/reschedule paths only select a STRICTLY higher-priority head, and
+// 0x30 -- the only syscall inside the spin -- has no yield at all. Measured cost in
 // run 20260824-101518: one handshake takes 8 wall seconds with the worker
 // reading NOT-RUNNING for 3 consecutive seconds, and vbl/s collapses to 1 while
 // it holds.
@@ -166,136 +252,340 @@ static bool refstatYieldEnabled()
     return on;
 }
 
+// 2026-09-02 part 50. ps2tek 29h/2Ah say ChangeThreadPriority / iChangeThreadPriority
+// return the thread's OLD priority on success. We returned KE_OK (0). Set
+// PS2X_CHGPRI_RET=0 to restore the old status-code return for A/B testing;
+// unset (the default) is the ps2tek-conformant behaviour.
+static bool chgPriReturnsOldPriority()
+{
+    static const bool on = []() -> bool
+    {
+        const char *e = std::getenv("PS2X_CHGPRI_RET");
+        return !(e && *e == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
 namespace ps2_syscalls
 {
-    // Restored 2026-07-14 for the RecompDebugger revival (see Thread.h).
-    std::vector<ThreadDebugSnapshot> getThreadDebugSnapshot()
+    namespace
+    {
+        EeScheduler &scheduler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            EeScheduler &result = runtime->eeScheduler();
+            result.bindMainContextForSyscall(*ctx, rdram);
+            return result;
+        }
+
+        // 2026-09-21: a borrowed host worker (EeScheduler::beginBorrowedWorker)
+        // has a NEGATIVE pseudo-thread id, so it has no guest thread at all.
+        // Every thread syscall below either names a thread or means "self";
+        // neither is answerable in that state, so the whole family returns
+        // KE_ILLEGAL_THID rather than resolving against whatever record is
+        // current. Returns true when it has answered the syscall.
+        bool rejectBorrowedWorker(EeScheduler &ee, R5900Context *ctx)
+        {
+            if (!ee.callerHasNoGuestThread())
+            {
+                return false;
+            }
+            // 2026-09-22 -- SELF-TARGETING ONLY. The comment above says the
+            // family "either names a thread or means 'self'; neither is
+            // answerable in that state", but only the second half is true. A
+            // call that names an explicit, positive tid does not need the
+            // caller to be a guest thread at all: EeScheduler::changePriority,
+            // suspendThread, resumeThread, terminateThread, cancelWakeup and
+            // referStatus all resolve their target by id and already return
+            // KE_UNKNOWN_THID for an id that is not there. Rejecting those was
+            // a loss of function, not a safety property.
+            //
+            // $a0 == 0 is this file's own self sentinel -- see
+            // iCancelWakeupThread just below, which spells the same test out
+            // by hand, and EeScheduler::changePriority's `if (id == 0) id =
+            // m_currentThreadId;`. For rotateReadyQueueImpl $a0 is a PRIORITY
+            // rather than a tid, but 0 means "my priority" there, so the same
+            // test carries the same meaning.
+            //
+            // SchedulerBorrowedGuard/Y3 pins the intended behaviour and is
+            // unaffected: all seven of its cases pass a0 = 0.
+            //
+            // This is what broke VSyncAndPriority/S2, which freezes the
+            // executor with a borrow and then calls
+            // ChangeThreadPriority(tidA, 5) -- an explicit tid, answerable,
+            // and rejected anyway, so A was never re-sorted.
+            if (getRegU32(ctx, 4) != 0u)
+            {
+                return false;
+            }
+            setReturnS32(ctx, KE_ILLEGAL_THID);
+            return true;
+        }
+
+        int rawThreadStatus(EeThreadStatus status)
+        {
+            switch (status)
+            {
+            case EeThreadStatus::Running:
+                return THS_RUN;
+            case EeThreadStatus::Ready:
+                return THS_READY;
+            case EeThreadStatus::Waiting:
+                return THS_WAIT;
+            case EeThreadStatus::WaitingSuspended:
+                return THS_WAITSUSPEND;
+            case EeThreadStatus::Suspended:
+                return THS_SUSPEND;
+            case EeThreadStatus::Dormant:
+                return THS_DORMANT;
+            }
+            return THS_DORMANT;
+        }
+
+        int rawWaitType(EeWaitReason reason)
+        {
+            switch (reason)
+            {
+            case EeWaitReason::Sleep:
+                return TSW_SLEEP;
+            case EeWaitReason::Semaphore:
+                return TSW_SEMA;
+            case EeWaitReason::EventFlag:
+                return TSW_EVENT;
+            case EeWaitReason::VSync:
+                return 4;
+            case EeWaitReason::External:
+            case EeWaitReason::Mpeg:
+                return 5;
+            case EeWaitReason::None:
+                return TSW_NONE;
+            }
+            return TSW_NONE;
+        }
+
+        int waitId(const GuestThread &thread)
+        {
+            if (thread.wait.reason == EeWaitReason::Semaphore)
+            {
+                return std::get<EeSemaphoreWait>(thread.wait.payload).id;
+            }
+            if (thread.wait.reason == EeWaitReason::EventFlag)
+            {
+                return std::get<EeEventFlagWait>(thread.wait.payload).id;
+            }
+            return 0;
+        }
+
+        [[noreturn]] void exitThreadWithHandlers(int tid,
+                                                 R5900Context *ctx,
+                                                 PS2Runtime *runtime,
+                                                 bool deleteThread)
+        {
+            EeScheduler &ee = runtime->eeScheduler();
+            const auto handlers = runtime->takeEeExitHandlers(tid);
+            std::vector<GuestInvocation> invocations;
+            invocations.reserve(handlers.size());
+            for (const PS2Runtime::EeExitHandlerRegistration &handler : handlers)
+            {
+                if (handler.function == 0u || !runtime->hasFunction(handler.function))
+                {
+                    continue;
+                }
+                GuestInvocation invocation{};
+                invocation.kind = GuestInvocationKind::ExitHandler;
+                invocation.context = *ctx;
+                invocation.context.pc = handler.function;
+                SET_GPR_U32(&invocation.context, 4, handler.argument);
+                SET_GPR_U32(&invocation.context, 29, ee.invocationStackTop());
+                SET_GPR_U32(&invocation.context, 31, 0u);
+                invocations.push_back(std::move(invocation));
+            }
+            if (invocations.empty())
+            {
+                ee.exitCurrent(deleteThread);
+            }
+            invocations.back().onComplete = [runtime, deleteThread](const R5900Context &, R5900Context &)
+            {
+                runtime->eeScheduler().exitCurrent(deleteThread);
+            };
+            ee.invokeCurrentSequence(std::move(invocations));
+        }
+
+        void changePriorityImpl(uint8_t *rdram,
+                                R5900Context *ctx,
+                                PS2Runtime *runtime,
+                                bool interruptSafe)
+        {
+            EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            if (rejectBorrowedWorker(ee, ctx)) { return; }
+            const int id = static_cast<int>(getRegU32(ctx, 4));
+            const int priority = static_cast<int>(getRegU32(ctx, 5));
+            int oldPriority = 0;
+            const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
+            // 2026-09-01 part 48 -- the second candidate producer of -403.
+            if (result == KE_ILLEGAL_PRIORITY)
+            {
+                static const char *const k[] = {"thid", "prio", "isafe", "pc", "ra"};
+                const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                                      static_cast<uint64_t>(static_cast<uint32_t>(priority)),
+                                      interruptSafe ? 1u : 0u,
+                                      ctx->pc,
+                                      getRegU32(ctx, 31)};
+                ps2x_probe_kv("PRIOREJECT", 5, k, v);
+            }
+            // 2026-09-02 part 50 -- ps2tek 29h/2Ah: ChangeThreadPriority returns
+            // the thread's OLD priority on success, not a status code. We were
+            // returning KE_OK (0) and discarding oldPriority, which breaks the
+            // guest's own save/restore pair around its critical section:
+            //
+            //   0x11e5d4  jal 0x174b30         ; ChangeThreadPriority(self, boost=1)
+            //   0x11e5e0  sw  $v0, -28144($v1) ; saved = $v0   <-- got 0
+            //   ...
+            //   0x11e668  jal 0x174b30         ; ChangeThreadPriority(self, saved)
+            //
+            // Every critical-section EXIT therefore pinned the caller at
+            // priority 0 -- the top of the ready queue. In the 2026-09-02 04:24
+            // run that left main RUNNING at pri 0 forever while the sub_11EAC8
+            // acker sat READY at the guest's boost level of 1 and could never
+            // preempt it ([thsync] VERDICT=WORKER-NOT-RUNNING, nTh=6).
+            //
+            // Failure codes are left alone: our KE_* values are the house
+            // convention and PRIOREJECT above keys off KE_ILLEGAL_PRIORITY.
+            // Gated so one binary serves both arms of the A/B.
+            const int returned =
+                (result == KE_OK && chgPriReturnsOldPriority()) ? oldPriority : result;
+
+            // Every call, not just the rejects: the open question after the
+            // priority-0 fix is whether the guest ever raises main above the
+            // boost level at all, or whether main stays at 0 from ExecPS2
+            // onward (ps2tek 07h creates the main thread at priority 0). Only a
+            // full census of thid/prio/old answers that; a reject-only probe
+            // cannot. Capped, and the cap is reported in the record so a
+            // saturated probe cannot be read as an absence.
+            {
+                // Thread 6 gets its own budget: it appears ONCE in the whole
+                // 6000-record 09-03 census (creation, prio 0x19), so its warm
+                // budget is guaranteed still intact when the stall starts, and
+                // the separate n6 counter gives its true call rate even after
+                // the steady-state thinning kicks in.
+                static ProbeBudget budget(1500u, 24u);
+                static ProbeBudget t6Budget(400u, 24u);
+                const bool anyBudget = budget.allow();
+                // Budget on the RESOLVED thread, not the argument: a caller
+                // passing id == 0 ("self") would otherwise log thid=0x0 and
+                // miss the thread-6 budget entirely. The three known callers
+                // (enter_critsec ra=0x11e5dc, leave_critsec ra=0x11e670,
+                // spinner sub_11E690) all pass an explicit tid via GetThreadId,
+                // but the caller that pins thread 6 is exactly what is not yet
+                // known, so do not assume it follows the same shape.
+                const int callerId = ps2x_guest_current_thread_id();
+                const int resolvedId = (id == 0) ? callerId : id;
+                const bool t6Budgeted = (resolvedId == 6) && t6Budget.allow();
+                if (anyBudget || t6Budgeted)
+                {
+                    // "cur" = the thread that ISSUED this call, as opposed to
+                    // "rid" (the thread being changed). Part 59 took the static
+                    // graph as far as it goes: the spinner sub_11E690 is reached
+                    // only through callback slot 6, dispatched from cblist_run(6)
+                    // (0x13c6e8), which has FOUR call sites (0x11e390, 0x11e480,
+                    // 0x11e53c, 0x11eb3c) and is not confined to one thread -- so
+                    // no static read can name the spinner's host. "cur" on the
+                    // ra=0x11e6e8 records answers it directly, and "cur" on the
+                    // ra=0x11e5dc records confirms whether the poisoned save is
+                    // thread 6 saving its own already-boosted priority.
+                    static const char *const k[] = {"thid", "prio", "old", "ret", "isafe", "ra", "n", "n6", "rid", "cur"};
+                    const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(priority)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(oldPriority)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(returned)),
+                                          interruptSafe ? 1u : 0u,
+                                          getRegU32(ctx, 31),
+                                          budget.calls(),
+                                          t6Budget.calls(),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(resolvedId)),
+                                          static_cast<uint64_t>(static_cast<uint32_t>(callerId))};
+                    ps2x_probe_kv("CHGPRI", 10, k, v);
+                }
+            }
+
+            setReturnS32(ctx, returned);
+            ee.transferIfRequested(interruptSafe);
+        }
+
+        void rotateReadyQueueImpl(uint8_t *rdram,
+                                  R5900Context *ctx,
+                                  PS2Runtime *runtime,
+                                  bool interruptSafe)
+        {
+            EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            if (rejectBorrowedWorker(ee, ctx)) { return; }
+            const int result = ee.rotateReadyQueue(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            // 2026-09-01 part 48 -- the third and last producer of -403.
+            if (result == KE_ILLEGAL_PRIORITY)
+            {
+                static const char *const k[] = {"prio", "isafe", "pc", "ra"};
+                const uint64_t v[] = {static_cast<uint64_t>(getRegU32(ctx, 4)),
+                                      interruptSafe ? 1u : 0u,
+                                      ctx->pc,
+                                      getRegU32(ctx, 31)};
+                ps2x_probe_kv("ROTREJECT", 4, k, v);
+            }
+            setReturnS32(ctx, result);
+            ee.transferIfRequested(interruptSafe);
+        }
+
+        void wakeupThreadImpl(uint8_t *rdram,
+                              R5900Context *ctx,
+                              PS2Runtime *runtime,
+                              bool interruptSafe)
+        {
+            EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            setReturnS32(ctx, result);
+            ee.transferIfRequested(interruptSafe);
+        }
+
+        void releaseWaitImpl(uint8_t *rdram,
+                             R5900Context *ctx,
+                             PS2Runtime *runtime,
+                             bool interruptSafe)
+        {
+            EeScheduler &ee = scheduler(rdram, ctx, runtime);
+            const int result = ee.releaseWait(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            setReturnS32(ctx, result);
+            ee.transferIfRequested(interruptSafe);
+        }
+    }
+
+    // Snapshots the EeScheduler's published thread table. Safe to call from
+    // any thread (EeScheduler::snapshot() is mutex-guarded); used by the debug
+    // IPC layer once per video frame. Restored 2026-07-14 for the
+    // RecompDebugger revival, re-pointed at EeScheduler in Phase 3c-3b.
+    std::vector<ThreadDebugSnapshot> getThreadDebugSnapshot(PS2Runtime *runtime)
     {
         std::vector<ThreadDebugSnapshot> out;
-        std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-        out.reserve(g_threads.size());
-        for (const auto &entry : g_threads)
+        if (!runtime)
         {
-            const ThreadInfo &info = *entry.second;
-            ThreadDebugSnapshot snap;
-            snap.tid             = entry.first;
-            snap.entry           = info.entry;
-            snap.currentPc       = info.currentPc.load(std::memory_order_relaxed);
-            snap.stack           = info.stack;
-            snap.status          = info.status;
-            snap.waitType        = info.waitType;
-            snap.waitId          = info.waitId;
-            snap.currentPriority = info.currentPriority;
-            out.push_back(snap);
+            return out;
+        }
+        const EeKernelSnapshot snap = runtime->eeScheduler().snapshot();
+        out.reserve(snap.threads.size());
+        for (const EeThreadSnapshot &t : snap.threads)
+        {
+            ThreadDebugSnapshot debugSnap;
+            debugSnap.tid             = t.id;
+            debugSnap.entry           = t.entry;
+            debugSnap.currentPc       = t.pc;
+            debugSnap.stack           = t.stack;
+            debugSnap.status          = rawThreadStatus(t.status);
+            debugSnap.waitType        = rawWaitType(t.waitReason);
+            debugSnap.waitId          = t.waitId;
+            debugSnap.currentPriority = t.currentPriority;
+            out.push_back(debugSnap);
         }
         return out;
     }
 
-    static void applySuspendStatusLocked(ThreadInfo &info)
-    {
-        if (info.waitType != TSW_NONE)
-        {
-            info.status = THS_WAITSUSPEND;
-        }
-        else
-        {
-            info.status = THS_SUSPEND;
-        }
-    }
-
-    static void runExitHandlersForThread(int tid, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        if (!runtime || !ctx)
-            return;
-
-        std::vector<ExitHandlerEntry> handlers;
-        {
-            std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
-            auto it = g_exit_handlers.find(tid);
-            if (it == g_exit_handlers.end())
-                return;
-            handlers = std::move(it->second);
-            g_exit_handlers.erase(it);
-        }
-
-        for (const auto &handler : handlers)
-        {
-            if (!handler.func)
-                continue;
-            try
-            {
-                rpcInvokeFunction(rdram, ctx, runtime, handler.func, handler.arg, 0, 0, 0, nullptr);
-            }
-            catch (const ThreadExitException &)
-            {
-                // ignore
-            }
-            catch (const std::exception &)
-            {
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // on_fiber_exit — called by fiber_trampoline (via g_fiber_exit_hook)
-    // after dispatchLoop returns.  Runs exit handlers and resets ThreadInfo.
-    // -----------------------------------------------------------------------
-    static void on_fiber_exit(int tid, uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime)
-    {
-        auto info = lookupThreadInfo(tid);
-
-        runExitHandlersForThread(tid, rdram, ctx, runtime);
-
-        uint32_t detachedAutoStack = 0;
-        if (info) {
-            std::lock_guard<std::mutex> lock(info->m);
-            info->started = false;
-            info->status = THS_DORMANT;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            info->wakeupCount = 0;
-            info->suspendCount = 0;
-            info->forceRelease = false;
-            info->terminated = false;
-        }
-
-        bool stillRegistered = false;
-        {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            stillRegistered = (g_threads.find(tid) != g_threads.end());
-        }
-        if (!stillRegistered && info) {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->ownsStack && info->stack != 0) {
-                detachedAutoStack = info->stack;
-                info->stack = 0;
-                info->stackSize = 0;
-                info->ownsStack = false;
-            }
-        }
-        if (detachedAutoStack != 0 && runtime) {
-            runtime->guestFree(detachedAutoStack);
-        }
-
-        // Consume this thread's active-thread token exactly once. If `info` is
-        // null the g_threads entry was already removed by whoever also took the
-        // token (notifyRuntimeStop reaping residual guest threads, or
-        // ExitDeleteThread erasing its own entry), so this exit must NOT
-        // decrement again. When `info` is present consumeActiveToken's atomic
-        // exchange is the sole arbiter: a concurrent notifyRuntimeStop() holding
-        // the same shared_ptr races here and exactly one side wins the
-        // true->false transition and performs the single fetch_sub.
-        consumeActiveToken(info);
-    }
-
-    static std::once_flag s_fiber_exit_hook_once;
-    static void ensureFiberExitHookRegistered() {
-        std::call_once(s_fiber_exit_hook_once, [](){
-            g_fiber_exit_hook = on_fiber_exit;
-        });
-    }
-
-    void FlushCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void FlushCache(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         setReturnS32(ctx, KE_OK);
     }
@@ -305,519 +595,351 @@ namespace ps2_syscalls
         FlushCache(rdram, ctx, runtime);
     }
 
-    void EnableCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void EnableCache(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         setReturnS32(ctx, KE_OK);
     }
 
-    void DisableCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void DisableCache(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         setReturnS32(ctx, KE_OK);
     }
 
-    void ResetEE(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        std::cerr << "Syscall: ResetEE - requesting runtime stop" << std::endl;
-        // runtime->requestStop();
-        setReturnS32(ctx, KE_OK);
-    }
-
-    void SetMemoryMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void ResetEE(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         setReturnS32(ctx, KE_OK);
     }
 
-    void InitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void SetMemoryMode(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
-        // This is a common ps2sdk helper that some games link against.
-        setReturnS32(ctx, 1);
+        setReturnS32(ctx, KE_OK);
+    }
+
+    void InitThread(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        setReturnS32(ctx, EeScheduler::kMainThreadId);
     }
 
     void CreateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t paramAddr = getRegU32(ctx, 4); // $a0 points to ThreadParam
-        if (paramAddr == 0u)
+        const uint32_t address = getRegU32(ctx, 4);
+        if (address == 0u)
         {
-            std::cerr << "CreateThread error: null ThreadParam pointer" << std::endl;
             setReturnS32(ctx, KE_ERROR);
             return;
         }
-
-        const uint32_t *param = reinterpret_cast<const uint32_t *>(getConstMemPtr(rdram, paramAddr));
-
+        const auto *param = getEeGuestStruct<ee_thread_t>(rdram, address);
         if (!param)
         {
-            std::cerr << "CreateThread error: invalid ThreadParam address 0x" << std::hex << paramAddr << std::dec << std::endl;
             setReturnS32(ctx, KE_ERROR);
             return;
         }
 
-        auto info = std::make_shared<ThreadInfo>();
-        info->attr = param[0];
-        info->entry = param[1];
-        info->stack = param[2];
-        info->stackSize = param[3];
-
-        auto looksLikeGuestPtr = [](uint32_t v) -> bool
+        if (param->stack_size < 0)
         {
-            if (v == 0)
-            {
-                return true;
-            }
-            const uint32_t norm = v & 0x1FFFFFFFu;
-            return norm < PS2_RAM_SIZE && norm >= 0x10000u;
-        };
-
-        auto looksLikePriority = [](uint32_t v) -> bool
-        {
-            // Typical EE priorities are very small integers (1..127).
-            return v <= 0x400u;
-        };
-
-        const uint32_t gpA = param[4];
-        const uint32_t prioA = param[5];
-        const uint32_t gpB = param[5];
-        const uint32_t prioB = param[4];
-
-        // Prefer the standard EE layout (gp at +0x10, priority at +0x14),
-        // but keep a fallback for callsites that used the swapped decode.
-        if (looksLikeGuestPtr(gpA) && looksLikePriority(prioA))
-        {
-            info->gp = gpA;
-            info->priority = prioA;
+            setReturnS32(ctx, KE_ERROR);
+            return;
         }
-        else if (looksLikeGuestPtr(gpB) && looksLikePriority(prioB))
+        if (param->stack != 0u)
         {
-            info->gp = gpB;
-            info->priority = prioB;
-        }
-        else
-        {
-            info->gp = gpA;
-            info->priority = prioA;
-        }
-
-        info->option = param[6];
-        if (info->priority == 0)
-        {
-            info->priority = 1;
-        }
-        if (info->priority >= 128)
-        {
-            info->priority = 127;
-        }
-        info->currentPriority = static_cast<int>(info->priority);
-
-        int id = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            // Keep IDs in the classic low range used by patched libkernel helpers.
-            for (int attempts = 0; attempts < 0xFE; ++attempts)
-            {
-                if (g_nextThreadId < 2 || g_nextThreadId > 0xFF)
-                {
-                    g_nextThreadId = 2;
-                }
-
-                const int candidate = g_nextThreadId;
-                g_nextThreadId = (g_nextThreadId >= 0xFF) ? 2 : (g_nextThreadId + 1);
-
-                if (g_threads.find(candidate) == g_threads.end())
-                {
-                    id = candidate;
-                    break;
-                }
-            }
-
-            if (id == 0)
+            uint32_t stackOffset = 0u;
+            bool scratch = false;
+            if (!resolveEeGuestRange(param->stack,
+                                     static_cast<size_t>(param->stack_size),
+                                     stackOffset,
+                                     scratch))
             {
                 setReturnS32(ctx, KE_ERROR);
                 return;
             }
-
-            g_threads[id] = info;
         }
 
-        // The guest's DECLARED intent, before StartThread's fixups run. Emitted
-        // even when stack==0/stackSize==0, because that combination is the
-        // precondition for the threadSp=callerSp fallback below and we need the
-        // record to prove whether it actually fires.
+        // PS2SDK EE t_ee_thread: status, func, stack, stack_size, gp_reg,
+        // initial_priority, current_priority, attr, option.
+        const EeThreadCreateParams decoded{
+            param->attr,
+            param->func,
+            param->stack,
+            static_cast<uint32_t>(param->stack_size),
+            param->gp_reg,
+            param->initial_priority,
+            param->option,
+        };
+        // 2026-09-01 part 48 -- THCREATE. The t=140s stall polls
+        // ReferThreadStatus(a0 = -403). -403 is KE_ILLEGAL_PRIORITY
+        // (EeScheduler.cpp:19), NOT a pseudo-thread id -- part 47's PSEUDOTID
+        // probe fired 0 times, so GetThreadId never leaked one and that
+        // hypothesis is dead. The remaining producers of -403 are
+        // createThread / changePriority / rotateReadyQueue. Of those only a
+        // createThread return is plausibly stored by the guest as a thread id
+        // and later handed back to ReferThreadStatus -- but that is still
+        // INFERENCE, so all three are probed rather than assumed. CreateThread
+        // is low volume (the game makes tens of threads, not thousands), so
+        // this logs every call, not just the failures: knowing which thread
+        // was refused matters as much as knowing that one was.
+        const int createResult = scheduler(rdram, ctx, runtime).createThread(decoded);
         {
-            static const char *const k[] = {"tid", "entry", "stack", "stackSize",
-                                            "gp", "prio", "attr"};
-            const uint64_t v[] = {static_cast<uint64_t>(id), info->entry,
-                                  info->stack, info->stackSize, info->gp,
-                                  info->priority, info->attr};
-            ps2x_probe_kv("EECREATE", 7, k, v);
+            static const char *const k[] = {"res",  "prio", "func", "attr",
+                                            "stksz", "stk",  "ra"};
+            const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(createResult)),
+                                  static_cast<uint64_t>(static_cast<uint32_t>(param->initial_priority)),
+                                  param->func,
+                                  param->attr,
+                                  static_cast<uint64_t>(static_cast<uint32_t>(param->stack_size)),
+                                  param->stack,
+                                  getRegU32(ctx, 31)};
+            ps2x_probe_kv("THCREATE", 7, k, v);
         }
-
-        setReturnS32(ctx, id);
+        setReturnS32(ctx, createResult);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4)); // $a0
-        if (tid == 0)
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        const int id = static_cast<int>(getRegU32(ctx, 4));
+        uint32_t ownedStack = 0;
+        const int result = ee.deleteThread(id, ownedStack);
+        if (result == KE_OK)
         {
-            setReturnS32(ctx, KE_ILLEGAL_THID);
+            runtime->removeEeExitHandlers(id);
+        }
+        if (ownedStack != 0u)
+        {
+            runtime->guestFree(ownedStack);
+        }
+        setReturnS32(ctx, result);
+    }
+
+    // 2026-09-02 part 52 -- THLIFE probe.
+    //
+    // Thread 3 (entry 0x11e7e0) has sat at status SUSPEND on its own entry PC
+    // for three consecutive 200s runs and has never executed one instruction of
+    // its body. The acker sub_11EAC8 ends every run polling it through
+    // thread_resume_if_suspended (0x11ed90 -> ReferThreadStatus 0x174ba0, ra
+    // 0x11edb4). Whether the guest suspends it, our resumeThread fails to clear
+    // the flag, or a resume succeeds and is immediately undone is not decidable
+    // from a 1 Hz status snapshot -- all three look identical. Record every
+    // Start/Suspend/Resume with the status on both sides of the call.
+    static int lifecycleStatusOf(EeScheduler &ee, int id)
+    {
+        GuestThread *t = ee.thread(id);
+        return t ? rawThreadStatus(t->status) : -1;
+    }
+
+    static int lifecyclePriorityOf(EeScheduler &ee, int id)
+    {
+        GuestThread *t = ee.thread(id);
+        return t ? t->currentPriority : -1;
+    }
+
+    // 2026-09-02 part 53 -- THLIFE now also answers WHY no preemption happens.
+    //
+    // Part 52 measured the ping-pong: resume_if_suspended (0x11ed90) puts
+    // thread 3 SUSPEND->READY, then suspend_if_running (0x11edf8) puts it
+    // READY->SUSPEND, 283 times, with no guest progress in between. Our
+    // resumeThread is correct -- st1 is READY every time. What never happens
+    // is the context switch: EeScheduler::resumeThread calls
+    // requestPreemptionIfHigher(), which bails when
+    //     readyThread.currentPriority >= running->currentPriority
+    // On real hardware, resuming a priority-8 thread from a lower-priority
+    // caller switches immediately, so thread 3 runs before the suspend lands.
+    //
+    // That comparison is the whole question and it is not visible from any
+    // existing probe: THCREATE gives creation priority, CHGPRI gives requested
+    // changes, neither gives the RUNNING thread at the moment of the resume.
+    // thread_resume_if_suspended has 11 static callers, so the caller cannot be
+    // attributed by counting. Record both sides of the comparison instead:
+    // me/mypri = the thread that issued the syscall, tpri = the target's
+    // priority. A record with tpri >= mypri explains the missing switch; a
+    // record with tpri < mypri means the bail is elsewhere and this hypothesis
+    // is dead.
+    static void probeThreadLifecycle(
+        EeScheduler &ee, char op, int id, int st0, int st1, int res, uint32_t ra)
+    {
+        static ProbeBudget budget(1500u, 24u);
+        if (!budget.allow())
+        {
             return;
         }
-
-        auto info = lookupThreadInfo(tid);
-        if (!info)
-        {
-            setReturnS32(ctx, KE_UNKNOWN_THID);
-            return;
-        }
-
-        uint32_t autoStackToFree = 0;
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->started || info->status != THS_DORMANT)
-            {
-                setReturnS32(ctx, KE_NOT_DORMANT);
-                return;
-            }
-
-            if (info->ownsStack && info->stack != 0)
-            {
-                autoStackToFree = info->stack;
-                info->stack = 0;
-                info->stackSize = 0;
-                info->ownsStack = false;
-            }
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            g_threads.erase(tid);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
-            g_exit_handlers.erase(tid);
-        }
-
-        if (runtime && autoStackToFree != 0)
-        {
-            runtime->guestFree(autoStackToFree);
-        }
-
-        setReturnS32(ctx, KE_OK);
+        const int me = ee.currentThreadId();
+        static const char *const k[] = {"op",  "thid",  "st0",  "st1", "res",
+                                       "ra",  "me",    "mypri", "tpri", "n"};
+        const uint64_t v[] = {static_cast<uint64_t>(static_cast<unsigned char>(op)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(st0)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(st1)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(res)),
+                              static_cast<uint64_t>(ra),
+                              static_cast<uint64_t>(static_cast<uint32_t>(me)),
+                              static_cast<uint64_t>(static_cast<uint32_t>(
+                                  lifecyclePriorityOf(ee, me))),
+                              static_cast<uint64_t>(static_cast<uint32_t>(
+                                  lifecyclePriorityOf(ee, id))),
+                              budget.calls()};
+        ps2x_probe_kv("THLIFE", 10, k, v);
     }
 
     void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4)); // $a0 = thread id
-        uint32_t arg = getRegU32(ctx, 5);              // $a1 = user arg
-        if (tid == 0)
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        const int id = static_cast<int>(getRegU32(ctx, 4));
+        const uint32_t arg = getRegU32(ctx, 5);
+        GuestThread *target = ee.thread(id);
+        if (!target)
         {
-            setReturnS32(ctx, KE_ILLEGAL_THID);
-            return;
-        }
-
-        auto info = lookupThreadInfo(tid);
-        if (!info)
-        {
-            std::cerr << "StartThread error: unknown thread id " << tid << std::endl;
             setReturnS32(ctx, KE_UNKNOWN_THID);
             return;
         }
-
-        if (!runtime || !runtime->hasFunction(info->entry))
+        if (target->status != EeThreadStatus::Dormant)
         {
-            std::cerr << "[StartThread] entry 0x" << std::hex << info->entry << std::dec
-                      << " is not registered" << std::endl;
+            setReturnS32(ctx, KE_NOT_DORMANT);
+            return;
+        }
+        if (!runtime->hasFunction(target->entry))
+        {
             setReturnS32(ctx, KE_ERROR);
             return;
         }
-        if (runtime->isStopRequested())
+        if (target->stack == 0u && target->stackSize != 0u)
         {
-            setReturnS32(ctx, KE_ERROR);
-            return;
-        }
-
-        const uint32_t callerSp = getRegU32(ctx, 29);
-        const uint32_t callerGp = getRegU32(ctx, 28);
-
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->started || info->status != THS_DORMANT)
+            target->stack = runtime->guestMalloc(target->stackSize, 16u);
+            if (target->stack == 0u)
             {
-                setReturnS32(ctx, KE_NOT_DORMANT);
+                setReturnS32(ctx, KE_ERROR);
                 return;
             }
-
-            info->started = true;
-            info->status = THS_READY;
-            info->arg = arg;
-            info->terminated = false;
-            info->forceRelease = false;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            info->wakeupCount = 0;
-            info->suspendCount = 0;
-            if (info->stack == 0 && info->stackSize != 0)
-            {
-                const uint32_t autoStack = runtime->guestMalloc(info->stackSize, 16u);
-                if (autoStack != 0)
-                {
-                    info->stack = autoStack;
-                    info->ownsStack = true;
-                }
-            }
-            if (info->stack != 0 && info->stackSize == 0)
-            {
-                info->stackSize = 0x800u;
-            }
+            target->ownsStack = true;
         }
 
-        uint32_t threadSp = callerSp;
-        if (info->stack)
+        // Arm the STACKOOB bounds guard for this thread. When no stack is
+        // registered (target->stack == 0) hi=0 disables the check rather than
+        // inventing a range (see ps2x_stack_check).
+        if (target->stack != 0u)
         {
-            const uint32_t stackSize = (info->stackSize != 0) ? info->stackSize : 0x800u;
-            threadSp = (info->stack + stackSize) & ~0xFu;
-        }
-        // borrowed=1 means info->stack was still 0 after both fixups above, so
-        // this fiber is about to run on the CREATING FUNCTION'S stack pointer.
-        // That is the Thread.cpp:398 latent bug named in the plan; this record
-        // is what confirms or clears it, instead of us arguing about it.
-        const uint32_t borrowedSp = (info->stack == 0) ? 1u : 0u;
-        uint32_t threadGp = info->gp;
-        const uint32_t normalizedGp = threadGp & 0x1FFFFFFFu;
-        if (threadGp == 0 || normalizedGp < 0x10000u || normalizedGp >= PS2_RAM_SIZE)
-        {
-            threadGp = callerGp;
-        }
-
-        {
-            static const char *const k[] = {"tid", "entry", "stack", "stackSize",
-                                            "sp", "gp", "callerSp", "borrowed"};
-            const uint64_t v[] = {static_cast<uint64_t>(tid), info->entry,
-                                  info->stack, info->stackSize, threadSp,
-                                  threadGp, callerSp, borrowedSp};
-            ps2x_probe_kv("EESTART", 8, k, v);
-        }
-
-        // Arm the bounds guard for this fiber. When the stack was borrowed from
-        // the caller we have no honest range to check against, so we register
-        // hi=0 ("unknown") rather than inventing one -- a guard that fires on a
-        // made-up range is worse than no guard.
-        if (info->stack != 0)
-        {
-            const uint32_t stackSize = (info->stackSize != 0) ? info->stackSize : 0x800u;
-            ps2x_stack_register(tid, info->stack, info->stack + stackSize);
+            const uint32_t stackSize = (target->stackSize != 0u) ? target->stackSize : 0x800u;
+            ps2x_stack_register(id, target->stack, target->stack + stackSize);
         }
         else
         {
-            ps2x_stack_register(tid, 0, 0);
+            ps2x_stack_register(id, 0, 0);
         }
 
-        ensureFiberExitHookRegistered();
-        // Mint this thread's active-thread token (see mintActiveToken for the
-        // memory-ordering rationale).
-        mintActiveToken(info);
-
-        // Create the fiber and enqueue it Ready. Throws on allocation failure or if the scheduler is shutting down; the catch below reports it as KE_NO_MEMORY.
-        try
-        {
-            ps2sched::create_fiber(tid,
-                                   info->currentPriority > 0 ? info->currentPriority
-                                                             : static_cast<int>(info->priority),
-                                   info->entry, threadSp, threadGp, arg, runtime, rdram);
-        }
-        catch (const std::exception& e)
-        {
-            // Undo the g_activeThreads increment and reset thread state. Consume
-            // the token we just minted; consumeActiveToken's exchange guards
-            // against a concurrent notifyRuntimeStop() that reaped this same
-            // ThreadInfo.
-            consumeActiveToken(info);
-            {
-                std::lock_guard<std::mutex> lock(info->m);
-                info->started = false;
-                info->status  = THS_DORMANT;
-            }
-            std::cerr << "[StartThread] create_fiber failed: " << e.what() << std::endl;
-            setReturnS32(ctx, KE_NO_MEMORY);
-            return;
-        }
-
-        // Update ThreadInfo status to READY now that the fiber is enqueued.
-        // Guard against a race where TerminateThread ran between create_fiber
-        // and here: if the thread was already transitioned to THS_DORMANT by
-        // the terminate path, do not revert it to THS_READY.
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->status != THS_DORMANT)
-                info->status = THS_READY;
-        }
-
-        // Yield if the new thread has higher or equal priority.
-        ps2sched::maybe_yield();
-        setReturnS32(ctx, KE_OK);
+        const int before = rawThreadStatus(target->status);
+        const int result = ee.startThread(id, arg, *ctx, false);
+        probeThreadLifecycle(ee, 'S', id, before, lifecycleStatusOf(ee, id), result, getRegU32(ctx, 31));
+        setReturnS32(ctx, result);
+        ee.transferIfRequested(false);
     }
 
     void ExitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        runExitHandlersForThread(g_currentThreadId, rdram, ctx, runtime);
-        auto info = ensureCurrentThreadInfo(ctx);
-        if (info)
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            markSelfExitingLocked(*info);
-        }
-        throw ThreadExitException();
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        exitThreadWithHandlers(ee.currentThreadId(), ctx, runtime, false);
     }
 
     void ExitDeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = g_currentThreadId;
-        runExitHandlersForThread(tid, rdram, ctx, runtime);
-        auto info = ensureCurrentThreadInfo(ctx);
-        if (info)
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            markSelfExitingLocked(*info);
-        }
-        {
-            std::lock_guard<std::mutex> lock(g_thread_map_mutex);
-            g_threads.erase(tid);
-        }
-        // We just erased our own g_threads entry, so the on_fiber_exit that runs
-        // after this throw will see a null ThreadInfo and skip the token consume.
-        // Consume the active-thread token here instead, so g_activeThreads is
-        // decremented exactly once for this started thread.
-        consumeActiveToken(info);
-        throw ThreadExitException();
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        exitThreadWithHandlers(ee.currentThreadId(), ctx, runtime, true);
     }
 
     void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        auto info = resolveSelfOrThread(ctx, tid);
-        if (!info) return;
-
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
+        uint32_t ownedStack = 0;
+        const int result = ee.terminateThread(static_cast<int>(getRegU32(ctx, 4)), ownedStack, false);
+        if (ownedStack != 0u)
         {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
-            {
-                setReturnS32(ctx, KE_DORMANT);
-                return;
-            }
-            info->terminated = true;
-            info->forceRelease = true;
+            runtime->guestFree(ownedStack);
         }
-
-        if (tid == g_currentThreadId)
-        {
-            runExitHandlersForThread(tid, rdram, ctx, runtime);
-            throw ThreadExitException();
-        }
-        else
-        {
-            ps2sched::request_terminate(tid);
-            ps2sched::join_fiber(tid);
-        }
-
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, result);
     }
 
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        auto info = resolveSelfOrThread(ctx, tid);
-        if (!info) return;
-
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
-            {
-                setReturnS32(ctx, KE_DORMANT);
-                return;
-            }
-            info->suspendCount++;
-            applySuspendStatusLocked(*info);
-        }
-
-        if (tid == g_currentThreadId)
-        {
-            // Drive the scheduler gate through fc->suspendCount via
-            // suspend_self(), NOT block_current() directly. suspend_self()
-            // increments FiberContext::suspendCount and parks the fiber; the
-            // matching ResumeThread -> clear_suspend() zeroes it and re-
-            // enqueues when it reaches 0. info->suspendCount (incremented above)
-            // remains the PS2-visible count for status reporting.
-            if (info->terminated.load()) throw ThreadExitException();
-            ps2sched::suspend_self(); // parks until clear_suspend() wakes us
-            if (info->terminated.load()) throw ThreadExitException();
-            {
-                std::lock_guard<std::mutex> lock(info->m);
-                info->status = THS_RUN;
-            }
-        }
-        else
-        {
-            ps2sched::suspend_other(tid);
-        }
-
-        setReturnS32(ctx, KE_OK);
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
+        const int susId = static_cast<int>(getRegU32(ctx, 4));
+        const int susBefore = lifecycleStatusOf(ee, susId);
+        const int result = ee.suspendThread(susId, false);
+        probeThreadLifecycle(ee, 'U', susId, susBefore, lifecycleStatusOf(ee, susId), result, getRegU32(ctx, 31));
+        setReturnS32(ctx, result);
+        ee.transferIfRequested(false);
     }
 
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        auto info = resolveSelfOrThread(ctx, tid);
-        if (!info) return;
-
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
-            {
-                setReturnS32(ctx, KE_DORMANT);
-                return;
-            }
-            if (info->suspendCount <= 0)
-            {
-                setReturnS32(ctx, KE_NOT_SUSPEND);
-                return;
-            }
-            info->suspendCount--;
-            if (info->suspendCount == 0)
-            {
-                if (info->waitType != TSW_NONE)
-                {
-                    info->status = THS_WAIT;
-                }
-                else
-                {
-                    info->status = (tid == g_currentThreadId) ? THS_RUN : THS_READY;
-                }
-            }
-        }
-
-        // ThreadInfo::suspendCount is the PS2-visible nesting count.
-        // FiberContext::suspendCount is the scheduler parking gate. When the
-        // PS2 count reaches 0 the thread must run again, so force the scheduler
-        // gate to 0 in one shot (handles nested SuspendThread correctly).
-        {
-            int sc;
-            {
-                std::lock_guard<std::mutex> lock(info->m);
-                sc = info->suspendCount;
-            }
-            if (sc == 0) {
-                ps2sched::clear_suspend(tid); // fc->suspendCount = 0 + wake if Blocked
-                ps2sched::maybe_yield();
-            }
-        }
-
-        setReturnS32(ctx, KE_OK);
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
+        const int resId = static_cast<int>(getRegU32(ctx, 4));
+        const int resBefore = lifecycleStatusOf(ee, resId);
+        const int result = ee.resumeThread(resId, false);
+        probeThreadLifecycle(ee, 'R', resId, resBefore, lifecycleStatusOf(ee, resId), result, getRegU32(ctx, 31));
+        setReturnS32(ctx, result);
+        ee.transferIfRequested(false);
     }
+
+    // 2026-09-01 part 47 -- PSEUDOTID probe.
+    //
+    // The t=129s stall ends with iReferThreadStatus(a0=0xfffffe6d = -403).
+    // Negative ids are minted ONLY by EeScheduler::acquireInvocationThread()
+    // (EeScheduler.cpp:2940, m_nextInvocationThreadId--), and no real PS2
+    // thread id is ever negative. The suspected path is that the guest read
+    // one out of GetThreadId while an async invocation was standing in for a
+    // real thread, stored it, and asked about it later.
+    //
+    // That last link is INFERRED, so it gets measured rather than assumed:
+    // "raw" is what currentThreadId() would have returned, "given" is what the
+    // guest actually receives. raw != given proves the leak existed and that
+    // PS2X_PSEUDO_TID_HIDE suppressed it. Uncapped on purpose -- if the fix
+    // works this fires a handful of times, and a cap here would turn the
+    // interesting case (it kept happening) into a false negative.
+    std::atomic<uint64_t> g_pseudoTidSeen{0};
 
     void GetThreadId(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, g_currentThreadId);
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        const int raw = ee.currentThreadId();
+        const int given = ee.guestVisibleThreadId();
+        if (raw < 0)
+        {
+            const uint64_t n =
+                g_pseudoTidSeen.fetch_add(1, std::memory_order_relaxed) + 1u;
+            // 2026-09-22 Part 157 -- "a0" added.
+            //
+            // All 590 PSEUDOTID records in the t=593s run share ONE call site:
+            // pc=0x175b7c, ra=0x11ed18. That is the syscall inside the CRI ADX
+            // helper sub_175B68, called from sub_11ECD8. Disassembled, the
+            // instruction after this syscall is:
+            //
+            //     beq $s0, $a0, loc_175B98     ; GetThreadId() == target tid ?
+            //
+            // and only the taken branch enqueues a command and calls
+            // iSignalSema (0x174cd0, syscall 0x43) on the semaphore whose id
+            // lives at dword_560D70 -- semaphore 3, the doorbell that guest
+            // thread 2 (sub_1759A0) sleeps on forever. Measured in that run:
+            // sig=0 signals in 593 s, wblk=1, thread 2 blocked at progress 647.
+            //
+            // raw is -1 on every one of the 590 calls and we substitute
+            // given=1 (588x) or 6 (2x). Whether that substitution breaks the
+            // compare depends entirely on $a0, which we were not recording --
+            // so the "wrong branch" story stays a HYPOTHESIS until this field
+            // lands. a0 == given would mean the branch is taken and sema 3 is
+            // idle by design; a0 != given every time makes the substitution the
+            // prime suspect.
+            //
+            // Cost: one already-guarded register read on a path that fired 590
+            // times in 593 s -- nowhere near
+            // [[feedback_hot_path_probe_costs_runtime]] territory.
+            static const char *const k[] = {"raw", "given", "a0", "pc", "ra", "n"};
+            const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(raw)),
+                                  static_cast<uint64_t>(static_cast<uint32_t>(given)),
+                                  getRegU32(ctx, 4),
+                                  ctx->pc, getRegU32(ctx, 31), n};
+            ps2x_probe_kv("PSEUDOTID", 6, k, v);
+        }
+        setReturnS32(ctx, given);
     }
 
     // Shared body. Takes no scheduler action of any kind, so both 0x30 and the
@@ -825,46 +947,66 @@ namespace ps2_syscalls
     // scope: g_sched_mutex must never nest under a ThreadInfo::m (see
     // SleepThread's "Drop info->m before ANY scheduler operation"), so any yield
     // has to happen after this returns, not inside it.
-    static void referThreadStatusImpl(uint8_t *rdram, R5900Context *ctx)
+    static void referThreadStatusImpl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        uint32_t statusAddr = getRegU32(ctx, 5);
-
-        auto info = resolveSelfOrThread(ctx, tid);
-        if (!info) return;
-
-        ee_thread_status_t *status = reinterpret_cast<ee_thread_status_t *>(getMemPtr(rdram, statusAddr));
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
+        int id = static_cast<int>(getRegU32(ctx, 4));
+        if (id == 0)
+        {
+            id = ee.currentThreadId();
+        }
+        const GuestThread *thread = ee.thread(id);
+        // 2026-09-01 part 47 -- the consumer half of PSEUDOTID. A negative id
+        // arriving here means one leaked out of GetThreadId earlier in the run,
+        // and "found" says whether the pseudo-thread record still exists (it is
+        // erased on exit, EeScheduler.cpp:1804) or the guest gets KE_UNKNOWN_THID
+        // for a thread it believes it owns. This is the syscall the t=129s
+        // watchdog line names, so it is the exact point to watch.
+        if (id < 0)
+        {
+            static const char *const k[] = {"thid", "found", "pc", "ra"};
+            const uint64_t v[] = {static_cast<uint64_t>(static_cast<uint32_t>(id)),
+                                  thread != nullptr ? 1u : 0u,
+                                  ctx->pc, getRegU32(ctx, 31)};
+            ps2x_probe_kv("PSEUDOREFER", 4, k, v);
+        }
+        if (!thread)
+        {
+            setReturnS32(ctx, KE_UNKNOWN_THID);
+            return;
+        }
+        auto *status = getEeGuestStruct<ee_thread_status_t>(rdram, getRegU32(ctx, 5));
         if (!status)
         {
             setReturnS32(ctx, KE_ERROR);
             return;
         }
-
-        std::lock_guard<std::mutex> lock(info->m);
-        status->status = info->status;
-        status->func = info->entry;
-        status->stack = info->stack;
-        status->stack_size = info->stackSize;
-        status->gp_reg = info->gp;
-        status->initial_priority = info->priority;
-        status->current_priority = info->currentPriority;
-        status->attr = info->attr;
-        status->option = info->option;
-        status->waitType = info->waitType;
-        status->waitId = info->waitId;
-        status->wakeupCount = info->wakeupCount;
+        *status = {};
+        status->status = rawThreadStatus(thread->status);
+        status->func = thread->entry;
+        status->stack = thread->stack;
+        status->stack_size = static_cast<int>(thread->stackSize);
+        status->gp_reg = thread->gp;
+        status->initial_priority = thread->initialPriority;
+        status->current_priority = thread->currentPriority;
+        status->attr = thread->attr;
+        status->option = thread->option;
+        status->waitType = rawWaitType(thread->wait.reason);
+        status->waitId = waitId(*thread);
+        status->wakeupCount = thread->wakeupCount;
         setReturnS32(ctx, KE_OK);
     }
 
     void ReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
-        referThreadStatusImpl(rdram, ctx);
+        referThreadStatusImpl(rdram, ctx, runtime);
 
-        // Outside referThreadStatusImpl, so info->m is already released. See
-        // refstatYieldEnabled() above for why this is gated and what it fixes.
+        // Outside referThreadStatusImpl, so any scheduler-internal locks are
+        // already released. See refstatYieldEnabled() above for why this is
+        // gated and what it fixes.
         if (refstatYieldEnabled())
-            ps2sched::force_reschedule();
+            scheduler(rdram, ctx, runtime).yieldIfHigherPriorityReady(false);
     }
 
     void iReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -872,406 +1014,78 @@ namespace ps2_syscalls
         // ps2tek 31h: the i-prefixed form runs in interrupt context and must NOT
         // reschedule. Calls the impl directly rather than ReferThreadStatus, so
         // the gate above can never leak into it.
-        (void)runtime;
-        referThreadStatusImpl(rdram, ctx);
+        referThreadStatusImpl(rdram, ctx, runtime);
     }
 
     void SleepThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // Guest identity is keyed off g_currentThreadId, NOT fiber-ness (see
-        // WaitSema/WaitEventFlag in Sync.cpp for the full rationale). onFiber
-        // remains the gate only for the genuinely scheduler-only parts below
-        // (arm_park / the fiber wait loop's parking); a non-fiber thread
-        // carrying a real guest tid (g_currentThreadId != -1) still gets
-        // THS_WAIT bookkeeping via a ThreadInfo, so it is targetable by
-        // WakeupThread/ReleaseWaitThread, and takes the bounded-backoff retry
-        // loop below instead of parking, re-checking wakeupCount exactly like
-        // the fiber path.
-        const bool onFiber = (ps2fiber_current() != nullptr);
-        std::shared_ptr<ThreadInfo> info =
-            (g_currentThreadId != -1) ? ensureCurrentThreadInfo(ctx) : nullptr;
-        if (onFiber && !info)
-        {
-            // A real fiber must have a ThreadInfo; failure to create one is a
-            // genuine error.
-            setReturnS32(ctx, KE_UNKNOWN_THID);
-            return;
-        }
-
-        throwIfTerminated(info); // null-safe
-
-        int ret = 0;
-
-        if (!info)
-        {
-            // Fully borrowed host worker (g_currentThreadId == -1): PS2
-            // interrupt context cannot sleep on a PS2 thread it does not own.
-            // There is no ThreadInfo / wakeupCount to consult. Park-and-retry
-            // once with bounded backoff, then return OK so the worker does
-            // not livelock the emulator.
-            ps2sched::block_current();
-            nonFiberBlockBackoff();
-            setReturnS32(ctx, 0);
-            return;
-        }
-
-        std::unique_lock<std::mutex> lock(info->m);
-
-        if (info->wakeupCount > 0)
-        {
-            info->wakeupCount--;
-            info->status = THS_RUN;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-            ret = 0;
-        }
-        else
-        {
-            info->status = THS_WAIT;
-            info->waitType = TSW_SLEEP;
-            info->waitId = 0;
-            info->forceRelease = false;
-
-            NonFiberBackoff nfBackoff; // unused for fibers; ramps for non-fiber waiters
-
-            for (;;)
-            {
-                // Drop info->m before ANY scheduler operation so g_sched_mutex is
-                // never nested under info->m.
-                lock.unlock();
-                // Arm on every iteration: block_current() consumes wake_pending,
-                // so a wake arriving in the new publish/arm window would be missed
-                // if we skipped re-arming on subsequent iterations.
-                //
-                // Non-fiber (but identified) waiter: bounded exponential backoff
-                // so a never-satisfied condition cannot busy-spin the CPU.
-                const ps2sched::BlockResult br = nfBackoff.wait(onFiber);
-
-                lock.lock();
-
-                // 1. Terminate wins unconditionally (shutdown / TerminateThread).
-                if (info->terminated.load())
-                    throw ThreadExitException();
-
-                // 2. ReleaseWaitThread forced us out of the wait.
-                if (info->forceRelease.load())
-                {
-                    info->forceRelease = false;
-                    ret = KE_RELEASE_WAIT;
-                    break;
-                }
-
-                // 3. Genuine WakeupThread: a permit is available.
-                if (info->wakeupCount > 0)
-                {
-                    --info->wakeupCount;
-                    ret = 0;
-                    break;
-                }
-
-                // 4. Spurious wake (e.g. ResumeThread / clear_suspend with no
-                //    pending wakeup): stay asleep. Re-affirm wait state and loop.
-                info->status = THS_WAIT;
-                info->waitType = TSW_SLEEP;
-                info->waitId = 0;
-            }
-
-            info->status = THS_RUN;
-            info->waitType = TSW_NONE;
-            info->waitId = 0;
-        }
-
-        lock.unlock();
-        waitWhileSuspended(info);
-        setReturnS32(ctx, ret);
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        ee.sleepCurrent();
+        setReturnS32(ctx, KE_OK);
     }
 
     void WakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        if (tid == 0)
-        {
-            setReturnS32(ctx, KE_ILLEGAL_THID);
-            return;
-        }
-        if (tid == g_currentThreadId)
-        {
-            setReturnS32(ctx, KE_ILLEGAL_THID);
-            return;
-        }
-
-        auto info = lookupThreadInfo(tid);
-        if (!info)
-        {
-            setReturnS32(ctx, KE_UNKNOWN_THID);
-            return;
-        }
-
-        bool wasWaiting = false;
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
-            {
-                setReturnS32(ctx, KE_DORMANT);
-                return;
-            }
-            if (info->status == THS_WAIT && info->waitType == TSW_SLEEP)
-            {
-                wasWaiting = true;
-                if (info->suspendCount > 0)
-                {
-                    info->status = THS_SUSPEND;
-                }
-                else
-                {
-                    info->status = THS_READY;
-                }
-                info->waitType = TSW_NONE;
-                info->waitId = 0;
-                info->wakeupCount++;
-            }
-            else
-            {
-                info->wakeupCount++;
-            }
-        }
-
-        // If the thread was sleeping, make it ready and yield if higher priority.
-        if (wasWaiting) {
-            ps2sched::make_ready(tid);
-            ps2sched::maybe_yield();
-        }
-
-        setReturnS32(ctx, KE_OK);
+        wakeupThreadImpl(rdram, ctx, runtime, false);
     }
 
     void iWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        WakeupThread(rdram, ctx, runtime);
+        wakeupThreadImpl(rdram, ctx, runtime, true);
     }
 
     void CancelWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        auto info = resolveSelfOrThread(ctx, tid);
-        if (!info) return;
-
-        int previous = 0;
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            previous = info->wakeupCount;
-            info->wakeupCount = 0;
-        }
-        setReturnS32(ctx, previous);
+        EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (rejectBorrowedWorker(ee, ctx)) { return; }
+        setReturnS32(ctx, ee.cancelWakeup(static_cast<int>(getRegU32(ctx, 4))));
     }
 
     void iCancelWakeupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        if (tid == 0)
+        if (getRegU32(ctx, 4) == 0u)
         {
             setReturnS32(ctx, KE_ILLEGAL_THID);
             return;
         }
-
-        auto info = lookupThreadInfo(tid);
-        if (!info)
-        {
-            setReturnS32(ctx, KE_UNKNOWN_THID);
-            return;
-        }
-
-        int previous = 0;
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            previous = info->wakeupCount;
-            info->wakeupCount = 0;
-        }
-        setReturnS32(ctx, previous);
+        CancelWakeupThread(rdram, ctx, runtime);
     }
 
     void ChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        int newPrio = static_cast<int>(getRegU32(ctx, 5));
-        const int callerTid = g_currentThreadId;
-
-        // [chgpri:enter] -- catches every call, including ones that bail
-        // before the [chgpri] line below (resolveSelfOrThread() miss, or
-        // DORMANT/illegal-priority early-return). Needed to tell "syscall
-        // 0x29 never executes" from "it executes and bails".
-        std::cerr << "[chgpri:enter] tid=" << tid << " newPrioArg=" << newPrio
-                   << " callerTid=" << callerTid << std::endl;
-
-        auto info = resolveSelfOrThread(ctx, tid);
-        if (!info)
-        {
-            std::cerr << "[chgpri:enter] tid=" << tid << " resolveSelfOrThread MISS" << std::endl;
-            return;
-        }
-
-        int statusBefore = 0, waitTypeBefore = 0, waitIdBefore = 0;
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_DORMANT)
-            {
-                std::cerr << "[chgpri:enter] tid=" << tid << " bail=DORMANT" << std::endl;
-                setReturnS32(ctx, KE_DORMANT);
-                return;
-            }
-
-            if (newPrio == 0)
-            {
-                newPrio = (info->currentPriority > 0) ? info->currentPriority : 1;
-            }
-            if (newPrio <= 0 || newPrio >= 128)
-            {
-                std::cerr << "[chgpri:enter] tid=" << tid << " bail=ILLEGAL_PRIORITY newPrioArg=" << newPrio << std::endl;
-                setReturnS32(ctx, KE_ILLEGAL_PRIORITY);
-                return;
-            }
-
-            statusBefore = info->status;
-            waitTypeBefore = info->waitType;
-            waitIdBefore = info->waitId;
-            info->currentPriority = newPrio;
-        }
-
-        // [chgpri] -- Stage 5.17: names the boosted target unambiguously.
-        // getThreadDebugSnapshot()'s status field cannot be trusted to pick
-        // the target out of a crowd (three threads read THS_RUN
-        // simultaneously in the same 1 Hz sample, which cannot happen on a
-        // single EE core -- the field is not kept in sync with the real
-        // scheduler state on every transition). This logs the actual tid
-        // argument and its state AT THE MOMENT of the syscall that boosts it,
-        // which needs no inference. Uncapped: ChangeThreadPriority is a rare
-        // syscall (tens of calls per run, not per-tick), so volume is not a
-        // concern the way a per-instruction probe would be.
-        //
-        // Widened 2026-08-24 (run 87): the tid!=callerTid-only version fired
-        // ZERO times across a full 198s run whose [thsync] tick counter still
-        // reached 11 -- i.e. the handshake completes without ever calling
-        // ChangeThreadPriority on a thread other than the caller. That kills
-        // the "boosts the worker" reading outright; the raw disasm of
-        // sub_11E690 (0x11e6e0/0x11e744, both `jal 0x174b30` ->
-        // `addiu $v1,0x29; syscall`) confirms syscall 0x29 IS issued twice
-        // per call, so either every call is a self-boost (tid==callerTid) or
-        // resolveSelfOrThread()/DORMANT returns before reaching this line.
-        // Logging unconditionally (tagged self/other) distinguishes those
-        // without another blind round trip ([[feedback_probe_gate_on_shape_not_address]]).
-        {
-            std::cerr << "[chgpri] " << (tid == callerTid ? "SELF" : "OTHER")
-                       << " target=" << tid << " newPrio=" << newPrio
-                       << " callerTid=" << callerTid
-                       << " targetStatusBefore=0x" << std::hex << statusBefore
-                       << " targetWaitTypeBefore=" << std::dec << waitTypeBefore
-                       << " targetWaitIdBefore=" << waitIdBefore
-                       << std::endl;
-        }
-
-        ps2sched::update_priority(tid, newPrio);
-        // ps2tek 29h: ChangeThreadPriority forces a thread reschedule. It is
-        // NOT maybe_yield() -- that only yields to a strictly higher-priority
-        // head, so boosting a worker to the CALLER's own priority never gave
-        // up the fiber (Stage 5.17: sub_11E690 boosts to 1 while running at 1,
-        // then spins on [0x441924] that only the boosted worker can clear).
-        ps2sched::force_reschedule();
-
-        setReturnS32(ctx, KE_OK);
+        // Note (Phase 3c-3b): the SDBZ-only "chgpri" self-boost diagnostic that
+        // used to live here confirmed every ChangeThreadPriority call in the
+        // sub_11E690 handshake is a self-boost (tid==callerTid, status==Running).
+        // EeScheduler::changePriority() already covers that case natively: when
+        // status==Running it scans for a strictly-higher-priority ready thread
+        // and sets m_rescheduleRequested, which changePriorityImpl's
+        // ee.transferIfRequested() below then acts on -- the equivalent of the
+        // old ps2sched::force_reschedule() call, without needing an env gate.
+        changePriorityImpl(rdram, ctx, runtime, false);
     }
 
     void iChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ChangeThreadPriority(rdram, ctx, runtime);
+        changePriorityImpl(rdram, ctx, runtime, true);
     }
 
     void RotateThreadReadyQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int prio = static_cast<int>(getRegU32(ctx, 4));
-        if (prio == 0)
-        {
-            if (g_currentThreadId == -1)
-            {
-                setReturnS32(ctx, KE_ILLEGAL_THID);
-                return;
-            }
-            auto current = ensureCurrentThreadInfo(ctx);
-            if (current)
-            {
-                std::lock_guard<std::mutex> lock(current->m);
-                prio = (current->currentPriority > 0) ? current->currentPriority : 1;
-            }
-        }
-        if (prio <= 0 || prio >= 128)
-        {
-            setReturnS32(ctx, KE_ILLEGAL_PRIORITY);
-            return;
-        }
-
-        // Rotate the equal-priority group in the fiber run queue.
-        ps2sched::rotate_ready_queue(prio);
-        ps2sched::maybe_yield();
-
-        setReturnS32(ctx, KE_OK);
+        rotateReadyQueueImpl(rdram, ctx, runtime, false);
     }
 
     void iRotateThreadReadyQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        RotateThreadReadyQueue(rdram, ctx, runtime);
+        rotateReadyQueueImpl(rdram, ctx, runtime, true);
     }
 
     void ReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        int tid = static_cast<int>(getRegU32(ctx, 4));
-        if (tid == 0 || tid == g_currentThreadId)
-        {
-            setReturnS32(ctx, KE_ILLEGAL_THID);
-            return;
-        }
-
-        auto info = lookupThreadInfo(tid);
-        if (!info)
-        {
-            setReturnS32(ctx, KE_UNKNOWN_THID);
-            return;
-        }
-
-        bool wasWaiting = false;
-
-        {
-            std::lock_guard<std::mutex> lock(info->m);
-            if (info->status == THS_WAIT || info->status == THS_WAITSUSPEND)
-            {
-                wasWaiting = true;
-                info->forceRelease = true;
-                info->waitType = TSW_NONE;
-                info->waitId = 0;
-                if (info->suspendCount > 0)
-                {
-                    info->status = THS_SUSPEND;
-                }
-                else
-                {
-                    info->status = THS_READY;
-                }
-            }
-        }
-
-        if (!wasWaiting)
-        {
-            setReturnS32(ctx, KE_NOT_WAIT);
-            return;
-        }
-
-        // Make the released thread ready and yield if it has higher priority.
-        ps2sched::make_ready(tid);
-        ps2sched::maybe_yield();
-
-        setReturnS32(ctx, KE_OK);
+        releaseWaitImpl(rdram, ctx, runtime, false);
     }
 
     void iReleaseWaitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        ReleaseWaitThread(rdram, ctx, runtime);
+        releaseWaitImpl(rdram, ctx, runtime, true);
     }
 }

@@ -1,6 +1,9 @@
 #include "MiniTest.h"
 #include <cstdlib>
 #include <iostream>
+#ifdef _WIN32
+#include <crtdbg.h>
+#endif
 
 void register_code_generator_tests();
 void register_r5900_decoder_tests();
@@ -11,12 +14,15 @@ void register_ps2_runtime_kernel_tests();
 void register_ps2_runtime_interrupt_tests();
 void register_ps2_memory_tests();
 void register_ps2_vu1_tests();
+void register_ps2_vu1_capture_replay_tests();
+void register_ps2_vu_tests();
 void register_ps2_gs_tests();
 void register_ps2_gsdump_replay_tests();
 void register_ps2_sif_rpc_tests();
 void register_ps2_sif_dma_tests();
 void register_ps2_recompiler_tests();
 void register_ps2_runtime_expansion_tests();
+void register_ps2_iop_tests();
 void register_scheduler_tests();
 void register_scheduler_protocol_tests();
 void register_scheduler_race_tests();
@@ -52,6 +58,23 @@ void register_scheduler_join_starvation_tests();
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    // 2026-09-21: in a Debug CRT build a failed assert() and abort() each open
+    // a MODAL dialog box. That turns any non-interactive run -- CI, or simply
+    // looping this exe over several suite filters -- into a hang waiting for a
+    // mouse click, with no output to say why. Route the reports to stderr and
+    // let the process die with its normal exit code (abort() is still 3).
+    //
+    // This changes reporting only: it does not suppress the assertion, swallow
+    // the message, or let the run continue past it.
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    for (const int reportMode : {_CRT_WARN, _CRT_ERROR, _CRT_ASSERT})
+    {
+        _CrtSetReportMode(reportMode, _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(reportMode, _CRTDBG_FILE_STDERR);
+    }
+#endif
+
     // Optional filters: ps2x_tests.exe [suite-substring] [test-substring]
     // Both are case-insensitive substring matches. Needed because suites run in
     // alphabetical order and one hanging test blocks every later suite.
@@ -75,12 +98,15 @@ int main(int argc, char **argv)
     register_ps2_runtime_interrupt_tests();
     register_ps2_memory_tests();
     register_ps2_vu1_tests();
+    register_ps2_vu1_capture_replay_tests();
+    register_ps2_vu_tests();
     register_ps2_gs_tests();
     register_ps2_gsdump_replay_tests();
     register_ps2_sif_rpc_tests();
     register_ps2_sif_dma_tests();
     register_ps2_recompiler_tests();
     register_ps2_runtime_expansion_tests();
+    register_ps2_iop_tests();
     register_scheduler_tests();
     register_scheduler_protocol_tests();
     register_scheduler_race_tests();

@@ -4,6 +4,8 @@
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_diag.h"
 #include "ps2_log.h"
+#include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -14,8 +16,59 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <thread>
+#include "ThreadNaming.h"
 
 using namespace GSInternal;
+
+// Per-pixel VRAM access without std::function (perf 09-27). GS::ReadVram /
+// WriteVram go through std::function tables declared in ps2_gs_gpu.h (which we
+// cannot edit); every pixel paid for that indirection twice or three times.
+// Same PSM -> GSMem mapping as GS::GS(); unknown PSMs map to the Null access.
+namespace
+{
+using RasterReadFn = u32 (*)(u8 *, u32, u32, u32, u32);
+using RasterWriteFn = void (*)(u8 *, u32, u32, u32, u32, u32);
+struct RasterVramFns
+{
+    RasterReadFn read[64];
+    RasterWriteFn write[64];
+    RasterVramFns()
+    {
+        using namespace GSMem;
+        for (int i = 0; i < 64; ++i)
+        {
+            read[i] = ReadPixelNull;
+            write[i] = WritePixelNull;
+        }
+        read[GS_PSM_CT32] = ReadPixelCT32;   write[GS_PSM_CT32] = WritePixelCT32;
+        read[GS_PSM_CT24] = ReadPixelCT24;   write[GS_PSM_CT24] = WritePixelCT24;
+        read[GS_PSM_CT16] = ReadPixelCT16;   write[GS_PSM_CT16] = WritePixelCT16;
+        read[GS_PSM_CT16S] = ReadPixelCT16S; write[GS_PSM_CT16S] = WritePixelCT16S;
+        read[GS_PSM_T8] = ReadPixelP8;       write[GS_PSM_T8] = WritePixelP8;
+        read[GS_PSM_T8H] = ReadPixelP8H;     write[GS_PSM_T8H] = WritePixelP8H;
+        read[GS_PSM_T4] = ReadPixelP4;       write[GS_PSM_T4] = WritePixelP4;
+        read[GS_PSM_T4HH] = ReadPixelP4HH;   write[GS_PSM_T4HH] = WritePixelP4HH;
+        read[GS_PSM_T4HL] = ReadPixelP4HL;   write[GS_PSM_T4HL] = WritePixelP4HL;
+        read[GS_PSM_Z32] = ReadPixelZ32;     write[GS_PSM_Z32] = WritePixelZ32;
+        read[GS_PSM_Z24] = ReadPixelZ24;     write[GS_PSM_Z24] = WritePixelZ24;
+        read[GS_PSM_Z16] = ReadPixelZ16;     write[GS_PSM_Z16] = WritePixelZ16;
+        read[GS_PSM_Z16S] = ReadPixelZ16S;   write[GS_PSM_Z16S] = WritePixelZ16S;
+    }
+};
+const RasterVramFns g_rasterVram;
+
+// Call sites pass gs->m_vram (private; GSRasterizer is a friend, this is not).
+inline u32 rasterReadVram(u8 *vram, u32 psm, u32 base, u32 bw, u32 x, u32 y)
+{
+    return g_rasterVram.read[psm & 0x3Fu](vram, base, bw, x, y);
+}
+
+inline void rasterWriteVram(u8 *vram, u32 psm, u32 base, u32 bw, u32 x, u32 y, u32 value)
+{
+    g_rasterVram.write[psm & 0x3Fu](vram, base, bw, x, y, value);
+}
+}
 
 // [drawpath] run 32: origin path of the GIF packet currently being dispatched.
 // Defined in ps2_gif_arbiter.cpp; declared here rather than in a header so no
@@ -1438,12 +1491,81 @@ namespace
     {
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        // Inline round-half-away-from-zero instead of a CRT lround call per
+        // channel. Exact vs lround for v >= 0 (the double add can't round);
+        // v < 0 clamps to 0 either way.
+        const float v = top + (bottom - top) * fy;
+        return clampU8(static_cast<int>(static_cast<double>(v) + 0.5));
     }
 }
 
+#include "ps2_gs_raster_mt.inl"
+
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    if (gsmt::threadCount() > 0)
+    {
+        // Threaded path (ps2_gs_raster_mt.inl). The GS state this function and
+        // drawSprite change is updated here, on the GS thread, as before.
+        const auto &ctx = gs->activeContext();
+        if (gs->m_hasPreferredDisplaySource && ctx.frame.fbp == gs->m_preferredDisplayDestFbp)
+            gs->m_hasPreferredDisplaySource = false;
+
+        const auto prim = gs->m_registers.prim;
+        if (prim.prim == GS_PRIM_SPRITE)
+        {
+            // drawSprite's display-copy detection, same tests.
+            const GSVertex &v0 = gs->m_vtxQueue[0];
+            const GSVertex &v1 = gs->m_vtxQueue[1];
+            const int ofx = ctx.xyoffset.ofx >> 4;
+            const int ofy = ctx.xyoffset.ofy >> 4;
+            int x0 = static_cast<int>(v0.x) - ofx;
+            int y0 = static_cast<int>(v0.y) - ofy;
+            int x1 = static_cast<int>(v1.x) - ofx;
+            int y1 = static_cast<int>(v1.y) - ofy;
+            if (x0 > x1)
+                std::swap(x0, x1);
+            if (y0 > y1)
+                std::swap(y0, y1);
+            const int ux0 = x0;
+            const int uy0 = y0;
+            const int ux1 = ux0 + std::max(1, x1 - x0) - 1;
+            const int uy1 = uy0 + std::max(1, y1 - y0) - 1;
+            const bool outside = ux1 < ctx.scissor.x0 || ux0 > ctx.scissor.x1 ||
+                                 uy1 < ctx.scissor.y0 || uy0 > ctx.scissor.y1;
+            const uint64_t alphaReg = ctx.alpha.data;
+            const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
+            const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
+            if (!outside && prim.tme && prim.abe && prim.fst && prim.ctxt &&
+                ctx.frame.fbp != ctx.tex0.tbp0 && alphaMode == 0x64u &&
+                (alphaFix == 0x60u || alphaFix == 0x80u) &&
+                ux0 <= 0 && uy0 <= 0 && ux1 >= 639 && uy1 >= 447)
+            {
+                GSFrameReg copy{};
+                copy.fbp = ctx.tex0.tbp0;
+                copy.fbw = ctx.tex0.tbw;
+                copy.psm = ctx.tex0.psm;
+                gs->m_preferredDisplaySourceFrame = std::move(copy);
+                gs->m_preferredDisplayDestFbp = ctx.frame.fbp;
+                gs->m_hasPreferredDisplaySource = true;
+            }
+        }
+
+        gsmt::Job job;
+        job.v[0] = gs->m_vtxQueue[0];
+        job.v[1] = gs->m_vtxQueue[1];
+        job.v[2] = gs->m_vtxQueue[2];
+        job.ctx = ctx;
+        job.prim = prim;
+        job.pabe = gs->m_registers.pabe;
+        job.colclamp = gs->m_registers.colclamp;
+        job.texa = gs->m_registers.texa;
+        job.vram = gs->m_vram;
+        job.clut = nullptr;
+        gsmt::submit(job, gs->m_clut_cache.data(), gs);
+        return;
+    }
+
     const auto &ctx = gs->activeContext();
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
@@ -1594,6 +1716,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         return;
 
     const auto &ctx = gs->activeContext();
+    const bool diagOn = ps2_diag::enabled(); // hoisted: 7 probe gates per pixel below
 
     const auto prim = gs->m_registers.prim;
     const auto pabe = gs->m_registers.pabe;
@@ -1608,7 +1731,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // [glyphfate] (0)/(1). Must sit BEFORE the scissor return -- a scissor kill
     // is one of the fates being measured, and counting after the return would
     // make it indistinguishable from "never happened".
-    if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+    if (diagOn && ps2diag_fbstat::t_glyphDraw)
     {
         using namespace ps2diag_fbstat;
         g_gfIn.fetch_add(1, std::memory_order_relaxed);
@@ -1628,7 +1751,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // site purely because prim/alpha/a are unambiguously in scope here; these
     // three describe the box DRAW, not the outcome of any one store, so
     // sampling them before the scissor return costs nothing and loses nothing.
-    if (ps2_diag::enabled() && ps2diag_fbstat::t_boxDraw)
+    if (diagOn && ps2diag_fbstat::t_boxDraw)
     {
         using namespace ps2diag_fbstat;
         g_boAbe.store(static_cast<uint32_t>(prim.abe), std::memory_order_relaxed);
@@ -1651,7 +1774,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // returns below, which are the two places a red pixel can vanish without
     // touching any existing probe.
     ps2diag_fbstat::t_redPixel = false;
-    if (ps2_diag::enabled() && prim.tme)
+    if (diagOn && prim.tme)
     {
         using namespace ps2diag_fbstat;
 
@@ -1711,7 +1834,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     {
         if (ps2diag_fbstat::t_redPixel)
             ps2diag_fbstat::g_trKillAte.fetch_add(1, std::memory_order_relaxed);
-        if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+        if (diagOn && ps2diag_fbstat::t_glyphDraw)
             ps2diag_fbstat::g_gfAte.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1735,7 +1858,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     u32 fbrgba = 0;
     if (frmw)
     {
-        fbrgba = gs->ReadVram(fpsm, fbp, fbw, x, y);
+        fbrgba = rasterReadVram(gs->m_vram, fpsm, fbp, fbw, x, y);
 
         if (bitsPerPixel(fpsm) == 16)
         {
@@ -1756,10 +1879,10 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         zpass = true;
         break;
     case 2:
-        zpass = z >= gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z >= rasterReadVram(gs->m_vram, zpsm, zbp, fbw, x, y);
         break;
     case 3:
-        zpass = z > gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z > rasterReadVram(gs->m_vram, zpsm, zbp, fbw, x, y);
         break;
     }
 
@@ -1767,7 +1890,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     {
         if (ps2diag_fbstat::t_redPixel)
             ps2diag_fbstat::g_trKillZ.fetch_add(1, std::memory_order_relaxed);
-        if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+        if (diagOn && ps2diag_fbstat::t_glyphDraw)
             ps2diag_fbstat::g_gfZ.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1849,7 +1972,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         pixel = Rgba8888ToRgba5551(pixel);
     }
 
-    if (ps2_diag::enabled())
+    if (diagOn)
     {
         // Per-frame pixel aggregates consumed by the [gs:frame] probe. The old
         // 1-in-2,000,000 sampled probe was useless here: a full-screen clear is
@@ -1879,7 +2002,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
                                     std::memory_order_relaxed);
     }
 
-    if (ps2_diag::enabled())
+    if (diagOn)
     {
         // Classify the value we are actually about to store. RGB is the
         // low 24 bits for CT32 (see pack32 above); for 16bpp the value
@@ -2296,11 +2419,11 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
-    gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
+    rasterWriteVram(gs->m_vram, fpsm, fbp, fbw, x, y, pixel);
 
     if (!zmask)
     {
-        gs->WriteVram(zpsm, zbp, fbw, x, y, z);
+        rasterWriteVram(gs->m_vram, zpsm, zbp, fbw, x, y, z);
     }
 }
 
@@ -2310,6 +2433,8 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
     const auto tex = ctx.tex0;
     const auto prim = gs->m_registers.prim;
     const auto texa = gs->m_registers.texa;
+    // Hoisted: samplePoint runs per texel (4x under bilinear).
+    const bool diagOn = ps2_diag::enabled();
 
     int texW = 1 << tex.tw;
     int texH = 1 << tex.th;
@@ -2352,6 +2477,13 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         case GS_PSM_T4HL:
         case GS_PSM_T4HH:
             ps2diag_fbstat::t_lastTexIndex = out;
+
+            // Perf (09-27): everything below up to the CLUT lookup is probe
+            // bookkeeping -- several locked RMWs per texel, 4x under bilinear.
+            // Skip it entirely when the diag gate is off.
+            if (!diagOn)
+                return applyTexa(texa, tex.psm,
+                                 gs->ReadClutCache(tex.cpsm, static_cast<u8>(out), tex.csa));
 
             // [boxtex] -- Stage 5.11 run 22. Every paletted format, not just
             // T8: if suspect #16 is live the box may be arriving as T4, and
@@ -2418,7 +2550,7 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
                 if ((n & 63u) == 0u)
                 {
                     g_tfChk.fetch_add(1, std::memory_order_relaxed);
-                    const u32 direct = gs->ReadVram(tex.psm, tex.tbp0, tex.tbw,
+                    const u32 direct = rasterReadVram(gs->m_vram, tex.psm, tex.tbp0, tex.tbw,
                                                     static_cast<u32>(sampleU),
                                                     static_cast<u32>(sampleV)) & 0xFu;
                     if (direct != (out & 0xFu))
@@ -2893,6 +3025,130 @@ void GSRasterizer::drawSprite(GS *gs)
     }
 }
 
+// [meshdump] PS2X_MESHDUMP=<path> -- ad-hoc 3D-asset capture (2026-09-18).
+//
+// Dumps every triangle drawTriangle() submits to a Wavefront OBJ: position
+// (screen-space, post-VU1/post-projection -- one frozen pose/camera angle,
+// correct topology and UV, not a re-posable rest-pose rig) plus a
+// perspective-correct UV computed with the exact same math sampleTexture()
+// uses (fst ? raw u,v/16 : s,t divided by fabsQ(q), scaled by texture size).
+// A comment line notes the bound texture (tbp0/psm/tw/th) whenever it
+// changes, to pair the dump with the existing `SDBZ Textures/*.tm2` files.
+//
+// The file is TRUNCATED and rewritten every time the vsync tick advances, so
+// it always holds only the most-recently-completed (or in-progress) frame's
+// geometry, not the whole run -- there's no target-screen detection, so the
+// user starts the game with this set, waits for the desired character/screen
+// to be on-screen, then kills the process and opens whatever's on disk.
+//
+// Entirely opt-in: nothing is written unless PS2X_MESHDUMP names an output
+// file, so a normal run pays one getenv.
+namespace ps2diag_meshdump
+{
+inline const char *outPath()
+{
+    static const char *path = []() -> const char * {
+        const char *p = std::getenv("PS2X_MESHDUMP");
+        std::cerr << "[meshdump] env PS2X_MESHDUMP=" << (p ? p : "(unset)") << std::endl;
+        return p;
+    }();
+    return path;
+}
+
+inline void noteTriangleSeen()
+{
+    static std::atomic<uint64_t> count{0};
+    uint64_t n = ++count;
+    if (n <= 5 || (n % 2000) == 0)
+        std::cerr << "[meshdump] drawTriangle hit #" << n << std::endl;
+}
+
+struct State
+{
+    std::ofstream file;
+    uint64_t lastTick = ~0ull;
+    uint32_t nextIndex = 1;
+    uint32_t lastTbp0 = 0xFFFFFFFFu;
+    bool lastTexValid = false;
+};
+
+inline State &state()
+{
+    static State s;
+    return s;
+}
+
+inline void dumpTriangle(uint64_t tick, const GSVertex &v0, const GSVertex &v1, const GSVertex &v2,
+                          const GSContext &ctx, bool textured, bool fst)
+{
+    noteTriangleSeen();
+    const char *path = outPath();
+    if (!path || path[0] == '\0')
+        return;
+
+    State &s = state();
+    if (tick != s.lastTick)
+    {
+        s.file.close();
+        s.file.open(path, std::ios::out | std::ios::trunc);
+        s.lastTick = tick;
+        s.nextIndex = 1;
+        s.lastTexValid = false;
+    }
+    if (!s.file.is_open())
+        return;
+
+    if (textured)
+    {
+        uint32_t tbp0 = static_cast<uint32_t>(ctx.tex0.tbp0);
+        if (!s.lastTexValid || tbp0 != s.lastTbp0)
+        {
+            s.file << "# tex tbp0=0x" << std::hex << tbp0
+                   << " psm=0x" << static_cast<uint32_t>(ctx.tex0.psm) << std::dec
+                   << " tw=" << (1u << ctx.tex0.tw)
+                   << " th=" << (1u << ctx.tex0.th) << "\n";
+            s.lastTbp0 = tbp0;
+            s.lastTexValid = true;
+        }
+    }
+
+    const int texW = 1 << ctx.tex0.tw;
+    const int texH = 1 << ctx.tex0.th;
+    auto texelUV = [&](const GSVertex &v) -> std::pair<float, float>
+    {
+        if (!textured)
+            return { 0.0f, 0.0f };
+        float texUf, texVf;
+        if (fst)
+        {
+            texUf = static_cast<float>(v.u) / 16.0f;
+            texVf = static_cast<float>(v.v) / 16.0f;
+        }
+        else
+        {
+            const float invQ = 1.0f / fabsQ(v.q);
+            texUf = v.s * invQ * static_cast<float>(texW);
+            texVf = v.t * invQ * static_cast<float>(texH);
+        }
+        return { texUf / static_cast<float>(texW), 1.0f - texVf / static_cast<float>(texH) };
+    };
+
+    const GSVertex *verts[3] = { &v0, &v1, &v2 };
+    for (const GSVertex *v : verts)
+        s.file << "v " << v->x << ' ' << v->y << ' ' << v->z << "\n";
+    for (const GSVertex *v : verts)
+    {
+        const auto [u, vv] = texelUV(*v);
+        s.file << "vt " << u << ' ' << vv << "\n";
+    }
+    s.file << "f " << s.nextIndex << "/" << s.nextIndex << ' '
+           << (s.nextIndex + 1) << "/" << (s.nextIndex + 1) << ' '
+           << (s.nextIndex + 2) << "/" << (s.nextIndex + 2) << "\n";
+    s.nextIndex += 3;
+    s.file.flush();
+}
+}
+
 void GSRasterizer::drawTriangle(GS *gs)
 {
     const auto prim = gs->m_registers.prim;
@@ -2901,6 +3157,14 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
+
+    // Perf (09-27): only pay for the hit counter / vsync-tick query when a dump
+    // is requested or the diag gate is on.
+    if (ps2_diag::enabled() || ps2diag_meshdump::outPath())
+    {
+        const uint64_t meshdumpTick = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+        ps2diag_meshdump::dumpTriangle(meshdumpTick, v0, v1, v2, ctx, prim.tme != 0, prim.fst != 0);
+    }
 
     int ofx = ctx.xyoffset.ofx >> 4;
     int ofy = ctx.xyoffset.ofy >> 4;
@@ -2976,15 +3240,15 @@ void GSRasterizer::drawTriangle(GS *gs)
                 }
                 else
                 {
-                    const float invQ0 = 1.0f / fabsQ(v0.q);
-                    const float invQ1 = 1.0f / fabsQ(v1.q);
-                    const float invQ2 = 1.0f / fabsQ(v2.q);
-                    const float sOverQ = (v0.s * invQ0) * w0 + (v1.s * invQ1) * w1 + (v2.s * invQ2) * w2;
-                    const float tOverQ = (v0.t * invQ0) * w0 + (v1.t * invQ1) * w1 + (v2.t * invQ2) * w2;
-                    const float invQ = invQ0 * w0 + invQ1 * w1 + invQ2 * w2;
-                    iq = (std::fabs(invQ) > 1.0e-8f) ? (1.0f / invQ) : 1.0f;
-                    is = sOverQ * iq;
-                    it = tOverQ * iq;
+                    // The GS interpolates S, T and Q LINEARLY in screen space and
+                    // divides per pixel: u = (sum wi*si) / (sum wi*qi). Pre-dividing
+                    // each vertex by its own q here cancelled exactly against
+                    // sampleTexture()'s divide and left affine (PS1-style) texture
+                    // mapping -- invisible on 2D content where q == 1, smeared on 3D.
+                    // sampleTexture() does the one divide, guarded by fabsQ().
+                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
                     iu = 0;
                     iv = 0;
                 }

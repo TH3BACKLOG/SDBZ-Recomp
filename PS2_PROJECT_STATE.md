@@ -1,3 +1,10902 @@
+# PS2 Project State -- SDBZ Recomp
+
+**Game:** Super Dragon Ball Z (NTSC-U), `SLUS_214.42`.
+**What this is:** a **static recompilation**, not an emulator. The EE binary was translated
+ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
+(`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
+loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
+**Where we are (Part 162 is the top of the file, 2026-09-27):** fights run upright; boot is about 3x faster; the t≈5 recursive-preempt crash is fixed (`6ef281fc`). The next target is VU1 interpreter speed (about 33% of fight CPU). Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
+-- 09-15 run, Goku's select model on screen (Part 117). Warped 3D: our VIF1 + VU1 match PCSX2 bit-exact
+on a replayed capture (Part 118). Smeared 3D FIXED 09-16 -- two GS bugs (Part 119); open: Ranking-screen
+sky dome looks upside down. 09-17: that same object (`0x632b90`, RANKING/GAME OVER) also produces a
+**total scheduler halt** (black screen) -- live-traced to `WakeupThread(main)` apparently never landing;
+root cause not yet confirmed (Part 120). 09-17 Part 121: reproduced fresh, `WakeupThread` hypothesis
+unconfirmed by the wakechk probe; instead `waitForEvent()` was caught live falling into its
+unconditional-block branch with `m_deadlines` empty -- a `[semwatch:vblchain]` probe was armed to
+settle whether the VBlank pacing chain ever ran at all. 09-17 Part 122: **vblchain premise was wrong**
+-- that path is dead code for SDBZ by design (VBlank comes from the IRQ worker thread's own
+`postEvent()`, confirmed still healthy, ~22 ticks/s throughout). Re-traced with the SAME repro and
+`PS2X_WAKECHK=1` **fired 3621 times this run** (vs. 0 last time) -- every hit shows thread 1 correctly
+waking Sleep->Ready, not a lost wakeup. Real mechanism: thread 1 (main) is **livelocked**, spin-sleeping
+forever between `SleepThread()` at `0x174bc8` and the spinner `sub_11E690` (`0x11e670`), with
+`mreq@0x44193C` never clearing -- the scheduler is not stuck, the guest's own poll condition never
+comes true. 09-17 Part 123: **thread-1 livelock is a red herring** -- PCSX2 oracle confirms real
+hardware never shows it. 09-17 Part 124: root cause TRACED via static analysis + oracle cross-check
+to `sub_11F680`, a worker-shutdown busy-wait that sets a stop flag, calls `WakeupThread` on a target
+thread (`dword_441980`, this run = thread 4), and spins for an ack flag that never gets set.
+09-17 Part 125: `[teardownchk]` probe **CONFIRMS** `sub_11F680` is entered exactly once and never
+returns across a full 600s run; `[thsync]` shows thread 4 goes to sleep once at t=405s and never
+toggles again (a genuine lost-wakeup signature, distinct from thread 1's proven-fine wake path).
+New `[waketrace]` probe armed inside `EeScheduler::wakeupThread()` itself (bypassing the broken
+`WATCH`/`THLIFE` probe sink) to catch whether `WakeupThread(4)` takes the real wake branch or the
+no-op branch. 09-17 Part 126: that run's `[waketrace]` output was sitting **unread** in
+`run_log.txt` (exe postdates the probe) -- **"lost wakeup" is FALSIFIED**: all 64 capped hits took
+the real `makeReady` branch, on a regular ~96.7k-EE-cycle retry cadence. Static reading of
+`sub_11F680` (the shutdown waiter) and `sub_11E8D0` (thread 4's own body, decoded via the actual
+recompiled `.cpp`, not just IDA pseudo-C) shows a textbook `while(!stopFlag)` worker loop that
+re-reads `qword_4419B8` fresh every iteration and should exit on the very next wake after
+`stopFlag=1` -- it never does. New hypothesis: `sub_11E8D0` parks `&qword_4419B8` in callee-saved
+`$s4`/GPR20 ONCE at function entry and re-reads `*(s4)` register-indirectly at the loop-bottom
+check, so either that register has drifted in thread 4's persisted context, or the raw memory
+write genuinely isn't visible there. `[waketrace]` extended to log `s4`, `stopFlagRaw`, and
+`pcBefore` on every hit. 09-17 Part 127: that run's extended data came back and **falsified
+Part 126's whole premise, not just its guess** -- `s4=0x4419b8` matched exactly (GPR20 never
+drifted, hypothesis (a) dead) but `stopFlagRaw=0x0` on all 64 hits looked like hypothesis (b)
+confirmed... except cross-checking line numbers in `run_log.txt` showed all 64 `[waketrace]` hits
+(lines 22581-23586) landed **before** `[teardownchk]`'s ENTER (line 32312) -- the id==4 filter
+alone let the cap exhaust on ordinary pre-shutdown gameplay wakeups of thread 4, so *zero* of
+those samples were actually from `sub_11F680`'s retry loop. A new `g_ps2x_teardownActive` flag
+(cross-TU global, set by `workerShutdownWrapper` for the duration of its call into `sub_11F680`)
+now additionally gates `[waketrace]`'s trace condition so the 64-hit cap is spent only on wakes
+issued from inside the actual shutdown loop. `cl /Zs`-clean on both TUs. 09-18 Part 128: built+run,
+but that run never reached RANKING/GAME-OVER at all -- stalled earlier at a known SofDec
+worker-resume gate (`[[project_sofdec_worker_resume_chain]]`, Part 111 pattern, likely run-to-run
+timing variance), so `[teardownchk]` never fired and the Part 127 fix got zero exercise. Needs a
+rerun. 09-18 Part 129: rerun reached RANKING for real -- first correctly-scoped `[waketrace]` hit
+REFUTES both surviving hypotheses (`s4` exact, `stopFlagRaw=0x1`); `sub_11F680` still never
+returns despite a confirmed-correct wake, yet the game keeps running fine (not a total halt this
+run); thread 4 vanishes from the active-thread table by t=888 with no RETURNED ever logged.
+09-18 Part 130: **sky dome orientation CLOSED, not a bug** -- live PCSX2 oracle comparison at the
+RANKING screen shows the same sky as the recomp. Found instead: PCSX2's RANKING/GAME-OVER screen
+cycles varied gameplay-highlight footage (different characters each time), but the recomp's always
+shows the identical Vegeta/Trunks clip, in which Trunks visibly slides off the stage (user-confirmed
+"looks broken") -- new candidate bug, not yet investigated. 09-18 Part 131 (separate task, mesh-dump
+work): the `GATE-OPEN-BUT-DEAD` stall from Part 128 is NOT confined to the RANKING/SofDec-worker-
+resume path -- 5/5 unattended `PS2X_MESHDUMP` capture runs hit the identical `[thsync]` verdict at
+wildly variable onset (t=390s to t=1230s), uncorrelated with pad-input timing; a live window
+screenshot at one stall showed a solid black screen matching the opening-movie phase, not the
+memory-card UI. `PS2X_MESHDUMP` itself is code-correct and fully verified (wired into
+`GSRasterizer::drawTriangle`, `cl /Zs`-clean, builds+links) but produced zero triangle captures
+because every run dies in this stall before reaching any 3D content. 09-19 Part 132: read a
+previously-uncommitted-and-unread probe run (`[selectchk]`/`[f680disp]`/`[xferchk]`,
+`EeScheduler.cpp`) -- thread 4 wakes correctly and is picked by the scheduler but vanishes from
+the active-thread table almost immediately, and thread 1 is never once observed resuming inside
+`sub_11F680`'s own code range for the rest of the ~780s run (`[f680disp]` 0/4044 hits). Separately,
+much later in the same run (t=1223s), thread 1 itself permanently transitions to a real, valid
+`THS_SUSPEND` status (corrected from an initial same-session misread of "invalid/corrupted") and
+is never resumed -- a working hypothesis links both events, and the next step needs no new code
+(`PS2X_WAKETRACE_ID=1` rerun). 09-19 Part 133: that rerun came back **inconclusive for the intended
+question but surfaced a new finding** -- `[teardownchk]` ENTER fired at t~574s, exactly at the moment
+the `GATE-OPEN-BUT-DEAD` SofDec-movie stall (Part 128/131) flips back to `RENDER-GATE-CLOSED` and the
+live thread count drops 6->2, i.e. `sub_11F680` is reachable directly from the SofDec-stall
+give-up path, not just from RANKING. After that the scheduler nearly stops entirely (4 more
+`[selectchk]` dispatches in the remaining ~714s, vs. 983 in the Part 132 run) and the game flatlines
+(`gif/s=0 dma/s=0 vbl/s=0` at run end) rather than continuing to render like Part 132's run did.
+`[waketrace]` with `PS2X_WAKETRACE_ID=1` got **zero hits** -- uninformative here, since nothing was
+left alive long enough to attempt a thread-1 wakeup; the test needs a run that reproduces Part 132's
+"game keeps rendering to t~1223s" outcome, confirmed run-to-run nondeterministic. 09-19 Part 134:
+ran that rerun as a `-Repeat 3` batch -- **all 3 landed on Part 133's exact shape again, not Part
+132's.** `sub_11F680` ENTER fired at the `GATE-OPEN-BUT-DEAD`->`RENDER-GATE-CLOSED` collapse in
+every run (4/4 since this probe combo was armed), which is now a confirmed, reproduced correlation
+-- but Part 132's sustained-gameplay outcome hasn't reproduced in 4 attempts (looks like the
+outlier at ~1/5, not the norm), so the thread-1-wake question remains fully untested. Recommended
+pivot: root-cause the `GATE-OPEN-BUT-DEAD` collapse itself (`RenderDispatch 0x1712d0`'s `rgate`
+check, `0x113f28`/`0x113fd8` per the VERDICT string) instead of more blind reruns. 09-20 Part 135
+(static-only, no run): that pivot's static read finds a concrete candidate -- the per-frame worker
+resume dispatcher (`sub_11FBB8`) checks `ResumeThread(tid) == tid`, but `ResumeThread` returns a
+status code (0/negative), never the tid, so its `WakeupThread(tid)` fallback for a worker parked in
+`THS_WAIT` never fires; needs an oracle check (does PCSX2's worker ever reach `WAIT` at that point
+too?) before it's more than a hypothesis. Also **corrects Part 132**: `st=16` is `THS_DORMANT`
+(`0x10`), not `THS_SUSPEND` (`0x08`) -- thread 1 going Dormant, not staying Suspended, reframes what
+"never resumed" means there (needs a restart, not a wakeup). 09-20 Part 136: checked Part 135's
+`sub_11FBB8` hypothesis live against a running PCSX2 oracle -- **REFUTED as a red herring**. The
+oracle's worker thread does cycle out of `THS_WAIT` and its tick counter keeps advancing, yet the
+`==tid` check is provably just as unsatisfiable there (same ELF bytes). The real, working wake
+protocol is `noop_sub_e690`/`sub_11EAC8` (the spinner/acker already named in `[thsync]`'s own arm
+line and `EeScheduler.cpp`'s Fix-B comments) -- it calls the same `WakeupThread` primitive
+unconditionally, not gated behind the broken comparison. 09-20 Part 137: read that `req` check against
+the EXISTING `run_log.txt` (no new run) -- `req` never sticks at 1, it's essentially always 0, so that
+check was moot (the spinner fires too rarely for a 1Hz sample to catch it on either platform). The same
+read found a sharper signal instead: `[cblist]`'s list-6 tick (the SofDec pump) freezes at 2 for the
+entire 82s collapse while sibling lists keep ticking at full frame rate, and worker A (tid 6) cycles
+`THS_WAIT`<->`THS_WAITSUSPEND` every frame without ever reaching RUN -- a repeated, partially-successful
+retry, not a single missed wakeup, and distinct from FixB's priority-pinning bug (worker A's priority
+holds correct at 25 throughout). Next: decode the actual per-frame resume call site for worker A/list 6
+to see which half of the wake fails to stick. 09-20 Part 138: decoded the FULL call graph live via IDA --
+the per-frame path (`sub_11FBB8`) is confirmed dead for BOTH worker A and B (same `==tid` bug both
+branches); the real wake trigger, found by tracing the spinner's indirect-call-table registration
+(`0x54EBA0`, not the 8-list `0x54E960` system), is `sub_155630` (the exact FixB boost bracket), called by
+either the already-closed SofDec STOP handler or a pause/resume state-CHANGE handler (`sub_14F580`) --
+event-driven, not polled, matching "fires twice in 300s". 09-20 Part 139: decoded `sub_14F580`'s own
+2 callers and its 2 gate conditions -- **corrects Part 138**: the resume attempt is actually pumped every
+frame via the already-known-live SofDec pump (`sub_154FA8`->`noop_sub_5210`->...->`noop_wrapper___471`), not
+event-driven; it's gated on a single condition, an IOP-side SIF-RPC status field (`*(int*)(handle+72)`)
+reaching exactly `3`. Reframed question: does that status ever reach 3 during the collapse -- first point in
+this investigation where the live suspect is IOP/SIF status plumbing, not EE scheduler logic. 09-20 Part 140:
+**identified the code as CRI Sofdec's own `mwPly` middleware** -- the gate's failure branch prints CRI's own
+built-in diagnostic `"E99072103 mwPlyStartXX: can't link stream"`, confirming `handle+72==3` really does mean
+"SIF-RPC stream link complete" in the library's own vocabulary. Cross-referenced against the runtime source:
+`sceSifCmdIntrHdlr` is a no-op stub and `sceSifAddCmdHandler`'s registrations (`g_sifCmdHandlers`) are never
+dispatched anywhere in the codebase -- the IOP->EE SIF command-interrupt delivery path this status field would
+normally ride in on is structurally absent from the runtime. Not yet run-confirmed: grepped all existing run
+logs for the CRI string, zero hits so far. 09-20 Part 141: **run-confirmed** the deeper cause -- `[SifAddCmdHandler]`
+never fires either (0 hits across a full 1287s run spanning the collapse), so the registration call itself is
+never reached, not just undispatched. 09-20 Part 142: **root cause found, static only** -- `handle+72` can
+never reach `3` because the EE-side poll always calls its own `sif_bind_rpc` with handle forced to 0 (dead
+branch, decoded in full), AND the IOP module it would need (`CRI_ADXI.IRX`) is never loaded for real (only
+`ARKD_DVD.IRX` gets a real load per `ps2_iop.cpp`) -- the same deliberate architectural gap already
+documented for the separately-closed Stage 5.14/5.15 SFD-stream-ack issue. Two previously-separate
+investigation threads are now understood to share one root cause. Parts below are **newest first** -- Part
+142 is the top of the file.
+
+---
+
+## STOP -- read this before touching anything
+
+These are not style preferences. Each one has cost this project real sessions.
+
+**Build and runner**
+
+1. **NEVER clean the build.** No `--clean-first`, no `--target clean`, no deleting `build/`
+   or `.obj` files. A full MSVC rebuild is **30+ hours**. Incremental is seconds.
+2. **NEVER edit `ps2xRuntime/src/runner/*.cpp`.** Machine output. The recompiler overwrites it.
+   Fixes go in `ps2xRuntime/src/lib/game_overrides.cpp` -- nowhere else.
+3. **NEVER edit a `.h` header.** Headers reach all ~4,520 runner TUs => 30+ hour rebuild.
+   Use file-scope `static` in a `.cpp`, or `extern` between two `.cpp` files. If a header
+   change is genuinely unavoidable: STOP, state the cost, get approval.
+4. **NEVER run the recompiler against the live `config.toml`.** It writes into `output/`,
+   which `build.ps1:106-112` syncs into `ps2xRuntime/src/runner/`, which rewrites
+   `fn_forward_decls.h` => 30+ hour rebuild. Copy to a scratch config, regenerate there, diff first.
+   `fn_forward_decls.h` is auto-generated: never hand-edit it.
+5. **NEVER list or scan inside `ps2xRuntime/src/runner/`.** 30,000+ files; it crashes the context.
+   Safe: `Test-Path`, a `-Filter *.cpp | Select -First 1`, or opening one known path.
+6. **The user runs every build and every run.** Hand over the command; do not invoke
+   `build.ps1`, `launch_recomp.ps1`, `run_game_agent.bat`, x64dbg, or the deepseek
+   scripts. Delegation was granted once and **revoked 2026-09-01**.
+7. **`cl /Zs` syntax-checks a runtime TU in seconds** without emitting an `.obj`, writing
+   into `build/`, or spending a build cycle. Do this before handing over any build.
+   It never links, so `extern "C"` signature mismatches must still be diffed by hand.
+8. **Never fake the IOP.** Run the real `.IRX` in the R3000 interpreter.
+9. **Never create files in the project root.** Temp work goes to the scratchpad.
+
+**Measurement**
+
+10. **Absence is not evidence.** A capped probe, a short run window, an anomaly-only
+    probe, or a tracer blind to tail jumps all read zero while the code provably runs.
+    Establish the log string exists before treating its absence as a result.
+11. **`vbl/s` is a guest-progress constant, not a host frame rate.** It is arithmetic over
+    `PS2X_DET_VBLANK_QUANTUM`. Never infer what drew on screen from it.
+12. **Bind every probe to an instruction.** An untraced field is decoration.
+13. **Label hypothesis vs. verified, always.** Ask the binary (static disasm) before the
+    runtime; reproduce on the PCSX2 oracle before naming a root cause.
+14. **Never `open(path, 'w')` on a real file.** Write to `path + ".tmp"`, then
+    `os.replace`. This exact mistake truncated *this file* to 0 bytes on 2026-09-10.
+
+**Environment**
+
+15. `run_log.txt` is **UTF-16LE**. Read it with `analyze_run.py`, not a hand-rolled grep,
+    and never with a `[^\n]*X[^\n]*` regex -- records run to tens of KB with no newline
+    and the pattern backtracks catastrophically.
+16. The user launches from **Windows PowerShell 5.1**; the agent shell is **pwsh 7**.
+    Test PowerShell edits under 5.1. Never wrap a handover command in
+    `powershell -NoProfile -Command "..."` -- the outer shell eats every `$var`.
+17. Visual Studio on this machine is **18 (2026)**, not 2022.
+
+---
+
+## Canonical paths
+
+Read [[command_log]] in memory before quoting any path; never reconstruct one.
+
+| What | Path |
+|---|---|
+| Project root | `F:\SDBZ Recomp` |
+| ELF | `F:\SDBZ Recomp\ELF\SLUS_214.42` |
+| Runtime source (editable) | `F:\SDBZ Recomp\ps2xRuntime\src\lib\` |
+| Game fixes go here, only here | `...\src\lib\game_overrides.cpp` |
+| Generated runner (NEVER edit/scan) | `F:\SDBZ Recomp\ps2xRuntime\src\runner\` |
+| Build tree | `F:\SDBZ Recomp\build` |
+| Run log (UTF-16LE) | `F:\SDBZ Recomp\run_log.txt` |
+| Build log (the only place real compile errors appear) | `F:\SDBZ Recomp\build_log.txt` |
+| Archived runs | `F:\SDBZ Recomp\logs\archive\` |
+| Game data root (`MOVIE\`, etc.) | `F:\SDBZ Recomp\Super Dragon Ball Z ISO\Arcade Version\SDBZ ISO 2\` |
+| vcvars64 | `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat` |
+
+## Active Runner Command
+
+Both are **user-run**. Hand them over; do not execute them.
+
+```powershell
+# Build -- the config argument is MANDATORY. A bare call builds only Debug.
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+
+```powershell
+# Run -- -Exe is MANDATORY (the launcher defaults to a stale Debug exe).
+# Never -Determinism 0 on Stage 5.15+: det=0 loses the .SFD open outright.
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+```powershell
+# Play the opening movies on the host instead of skipping them (Part 108).
+$env:PS2X_FMV = "host"
+```
+
+Confirm you ran what you edited: diff the log's `[runmeta] exeWritten=` line against the
+source file's mtime. Read results with `analyze_run.py` (`--runs`, `--tag`, `--onset`,
+`--watch`, `--probe`), never by hand-grepping the console.
+
+---
+
+> **Recovery note (2026-09-10).** This file was truncated to 0 bytes by an agent edit script
+> (`open(path,'w')` opened for write, then a `UnicodeEncodeError` aborted before anything was
+> written). The body was restored from `git show HEAD:PS2_PROJECT_STATE.md` (commit
+> `a1ab10dd`, Part 96 and older) and the milestone ladder from the agent's context.
+> The header above is a **rewrite, not the original** -- the original (approx. lines 1-47)
+> is gone, and so is the prose of **Part 104** and **Part 105**. Their substance survives in
+> memory: `project_cappwarning_four_second_timer.md`, `project_sofdec_idle_loop_wall.md`,
+> `project_fmv_skip_and_title_screen.md`. Rule 14 above exists because of this.
+
+## Milestone ladder
+
+Replaces "which probe fired" as the unit of progress. Each rung needs an assertable signature.
+
+| # | Milestone | Signature | State |
+|---|---|---|---|
+| 1 | Boot to EE entry | dispatch table populated, no `dispatch-miss` | DONE |
+| 2 | IOP modules + SIF RPC up | ARKD_DVD.IRX loaded, RPC bound | DONE |
+| 3 | Atari loading screen | reached and rendered | DONE |
+| 4 | Past the opening logos | `[skipfmv] ACTIVE installed=4/4`, no `savepri=1 savetid=6` latch | **DONE 09-08** -- and since 09-10 the logos can be PLAYED, not just skipped: `PS2X_FMV=host`. Part 108 |
+| 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **DONE 09-10** -- acc hit 4.0 at t=119, `[warn:stat]` froze t=128. Part 106 |
+| 4.6 | Past `CAppLogoMain` (3-pass logo loop) | `[st4:stat] ret1=1` | **DONE 09-10** -- fired t=322 on the 420 s run. Part 107 |
+| 4.7 | Survive the app after `CAppLogoMain` (vt `0x4fae50`, SofDec-class) | ~~EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`~~ -- **that signature is WRONG, see Part 110**. Use: `[sofdec] pd0` reaches 0, or `w6tick` advances past 2. Root target per Part 111: `[0x500728] == 1` | **DONE 09-13** -- root cause: `sdbzSyscallThunk` re-issued thread-switching syscalls (Part 114). 450 s, `PS2X_SKIPFMV=0`, Fix B OFF: CAppLogoMain `ret1=1` t~335 -> `0x4fae50` CAppCopyRight t~340 -> `0x4f9a70` CAppDemoMovie t~374, demo movie playing at run end. See **Part 115** |
+| 5 | **Title screen** | WARNING `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]`. | **REACHED 09-13** -- after CAppDemoMovie's 83 s attract timeout, vt `0x4fa210` = `CAppTitleMain` from t~580 (binary-verified: vtable slot 2 returns `aCapptitlemain`). Visual check vs PCSX2 still pending. See **Part 116** |
+| 6 | Main menu navigable | pad input reaches the menu state machine; `CAppTitleMain` Tick state 2 waits on button mask `0x10` | **REACHED 09-15** -- `dis/main_menu.pix` loaded t~939 and t~1055, then char select. Whether pad input or attract flow drove it was not recorded. Part 117 |
+| 7 | Character select | `ply/sel.ani` + `ply/p01/p01asel.*` loaded; gstate `0,0,0,1` -> `1,1,0,1` | **REACHED 09-15** -- t~1111-1129, Goku in P1 slot (user-confirmed on screen). Part 117 |
+| 8 | In-game | -- | **REACHED 09-26/27**: autopress-driven fights run upright (Part 162); the blocker is now speed. Older notes: **NEXT** (attract demo fight already loads stage + 2 fighters, t~779-843). Blocked by the RANKING/GAME-OVER worker-shutdown hang in `sub_11F680`/`sub_11E8D0` (thread 4), Part 124-129 -- the thread-1 livelock (Part 120-122) was a falsified red herring (Part 123), and Part 126's first measurement was itself invalidated by a mis-scoped probe cap (Part 127). Part 131: the same `GATE-OPEN-BUT-DEAD` stall class also recurs during the opening-movie phase (t=390-1230s across 5 runs), independent of the RANKING-screen path -- blocks any unattended long run, not just teardown. Part 132: thread 4 vanishes from the scheduler right after waking, `sub_11F680` never sees it again (`[f680disp]` 0/4044 hits); thread 1 itself separately, validly Suspends 780s later (t=1223s) and is never resumed. Part 133: the `PS2X_WAKETRACE_ID=1` rerun was inconclusive (run flatlined right after the teardown attempt instead of continuing to render) but showed `sub_11F680` firing directly from the `GATE-OPEN-BUT-DEAD` SofDec stall's recovery, not RANKING-specific -- **possible same root cause as Part 131's opening-movie stall**. Part 134: `-Repeat 3` rerun, 3/3 runs reproduce Part 133's shape again (now 4/4 total) -- teardown-fires-from-collapse is CONFIRMED reproducible, but Part 132's sustained-gameplay outcome hasn't recurred in 4 tries (looks like the outlier); recommend root-causing the `GATE-OPEN-BUT-DEAD` collapse itself (`0x113f28`/`0x113fd8`) before more blind reruns. Part 135: static read finds `sub_11FBB8` compares `ResumeThread(tid)==tid` (return code vs. tid, essentially never true), gating the only `WakeupThread` fallback in the per-frame resume dispatch -- candidate root cause for the frozen worker tick, needs oracle confirmation; also corrects Part 132's `st=16` from `THS_SUSPEND` to `THS_DORMANT`. Part 136: live PCSX2 oracle check REFUTES Part 135's candidate as a red herring (identical broken check exists on hardware, which doesn't hang) -- real wake protocol is `noop_sub_e690`/`sub_11EAC8` (spinner/acker, req@0x441924), which calls `WakeupThread` unconditionally; next step is checking whether OUR `req` ever sticks at 1 during the collapse, via `[thsync]`'s existing fields. Part 137-141: separate sub-thread traces the RANKING screen's own SofDec pause/resume poll down to a single gate condition, `*(int*)(handle+72)==3`, identified as CRI Sofdec's own `mwPly` middleware's "stream link complete" status, and shows the SIF command-interrupt path it would ride in on is never engaged (`sceSifAddCmdHandler`: 0 calls in a full run). Part 142: **root cause found, static-only** -- the EE-side poll's own bind call is structurally dead (always invoked with handle=0, decoded in full, can never write `handle+72`), and `CRI_ADXI.IRX` -- the only IOP module that could ever write it via a real reply -- is never loaded by this runtime (deliberate, documented decision, same one already closed out for the unrelated Stage 5.14/5.15 SFD-stream-ack gap). Fix requires a design choice (host `CRI_ADXI.IRX` for real, or synthesize the completion like SJX/DTX already is) -- not started, needs direction. Part 143: user chose synthesis; **fix IMPLEMENTED** in `game_overrides.cpp` (`sdbzSifIsBoundAlwaysLinked1687B8`, replaces `wrap_sif_is_bound` at `0x1687B8`), syntax-checked EXIT=0. Part 144: built + run (1290s) -- fix confirmed installed (`[sifboundfix]` banner fired) but **never exercised** (0 per-call hits): this run never got past an EARLIER, separate blocker -- `rgate` (`[0x500728]`) opens briefly at t=400-412s then collapses back to `RENDER-GATE-CLOSED` for the remaining ~878s, `nTh=2` throughout, reproducing the still-unsolved Part 134/135/136 `rgate`-collapse pattern. Part 145: full static call graph traced (`eeref.py`) -- `rgate` is a ONE-SHOT "start the boot-logo movie's SofDec workers" semaphore (set once at a logo screen's step 0xd; cleared by that SAME screen's own exit/state-transition handler, corrects a swapped setter/clearer attribution in Part 111); traced the exit trigger to `sub_3E2FF0`'s state==1 branch, gated on `camera_fade_is_active()==0`. Part 146: re-read `[thsync]`'s OWN embedded VERDICT text, found `suspendThread` increments `suspendCount` UNCONDITIONALLY even when already Suspended/WaitingSuspended, added `[suspenddbl]`/`[suspendstuck]` probes. Part 147: built+run -- **REFUTED** (0 hits across a 187s `GATE-OPEN-BUT-DEAD` window, t=444-631s). Re-reading the same run's raw thread-6 field shows it toggles WaitingSuspended<->Waiting every few seconds the WHOLE window (resume repeatedly succeeds, cleanly) but NEVER reaches Ready/Running -- the wake half is the new prime suspect. Added `[wakerelevant]` on `wakeupThread`. Part 148: built+run -- the probe's cap (512) was exhausted in the first few seconds by routine baseline-thread traffic, but the ONE `id=6` hit that got through before saturation showed the exact "swallowed wake" the file's own pre-existing Part 132 comment predicted (`makeReady` branch taken, but `suspendCount!=0` internally bails it to `Suspended`, not `Ready`). Revised into two independent, larger-capped anomaly-only detectors (`[wakeswallow]`/`[wakemiss]`, cap 2048 each, routine successful wakes no longer logged at all). Syntax-checked EXIT=0, not built/run. Part 149: built+run -- **MAJOR**: this run got PAST the boot-logo `rgate` stall into 78s of real 3D rendering (242,000 `[meshdump] drawTriangle` hits, t=639-717s, falsifying Part 131's "0/5 runs ever reach 3D content"), then hit a SECOND, PERMANENT stall at t=717s (busy%->0, idle-loop trace, `stuckSecs` climbs 1:1 for the remaining ~570s, never recovers) that is squarely back at the ORIGINAL Part 120 "RANKING/GAME OVER total scheduler halt" target -- `[wakeswallow]`/`[wakemiss]`/`[suspenddbl]`/`[suspendstuck]` all measure a clean 0 across the entire permanent-stall window, refuting the Part 146-148 suspend/wake-race hypothesis for THIS stall; `rgate` simply never attempts to reopen (`RENDER-GATE-CLOSED` throughout), consistent with the active screen having no call path to the `rgate`-setter at all. Part 150: **ROOT CAUSE of the t=717s stall, found statically from the SAME log, no new run** -- the main thread dies executing a NULL scene-graph node. Register dump already in the Part 149 log (hole n=0, t=667s) shows `a0=0x0` at a C++ virtual dispatch (`0x1bde88`, vtable slot +0x24); `[frametrace]` puts it under `fighter_track_tick_clone_11` -> `tree_clone` (`0x19e940`), which allocated a clone node, got NULL from the heap, and passed it on unchecked. The allocator wrapper `0x111280` **counts failures at `0x500704` and returns NULL without checking**; it is not overridden in `game_overrides.cpp` and its counters have never been probed. By t=716s thread 1 is `THS_DORMANT` (`pc=0x1`) and thread 2 is orphaned on semaphore id 3 -- `nTh=2`, nothing left to schedule. Also corrects three Part 149 claims: the repeating 7-element "idle loop" is the **VBlank ISR** (`0x1bfa50`), not a spin-wait; semaphore silence begins at t=**667**s (same second as the holes), not t=668s; and the stuck class is `CAppDemoMainAlt` (vt `0x4f9ad0`), not a standalone RANKING screen. Open question is exhaustion vs. heap corruption -- `0x500704` settles it. **NEXT**: build + run with the `[heapwatch]`/`[st4c]` probe now drafted in `game_overrides.cpp`. Part 151: heap exhaustion CONFIRMED (`FAILED=212` at `0x500704`), high-water frozen 96 B under a ceiling -- and the t=717s hang turns out **not** to be permanent; the hard stall is a separate event later. Part 152: that ceiling is **ours** (`kGuestHeapHardLimit=0x01F00000`), and two allocators share the same region. Part 153: crt0 issues `SetupThread`/`InitHeap` **inline**, asking for a 16 KB stack and all remaining RAM; we withhold ~1 MB. Part 154: found TWO universal probe hooks already compiled into every TU and never used; built the missing query interface (`PS2X_JOURNAL`, an ordered store journal with exact `ctx->pc`) because `PS2X_WATCH` polls at 60 Hz and cannot see intra-frame writes. Part 155: static read of the sweep at `0x2ae310` -- a 16-slot child array walked with no NULL check. Part 156: **`[journal]` validated (20/21 unit tests) and run -- and it FALSIFIED the NULL-dispatch/use-after-teardown line entirely.** All 216 sweep stores hit three **valid** pool objects; attach, dispatch and teardown are correct end to end, and Part 155's "teardown clears neither" was wrong (`sub_3D1860`/`0x3d18a4` clears the bit). The real signal is a one-second window: the only actively-dispatched object is torn down at t=1277s and the EE freezes at t=1278s, blocked on semaphore id 3. **NEXT**: re-arm the same 9 PCs with `formatDispatchHistory()` on the `0x3d1d94` hit to name the caller that tore it down. |
+
+Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
+reached only because the earlier rungs now hold.
+
+## Part 163 (2026-09-28) -- VU1 recompiler + multi-threaded GS raster; fast guest stalls at Auto-Save notice
+
+**Commits (local, NOT pushed):** `80b31be7` VU1 static recompiler, `31ed67a9` MT CPU rasterizer.
+- MT raster: `ps2_gs_raster_mt.inl`, `PS2X_GS_RASTER_THREADS` (default 4; 0 = old path). Off when DIAG / skipbg / meshdump.
+- Hazard flushes are hooked in `ps2_gs_gpu.cpp` (uploads, CLUT load, local-to-local, readback, clears).
+- GS bench `fight_a16.gsr`: 336 -> 86 ms, VRAM hash unchanged (`e3361ce8186f6df4`).
+
+**OPEN BLOCKER -- in-game fight vbl/s not yet measured with MT raster:**
+- Guest sticks on "Super Dragon Ball Z uses an Auto-Save feature... X button to continue" (`gstate=0,0,0,1` forever).
+- Correlates with speed across 16 archived runs: every run at >=25 vbl/s on this screen sticks, every run at 13-20 passes.
+- Not caused by MT raster, /Ob2, or the VU1 recompiler (bisected). Opening-movie skip (`PS2X_FMV=host PS2X_FMV_OP=<missing>`) does not help. Autopress 60 also sticks.
+- Pad reaches the guest (`[pad] change btns=0xbfff`).
+- Clue (unverified): `[thsync]` at the stuck point shows thread 2 `st=16` (DORMANT); a good run at the same point has thread 2 `st=4 wt=2 wid=3` (waiting on sema 3).
+- **NEXT:** find what this screen waits on (static via `decomp.py`, or PCSX2) -- pad edge vs memory-card/IOP result vs thread 2 lifecycle.
+
+### Learned patterns (2026-09-28)
+- **Speedups expose guest timing bugs.** When a faster build hangs, compare old archived logs by guest speed at the same screen before bisecting code.
+- **The MT raster must be flushed at every GS read-back and every write from outside the rasterizer.** Missing one shows as stale pixels, not a crash. The GS bench VRAM hash is the gate.
+
+## Part 162 (2026-09-27) -- upside-down closed; boot ~3x faster; t≈5 crash root-caused and fixed
+
+**State:** fights run UPRIGHT on the full-regen build (sqrt.s fix `564cb9f9`, user-confirmed).
+Rung 8 (in-game) is effectively reached through autopress-driven fights. The work is now **speed**.
+Branch `sync/upstream-2026-09-24`. Commits this session (NOT pushed):
+- `c9ab422c` -- register recovered body `sub_001D06F0` (a JALR hole from 0x21cd1c; froze around t=5970).
+- `572dbc4b` -- perf(iop): batch EE->IOP cycle advance (`PS2X_IOP_BATCH`, default 2048 EE cycles).
+- `d72addab` -- perf(gs): gate the per-texel `[texfetch]` probes and per-triangle `[meshdump]` counting on `PS2X_DIAG`; adds `PS2X_PROFILE_START=<sec>` to HostSampler.
+- `6ef281fc` -- fix(dispatch): recursive-preempt stack drift (see below).
+
+**Measured speed (same autopress setup; ATARI logo finished at):**
+
+| Build | ATARI done |
+|---|---|
+| Morning (DIAG=1, per-checkpoint IOP) | t≈175 |
+| + IOP batching | t≈83 |
+| + DIAG=0 + rasterizer gating | t≈55 |
+
+- Fights are still about 2 gif/s.
+- The fight-only profile (`PS2X_PROFILE_START=250`, DIAG=0) shows the **VU1 interpreter at about 33%**: `commitReadyPipelines` 17.3%, `normalizeOperand` 6%, `calculatePairReadyCycle` 3.8%.
+- The rasterizer is only about 3%. **NEXT perf target: VU1Interpreter.**
+
+**t≈5 boot crash (also the old rung-4.7 `$ra=0` death, Part 110-ish / [[project_zero_ra_398d40]]):**
+1. The crash only showed with DIAG=0, in 2 of 4 runs.
+2. Mechanism: `dispatchGuestBranch` read `ctx->pc == entryPc` as "the callee returned".
+   - On recursion F -> G -> F (`0x1c2af0` -> vtable `0x2ae0e0` -> `0x1c2af0`), a checkpoint at the inner dispatch leaves pc == F while unwinding.
+   - The outer F-dispatch then continued its caller with sp 0x110 low.
+   - A stale `$ra` slot was then reloaded as 0, so pc went to 0.
+3. Fix: only treat it as a return when `$sp` equals its entry value; otherwise keep unwinding. It logs `[dispatch:recursive-preempt]`.
+4. Result: 6 of 6 runs clean, and a 420s run reaches fights.
+5. Found with `[ee:zero-pc-unwind]` spAfter arithmetic plus `-HwWatch` (`PS2X_HWWATCH_ADDR`/`_VAL=0`).
+
+### Learned patterns (2026-09-27)
+- **Per-checkpoint subsystem ticks eat the EE thread.** `EeScheduler::accountCycles` runs on every guest checkpoint, so anything it calls (IOP `runCycles`, `advanceEeTimers`) must be batched. Measure with `-HostProfile`.
+- **`launch_recomp.ps1` defaults `PS2X_DIAG=1`**, which costs about 8 locked RMWs per pixel. Perf numbers need `$env:PS2X_DIAG='0'` set beforehand. The default was NOT changed (it needs the user's OK).
+- **A faster runtime exposes latent races.** Before calling a new crash a regression, check whether it is intermittent under det=1. Host-posted events make dispatch checkpoints nondeterministic.
+- **A whole-run profile hides the fight bottleneck** behind boot and menus. Use `PS2X_PROFILE_START`.
+- **A stack slot "clobbered" by an ordinary prologue means sp was wrong**, not that there is a rogue writer. Compute the expected sp from the caller chain (entrySp minus the frame sizes) and compare it with the unwind `spAfter`.
+- The PowerShell tool blocks `Remove-Item` when the command also does `Set-Location 'F:\SDBZ Recomp'` (the path parser splits on the space). Use `$env:X = $null` instead.
+
+## Part 160 (2026-09-23) -- stride-growth fix VERIFIED live in a real run;
+first rotated-camera-matrix mismatch found, but oracle coverage is thin
+
+Wrote and shipped the Part 159 handover: `kVumatGrowEvery` 4 -> 1 in
+`ps2_vif1_interpreter.cpp` (doubles the MSCAL-sampling stride every dump
+instead of every 4). `cl /Zs` EXIT=0 before handover. User built (incremental,
+only that one .cpp recompiled) and ran to actual gameplay, 24 minutes.
+
+**Fix confirmed working, empirically:** old schedule clustered 12/24 dumps at
+one progress value; this run's dumps spread from 0x3c3162a to 0x40d5c6c
+(~3.8M progress ticks), reaching territory Part 159 never touched. Run ended
+at dump 13/24 (MSCAL-count threshold for dump 14 needs roughly double dump
+13's count -- a longer run reaches further, not a further code change).
+
+Also corrected a Part 159 decode bug: the vertex-block colour quadword isn't
+always exactly (128,128,128,128) -- alpha is always exactly 128.0, but RGB can
+be dimmed (125.49 seen). Re-detecting by "alpha==128.0, period 4" recovered
+3 dumps Part 159's stricter check would have wrongly called empty.
+
+Results: 4 dumps (3,4,7,9) replicate Part 159's non-inverted finding at wider
+progress. 2 dumps mismatch: dump 6 (same recurring diagonal/HUD-type matrix
+family, moderate-confidence miss) and dump 10 (**first dump with a genuinely
+rotated camera matrix**, not the recurring diagonal family -- predicts screen
+Y with zero overlap against the real GS record at the exact same progress,
+but that GS record is only 1 line, because VFLIP's own log-spaced sampling
+thins out this far into the run). Screen matrix re-verified bit-identical to
+the known-good constant a third time. Neither mismatch is confirmed as the
+upside-down defect -- both are open leads pointing at "go longer, so VFLIP's
+oracle density at high progress catches up."
+
+Full detail: `project_upside_down_framebuffer.md` section 12.
+
+---
+
+## Part 161 (preliminary, 2026-09-23) -- training mode reproduces the bug;
+video evidence shows something sharper than a clean Y-flip
+
+User reached **training mode** (Goku vs Vegeta), same symptom reported
+("image and characters are upside down, HUD correct"). Supplied a screen
+recording of the recomp's own training-mode session and a PCSX2 reference
+screenshot; analyzed offline via ffmpeg contact sheet + targeted full-res
+frames + cropped zooms (read-only, no build/run).
+
+Findings: arena flythrough (t=70-220s) and fight HUD (t~220s+) render
+**correctly**, consistent with prior GS/presentation exoneration. But the
+3D viewport itself shows **no character geometry at all** at t=228-252s
+(correct floor grid, then flat black), and only two tiny (~20-30px) sprite
+fragments clipped in just under the HUD by t~366s -- never a full-size
+figure anywhere in the sampled frames, right-side-up or upside-down. The
+PCSX2 reference shows both fighters full-size, standing on the floor, most
+of the screen height.
+
+This is **not** simply "characters Y-flipped at normal size" -- it looks
+more like the character-model draws are positioned/scaled almost entirely
+outside the visible viewport, with only a sliver clipping in, while the
+arena/HUD draws (unrelated draw calls) are fine. Refines the working model
+from Parts 158-160 (framebuffer-wide inversion) toward a defect scoped to
+the character-draw transform specifically. Not confirmed -- crops too small
+to prove orientation directly.
+
+**Practical payoff:** gives a real wall-clock capture-window estimate for
+the Part 161 VuCap plan's Steps 3-5 (previously needed the user to eyeball
+an in-match timestamp): bracket `PS2X_VUCAP_AT` around 220/280/340s since
+launch next time training mode is reached. Step 1 of the plan (VuCap
+round-trip proof on a disposable intro-cutscene capture) was handed to the
+user this session; not yet confirmed complete.
+
+Full detail: `project_upside_down_framebuffer.md` section 13.
+
+---
+
+## Part 159 (2026-09-23) -- combined VUMAT+VFLIP run: VU1's own predicted
+screen Y MATCHES the same run's GS output for at least one mesh -- NOT inverted
+
+No rebuild -- ran the Part 158 handover as-is (`PS2X_VUMAT=1` and
+`PS2X_VFLIP=1` together). Build chain unchanged from Part 158
+(src 20:59:15 -> obj 21:04:51 -> exe 21:05:14); run 23:20-23:44.
+`run_probe.jsonl` 32,460 records: VUMAT 3,578 (same shape as Part 158),
+**VFLIP 1,262 (new -- unarmed in Part 158's run)**.
+
+**Corrected the Part 158 memory layout**: the vertex stream does not start at
+`top`, it starts at `top+2` -- `top+0/1` are a 2-quadword non-float header.
+Reading from `top+2` with stride 4 gives a colour quadword landing on exactly
+`(128,128,128,128)` every 4th vertex, confirming the offset.
+
+**The test the Part 158 handover specified, run for the first time**: transform
+a captured vertex by its dump's own captured composite matrix, perspective
+divide, compare to VFLIP's GS-recorded Y from the *same run, same progress*.
+
+Dump 1 (top=0x10, progress=0x3c2cc7d, 20 vertices): predicted screen Y range
+1900.58..1920.45 sits **inside** the real recorded range (1496.38..2091.13,
+207 records), and matches the specific VFLIP sub-window (n=53..79,
+1898.75..1925.69) closely. Slope of predicted screenY vs. source world Y:
+**-1.62** -- world up maps to screen up (GS Y grows downward), the **correct**
+non-inverted direction, with **no mirroring applied** to get the match. Dumps
+6 and 11 (same progress) agree; dump 8 hit a near-zero clip-space w (degenerate
+outlier, not evidence). Dump 5's matrix is the same unexplained
+"identity camera rotation" flagged in Part 158 section 10f -- its predicted
+range falls entirely outside the real one and mirroring does not fix it either;
+read as a different, likely off-screen/culled object, not as evidence of
+inversion, and not independently confirmed either way.
+
+**This is a second, independent method agreeing with Part 158's matrix-sign
+verdict** (static matrix analysis) -- an actual vertex, actually transformed by
+the actual captured matrix from a live run, lands on the same run's own
+GS-recorded position, correctly oriented.
+
+⚠ **Narrows, does not close, the Part 158 section 10g contradiction.** If VU1's
+own output is correct for this draw call and the rendered frame is still
+inverted overall (sky at bottom, Part 158 section 9b), the remaining candidates
+are: (a) the defect is scoped to specific draw calls/matrices, not universal to
+all 3D -- dump 5's unmatched matrix is the closest lead, or (b) the defect is
+temporal -- every usable dump this run again landed at the SAME progress value
+(the earliest instant VFLIP saw 3D geometry), so nothing later in the run was
+checked. The stride-doubling-every-4 schedule is still too slow to spread past
+the run's first instant; reaching a later frame needs a rebuild with a
+faster-growing stride. Not retrying with the current probe shape.
+
+Half of the 24 VUMAT dumps (`top=0x1a0`/`0x19d`, decimal 416/413) had their
+vertex stream entirely outside the captured q0..255 window and could not be
+checked at all this run.
+
+Full detail: `project_upside_down_framebuffer.md` section 11.
+
+---
+
+## Part 158 (2026-09-22) -- upside-down 3D: the `[vumat]` probe landed and **FALSIFIED the matrix hypothesis**. VU1's transform correctly negates Y and our screen matrix is **bit-identical to PCSX2's**. Combined with Part 157, the entire GS *and* the presentation path are now eliminated, and the chain of verified facts is internally contradictory -- one of them must be wrong.
+
+**Trigger:** user built and ran. Build chain verified by timestamp: source 20:59:15 -> `ps2_vif1_interpreter.obj` 21:04:51 -> `ps2EntryRunner.exe` 21:05:14 -> run 22:16.
+
+**The probe.** `[vumat]` dumps VU1 data memory (quadwords 0..255) at the MSCAL site in `ps2_vif1_interpreter.cpp`, log-spaced with a stride that doubles every 4 dumps, gated on `PS2X_VUMAT`. Result: **24 dumps, 3,578 quadword records**, and the `[cap] tag=vumat limit=24 -- disarming` line fired after the last dump exactly as designed.
+
+**What the dump contains.** VU1 quadwords 0..11 are a three-matrix block -- `q0..q3` composite, `q4..q7` view-projection, `q8..q11` screen matrix -- and `q15+` is the vertex stream (stride 4: position+flag, normal+/-1, colour 128^4, ST). The layout is **verified, not assumed**: `q0..q3 == (q4..q7) x (q8..q11)` holds with **15 of 16 elements bit-exact** across all 24 dumps; the 16th is `[2][2]`, a depth term the *game* rounds to an integer. Full map recorded in `reference_sdbz_vu1_memory_layout.md`.
+
+**Oracle-validated.** The same block is built on the EE, and EE RAM *is* readable in PCSX2 (unlike `0x11000000`, which still returns zeros). Found by searching for the screen-matrix byte pattern: a static copy at `0x00509110` plus ~20 per-frame packet copies across `0x0077xxxx`. Reading `0x00772180` gives the identical layout, the same multiplication rule, and **the same 7.66e-04 residual on the same element** -- so the decoding is confirmed against the oracle, not merely self-consistent.
+
+**The verdict, against a test declared BEFORE the data was seen.** Part 157 committed to: *"GS Y grows downward while world Y grows up, so a correct view-projection must negate Y relative to X. If m11 has the same sign as m00, the world renders upside down and that is the bug."*
+
+| | m00 | m11 | |
+|---|---|---|---|
+| screen matrix, all 24 dumps | +1024 | **-1024** | Y negated |
+| composite, 23 of 24 dumps | +716.55 | **-835.98** | opposite signs |
+| **PCSX2 screen matrix** | +1024 | **-1024** | **bit-identical to ours** |
+
+Our screen matrix is bit-identical to PCSX2's, the Y negation is present and correct, and both sides put the *view-projection's* m00/m11 at the same sign -- so our sign convention matches real hardware. **The matrix feeding VU1 is not inverted. Do not re-run this test.**
+
+**Also killed this round: "we present the wrong framebuffer."** The comment at `ps2_gs_gpu.cpp:5471` claims FRAME.FBP alternates 0x0/0x70 while DISPFB stays constant at 0x1070 -- which would mean half of all frames are never displayed. **That comment is stale.** All 172 `[present]` records this run show `dispfb1`/`dispfb2` alternating `0x1000`/`0x1070`, `srcFbp == dispFbp` every time, and `ctx0.fbp` always the *other* buffer. Textbook double buffering, working. **TODO: correct that comment.**
+
+**Independent consistency check.** XYOFFSET `(1792.0, 1824.0)` implies a 512x448 target (2048-1792=256 half-width, 2048-1824=224 half-height); `[present]` independently reports `w=512 h=448`. Two unrelated sources agree.
+
+**Known limits of this sample -- it is a floor.** The 24 dumps span **MSCAL 0..251 only** (progress 63.08M..63.24M) -- the first instant of 3D, not the run. The stride only reached 64, and 20 of the 24 dumps are byte-identical. Only `q0..q255` was dumped, so the `top=0x1a0` input buffer was never captured.
+
+**Unexplained, and NOT yet evidence.** In 20 of 24 dumps our view-projection is exactly `diag(+0.69976, +0.81639)` with a zero w-column in rows 0 and 1 -- an identity camera rotation. PCSX2's, at the moment sampled, is a fully rotated perspective camera. **Different scenes at different moments, so this is not a valid diff**, and the recorded frame is a GAME OVER screen where a static camera is plausible. Worth confirming during an actual fight; not a finding.
+
+**The contradiction.** Every link is now verified, and together they are inconsistent: the render is inverted (recorded frame, sky and clouds at the bottom); 2D sprites in the *same* framebuffer are upright; both layers draw through the same GS context, XYOFFSET and scissor; all four GS vertex-Y decode sites are identical; presentation follows DISPFB correctly; VU1's input matrix negates Y bit-identically to PCSX2; and our VU1 is byte-exact on PCSX2's replayed input (30,136 runs, 09-15). One of these must be false.
+
+**NEXT -- needs NO rebuild.** Both probes are already compiled in and env-gated. Arm `PS2X_VUMAT=1` **and** `PS2X_VFLIP=1` in one run, then transform the dumped vertices by the dumped composite matrix, perspective-divide, and compare the predicted screen Y against the GS Y that the *same run* recorded. Agreement puts the flip upstream of the vertex data; disagreement convicts VU1's execution in our runtime -- which the PCSX2-input replay harness is structurally unable to see.
+
+## Part 148 (2026-09-20) -- Part 147's `[wakerelevant]` probe caught the anomaly ONCE before its cap was exhausted by unrelated baseline-thread traffic in the first few seconds; the one hit that survived matches the Part 132 comment's already-predicted "swallowed wake" exactly -- probe revised into two independent, much larger-capped anomaly detectors (`[wakeswallow]`/`[wakemiss]`) that skip routine successful wakes entirely, re-run needed
+
+**Trigger:** user built (period auto-stripped by the `build.ps1` fix) and ran (1300s). Read the log.
+
+**The run itself was fine** (build clean, `[wakerelevant]` banner fired once, 512 real hits -- the cap).
+**But the cap was a false-negative trap**, exactly the pattern
+[[feedback_capped_probes_false_negatives]] warns about: threads 1/4/5 take the `makeReady` branch on
+essentially every frame from the very start of the run (successful, ordinary Sleep/wake cycling, nothing
+wrong with it) and exhausted all 512 slots within about 20.5M eeCycles of run start -- a few seconds,
+nowhere near the `t=444-631s` `GATE-OPEN-BUT-DEAD` window this probe exists to observe. Id distribution
+across the captured hits: `id=1`:169, `id=4`:171, `id=5`:170, `id=6`:**1**.
+
+**That one `id=6` hit is the whole answer, as far as it goes:** `statusBefore=3` (`WaitingSuspended`),
+branch `makeReady` was entered (status+reason matched), but afterward `suspendCountAfter=1` and
+`statusAfter=4` (`Suspended`, NOT `Ready`=1). This is byte-for-byte the scenario this file's own
+pre-existing Part 132 comment (a few lines below, attached to the older `[waketrace]` probe) already
+predicted: *"if target.suspendCount != 0 at call time, makeReady sets status=Suspended and returns WITHOUT
+enqueueing... 'branch=makeReady' alone does not distinguish a real enqueue from this silent bail."*
+`wakeupThread` WAS called on thread 6, took the real-wake code path, and the wake was **silently swallowed**
+because the thread was still suspended at that exact instant. Confirmed the `EeThreadStatus` enum ordinals
+from `ee_scheduler.h` directly rather than guessing (`Running=0, Ready=1, Waiting=2, WaitingSuspended=3,
+Suspended=4, Dormant=5`) before drawing this conclusion.
+
+**One hit, very early in the run, is suggestive but not sufficient** -- need this measured across the
+actual 187s stall window, which the exhausted cap never reached.
+
+**Probe revised**, same file (`EeScheduler::wakeupThread`, ~line 2553-2705): replaced the single
+undifferentiated `[wakerelevant]` (which logged every successful wake, including routine ones) with two
+independent counters/caps so routine traffic on hot threads can no longer starve the interesting signal --
+`[wakeswallow]` (fires only when the `makeReady` branch is entered but `statusAfter != Ready`, i.e. exactly
+the swallow above; cap 2048) and `[wakemiss]` (fires when the `wakeupCountOnly` branch is taken on a target
+that WAS genuinely Waiting/WaitingSuspended, i.e. `reason != Sleep`; cap 2048, unchanged logic, just its
+own counter now). Neither logs a routine successful wake anymore -- only the two anomaly shapes. Syntax-
+checked `cl /Zs` -- `EXIT=0`. **Not built or run.**
+
+**Next (user):** `& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo` + the same ~1300s run. Grep for
+`[wakeswallow]`/`[wakemiss]`. Given the one early hit already confirmed `[wakeswallow]` CAN fire, the real
+question this run answers is RATE: if it fires repeatedly throughout the `GATE-OPEN-BUT-DEAD` window
+(matching the ~every-2-7s toggle cadence Part 147 measured), that is the root cause -- `wakeupThread` and
+`resumeThread` are racing (wake arriving while still suspended, over and over, each one individually
+"handled" but never landing), and the fix is ordering/coalescing those two calls in `sub_11FBB8`'s runtime
+handling, not either function alone. If it's rare/absent during that window specifically, look elsewhere.
+
+## Part 149 (2026-09-20) -- MAJOR: this run got PAST the SofDec stall into real 3D content (242,000 `[meshdump]` `drawTriangle` hits, t=639-717s, falsifying Part 131's "0/5 runs ever reach 3D content"), then hit a SECOND, PERMANENT stall at t=717s that `[wakeswallow]`/`[wakemiss]`/`[suspenddbl]`/`[suspendstuck]` all measure as completely clean (0 real hits each) -- the Part 146-148 suspend/wake-race hypothesis is REFUTED for this stall; `rgate` never even attempts to reopen (`VERDICT=RENDER-GATE-CLOSED` for the entire ~570s), unlike the earlier oscillating `GATE-OPEN-BUT-DEAD` pattern
+
+**Trigger:** user built + ran (1300s, `PS2X_MESHDUMP` left unset -- counts only, no file capture) and
+mentioned in passing "I let the graphics dump run for a while."
+
+**Run shape, in order:**
+- t=1-383s: normal boot/logo/menu progression, `VERDICT=RENDER-GATE-CLOSED` (expected, pre-`rgate`).
+- t=384-417s (33s): `rgate=1`, `VERDICT=GATE-OPEN-BUT-DEAD` -- the familiar short oscillating stall from
+  Parts 134-148. Self-recovers at t=418s back to `RENDER-GATE-CLOSED`.
+- t=418-639s: normal operation continues (`busy%~100-106`, `stuckSecs` only ever transient 0-13),
+  `VERDICT=RENDER-GATE-CLOSED` throughout -- `rgate` never reopens, yet the game keeps making progress.
+  This proves the boot-logo `rgate`/SofDec-worker mechanism (Part 145) is NOT what gates the game's
+  general forward progress; something else entirely drives it past this point.
+- **t=639-717s (78s): real 3D rendering** -- `[meshdump] drawTriangle` fires 242,000 times, `[gs:image]`/
+  `[gs:frame-change]`/`[dma:chain]` all active, `bssnz` jumps 42026->98816 (new game state resident).
+  This directly falsifies Part 131's "`PS2X_MESHDUMP` is code-correct... but produced zero triangle
+  captures because every run dies in this stall before reaching any 3D content" -- it does NOT always die
+  there; this run got through. `PS2X_MESHDUMP` was left unset this run (opt-in path per
+  `ps2_gs_rasterizer.cpp:2914`), so the counter fired but no actual mesh/texture files were written --
+  next run needs `PS2X_MESHDUMP=<path>` set to actually capture geometry now that reachability is proven.
+- **t=717s: HARD PERMANENT STALL.** `busy%` drops from 118 to 0 in one second (t=716->717), `pc=0x0
+  ra=0x0`, then settles into the exact idle-loop trace signature from the earlier "sofdec pump never
+  idle" investigations (`0x171320 -> 0x11e3b0 -> 0x11e560 -> 0x11f240 -> 0x104b30 -> 0x1bfb80 -> 0x1bfa50 ->
+  0x171320 -> ...`, repeating). `progress` (the watchdog's forward-motion counter) freezes at `71876992`-ish
+  and crawls by only ~11 total over the remaining ~570s of the run (vs. thousands/sec while healthy).
+  `stuckSecs` climbs **exactly 1:1 with wall-clock time** from t=717 to the t=1290 window-close (never
+  resets, never recovers) -- unlike the Part 134-148 pattern, this is not an oscillation, it is terminal
+  for the rest of the run.
+
+**Anomaly probes measured across this entire run, including the full ~570s permanent-stall window:**
+`[wakeswallow]`: 0. `[wakemiss]`: 0. `[suspenddbl]`: 0 (only the banner line matched the grep).
+`[suspendstuck]`: 0. None of the Part 146-148 suspend/wake-race hypotheses fire even once here, and the
+probes were nowhere near their 2048 caps -- a clean, well-powered negative
+([[feedback_capped_probes_false_negatives]] does not apply; this is a real absence, not starvation).
+
+**Working read:** this t=717s stall reuses the same idle-loop code path as the boot-logo `GATE-OPEN-BUT-
+DEAD` cases, but is a DIFFERENT instance of it -- `rgate` isn't oscillating open/closed here, it simply
+never gets set again after the game moves past the boot-logo screens (expected per Part 145: only the 3
+boot-logo screens' step-machines call the `rgate`-setter `sub_113F40`).
+
+> ⚠️ **CORRECTED IN PART 150 -- do not carry the rest of this paragraph forward.** The original text
+> here guessed that t=717s was "very likely RANKING or GAME-OVER" and that the stall was a missing
+> `rgate`-setter call. Part 150 re-read the SAME log against the ELF and settled both points without a
+> new run:
+> - The active object's class IS identified: vtable `0x4f9ad0`, `Tick` = `0x3e34f0`, `Update` =
+>   `0x3e35c0` (`CAppDemoMainAlt_Update`, which delegates to `CAppRankingBase_Update` at `0x41b2b0`).
+>   It is recompiled, not a dispatch hole. So "RANKING code is in the path" is now VERIFIED, but the
+>   screen is `CAppDemoMainAlt`, not a standalone RANKING screen.
+> - The idle-loop trace is **not a spin-wait at all**: `0x1bfa50` is the VBlank ISR. The 7-element cycle
+>   is simply the interrupt being the only guest code still executing after the main thread died. The
+>   `rgate`-setter line of inquiry is therefore moot for this stall.
+
+**Not yet done (as of Part 149):** confirming WHICH screen is active at t=717s.
+**-> DONE in Part 150, statically, from the existing log. See the Part 150 section.**
+
+## Part 156 (2026-09-21) -- **THE RUN LANDED, AND IT FALSIFIED THE HYPOTHESIS.** There is no NULL dispatch and no use-after-teardown: all 216 measured sweep stores hit three valid pool objects. The real signal is a **one-second window** -- the only actively-dispatched object is torn down at t=1277s and the EE freezes at t=1278s.
+
+`[journal]` (WP1) worked exactly as designed on its first real run.
+
+### 0. Provenance and completeness -- read this before trusting anything below
+
+- `ps2x_tests.exe Observability`: **20/21 pass**, all four `[journal]` tests green, including the
+  intra-frame-transient test that is WP1's stated success criterion. The one failure
+  (`clut-cache: CSM1 T4 reload ...`) is pre-existing PR #144 GS work, untouched here.
+- Run: `RelWithDebInfo`, `-Determinism 1 -NoDebugger`, `PS2X_JOURNAL_PC` armed on 9 PCs.
+- **261 JOURNAL records, `ord` 0x0..0x104, cap 4096. NOT saturated, no `[cap]` line.**
+  This is therefore the **complete population** of stores from those 9 PCs, not a sample --
+  which is what makes the negative findings below admissible at all
+  (cf. `feedback_capped_probes_false_negatives`).
+
+### 1. VERIFIED: every sweep store resolves to a valid, live object
+
+`0x2ae620` is `sw $zero, 928($a1)` so `$a1 = addr - 0x3A0`; `0x2ae630` writes `base + 0x5A0`.
+Both derivations agree on all 216 records, giving exactly **three** distinct objects:
+
+| `0x2ae620` addr | `0x2ae630` addr | derived base | agree |
+|---|---|---|---|
+| `0x61a960` | `0x61ab60` | **`0x61a5c0`** (A) | yes |
+| `0x619fb0` | `0x61a1b0` | **`0x619c10`** (B) | yes |
+| `0x619600` | `0x619800` | **`0x619260`** (C) | yes |
+
+Spacing is exactly **`0x9B0`**. `sub_3D1570` -- the object factory -- calls
+`pool_entry_pop___30(**2480**)`, and `2480 == 0x9B0`. It caps at 32 (`if (*(a1+236) < 32)`)
+and fills a 32-slot array at `a1+108`. The 32 records at ord 0-31 (pc `0x3d1654`,
+`*(inited+832) &= ~8u`) are that pool being constructed, descending from base `0x6240c0`.
+
+`0x6240c0 - 16*0x9B0 = 0x61a5c0`, so **A, B, C are elements 16, 17, 18** of that pool.
+
+**No NULL. No garbage. No stale slot. In 216 stores.**
+
+### 2. VERIFIED: the full lifecycle of object A is CORRECT end to end
+
+| ord | progress | pc | field | val | meaning |
+|---|---|---|---|---|---|
+| 16 | 64,000,824 | `0x3d1654` | +0x340 | 0 | factory creates A; pending bit cleared |
+| 32 | 86,280,142 | `0x3d1824` | +0x340 | **8** | attach **sets** pending bit3 |
+| 33 | 86,280,142 | `0x3d09b0` | +0x4F0 | 0 | dispatcher slot cleared |
+| 34 | 86,280,142 | `0x3d1a7c` | +0x4F0 | **0x501f44** | dispatcher **installed, NON-NULL** |
+| 35-250 | 86.28M -> 87.31M | `0x2ae620/630` | +0x3A0 / +0x5A0 | 0 / **1** | swept once per vblank, **108 frames** |
+| 251 | 87,330,318 | `0x3d1d94` | +0x4F0 | 0 | teardown clears the dispatcher |
+| 252 | 87,330,318 | `0x3d18a4` | +0x340 | **0** | detach **clears the pending bit** |
+| -- | 87,330,428 | | | | next sweep: **A absent**, B+C only |
+| -- | 87,350,652 | | | | last sweep, B+C only -- **last guest activity** |
+
+Attach arms it, a real dispatcher is installed, the sweep services it every frame, teardown
+clears both fields, and A leaves the sweep on the very next frame. **The state machine works.**
+
+### 3. CORRECTION -- Part 155 section 4 was wrong
+
+Part 155 stated: *"teardown clears neither the bit nor the slot."* **It clears the bit.**
+`sub_3D1860` is the detach counterpart of `obj_attach_child` and ends with:
+
+```c
+if ( wrap_obj_get_field0c_b_b() ) {
+    field0c_b = get_field_val_z_232(a2);
+    void_struct_field_update_m(a1, field0c_b);
+    *(_DWORD *)(a2 + 832) &= ~8u;      // 0x3d18a4  <-- clears flags_340 bit3
+}
+```
+
+and the run proves it fires (ord 252, value 0 into `A+0x340`). The static pass missed it
+because it only inspected `obj_detach_and_free_resources` (`0x3d1c40`); the bit-clear lives in
+a **different, adjacent function**. This is `feedback_absolute_quantifiers_are_audit_targets`
+landing on my own draft -- "clears neither" was the unaudited word.
+
+Also retired: Part 155's framing of `0x2ae620` as a "hole path". It is the **normal**
+once-per-vblank service path for a pending object, and it ran 108 times cleanly.
+
+### 4. VERIFIED: where the stall actually is -- a one-second window
+
+`[watchdog] progress=` from the same run:
+
+```
+t=1276s  progress=87309788
+t=1277s  progress=87332001     <- A torn down here (journal progress 87,330,318)
+t=1278s  progress=87370633     <- FROZEN. +1 per ~4s for the next 574s.
+t=1852s  progress=87370784     stuckSecs=574
+```
+
+- **A is the only object** the sweep ever writes `1` to at `+0x5A0`; B and C always get `0`.
+  A was the active one.
+- A dies at **t~1277s**. The EE stops at **t=1278s**.
+- Terminal state: `[thsync] VERDICT=RENDER-GATE-CLOSED`, two threads --
+  `[1: st=16 pc=0xd0d4d400]` (dormant, garbage pc) and
+  `[2: st=4 wt=2 wid=3 pri=0 pc=0x1759e8]` blocked on **semaphore id 3**. The EE spins
+  forever in `0x171320 -> 0x11e3b0 -> 0x11e560 -> 0x11f240 -> 0x104b30 -> 0x1bfb80 -> 0x1bfa50`.
+
+WARNING -- **HYPOTHESIS, not verified:** that A's teardown *causes* the freeze. What is
+**verified** is the one-second adjacency plus A being the sole actively-dispatched object.
+
+### 5. The next question has changed
+
+Not *"what dispatched through NULL"* -- nothing did. It is:
+
+> **Who tore down object `0x61a5c0` at progress 87,330,318, and should it have?**
+
+`0x3d1c40` is reached through a **vtable** (data xrefs at `0x4f8b70`, `0x4f8be0`, `0x4f8d30`,
+`0x4f8de0`), so no static xref names the caller. Cheapest next measurement: re-arm the same
+9 PCs and attach `formatDispatchHistory()` (`ps2_runtime.cpp:825`) to the `0x3d1d94` hit to
+capture the call ring at the moment of teardown. One build, one run.
+
+### 6. Method note -- what `[journal]` bought
+
+Four root causes were declared and withdrawn in the ten days before this. This run did not
+produce a fifth; it **closed a line of inquiry with a complete, uncapped population** and
+corrected two prior findings. The ordered-store journal answered in one run a question that
+`PS2X_WATCH` structurally could not answer at all, because the whole attach/dispatch/teardown
+sequence for A happens inside single frames.
+
+### 7. Process failure this session -- I destroyed MEMORY.md
+
+`io.open(p, "w", ...).write(s)` truncated `memory/MEMORY.md` to **0 bytes** when the encode
+threw *after* the open (an unpaired surrogate from writing an astral emoji as two `\u`
+escapes). `memory/` is not a git repo. It was recoverable only because the full text was in
+that turn's context. Recorded in `feedback_never_open_w_on_a_real_file` with the safe shape:
+**encode first, write a temp file, `os.replace`.**
+
+
+## Part 155 (2026-09-21) -- static only, no build, no run. **The sweep is not walking one object: it walks a 16-slot child-pointer array at `root+0x71C` with no NULL check, and NOTHING in the teardown path ever clears a slot.** Search space for slot writers closed across all 17,089 generated TUs.
+
+### 1. VERIFIED from real MIPS: the sweep's inner loop is a 16-slot array walk
+
+```
+0x2ae300  daddu $s4, $zero, $zero   ; i = 0
+0x2ae304  daddu $s1, $zero, $zero   ; byteoff = 0
+0x2ae308  lw    $v0, 0x0($s3)       ; root  <-- RELOADED every iteration
+0x2ae30c  addu  $v0, $s1, $v0       ; root + i*4
+0x2ae310  lw    $a1, 0x71C($v0)     ; child = root->slot[i]
+0x2ae314  lw    $v0, 0x340($a1)     ; <-- NO NULL CHECK ON $a1
+0x2ae318  andi  $v0, $v0, 0x8
+0x2ae320  bnez  $v0, 0x2ae620       ; pending-dispatch -> hole path
+0x2ae32c  slti  $v0, $s4, 0x10      ; i < 16
+0x2ae330  bnez  $v0, 0x2ae308
+0x2ae334  addiu $s1, $s1, 0x4       ; (delay slot)
+```
+
+So the array is `root+0x71C .. root+0x758`, **16 pointer slots, walked unconditionally**.
+Part 154 read this as a single object reached through `$a1`; that was too narrow.
+There is also **no parent-level `flags_340` gate** here -- the only gate is on the child.
+
+### 2. VERIFIED: two independent sites use the same idiom, also unchecked
+
+| site | shape |
+|---|---|
+| `0x2af510` -> `0x2af528` -> `0x2af52c` | gates on the **parent's** `flags_340` bit3 FIRST, then `lw 0x71C`, then gates on the child's |
+| `0x2afcac` -> `0x2afcc8` -> `0x2afccc` | same, parent gate at `0x2afcac` |
+
+Both then test `flags_5A0 & 2` (`0x2af540`, `0x2afce0`). Neither null-checks the slot either.
+The game-wide invariant is therefore **"a slot is never NULL and never stale"** -- and the
+sweep at `0x2ae310` is the one site that does not even check the parent first.
+
+### 3. VERIFIED: attach sets the bit but does NOT occupy a slot
+
+`obj_attach_child` (`0x3d17d0`) sets `a2->flags_340 |= 8` at `0x3d1824` -- the exact bit the
+sweep consumes -- and writes **no** `+0x71C..+0x758` slot. Its linkage call is
+`struct_field_reader_z_24(v6, a3, ...)` at `0x3d1814`. **Setting the pending bit and
+occupying a slot are separate operations**, so they can fall out of step.
+
+### 4. VERIFIED: teardown clears neither the bit nor the slot
+
+`obj_detach_and_free_resources` (`0x3d1c40`, renamed; was `struct_field_reader_z_115`)
+now decompiles with named fields:
+
+- unlinks a doubly-linked node at `obj->field_590` (prev `+4`, next `+8`, owner `+12`,
+  owner's head at `+16`)
+- releases `field_568` / `56C` / `570` / `574` / `560`
+- zeroes `dispatcher_4F0` at `0x3d1d94`
+- touches **neither `flags_340` nor any parent slot in `+0x71C..+0x758`**
+
+### 5. SEARCH SPACE CLOSED: who writes the slots
+
+Across **all 17,089** generated TUs:
+
+- every access to `0x71C..0x758` is a **direct-offset** `lw`/`sw`;
+- `addiu/daddiu rX, rY, 0x71C` has **zero** matches, so no site computes a base pointer into
+  the array and stores through it.
+
+That makes the direct-offset grep **complete for the direct forms**, not merely "nothing
+found". The only zero-stores into the window are bulk initializers
+(`0x1cde10..0x1cde34`, `0x39b7a4..0x39b8ac`) plus `obj_dtor_full` clearing **slot 0 only**
+(`0x1ce8cc`). **No detach path clears a slot.**
+
+⚠️ **Stated limit:** I checked direct `sw rX, 0xNNN(rY)` and `addiu rX,rY,0x71C`. A store
+through a base computed some other way (e.g. `addiu $t0,$root,0x700` then `sw $x,0x1C($t0)`)
+would still evade this. Not exhaustively excluded.
+
+### 6. What this changes about the run -- the arming list is already correct
+
+The planned arming already includes `0x2ae620` (`sw $zero, 928($a1)`). **That store's address
+reveals the slot's pointer value**: `$a1 = addr - 928`. Reads can never be hooked, so this is
+the only way to see what `0x2ae310` loaded. It discriminates the two live mechanisms:
+
+| `$a1 = addr - 928` | mechanism |
+|---|---|
+| a plausible heap pointer | **use-after-teardown** -- slot still points at a torn-down object |
+| `0`, or garbage | **stale / uninitialised slot** -- `lw 0x340($a1)` read from low memory |
+
+Grouping by `addr - 0x4F0` (Part 154's plan) still works for the teardown case; add grouping
+by `addr - 928` for the sweep case.
+
+**Second-tier arming** if the first run is ambiguous -- the three non-zero slot writers:
+`0x340cf8`, `0x1ce71c`, `0x367c70`, plus the slot-0 clear `0x1ce8cc`.
+
+### 7. Not established
+
+- Whether `0x1cdc80`'s object (initialiser clearing slots 0..7 only, `0x71C..0x738`) is the
+  same type as the sweep's root. **Not shown** -- do not treat "slots 8..15 uninitialised" as
+  a finding yet.
+- Whether the two roots in the sweep's 2-entry local array are the same type as the parents
+  in `0x2af4c0` / `0x2afc70`.
+
+
+## Part 154 (2026-09-21) -- method over bug. **TWO universal probe hooks were already compiled into all 17,086 recompiled TUs and had never been used.** Built the missing one (`PS2X_JOURNAL`), declared `SdbzAppObj` in the live IDB, and sharpened the NULL dispatch to a specific use-after-teardown. Zero builds, zero runs by me; three TUs `cl /Zs` clean and handed over.
+
+### 1. The store hook we already owned
+
+```
+ps2_runtime_macros.h:475  WRITE32 -> ps2TraceGuestWrite(rdram, addr, 4, val, 0, "WRITE32", ctx)
+ps2_runtime.h:292         -> if (g_writeWatchActive) ps2_watch::onGuestWrite(addr, size, lo, hi, ctx->pc)
+ps2_runtime.cpp:113       void onGuestWrite(...)      <-- OUT-OF-LINE, in a .cpp
+```
+
+Every guest store in every recompiled TU already calls this, and the implementation is in a
+`.cpp`, so it is a ~4-6 min incremental build to change. Calls have the same property via
+`dispatchGuestBranch` (`ps2_runtime.cpp:2253`, 15,987/17,086 TUs) -- but two *unconditional*
+`GPR_U32` reads there once cost **19% of guest throughput**, so any call hook must sit behind
+a relaxed atomic bool.
+
+**Reads are NOT hooked and never can be cheaply** (`READ32` -> `FAST_READ32`;
+`ps2_runtime_macros.h` is on the PCH + runner include graph = 30+ hr). Same reason no new
+logging macro can be added to `ps2_log.h`.
+
+Both existing consumers of the store hook are weak: `PS2X_WATCH` **polls at ~60 Hz**
+(`ps2_runtime.cpp:6582`), so an intra-frame write/overwrite is invisible; `PS2X_TRAPVAL`
+matches a value anywhere in a range and was retired as noise.
+
+### 2. NEW: `PS2X_JOURNAL` -- ordered store journal (built, syntax-checked, NOT yet run)
+
+Implemented in `ps2xRuntime/src/lib/Kernel/Diag/trace_calls.cpp` (see defect #4 below for why
+not its own file), wired into `onGuestWrite` and armed in `PS2Runtime::run`.
+
+- `PS2X_JOURNAL=LO:HI[:LABEL][,...]` -- journal every store touching a half-open range.
+- `PS2X_JOURNAL_PC=PC[,PC...]` -- journal every store issued BY these instructions, whatever
+  address they hit. **This is the mode that matters here**: the object is on the heap and the
+  `[hole]` probe prints only `target`/`source`/`ra`, never the object address, so range arming
+  cannot be aimed. PC arming needs nothing known in advance, and the object base is recovered
+  as `addr - fieldOffset`.
+- Records go to the structured JSONL sink as `probe=JOURNAL` with `ord` (a total order),
+  `addr`, `size`, `val`, `pc`. Capped, with a `[cap]` line so saturation cannot read as
+  absence.
+
+### 3. MEASURED: `ctx->pc` names the storing instruction EXACTLY
+
+Worth recording because a comment in `ps2_runtime.cpp` claimed the opposite, and my own first
+draft of the journal repeated a wrong version of it.
+
+Over a 300-file sample of `output/` (3,622 stores, 1,050 of them in branch delay slots):
+
+- all **1050/1050** delay-slot stores have a `ctx->pc` assignment within 5 preceding lines;
+- in **1050/1050** the value assigned is the **store's own address**, not the branch's.
+
+Both the resume path and the fall-through path assign it; `branch_pc` carries the branch
+separately. So a journal consumer may match on an exact store address. The stale comment at
+`ps2_runtime.cpp` has been corrected in place.
+
+### 4. ⚠ **RETRACTED** — I predicted a new `.cpp` would never be compiled. It was wrong.
+
+I reasoned that `CONFIGURE_DEPENDS` runs via `VerifyGlobs.cmake`, driven by `ZERO_CHECK`,
+which reaches `ps2_runtime` only as a `<ProjectReference>` -- and that `build.ps1:231-232`
+says MSBuild does not walk references when targeting a bare `.vcxproj`. Conclusion: a new
+`.cpp` would never be compiled, and `-Test` would link a stale lib.
+
+**The first real build disproved it.** Building `ps2_runtime.vcxproj` directly printed
+`Checking File Globs` (VerifyGlobs ran, so ZERO_CHECK ran) and built `glfw.vcxproj` and
+`raylib.vcxproj` -- both ProjectReferences. **MSBuild does walk them here.** A new file
+under `src/lib/Kernel/` would have been picked up after all, and the `-Test` corollary
+rests on the same false premise.
+
+`build.ps1:231-232` still says the opposite of what the build does; treat it as stale or
+narrower than it reads, and do not build further inferences on it.
+
+Consequence for this part: folding `[journal]` into `Kernel/Diag/trace_calls.cpp` instead
+of its own file was an **unnecessary** precaution. Harmless, but it makes that TU do two
+unrelated jobs, and it should be split back out when convenient.
+
+Recorded as `feedback_new_cpp_file_is_never_compiled`, rewritten as a worked example of a
+confident wrong inference from a source comment.
+
+### 5. `SdbzAppObj` is now a declared type in the live IDB
+
+IDA Pro is open with `SLUS_214.42` and had **zero** structs defined -- 153 parts of findings
+were living in markdown. Declared `SdbzAppObj` from the ctor + attach + teardown, named where
+verified with explicit `pad_*` elsewhere, and set prototypes so decompiles print
+`obj->dispatcher_4F0` instead of `*(_DWORD *)(a1 + 1264)`.
+
+| offset | member |
+|---|---|
+| +0x340 (832) | `flags_340` -- the pending-dispatch flag word |
+| +0x3A0 (928) | `field_3A0` |
+| +0x4F0 (1264) | `dispatcher_4F0` -- what both `[hole]` sites jalr through |
+| +0x520 (1312) | `flags_520` -- written by `reg_save_unk_z_c` @ `0x1cb750` |
+| +0x5A0 (1440) | `flags_5A0` |
+
+Renames: `0x3d0990` -> `SdbzAppObj_Ctor`, `0x3d1a40` -> `SdbzAppObj_AttachDispatcher`.
+Comments recorded at `0x2ae314`, `0x2ae630`, `0x2ae634`, `0x3d0ed0`, `0x3d1820`, `0x3d1d94`.
+
+⚠️ `get_callers` and `get_xrefs_to_field` both return `[]` in this IDB **even with positive
+controls** -- use `get_xrefs_to`, which A/B-matched `eeref.py` exactly and adds
+containing-function and code/data typing.
+
+### 6. PREMISE RE-VERIFIED: the two sites I analysed are the ones actually failing
+
+The first `[hole]` records in `run_log.txt` come from `0x1bde88` / `0x2b733c`, which are not my
+sites -- so I counted all 64:
+
+| source | holes |
+|---|---|
+| **`0x2ae640`** | **25** |
+| **`0x3d0ed0`** | **25** |
+| 9 others | 14 |
+
+**50 of 64**, and 64 is the cap, so that is a floor.
+
+### 7. The NULL dispatch, sharpened -- and one of my own theories killed
+
+```
+0x2ae314  lw   $v0, 832($a1)      ; GATE: flags_340 bit3
+0x2ae320  bne  $v0, $zero, 0x2ae620
+0x2ae620  sw   $zero, 928($a1)
+0x2ae630  sw   $v0, 1440($a1)     ; clears flags_5A0 bit3 -- a DIFFERENT FIELD
+0x2ae634  lw   $a0, 1264($a1)     ; NO null check
+0x2ae640  jalr $ra, $t9           ; -> target=0x0 when the field is 0
+```
+
+- VERIFIED asymmetry: the gate tests `flags_340`, the clear writes `flags_5A0`, same `$a1`.
+  Unresolved whether bug or two independent flag words.
+- VERIFIED, and it killed my first theory that the gate was sticky: `flags_340` bit3 is set by
+  `obj_attach_child` (`0x3d1820 ori 0x8`) and cleared by **three** sites (`0x3d164c`,
+  `0x3d18a4`, `0x3d1950`).
+- VERIFIED: `obj_detach_and_free_resources` zeroes `dispatcher_4F0` at `0x3d1d94` and **never
+  touches `flags_340`**.
+
+HYPOTHESIS, not proven: teardown clears the dispatcher but leaves the pending-dispatch bit
+set, so the next sweep dereferences NULL. Nothing yet ties teardown and sweep to the same
+object -- which is exactly what the journal run will show.
+
+### Handover (user runs both)
+
+1. `scratchpad\build_and_test_journal.ps1` -- builds ps2x_tests and runs the `Observability`
+   suite. Seconds, no game. ⚠ The script must NOT set `$ErrorActionPreference = 'Stop'`:
+   build.ps1 pipes `cmd /c ... 2>&1` and VsDevCmd emits a benign "vswhere.exe is not
+   recognized" line on stderr, which 'Stop' promotes to a terminating error mid-build.
+2. Then `build.ps1 RelWithDebInfo 6`, and launch with
+   `PS2X_JOURNAL_PC=0x3d09b0,0x3d1a7c,0x3d1d94,0x3d1824,0x3d1654,0x3d18a4,0x3d1950,0x2ae620,0x2ae630`
+   (ctor / attach / teardown / flag-set / three flag-clears / sweep-zero / sweep-clear).
+
+### Next (Part 155)
+
+1. Read the `probe=JOURNAL` records ordered by `ord`, grouped by `addr - 0x4F0`. If an object
+   shows `flags_340` set, then `dispatcher_4F0 -> 0` from `0x3d1d94`, then a sweep entry with
+   no intervening clear, **use-after-teardown is proven**.
+2. WP3: allocator side table + overlap detector, then the four fixes one at a time.
+3. WP4: a real assert facility -- there is none, and the 29 `assert()`s in `EeScheduler.cpp`
+   are compiled out in RelWithDebInfo, the build we actually run.
+4. WP5: `build_scripts/measure.ps1`, proposed in Part ~150 and never built.
+5. WP6: EE snapshot feasibility audit -- no EE save-state exists, so every experiment costs a
+   20-minute boot.
+
+
+## Part 153 (2026-09-21) -- static only, no build, no run. **Part 152's "InitHeap / SetupThread are never called" is FALSIFIED: both syscalls are issued INLINE in crt0.** The game asks for a **16 KB** main stack and "all remaining RAM" for the heap. Our `SetupHeap` ignores the `-1` and pins the limit at `0x1F00000`, withholding **1,032,192 bytes** the real kernel would have handed over. Second correction: the two allocators do not start 4,096 bytes apart -- after crt0 they start at the **same address**.
+
+Method: `eeref.py field 1264` + `mips_r5900_disassembler.py` on crt0, plus reads of our own
+runtime. Zero builds, zero runs. Both of Part 152's "free static reads" are now done.
+
+### 1. CORRECTION -- `SetupThread` (0x3C) and `InitHeap` (0x3D) DO run
+
+Part 152 reported both as never called, on the strength of `eeref.py refs 0x174c60` and
+`0x174c70` returning zero. **That result was true and the conclusion drawn from it was wrong.**
+Those addresses are *library wrapper functions*, and nothing calls the wrappers. crt0 issues
+the syscalls **inline**, at `0x1001c4` and `0x1001e0`:
+
+```
+0x00100198  lui   $a0, 0x50                 ; SetupThread args
+0x0010019c  lui   $a1, 0x0
+0x001001a0  lui   $a2, 0x0
+0x001001a4  lui   $a3, 0x56
+0x001001a8  lui   $t0, 0x10
+0x001001ac  addiu $a0, $a0, 0x3070          ; $a0 = 0x00503070  = gp
+0x001001b0  addiu $a1, $a1, 0xffffffff      ; $a1 = -1          = "top of RAM"
+0x001001b4  addiu $a2, $a2, 0x4000          ; $a2 = 0x4000      = 16 KB stack
+0x001001b8  addiu $a3, $a3, 0x800           ; $a3 = 0x00560800  = args
+0x001001bc  addiu $t0, $t0, 0x220           ; $t0 = 0x00100220  = root func
+0x001001c0  or    $gp, $a0, $zero
+0x001001c4  addiu $v1, $zero, 0x3c          ; <-- SetupThread
+0x001001c8  syscall
+0x001001cc  or    $sp, $v0, $zero           ; $sp = whatever we return
+
+0x001001d0  lui   $a0, 0x64
+0x001001d4  lui   $a1, 0x0
+0x001001d8  addiu $a0, $a0, 0x380           ; $a0 = 0x00640380  = ELF max loaded end
+0x001001dc  addiu $a1, $a1, 0xffffffff      ; $a1 = -1          = "rest of RAM"
+0x001001e0  addiu $v1, $zero, 0x3d          ; <-- InitHeap / SetupHeap
+0x001001e4  syscall
+```
+
+This is `feedback_absolute_quantifiers_are_audit_targets` -- "NEVER CALLED" in Part 152 was an
+absolute quantifier resting on a wrapper address, not on the syscall.
+
+**Independent confirmation from existing data, no run needed.** Our `SetupThread`
+(`Kernel/Syscalls/System.cpp:630`) for `stack == -1, size > 0` returns
+`PS2_RAM_SIZE - size` = `0x2000000 - 0x4000` = **`0x01FFC000`**. Part 151 measured
+`stackLow = 0x1ff8cec`, which is `0x3314` = 13,076 bytes below that -- inside a 16,384-byte
+stack, with 3,308 bytes to spare. The handler ran and the number it produced is the one the
+game is standing on.
+
+### 2. The real ceiling loss is ~1 MB, and it is a `-1` we drop on the floor
+
+`SetupHeap` (`System.cpp:679`):
+
+```cpp
+static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+uint32_t heapLimit = kDefaultGuestHeapEnd;
+if (heapSize != 0u && heapSize != 0xFFFFFFFFu) { ... }   // <-- crt0 passes exactly 0xFFFFFFFF
+```
+
+The game passes `-1`, the branch is skipped, and the limit stays `0x1F00000`. The real EE
+kernel treats `-1` as "everything up to the main stack".
+
+| quantity | value |
+|---|---|
+| our heap limit | `0x01F00000` |
+| main stack bottom (`sp` we returned − 16 KB) | `0x01FF8000` |
+| **withheld from the game** | `0x01FF8000 - 0x01F00000` = **`0xF8000` = 1,015,808 B** |
+| ... up to `sp` itself | `0xFC000` = 1,032,192 B |
+
+The layout comment at `ps2_runtime.cpp:347` justifies the reservation as keeping clear of "the
+game-chosen main stack at top-of-RAM". **That stack is 16 KB.** The reservation is 64x larger
+than the thing it reserves for.
+
+⚠️ **VERIFIED:** the arithmetic and the source of every number above.
+⚠️ **NOT VERIFIED:** that returning ~1 MB more would fix the stall. Part 151 saw 212 NULLs
+after the high-water pinned, and the one traced request was `0x728` = 1,832 bytes; ~1 MB is
+~550 more allocations of that size. This closes an environment gap. It may only move the wall.
+
+### 3. CORRECTION -- the two allocators start at the SAME address, not 4,096 apart
+
+Part 152 reported game dlmalloc at `0x640380` and our `guestMalloc` at `0x641380`, "4,096
+bytes apart". That is only true *before crt0 runs*. crt0's `SetupHeap(0x640380, -1)` calls
+`PS2Runtime::configureGuestHeap(0x640380, 0x1F00000)`, which calls `resetGuestHeapLocked` and
+rebuilds the free list as one block **starting at `0x640380`** -- the game's own initial `brk`.
+
+| allocator | region after crt0 | first address handed out |
+|---|---|---|
+| game dlmalloc (sbrk from `0x461B64`) | `0x640380` -> `0x1F00000` | `0x640380` |
+| our `PS2Runtime::guestMalloc` | `0x640380` -> `0x1F00000` | `0x640380` |
+
+**VERIFIED by construction:** identical base, identical limit, no reservation, no mutual
+awareness. The first allocation from each side is the same address.
+
+**Third defect found in the same function:** `resetGuestHeapLocked` does
+`m_guestHeapBlocks.clear()` unconditionally. Any `guestMalloc` made *before* crt0's SetupHeap
+is silently forgotten, and its memory is immediately available to be handed out again.
+
+⚠️ Still **HYPOTHESIS**: that this is what produces the asset-valued `[hole]` targets. The
+mechanism is now exact, but no specific runtime allocation has been tied to a specific game
+block. That needs a probe or a RAM diff.
+
+### 4. `[base + 0x4F0]` -- who writes it. **My Part 152 hypothesis is falsified.**
+
+`eeref.py field 1264`: 152 accesses, **142 loads and 10 stores**, 0 `fold` hits. Seven of the
+ten stores are `swc1` (a float field on a different struct, all in `0x1e6xxx`/`0x340xxx`).
+**Only three pointer stores exist in the entire image:**
+
+| site | what it does |
+|---|---|
+| `0x3d09b0` in `sub_3D0990+0x20` | constructor / reset: `sw $zero, 1264($s0)` amid ~30 other zeroed fields |
+| `0x3d1a7c` in `obj_sub_1a40+0x3c` | attach: `sw $a0, 1264($a1)` -- the pointer is an **incoming argument** |
+| `0x3d1d94` in `obj_detach_and_free_resources+0x154` | teardown: `sw $zero, 1264($s0)`, guarded by `bne $v1,$zero` -- clears only if already set, and **frees nothing** |
+
+Part 152 proposed that the NULL `[hole]` targets came from an unchecked `Heap_Alloc` return
+being stored into this field. **There is no such store anywhere.** The field is only ever
+zeroed or assigned a caller-supplied pointer. `obj_sub_1a40` has 11 callers plus a vtable slot
+at `0x4f8d2c`, and the two sampled callers (`obj_init_state_machine+0x2c`,
+`CAppMain_Ctor_clone_03+0x18`) both pass their own `$a0` straight through -- the pointer
+originates further up the chain, not from a malloc at this level.
+
+### 5. Neither `[hole]` site null-checks the field -- so `target=0x0` is fully explained
+
+```
+; 0x3d0ea0  wrap_thunk_FUN_00301c10          ; 0x2ae620
+jal   0x300ab0                               sw   $zero, 928($a1)
+bne   $v0, $zero, 0x3d0ec4   ; guard is on   lw   $v1, 1440($a1)
+                             ; 0x300ab0's    ...
+                             ; return, NOT   sw   $v0, 1440($a1)
+                             ; on the field
+lw    $a0, 1264($s0)                         lw   $a0, 1264($a1)
+lw    $t9, 0($a0)        ; <-- no NULL test  lw   $t9, 0($a0)     ; <-- no NULL test
+lw    $t9, 64($t9)                           lw   $t9, 48($t9)
+jalr  $ra, $t9                               jalr $ra, $t9
+```
+
+**VERIFIED mechanism for `target = 0x0`:** with the field at 0, `lw $t9, 0($0)` reads guest
+address 0 (zeroed low RAM) -> 0, then `lw $t9, 48(0)` -> 0, then `jalr 0`. The logged target
+of `0x0` is exactly what a zero field produces two dereferences deep.
+
+**Revised HYPOTHESIS** (replacing Part 152's): the NULL holes are a **use-after-teardown** --
+`obj_detach_and_free_resources` zeroes `[+0x4F0]` at `0x3d1d94`, and one of these two
+unchecked sites runs on that object afterwards. This fits Part 151's timeline, where the holes
+follow the worker-shutdown sequence, better than an allocation failure does. It is *not* proven:
+nothing yet shows the teardown and the dispatch hitting the same object.
+
+### Next (Part 154)
+
+1. **Static, free.** Callers of `obj_detach_and_free_resources` vs. callers of the two hole
+   sites -- do they share an object? That would promote the use-after-teardown hypothesis to a
+   finding without a run.
+2. **Static, free.** Walk up from `obj_sub_1a40`'s 11 callers to find where the `$a0` pointer
+   is actually produced, and whether *that* is an unchecked allocation.
+3. **One-line change, needs a build.** Honour `heapSize == 0xFFFFFFFF` in `SetupHeap` by
+   returning the main-stack floor instead of `kDefaultGuestHeapEnd`, and raise
+   `kGuestHeapHardLimit` to match. ⚠️ Must be paired with #4 or it makes the overlap wider.
+4. **The real bug, needs a design decision.** The two allocators must not share a region.
+   Either give `guestMalloc` its own reservation outside the game's heap, or route it through
+   the game's dlmalloc. Also fix the unconditional `m_guestHeapBlocks.clear()` in
+   `resetGuestHeapLocked`.
+5. **Oracle.** PCSX2 break at `0x1001e4` and record `$v0` from the `InitHeap` syscall -- the
+   real kernel's answer to `(0x640380, -1)`. One number confirms the ceiling arithmetic above.
+   WARNING: a UI-paused PCSX2 gives false negatives (`reference_pcsx2_debugger_quirks`).
+
+Still carried forward unchanged: the `[st4c]` probe defect (`tableFull=7508 slots=4`), the
+`[hole]` cap at 64 (so 64 is a floor), and the unconditional per-triangle `[meshdump]`
+`std::cerr` in `ps2_gs_rasterizer.cpp`.
+
+
+## Part 152 (2026-09-20) -- static only, no build, no run. **The heap ceiling is OURS.** `EndOfHeap` (syscall 0x3E) is hard-clamped to `kGuestHeapHardLimit = 0x01F00000` in `ps2_runtime.cpp`, and the measured `high=0x1efffa0` sits **96 bytes under it**. Second finding: **two allocators share the same region** -- the game's dlmalloc (sbrk from `0x640380`) and our own `guestMalloc` free list (from `0x641380`) -- with no mutual awareness.
+
+Method: `mips_r5900_disassembler.py` on the ELF plus reads of our own runtime source. Zero
+builds, zero runs. Per `feedback_static_before_probe`, every question Part 151 left open about
+the *mechanism* was answerable here.
+
+### 1. The allocator chain, resolved end to end
+
+`0x1111f0` (`Heap_Alloc`) and `0x111280` (mapped as `stack_depth_track`) are **byte-identical
+clones of the same wrapper** -- the func-map name on the second is junk. That wrapper is the
+telemetry site Part 150 probed. Decoded with `$gp = 0x503070`:
+
+| operand | address | Part 150/151 label | verified role |
+|---|---|---|---|
+| `-10608($gp)` | `0x500700` | `ok` | incremented on success; **decremented by `Heap_Dealloc` at `0x1111e0`** => live-block count. Part 151's read confirmed statically. |
+| `-10604($gp)` | `0x500704` | `FAILED` | incremented on `alloc == NULL` |
+| `-10600($gp)` | `0x500708` | `high` | high-water of `ptr + size`. A **watermark, not a ceiling.** |
+| `-32752($gp)` | `0x4FB080` | `stackLow` | min-tracker of `&sp[0x2c]`, the *caller's stack address*. Initial value in `.data` is `0xFFFFFFFF`. **Unrelated quantity to `high`.** |
+
+The wrapper has **no retry and no error path**: on failure it bumps `FAILED`, falls through the
+watermark update, and returns NULL to the caller.
+
+Full call chain:
+
+```
+Heap_Alloc 0x1111f0  ->  0x18d680 (lock; heap handle @0x465158)
+                     ->  0x18d978 (dlmalloc malloc, 0x728 bytes)
+                     ->  0x18d720 (malloc_extend_top -- textbook dlmalloc)
+                     ->  0x190f10 (MORECORE wrapper + errno @0x640300)
+                     ->  0x1753a0 (sbrk; break pointer @0x461B64)
+                     ->  0x174c80 (`addiu $v1,$zero,0x3e; syscall`)   <-- THE CEILING
+```
+
+`0x1753a0` decoded:
+
+```
+s0 = curbrk + increment
+v0 = EndOfHeap()                       // syscall 0x3E
+if (limit < newbrk)  -> errno = 12 (ENOMEM); return -1
+else                 -> curbrk = newbrk; return old brk
+```
+
+dlmalloc globals confirmed against the log: `0x465158` -> `0x464e68` (matches
+`[heapwatch:stat] heap=0x464e68`), `0x465168` = arena/top, `0x465580` = `sbrk_base` (init
+`-1`), `0x465598` = `sbrked_mem`, `0x465588`/`0x465590` = the two 64-bit max trackers.
+
+### 2. The ceiling is a constant in our runtime
+
+`ps2xRuntime/src/lib/ps2_runtime.cpp:340`:
+
+```cpp
+constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+```
+
+`Syscalls/System.cpp` `EndOfHeap()` returns `runtime->guestHeapLimit()`, and **every** path
+clamps to that constant:
+
+- `clampGuestHeapLimit()` forces any limit `> 0x1F00000` back down to `0x1F00000`, and maps
+  `0` to `0x1F00000`.
+- `SetupHeap` (0x3D) additionally *ignores the game's requested size* when it is `-1`, leaving
+  `heapLimit = kDefaultGuestHeapEnd = 0x01F00000`.
+
+`high = 0x1efffa0` is `0x1F00000 - 0x60`. **The game consumed the entire heap we gave it, to
+within 96 bytes, and then took 212 NULLs.**
+
+The 1 MB reservation is not arbitrary -- the comment above the constant states it keeps the
+region clear of "the game-chosen main stack at top-of-RAM ... SDK crt0 calls SetupThread to
+place that stack at the top of user RAM". `stackLow=0x1ff8cec` is consistent with that.
+**Whether 1 MB is the right reservation is untested.** On real hardware the EE kernel hands
+the heap everything up to the stack; if SDBZ's main stack is much smaller than 1 MB, we are
+withholding heap the game is entitled to. That is a PCSX2 question, not a static one.
+
+### 3. `InitHeap` and `SetupThread` are NEVER CALLED  — ⚠ **FALSIFIED IN PART 153**
+
+`eeref.py refs` on `0x174c70` (syscall 0x3D) and `0x174c60` (0x3C): **zero references, no
+dispatch slot.** Control per the plan's own warning: `eeref.py refs 0x174c80` (EndOfHeap)
+correctly reports `CALL 0x1753f0 jal in sub_1753A0+0x50`, so the tool sees this region --
+the empty result is evidence, not missing coverage.
+
+⚠ **CORRECTED IN PART 153.** `0x174c60` / `0x174c70` are *library wrappers*, and nothing
+calls the wrappers — that part was right. But crt0 issues both syscalls **inline**, at
+`0x1001c4` (0x3C, 16 KB stack at top of RAM) and `0x1001e0` (0x3D, base `0x640380`, size `-1`).
+Our `SetupHeap` handler **does** run, and it drops the `-1`. See Part 153 §1–§2.
+
+~~Consequence: our `SetupHeap` handler never runs for this game. The heap limit is whatever
+`loadELF()` computed, never anything the game asked for.~~
+
+### 4. TWO ALLOCATORS, ONE REGION -- verified by construction
+
+Read directly out of the ELF program headers and `.data`:
+
+| value | source | address |
+|---|---|---|
+| ELF max loaded end | PT_LOAD `0x100000 + memsz 0x540380` | **`0x00640380`** |
+| game's initial `brk` | word at `0x461B64`, **in `.data`** (not bss) | **`0x00640380`** |
+| our `suggestedHeapBase` | `align16(maxLoadedRdramEnd + kGuestHeapSafetyPad 0x1000)` | **`0x00641380`** |
+
+`maxLoadedRdramEnd` is computed **only** from the main ELF's PT_LOAD segments
+(`ps2_runtime.cpp:1476,1577`) -- nothing else raises it.
+
+| allocator | region | policy |
+|---|---|---|
+| game dlmalloc via sbrk | `0x640380` -> `0x1F00000` | bump the break upward |
+| our `PS2Runtime::guestMalloc` | `0x641380` -> `0x1F00000` | first-fit free list, one initial block `[base, limit)` |
+
+**They start 4,096 bytes apart, grow into the same ~26 MB, and neither knows the other exists.**
+⚠ **CORRECTED IN PART 153: only until crt0 runs.** `SetupHeap(0x640380, -1)` calls
+`configureGuestHeap(0x640380, 0x1F00000)`, which rebuilds our free list starting at
+`0x640380` — the game's own `brk`. After crt0 the two bases are **identical**, not 4,096
+apart, and the first allocation from each side is the same address.
+Our side is used heavily and by real subsystems, not just stubs: guest thread stacks
+(`Syscalls/Thread.cpp:759`), GS packet buffers (`Stubs/GS.cpp:808,902,1004`), Font, MPEG,
+LibC `malloc`, and `GuestScratchStack` (`ps2_runtime.h:750`).
+
+**VERIFIED:** the ranges overlap by construction; there is no reservation between them.
+**HYPOTHESIS (unmeasured):** that they actually hand out the same bytes in this run, and that
+this is what produces the stomped pointers in `[hole]`. Nothing here ties a specific runtime
+allocation to a specific game block. A probe or a RAM diff is required.
+
+### 5. The `[hole]` sites are ONE code shape, and it splits the failures in two
+
+`0x3d0ed0` (25 hits) and `0x2ae640` (25 hits) are the same four instructions:
+
+```
+lw   $a0, 1264($base)    // obj = base->field_0x4F0   (1264 = 0x4F0)
+lw   $t9, 0($a0)         // vtable = *obj
+lw   $t9, 48/64($t9)     // fn = vtable[0x30]  /  vtable[0x40]
+jalr $t9                 // <-- the hole
+```
+
+Both read **the same field, `[base + 0x4F0]`**, and dispatch two dereferences deep. So the
+logged `target` is `*(*(base->0x4F0) + 0x30)`. That makes the target value diagnostic:
+
+| logged target | meaning | when it fired |
+|---|---|---|
+| `0x0` (n=0,1,2) | `[base+0x4F0]` was **NULL** -> `[0+0x30]` reads zeroed low RAM | t=750s, with the **first** `FAILED` burst |
+| `0x3f800000` (=1.0f), `0x41414141` (="AAAA"), `0x6e6e69` (="inn"), long float runs (n=3..63) | `[base+0x4F0]` points at **live asset bytes** -- memory that belongs to something else | t=1235-1237s |
+
+**HYPOTHESIS, well-motivated but not proven:** the NULL holes are exhaustion (an unchecked
+`Heap_Alloc` return stored into `[base+0x4F0]`), and the asset-valued holes are a *different*
+mode -- a pointer into memory handed out twice. The timeline separates them by ~485 s, which
+is consistent with two causes rather than one.
+
+### Next (Part 153)
+
+1. **Static, free.** `eeref.py field 1264` -> find who *writes* `[base+0x4F0]`, and whether
+   that write is an unchecked `Heap_Alloc` return. This closes the NULL-hole mode with no run.
+2. **Static, free.** Find SDBZ's main stack extent (crt0 must set `$sp` directly, since
+   syscall 0x3C is never called). If the stack needs far less than 1 MB,
+   `kGuestHeapHardLimit` is simply too low and raising it is a one-line change.
+3. **Cheap probe, needs a build.** Log `guestHeapBase/End/Limit` once at startup (the
+   `[SetupHeap]` line already exists but is gated behind `PS2_IF_AGRESSIVE_LOGS`), plus the
+   `size` argument of failing `Heap_Alloc` calls, to separate "leak" from "one huge request".
+4. **Oracle.** PCSX2: break at `0x174c80` and record `$v0` -- what the real kernel returns for
+   `EndOfHeap`. One number decides whether our ceiling is wrong.
+   WARNING: a UI-paused PCSX2 gives false negatives (`reference_pcsx2_debugger_quirks`).
+
+Still carried forward unchanged from Part 151: the `[st4c]` probe defect (`tableFull=7508
+slots=4`) and the `[hole]` cap at 64 (so 64 is a floor).
+
+## Part 151 (2026-09-20) -- the Part 150 probe ran. **`FAILED=212`: the heap-exhaustion hypothesis is CONFIRMED.** But the run also **falsified two Part 149/150 claims**: the t=717s stall is *not* permanent (the game escaped it at t=1155s), and the hard stall is a *separate, later* event at t=1267s.
+
+Run: `run_log.txt`, 54 MB UTF-16LE, 56,505 lines, `-RunSeconds 1300`, `PS2X_MESHDUMP` armed.
+Line->time index from `[watchdog] t=Ns`. All three Part 150 probes fired.
+
+### 1. VERIFIED -- the decisive timeline
+
+| t | event |
+|---|---|
+| 726s | `[lstick] vt` becomes `0x4f9ad0` -- the class Part 149/150 called "permanently stuck" |
+| 736s | `CAppRankingBase_Update` (`0x41b2b0`) starts being called on `obj=0x632ac0` |
+| 750s | **`[heapfail] n=1` FAILED 0->9**, and holes n=0/1/2 fire (`target=0x0`, `source=0x1bde88`) |
+| 736-1154s | **981 consecutive `ret=0`** -- F1 reproduced, and it lasts **~420 s** |
+| ~1155s | **`ret=1` x17.** The gate opens. `halfword[obj+0x5C]` increments, the phase machine leaves state 4 |
+| 1159s | class -> `0x4f99a0`; rank calls freeze at 998 (object torn down) |
+| 1164s | class -> `0x4f9a10` (final; `vt40=0x3e2460`) |
+| 1180-1263s | **FAILED 14 -> 212** across 35 change events, accelerating |
+| 1235-1237s | holes n=3..63 fire in a burst -- garbage targets (below) |
+| ~1267s | hard stall. `[selectchk] picked=0 pri=-1 t4status=-1`, `busy%=0`, VBlank-ISR idle trace |
+| 1289s | log ends, `stuckSecs=22` |
+
+### 2. VERIFIED -- the allocator is exhausted, not (only) corrupt
+
+`[heapwatch:stat] why=periodic samples=16422 failEvents=37 ok=4024 FAILED=212 failMax=212`
+`gp=0x503070 okAddr=0x500700 failAddr=0x500704 high=0x1efffa0 stackLow=0x1ff8cec heapPtrAddr=0x465158 heap=0x464e68`
+
+- `gp` resolved to the expected `0x503070`, so the five derived addresses are the intended ones.
+- **`FAILED` at `0x500704` = 212, from 37 distinct change events.** Part 150's pre-registered
+  criterion was: *non-zero => exhaustion*. **That criterion is met.**
+- `high` (`0x500708`) froze at **`0x1efffa0`** from t=750s onward and never moved again.
+  **CORRECTED IN PART 152.** This section originally read "64 KB + 96 B below the top of RAM ...
+  the heap grew until it reached the stack region". Both halves were wrong. The arithmetic:
+  `0x2000000 - 0x1efffa0 = 0x100060` = **1 MB + 96 B**, not 64 KB. And the ceiling is not the
+  stack -- Part 152 disassembled the allocator and found `high` is **96 bytes under
+  `0x1F00000`**, which is `kGuestHeapHardLimit`, a hardcoded constant in *our own runtime*.
+  `stackLow=0x1ff8cec` is ~1 MB *above* `high`, not inside any gap with it. See Part 152.
+- `ok` (`0x500700`) is flat at ~4025 while `FAILED` climbs 9 -> 212. It behaves as a **live-block
+  count**, not a cumulative success counter (it *decreases*: 4053 -> 4025).
+
+### 3. VERIFIED -- what the failed allocations turn into
+
+`[hole]` fired 64 times and **`[cap] tag=hole` is present, so 64 is a floor, not the true count.**
+(Contrast Part 149, where the 4 holes were verified un-capped.)
+
+| source | count | func map |
+|---|---|---|
+| `0x3d0ed0` | 25 | `wrap_thunk_FUN_00301c10` (`0x3d0ea0..0x3d0eec`) |
+| `0x2ae640` | 25 | `str_copy_n_e_clone_70` (`0x2ae0e0..0x2ae84c`) -- IDA name, junk |
+| `0x1bde88` | 3 | **`vtable_dispatch_o_0_clone_04`** (`0x1bde80..0x1bde90`) |
+| `0x1bdf90`/`0x1bdf30`/`0x1bded0`/`0x3d0e50` | 2 each | `sub_1BDF50` / `sub_1BDEF0` / `sub_1BDE90` / `sub_3D0E20` |
+| `0x3d0f60`, `0x2b733c`, `0x204310` | 1 each | `sub_3D0F40`, `sub_2B7270`, `mem_fill_z_31_clone_07` |
+
+The func map independently confirms Part 150's hand-disassembly: **`0x1bde80` is a virtual-dispatch
+stub.** The jump targets are not addresses at all:
+
+- `n=0`: `target=0x0` -- the NULL case Part 150 root-caused.
+- `n=7`: `0x41414141` = `"AAAA"`; `n=9`: `0x6e6e69` = `"inn"` -- **ASCII text**.
+- `n=18`: **`0x3f800000` = exactly `1.0f`**; n=11..63 are a long alternating run of
+  plausible floats between `0x2ae640` and `0x3d0ed0` -- **a ping-pong pair walking float data**.
+
+So the object pointers being dispatched through point into **asset/vertex buffers**, not objects.
+
+### 4. VERIFIED -- F1 is NOT the cause, and it is NOT permanent
+
+`[rank:stat] installed=1 calls=998 retNz=17 lastRet=0x1 a0=0x632ac0 retHist=0:981,1:17,other:0`
+
+`CAppRankingBase_Update` returned 0 on **981 straight calls** and then **1 on 17 calls**, after
+which it stopped being called. The ranking screen **completed and advanced**. This:
+
+- **confirms** Part 150's static read of the gate (`ret != 0` is what increments `[obj+0x5C]`);
+- **falsifies** the Part 149/150 framing that the t=717s state-4 hang is terminal. It is a
+  ~420 s soft stall the game escapes on its own;
+- means the hard stall at t=1267s is **downstream of** the screen transition, not caused by it.
+
+### 5. PROBE DEFECT -- `[st4c]` self-convicts
+
+`[st4c:stat] tableFull=7508 slots=4`. The 4 slots were claimed first-come by
+`0x4fa400 / 0x4f99a0 / 0x4faf10 / 0x4fadf0`; **`0x4f9ad0` never got one**, and 7,508 samples were
+dropped. All four tracked rows report `h5Cchg=0`. Per `feedback_degenerate_result_convicts_the_probe`
+those four zeroes are **not** a measurement. `[rank:stat]` answered the question instead.
+Fix if re-run: raise `kSt4cSlots` to 16, or evict LRU instead of first-come.
+
+### 6. P3 SUCCEEDED -- first mesh capture
+
+`meshdump/frame.obj`, 890,674 bytes: **16,302 `v`, 16,302 `vt`, 5,434 `f`**, with a
+`# tex tbp0=0x2a00 psm=0x13 tw=256 th=256` binding comment. **3,502,000** `drawTriangle` hits this
+run vs 242,000 in Part 149. Stage 1 of `project_meshdump_blocked_by_sofdec_stall` is DONE.
+The unconditional per-triangle `std::cerr` in `ps2_gs_rasterizer.cpp` is now a real cost -- remove it.
+
+### 7. HYPOTHESIS (explicitly not verified)
+
+That the t=1267s hard stall is *caused by* the exhaustion is still inference, on three grounds:
+the 750s heapfail and holes n=0..2 are simultaneous; the 1180s failure burst precedes the 1235s
+hole burst by 55 s and the stall by 87 s; and the dispatch targets are demonstrably asset data.
+Not proven: nothing yet ties a specific failed allocation to a specific bad pointer.
+
+Also unexplained: **why the heap fills at all.** `ok` flat at ~4025 live blocks while `high` is
+pinned just under the ceiling suggests a leak or an oversized reservation, not normal churn.
+**Part 152 answers this**: the ceiling is `0x1F00000`, set by our runtime, and a second
+allocator is carving the same region.
+
+### Next (Part 152)
+
+1. **Static, no run:** disassemble `0x18d978` (the dlmalloc-style free list) to find what sets
+   `high` at `0x500708`, and whether the ceiling is a computed limit or literally "hit the stack".
+2. **Static:** `0x2ae640` and `0x3d0ed0` alternate 25/25. Disassemble both; a mutually-recursive
+   pair walking float data is a specific, findable bug.
+3. **Probe (needs a build):** raise `kSt4cSlots` to 16; raise the `[hole]` cap above 64; and log
+   the *size* argument of the failing `0x111280` allocations to separate "leak" from "one huge request".
+4. **Oracle:** PCSX2 break on `0x111280`, read `$a0` (size) and `$v0` at the first failure.
+
+## Part 150 (2026-09-20) -- ROOT CAUSE of the t=717s permanent stall, found STATICALLY from the Part 149 log (no new run): the main thread dies executing a **NULL scene-graph node**, produced by an unchecked heap-allocation failure inside `tree_clone`
+
+**Method:** no build, no run. Line->timestamp index over `/tmp/run_log_utf8_part149.txt` (14.6 MB,
+54,489 lines), cross-read against `ELF/SLUS_214.42`, `build_scripts/funcmap/sdbz_func_map_merged.csv`,
+`decomp.py`, `eeref.py` and `mips_r5900_disassembler.py`. `$gp = 0x503070` (set at `0x1001c0`) was needed
+to resolve every gp-relative address below.
+
+### The two failures, now cleanly separated
+
+- **F1 (soft, from ~t=640s):** `CAppDemoMainAlt_Update` (`0x3e35c0`) returns 0 every frame, so the generic
+  CApp phase machine (`0x3E0E60`) never advances `byte[obj+9]` from 4 to 5. Frames still render.
+- **F2 (hard, at t=717s):** the main thread **terminates**. This is the permanent stall.
+  **F2 is now root-caused. F1 is not, and F1 is NOT caused by F2 (F1 is ~27s earlier).**
+
+### F2 -- the verified chain
+
+**The scheduler evidence.** Thread table at the transition:
+
+```
+t=701  [1:st=1, wt=0,wid=0,pri=1,pc=0x175210]   [2:st=4,wt=2,wid=3,pri=0,pc=0x1759e8]
+t=716  [1:st=16,wt=0,wid=0,pri=1,pc=0x1     ]   [2:st=4,wt=2,wid=3,pri=0,pc=0x1759e8]
+```
+
+`st=16` = `THS_DORMANT`, `pc=0x1`. Thread 1 is gone. Thread 2 has been blocked on semaphore id 3
+(`st=4 wt=2 wid=3`) since t=406s and its signaller is now dead. `nTh=2` -- no other threads exist.
+There is nothing left to run. This is why `busy%` goes to 0 and never returns.
+
+**The `[hole]` evidence.** Exactly four dispatch holes fired all run (verified NOT a
+`[cap] tag=hole` saturation artifact -- the saturation line is absent, while 8 other tags DID cap):
+
+```
+t=667  n=0  target=0x0         source=0x1bde88  ra=0x1be38c  op=JR    IndirectJump
+t=667  n=1  target=0x3ebe071b  source=0x2b733c  ra=0x2b7344  op=JALR  IndirectCall
+t=667  n=2  target=0xc00c8bc1  source=0x1bde88  ra=0x1be38c  op=JR    IndirectJump
+t=716  n=3  target=0x1         source=0x1       ra=0x1       op=EE scheduler DirectJump
+```
+
+`0x1bde80` and `0x2b7330` are both **C++ virtual dispatch stubs** (hand-disassembled, `decomp.py`'s
+pseudo-C is not trusted here per the IDA `&`-dropping trap):
+
+```
+0x001bde80  lw $t9, 0($a0)      ; load vtable
+0x001bde84  lw $t9, 36($t9)     ; slot +0x24
+0x001bde88  jr $t9              ; <- hole n=0, n=2
+
+0x002b7330  lw $t9, 0($s2)      ; load vtable
+0x002b7338  lw $t9, 16($t9)     ; slot +0x10
+0x002b733c  jalr $ra, $t9       ; <- hole n=1
+```
+
+**The decisive register dump** (already captured in the Part 149 log, lines 40745-40790, at hole n=0):
+
+```
+a0=0x0  a1=0x1eff490  s0=0x0  s4=0x1eff490  s5=0x1bde80  sp=0x1ffba00  gp=0x503070
+a0Readable=yes  a0[0]=0xda812011  a0[4]=0x0  a0[8]=0x0  a0[c]=0x1eff490
+[stack] 0x1ffb9f0 (sp-0x10) 0x465158 0x0 0x1c0 0x0
+```
+
+**`a0 = 0x0`.** The object is **NULL, not corrupted.** `a0[0]=0xda812011` is merely whatever sits at
+guest address 0 (boot-vector code) being read as a vtable pointer; `[0]` then `[+0x24]` of that yields 0,
+and `jr 0` walks off the world. `s5=0x1bde80` confirms the walker's callback argument.
+
+**The caller chain** (from the `[frametrace]` block captured in the same dump, resolved against the func
+map):
+
+```
+fighter_track_tick_clone_11 +0xa0 / +0x10c   (0x2b8ce0 / 0x2b8d4c)
+  -> tree_clone +0x48 / +0x84                (0x19e988 / 0x19e9c4)
+       -> strcpy (0x191780) / strlen (0x191898)   x many -- copying node names
+       -> tree_walk(node=0x0, cb=0x1bde80, arg=0x1eff490)   (0x1be350)
+```
+
+`tree_clone` (`0x19e940`) allocated a clone node, **got NULL back, and stored/passed it unchecked.**
+The heap handle address `0x465158` sitting at `sp-0x10` shows the allocator frame was still warm.
+
+**The allocator, traced end to end:**
+
+```
+0x111280  accounting wrapper  -- counts failures, returns NULL UNCHECKED
+  0x18d680  lock -> alloc -> unlock;  heap handle = *(u32*)0x465158   (a POINTER stored there,
+                                                                       NOT the heap itself)
+    0x18d978  dlmalloc-style free-list: (size+19)&~15, bin = sz>>9, small-bin sz>>3, 16B align
+```
+
+The wrapper at `0x111280` maintains **the game's own heap telemetry**, gp-relative off `$gp=0x503070`:
+
+| Address | `0x111280` insn | Meaning |
+|---|---|---|
+| `0x500700` | `lw $v1, -10608($gp)` | allocations SUCCEEDED |
+| **`0x500704`** | `lw $v1, -10604($gp)` | **allocations FAILED** |
+| `0x500708` | `lw $v1, -10600($gp)` | high-water mark (`ptr+size`) |
+| `0x4FB080` | `lw $v1, -32752($gp)` | lowest stack pointer seen |
+| `0x465158` | (in `0x18d680`) | pointer to the heap handle |
+
+Grepped `game_overrides.cpp`: `18d680`, `111280`, `0x500700`, `0x500704`, `0x500708` appear **nowhere**.
+The allocator is not overridden and these counters have never been probed.
+
+### Verified vs. hypothesis (per [[feedback_no_guessing]])
+
+**VERIFIED:** the node is NULL; `tree_clone` under `fighter_track_tick_clone_11` produced it; the
+allocator wrapper returns NULL unchecked; thread 1 is `THS_DORMANT` by t=716; thread 2 is orphaned on
+sem id 3; the "idle loop" is the VBlank ISR (`0x1bfa50`), not a spin-wait; `0x1bfb80` is an orphan
+2-instruction thunk with no func-map entry and no `output/` file.
+
+**HYPOTHESIS (unresolved):** *why* the allocator returned NULL. Two candidates fit equally:
+heap **exhaustion** (genuinely full) or free-list **corruption** (a bad free / overrun). The float-shaped
+garbage in holes n=1/n=2 (`0x3ebe071b` = 0.3711f, `0xc00c8bc1` = -2.196f -- transform-data-shaped) mildly
+favours corruption, but that is not enough to call it.
+
+`0x500704` splits them in one read: **non-zero => exhaustion; zero while holes still fire => corruption.**
+
+### Corrections this Part makes to Part 149
+
+1. "Likely the actual RANKING/GAME-OVER target" was a guess. The class is `CAppDemoMainAlt`
+   (vt `0x4f9ad0`); RANKING code is in the path via `CAppRankingBase_Update` (`0x41b2b0`), but this is
+   not a standalone RANKING screen.
+2. The repeating 7-element trace is the **VBlank ISR**, not a wait site. Chasing it as a spin-wait
+   (and chasing a missing `rgate`-setter) was the wrong frame.
+3. "All semaphore activity ceases at t=668s" -> **t=667s**, the *same second* as holes n=0/n=1/n=2.
+   Not a coincidence; the same event. (493 `[semwatch:signal]` lines fall in t=660..717.)
+4. `[st4]` (gated on `0x420260`) and `[st4b]` (gated on `0x3e2ff0`) were aimed at objects that went
+   dormant at t=348s and t=422s. Both measured nothing relevant. **Third recurrence of
+   [[feedback_probe_gate_on_shape_not_address]].**
+
+### Next (Part 151) -- one build, one run. Probe is WRITTEN and `cl /Zs`-clean (EXIT=0).
+
+All three additions live in `ps2xRuntime/src/lib/game_overrides.cpp`, inside the existing `[sofdec]`
+probe's machinery. No new hook, no hot-path cost -- everything is sampled from the per-frame phase
+machine `0x3E0E60`, which already had `rdram` and a trustworthy `$gp` in hand.
+
+1. **`[heapwatch:stat]` + `[heapfail]`** -- the five allocator words, all derived from the **live `$gp`**
+   (never a baked address), with the derived addresses printed alongside so a wrong `gp` convicts the
+   probe instead of producing a confident wrong number. `[heapfail]` emits on every *change* of the
+   failure counter (cap 64, with a `[cap]` line); `[heapwatch:stat]` carries `FAILED=`/`failMax=`
+   unbounded every 5s. **`FAILED=` is the decisive field: non-zero => exhaustion, zero while the
+   `0x1bde88` holes still fire => free-list corruption.**
+2. **`[st4c:stat]`** -- the F1 probe, replacing the mis-aimed `[st4]`/`[st4b]`. Gate is **"this object is
+   in phase-machine state 4"**, rows keyed by whatever vtable is live (4 slots + a `tableFull=`
+   counter). Per row: `vt`, `vt40`, `obj`, `samples`, `h5C`/`h5Cchg`, `b2E`, `f64`/`f64chg`,
+   `fadeMode`/`fadeState`/`fadeBusy`. Changes are COUNTED, not snapshotted. `rows=0` prints an explicit
+   "this is a probe miss, not a measurement" line.
+   **Verification contract:** the row whose `obj=` matches `[lstick:stat]`'s live object is the only one
+   that describes the stall. If it shows a healthy changing machine while `[lstick:stat] st=4:N` keeps
+   rising, the probe is mis-aimed again and must NOT be reported as a finding.
+3. **`[rank:stat]`** -- new wrapped site `rank.41b2b0` (`CAppRankingBase_Update`, confirmed present in
+   the func map and `output/`). Captures the masked return `$v0 & 0xFF` in `sofdecCapturePost` -- the
+   only thing that can increment `halfword[obj+0x5C]`. Prints `installed=` separately from `calls=` so
+   "never registered" is distinguishable from "registered but never called".
+
+Plus set `PS2X_MESHDUMP` (P3) -- free, and t=639-717s is a proven capture window.
+
+**Plan item P2 (thread-lifecycle probe) is already answered by the thread table above -- do not spend it.**
+
+```
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+$env:PS2X_MESHDUMP = "F:\SDBZ Recomp\meshdump\frame.obj"
+& "F:\SDBZ Recomp\launch_recomp.ps1" -RunSeconds 1300 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+
+**First greps on the new log:** `[heapfail]`, `FAILED=`, `[st4c:stat]`, `[rank:stat]`.
+
+## Part 147 (2026-09-20) -- Part 146's `suspendCount` hypothesis REFUTED by a real build+run (0 `[suspenddbl]`/`[suspendstuck]` hits across a 187s window); re-reading the SAME run's raw thread-6 field finds it is NOT frozen -- it toggles WaitingSuspended<->Waiting every few seconds for the whole window, proving suspend/resume bookkeeping is clean and pointing squarely at `wakeupThread` instead; a new, unconditional probe (`[wakerelevant]`) is now in place to test it
+
+**Trigger:** user built (`build.ps1 RelWithDebInfo`) and ran (1300s) with Part 146's probe live.
+
+**Build:** succeeded, no new warnings from the probe addition. **Run:** reproduced the
+`GATE-OPEN-BUT-DEAD` window again -- longer this time, **187s** (`t=444-631s`, vs Part 144's 12s),
+confirming this reproduces across runs and giving the probe a large window to catch the anomaly in.
+
+**`[suspenddbl]`/`[suspendstuck]`: zero anomaly hits.** Only the one-time install banner matched the
+`[suspenddbl]` grep (not a real hit). `suspendCount` bookkeeping never desynced across the whole 187s
+window. **Part 146's hypothesis is REFUTED.** `sifboundfix` also still shows only its banner (1 hit) --
+Part 143's fix remains unexercised, unrelated to this window, consistent with Part 144.
+
+**Re-reading the raw `[6:st=...]` field (not just the rgate/VERDICT summary) changes the picture
+completely.** Thread 6 (worker A) is NOT stuck in one frozen snapshot the way Part 111's single-sample
+read made it look -- across the full 187s it **toggles `st=12` (WaitingSuspended) <-> `st=4` (Waiting)
+roughly every 2-7 seconds, continuously, for the entire window** (transition list extracted directly from
+`run_log.txt`, dozens of flips). Per `EeScheduler::resumeThread`, a `WaitingSuspended -> Waiting`
+transition can ONLY happen via a real, successful `resumeThread()` call reaching `suspendCount==0` -- so
+this independently reconfirms Part 146's refutation from the other direction: resume is not just anomaly-
+free, it is **actively succeeding, over and over**, exactly matching Part 111's decoded per-frame design
+(`sub_11E8D0` suspends every frame; `RenderDispatch`'s `ResumeThread` un-suspends every frame while
+`rgate==1`).
+
+**What never happens, across all 187s and dozens of successful resumes: a transition to Ready/Running.**
+The thread keeps getting un-suspended, cycles right back to `WaitingSuspended` a few seconds later, and
+never once does real work in between. Since `resumeThread` only clears the *suspend* half of the state
+(`WaitingSuspended -> Waiting`, still blocked on its underlying Sleep wait), the thread needs a SEPARATE
+`WakeupThread` call to actually clear the Sleep wait and become Ready -- and nothing in this window appears
+to be doing that.
+
+**New probe added** (`EeScheduler.cpp`, `wakeupThread`, ~line 2520-2660): `[wakerelevant]`, always-on
+(no env var), fires whenever `wakeupThread` is called on ANY thread currently `Waiting`/`WaitingSuspended`
+-- covering both the real-wake branch (`makeReady()`) and the silent no-op branch (`++wakeupCount` only,
+taken when `wait.reason != Sleep`), capped at 512, paired with a one-time install banner. Deliberately NOT
+gated by id or by `g_ps2x_teardownActive` the way the existing Part 125 `[waketrace]` probe is (that one is
+hardcoded to `PS2X_WAKETRACE_ID` default 4 and only active inside the RANKING-screen teardown wrapper --
+neither applies to this earlier, opening-movie window, whose worker tid is 6 and never reaches teardown).
+Syntax-checked `cl /Zs` -- `EXIT=0`, no new diagnostics. **Not built or run.**
+
+**Next (user):** `& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo`, then the same ~1300s run. Grep the log for
+`[wakerelevant]`. **Zero hits** = `wakeupThread` is never even called on this thread while it sleeps --
+the bug is upstream, in whatever guest/runtime code is supposed to call it (or gate it) during this window.
+**Hits with `branch=wakeupCountOnly(MISS)`** = it IS called, but `wait.reason != EeWaitReason::Sleep` at
+that moment, so the wake is silently swallowed -- worth then checking what `reasonBefore` actually is.
+**Hits with `branch=makeReady`** = the wake genuinely succeeds sometimes; if so, look at why the thread
+still doesn't progress afterward (a different, later-stage question).
+
+## Part 146 (2026-09-20) -- the `[thsync]` probe's OWN embedded verdict, re-read carefully, already answers Part 145's open question and points at a concrete, testable runtime bug: `suspendCount` can silently over-increment because `EeScheduler::suspendThread` bumps it unconditionally even when the thread is already Suspended/WaitingSuspended
+
+**Trigger:** direct continuation of Part 145. Before chasing the exit-transition trigger (state==1 +
+`camera_fade_is_active()==0`, traced in Part 145 from `sub_003E2FF0_0x3e2ff0.cpp`), re-read what `[thsync]`
+itself already says during this run's t=400-412s window -- it had been quoted only in summary before.
+
+**The window is NOT brief -- `rgate==1` holds continuously for all 12 seconds**, not just a blip (correcting
+an imprecise reading in Part 144/145's "briefly"). Every `[thsync]` line from t=400-411s carries the SAME
+embedded text: `VERDICT=GATE-OPEN-BUT-DEAD(rgate==1 yet the worker did not tick; the resume is reaching
+ResumeThread and failing -- next lane is Thread.cpp)`. This is a **pre-existing probe verdict written by an
+earlier session**, not something I derived -- it was just never acted on for this exact run. Thread table at
+t=400-402s shows `nTh=6` (up from the steady-state 2 -- 4 more guest threads exist, matching `ADX_Init`'s
+worker creation), with `[3:st=8,...,pc=0x11e7e0]` (SUSPEND at entry -- Part 111's th3) and
+`[6:st=12,...,pc=0x174bc8]` (WAITSUSPEND at the SleepThread stub -- Part 111's worker-A th6) **frozen in
+that exact shape for the whole window**, byte-for-byte the same signature Part 111 decoded on the original
+417s stall. After t=412s, `nTh` drops back to 2 -- the 4 extra threads vanish from the table (destroyed, most
+likely as a side effect of Part 145's exit-transition tearing the object down).
+
+**Read `EeScheduler::resumeThread`/`suspendThread` (`EeScheduler.cpp:2179-2257`) to check the probe's own
+lead.** Found an asymmetry: `suspendThread` (line 2196) does `++target->suspendCount;` **unconditionally**,
+before the status switch -- including when `target->status` is already `Suspended` or `WaitingSuspended`
+(those cases just `break`, they do not skip the increment). `resumeThread` (line 2241) does
+`--target->suspendCount;` and **only actually wakes the thread when the count reaches exactly 0**
+(`if (target->suspendCount != 0) return KE_OK;`). This matches real PS2 SDK semantics for a *nesting*
+suspend count -- but it means: if the guest's own per-frame "SuspendThread-if-not-already" check
+(`sub_11E8D0`'s own status read, Part 111) ever calls the real `SuspendThread` syscall on a thread our
+runtime already has Suspended/WaitingSuspended -- e.g. because the guest's own status view and our
+runtime's are one frame out of sync -- `suspendCount` silently climbs above 1, and `RenderDispatch`'s single
+per-frame `ResumeThread` call (Part 111's decode: `ResumeThread-if-suspended` -- ONE call, no loop) is no
+longer enough to bring the count back to 0. This would produce **exactly** the observed shape: `rgate==1`
+truthfully (the gate genuinely opened), `ResumeThread` genuinely called every frame (reached), yet the
+worker thread never actually transitions out of Suspended/WaitingSuspended -- silently, with no error
+returned to the guest (`KE_OK` either way).
+
+**PROBE ADDED** (`ps2xRuntime/src/lib/Kernel/EeScheduler.cpp`, `suspendThread`/`resumeThread`,
+~line 2179-2440): two always-on anomaly counters, no env var needed, so a "zero hits" result is trustworthy
+rather than "never checked" -- `[suspenddbl]` fires the instant `suspendThread` is called on a thread
+already `Suspended`/`WaitingSuspended` (the over-increment event itself, capped 256); `[suspendstuck]`
+fires the instant `resumeThread` decrements the count but it does not reach 0 (the direct match for
+"ResumeThread reached but failing", capped 256). Both print a one-time unconditional install banner
+(`[suspenddbl] probe installed...`) so the probe's presence is never in doubt. `PS2X_SUSPENDTRACE=1`
+(optionally `PS2X_SUSPENDTRACE_ID=<tid>`) additionally traces every suspend/resume call regardless of
+anomaly, capped 4096, for deep follow-up once the anomaly counters confirm something is wrong. Syntax-
+checked with `cl /Zs` -- `EXIT=0`, no new diagnostics (note: this session's `cmd.exe /c` from the Bash tool
+was not executing commands at all -- banner only, RC=0, no output -- had to run the syntax check via the
+PowerShell tool instead; same vswhere-not-recognized benign warning as before). **Not built or run** --
+[[feedback_user_runs_builds]].
+
+**Next (user):** `& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo`, then a run long enough to hit the
+`GATE-OPEN-BUT-DEAD` window again (1300s at `-RunSeconds`, same as Part 144's). Check the log for
+`[suspenddbl]`/`[suspendstuck]` hits. Any hits = CONFIRMED, and the fix is either (a) making
+`suspendThread` a no-op when already `Suspended`/`WaitingSuspended` (matching what "if-not-already" implies
+the guest expects), or (b) finding why the guest's own status check races ahead of our runtime's status.
+Zero hits = this hypothesis REFUTED -- re-open Part 145's exit-transition-timing lead instead.
+
+## Part 145 (2026-09-20) -- `rgate`'s full static call graph traced with `eeref.py`; CORRECTS a Part 111 attribution error (setter/clearer were swapped); `rgate` is a ONE-SHOT "start the boot-logo movie's SofDec workers" semaphore, cleared by the SAME logo object's own exit/transition handler -- open question is now narrow: why does that exit fire ~12s after open on our runner instead of after the movie's natural duration
+
+**Trigger:** direct continuation of Part 144 -- root-causing the `rgate` collapse instead of touching Part 143's fix again.
+
+**Independently re-verified the word's only static references**, using `eeref.py refs 0x500728` (not
+trusting Part 111's own prose -- [[feedback_reverify_inherited_conclusions]]):
+
+```
+GP   0x113eec  lw   -10568($gp)  in singleton_lazy_init_e_0_clone_01+0xc     (the read/guard)
+GP   0x113f28  sw   -10568($gp)  in singleton_lazy_init_e_0_clone_01+0x48    (writes ZERO -- clear)
+GP   0x113fd8  sw   -10568($gp)  in sub_113F40+0x98                          (writes ONE  -- set)
+GP   0x1712dc  lw   -10568($gp)  in RenderDispatch+0xc                       (the resume-gate read)
+```
+
+Exactly 4 references in the whole static EE image, confirmed by both the reverse call graph and a direct
+`refs` scan (two independent eeref queries agree) -- no other clones, no hidden writers.
+
+**Correction:** Part 111 (line ~2301) says "`sub_113F40` is the only thing that can clear it" -- this is
+BACKWARDS. Decoded both functions byte-for-byte: `sub_113F40` at `0x113fd8` does
+`SET_GPR_S32(v0,1); ...; WRITE32(gp-0x2948, v0)` -- writes **1** (sets). `singleton_lazy_init_e_0_clone_01`
+at `0x113f28` does `WRITE32(gp-0x2948, $zero)` in the delay slot of an unconditional branch reached only
+from its own `do-work` path -- writes **0** (clears). Part 111's functional conclusions (the gate is real,
+RenderDispatch depends on it) are still correct; only this one setter/clearer label was swapped.
+
+**Full call graph (`eeref.py up`, depth 3):**
+
+- **Setter** `sub_113F40` <- `sub_113D30` (sole caller) <- exactly 3 callers, and `game_overrides.cpp`'s
+  own Stage-5.17 sreg-probe comment (line ~8196) already names all three: `sub_3E2E80` ("unnamed clone
+  slot 0"), `sub_420E70` (**`CAppLogoAtari` slot 0**), `sub_4216E0` (**`CAppLogoOkrtron` slot 0**) -- the
+  three opening-logo splash screens' own step machines. Step 0xd of that machine (`jal 0x113D30`) is
+  "the ONLY path to CRI" per that same existing comment -- confirms this is a one-time, early-boot trigger,
+  not a per-frame re-arm. Steps 1-0xe "advance unconditionally" (no blocking condition), so the whole
+  0->0xf run completes in one shot once step 0 unblocks.
+- **Clearer** `singleton_lazy_init_e_0_clone_01` <- `wrap_wrap_obj_set_flags_clone_01` (sole caller,
+  `0x113c60`) <- exactly 3 callers: `sub_3E2FF0`, `state_byte_transition_k_3` (`0x420fc0`),
+  `state_byte_transition_l_3` (`0x421830`) -- each offset **+0x150/+0x170** from its matching setter-side
+  sibling (`0x420E70`+0x150=`0x420FC0`; `0x4216E0`+0x150=`0x421830`; `0x3E2E80`+0x170=`0x3E2FF0`) --
+  strongly indicating these are a SECOND vtable slot / state-transition handler on the SAME 3 logo-screen
+  objects, not unrelated code.
+
+**Decoded `wrap_wrap_obj_set_flags_clone_01` (`0x113c60-0x113d28`) in full:** clears a status byte
+(`[0x54BE28]=0`), conditionally walks and frees a linked list at `this+0xCC` (calling `func_10E6C0` per
+node), conditionally calls `func_14C8C8`/`func_1109E0` and zeroes `this+0x30`/`this+0xD0` -- all gated on
+`this->field_0x30 != 0` -- **then unconditionally, on every path, calls `func_114B00()` then
+`func_113EE0()` (== `singleton_lazy_init`, the clearer)**. So every call to this function reaches the
+clearer; the clearer's own internal guard (`if (rgate==1) {do CRI one-time work; clear} else {no-op}`) is
+the only thing preventing spurious clears on the frames rgate is already 0.
+
+**Reframing, not just a rename:** `rgate` is not a persistent "SofDec active" state -- it's a **one-shot
+semaphore**: (1) a logo screen's step machine reaches step 0xd exactly once and sets it; (2) `RenderDispatch`
+reads it every frame and, while it is 1, resumes the SofDec worker threads (which `sub_11E8D0` re-suspends
+every single frame -- Part 111); (3) the SAME logo screen's own exit/state-transition handler eventually
+clears it, which is supposed to happen only once the movie has genuinely finished and workers no longer
+need resuming. On the PCSX2 oracle this reads as "1 continuously for the whole time SofDec is live"
+(Part 111) simply because nothing clears it until the movie's natural end. **On our runner, this run's own
+`[thsync]` trace shows the pattern working AS DESIGNED for a few seconds** -- `[watchdog]` trace at
+t=403-404s shows `0x11fbb8` (== `sub_11FBB8`, the resume-workers call Part 111 decoded) actually firing,
+confirming the gate opened and genuinely resumed the workers -- **then collapses again at t=412s**, ~8-12s
+later, cutting the movie off far short of its real duration.
+
+**PS2X_SKIPFMV already ruled out** as the explanation for this specific gate (Part 111: "the player leaks
+whether or not the FMV plays" -- exonerated for this exact mechanism), so the premature exit-transition is
+not simply the skip-FMV path firing.
+
+**Open question, now narrow:** what makes `state_byte_transition_k_3`/`_l_3`/`sub_3E2FF0` (whichever one
+belongs to the logo screen actually on screen in a given run) fire its exit transition after only ~8-12s
+instead of after the movie's real duration. `sub_3E2FF0` is already independently referenced in Part 112
+as "`st4b`" (a stuck camera-fade byte investigation, "parallel, not yet reconciled" with this thread) --
+these two threads may now be the same bug.
+
+**Next:** read whichever of the 3 sibling "step 0" functions (`sub_3E2E80`/`0x420E70`/`0x4216E0`) is the
+one actually active in this run (cross-reference the watchdog trace / `gstate` around t=400s to identify
+the vtable), then read its OWN exit-transition sibling (`sub_3E2FF0`/`0x420fc0`/`0x421830`) to find the
+concrete condition that triggers the transition -- timer, frame count, or a callback return value -- and
+whether that condition is satisfied correctly or prematurely on our runner vs. what hardware timing would
+imply.
+
+## Part 144 (2026-09-20) -- Part 143's fix BUILT + RUN, but NEVER EXERCISED: this run never reached the RANKING screen at all -- it reproduces the earlier, still-unsolved `rgate`-collapse pattern (Part 135/136 territory), a different and earlier blocker than the one Part 143 fixed
+
+**Trigger:** user ran `build.ps1` (Debug, default config) then a 1300 s `RelWithDebInfo` run per the
+handoff (`PS2X_TEARDOWNCHK=1`, `-RunSeconds 1300`). Read `run_log.txt` (51 MB, UTF-16LE, converted with
+`iconv`) directly rather than asking the user to paste it.
+
+**Build result:** succeeded, only benign warnings (`LNK4075`/`LNK4006` x2/`LNK4088` -- pre-existing
+raylib/user32 symbol collisions and the expected `/FORCE`+`/INCREMENTAL` interaction, unrelated to this
+change). `ps2EntryRunner.exe` produced.
+
+**`[sifboundfix]` result -- installed but silent:** exactly 1 hit in the whole 1290 s run, and it's the
+unconditional startup banner (`enabled hook=0x1687b8...`). **Zero** per-call log lines (the capped,
+`handle!=0`-gated line). Per [[feedback_capped_probes_false_negatives]] the banner confirms the override
+really is registered -- so this is a real "never called" finding, not an install failure.
+
+**Why:** `[thsync]`'s own embedded VERDICT (pre-existing probe text, not new this session) shows why. This
+run's `rgate` (`[0x500728]`) flips `0->1` (`RENDER-GATE-CLOSED`->`GATE-OPEN-BUT-DEAD`) only briefly,
+**t=400-412s** (12 `rgate=1` samples, 11 `GATE-OPEN-BUT-DEAD` verdicts out of 1290 total `[thsync]` lines),
+then collapses back to `RENDER-GATE-CLOSED` and **stays there for the remaining ~878 s** (`nTh=2` the whole
+time -- only 2 guest threads ever exist; RANKING/GAME-OVER needs more, per Part 132's thread counts). This
+is byte-for-byte the same shape already documented at line ~835 (an earlier reference run: "t=575-1288s...
+RENDER-GATE-CLOSED, nTh=2, and the scheduler barely dispatches"), and the same open problem flagged at
+Part 134/135/136: `rgate` collapsing shut is gated by `0x113f28`/`0x113fd8`, a candidate (`sub_11FBB8`'s
+`ResumeThread()==tid` check) was already tried and REFUTED on the PCSX2 oracle (Part 136), and the real
+collapse mechanism is still unidentified.
+
+**Conclusion:** Part 143's fix is real, installed, and syntactically sound, but it patches a gate
+(`*(handle+72)==3`) that lives *inside* the RANKING-screen-specific SofDec poll -- code this run never
+reached, because a separate, earlier blocker (the `rgate` collapse at t~412s) prevents the game from ever
+getting past `nTh=2` in the first place. **Both bugs are real; they are not the same bug.** Part 142/143
+does not need to be reverted (it may still matter once `rgate` is fixed and the RANKING screen is actually
+reached), but it does not explain -- and cannot fix -- this run's hang.
+
+**Next:** root-cause the `rgate` collapse itself, per the standing Part 134/136 recommendation:
+`0x113f28`/`0x113fd8` (the two write sites) and whatever clears `[0x500728]` back to 0 at t~412s. Static
+read of `sub_00113F40_0x113f40.cpp` (already referenced at line 2260-2261 as one of the two writer sites)
+is the next concrete step, or a live PCSX2 breakpoint/watchpoint on `0x500728` around the t~412s-equivalent
+point on the oracle, to see whether hardware ever clears it the same way.
+
+## Part 143 (2026-09-20) -- FIX IMPLEMENTED: synthesize `wrap_sif_is_bound`'s completion in `game_overrides.cpp`, same idiom as the existing SJX/DTX bind echo; syntax-checked, awaiting build + run
+
+**Trigger:** user chose option (b) from Part 142's two fix choices -- "synthesize the completion like
+SJX/DTX" rather than hosting `CRI_ADXI.IRX` for real.
+
+**What changed:** `ps2xRuntime/src/lib/game_overrides.cpp`, `applySdbzSofDecSifLinkFix` /
+`sdbzSifIsBoundAlwaysLinked1687B8`, registered via `PS2_REGISTER_GAME_OVERRIDE("SDBZ SofDec SIF-link
+synthesis", "SLUS_214.42", ...)` in the same list as the other SDBZ overrides. Uses
+`runtime.replaceFunction(0x001687B8u, ...)` (a real dispatch-table entry already exists there for
+`wrap_sif_is_bound_0x1687b8`, so `replaceFunction` is correct, not `registerFunction` -- see
+`applySdbzKernelThunkFixes`'s own comment on the distinction).
+
+The override fully replaces the guest function (never calls through to the real `sif_is_bound`/
+`sif_bind_rpc` chain, which Part 142 proved is a dead end anyway): reads `$a0` (the handle); if nonzero,
+writes `3` into `*(handle+72)` and returns `3` in `$v0` (CRI's own "stream link complete" sentinel, the
+exact value `noop_wrapper___471` and its 3 sibling call sites already compare against); if the handle is
+still `0` (object not yet constructed), returns `-1` without touching memory, matching the real function's
+own outcome for that case without replicating its unconditional read from address `72`. Every application
+is bounded-logged (`[sifboundfix]`, cap 64) plus one unconditional startup banner, matching this file's own
+established probe idiom ([[feedback_capped_probes_false_negatives]] -- always pair a capped tag with an
+unconditional install line so "no records" cannot be misread as "never installed").
+
+**Why this address and not a shared one:** confirmed via `output/register_functions.cpp` that `0x1687B8`
+has exactly 3 dispatch-table entries, all internal re-entry points of this ONE compiled function instance
+(not shared with padman/mcman/etc., which have their own separately-addressed `wrap_sif_is_bound_*`
+copies). Grepped all 4 real callers (`noop_wrapper____0x154ae0` x2, `obj_set_fields____0x154a60`,
+`sub_001506E8_0x1506e8`, `sub_00154DB8_0x154db8`) and confirmed every one reaches `0x1687B8` via `jal` ->
+`dispatchGuestBranch` (interceptable), never a bare tail-call -- so `replaceFunction` on this one address
+covers every real caller, and only this one SofDec/mwPly client's status is touched.
+
+**Verified before handoff:** syntax-checked with `cl /Zs` per [[project_syntax_check_without_building]]
+(flags re-derived fresh from `build/ps2xRuntime/ps2_runtime.vcxproj`, not reused from memory) --
+`EXIT=0`, only the pre-existing baseline `getenv`/`fopen` C4996 warnings, no new diagnostics. **Not built,
+not run** -- per [[feedback_user_runs_builds]] the build itself is the user's to run.
+
+**Next (user):** `& "F:\SDBZ Recomp\build.ps1"` (RelWithDebInfo recommended), then run and check for
+`[sifboundfix]` in the log and whether the RANKING/GAME-OVER screen's `sub_11F680` teardown / worker tick
+now proceeds past the collapse point instead of hanging.
+
+## Part 142 (2026-09-20) -- ROOT CAUSE FOUND (static, no new run): `handle+72` can never reach `3` because the EE side's own bind call is structurally a no-op, and the IOP module it would depend on (`CRI_ADXI.IRX`) is never loaded -- unifying this investigation with the already-closed Stage 5.14/5.15 findings
+
+**Trigger:** direct follow-through on both of Part 141's "not yet started" items -- (1) whether
+`wrap_sif_is_bound_0x1687b8` (real address of the "`wrap_sif_is_bound`" IDA name used loosely in Part 140;
+the earlier `wrap_sif_is_bound_0_0x159470` file is an unrelated sibling for a different call site, misread
+at first and corrected before writing this up) ever returns true, and (2) whether SofDec's IOP module boot
+gets far enough to attempt the bind. Both answered by static source-reading plus one grep of the existing
+`run_log.txt` -- no new run.
+
+**(1) `wrap_sif_is_bound_0x1687b8` (`output/wrap_sif_is_bound_0x1687b8.cpp`) decoded in full:**
+```
+wrap_sif_is_bound_0x1687b8(a0=handle):
+  s0 = a0
+  v0 = sif_is_bound(a0=handle)          // func_15B560: returns 0 if *(handle+72)!=0 (already "bound"), else -1
+  a1 = 0xFF111 ; a0 = 0                 // a0 is zeroed HERE, unconditionally, before the branch below
+  if (v0 != 0)                          // not yet bound
+      sif_bind_rpc(a0=0, a1=0xFF111)    // <-- called with handle=0, always, regardless of the real handle
+  return *(int*)(s0 + 72)               // re-reads the ORIGINAL handle's status word and returns it
+```
+`sif_bind_rpc_0x15b340.cpp` decoded next: it takes its own `a0` as the "handle" (its internal `s0`). The
+ONLY branch that ever writes `*(handle+72)` requires `s0 != 0`. Since the caller above always passes
+`a0=0`, that branch is **provably unreachable from this call site** -- the `s0==0` path taken instead just
+calls `sub_0015B3B0_0x15b3b0(a0=0x4610FC, a1=cid)`, a generic one-shot "notify" primitive (record a value at
+`node+8` once; if a callback is already registered at `node+0`, call it with `node+4` as the arg). Grepped
+all of `output/` (mirrors the compiled `runner/` tree) for the literal address `4610fc`/`461100`/`461104`:
+**zero real hits** (`register_functions.cpp`'s one hit is a decimal table *index* that coincidentally reads
+`461100`, unrelated to this hex address) -- nothing else in the recompiled EE code ever writes
+`*(0x4610FC)`, so this node's callback slot can never be populated either. Two independent dead ends from
+the same call chain.
+
+**Conclusion for (1):** this is not a translation bug -- it is the actual decoded MIPS. The movie/mwPly
+per-frame poll (`noop_wrapper___471` -> `wrap_sif_is_bound_0x1687b8`) can **never** cause `handle+72` to
+reach `3` by itself; every call it makes into `sif_bind_rpc` is degenerate by construction (handle forced
+to 0 first). Whatever *was* supposed to set `handle+72=3` has to come from somewhere else entirely -- a
+real reply arriving through the SIF command-interrupt path Part 140/141 already showed is never engaged.
+
+**(2) IOP module boot, checked via the real loader tag (`[iop:LOADFILE]`, `ps2_iop.cpp:563-657`), not
+`sceSifLoadModule`/`[SIF module]` (0 hits, but that tag covers a different, apparently-unused API in this
+game -- not itself evidence, see below).** Grepped the same converted `run_log.txt` used in Part 141:
+```
+[iop:LOADFILE] path="cdrom0:\ARKD_DVD.IRX;1"
+[iop:LOADFILE] path="cdrom0:\CRI_ADXI.IRX;1"
+[iop:LOADFILE] path="cdrom0:\LIBSD.IRX;1"
+[iop:LOADFILE] path="cdrom0:\MCMAN.IRX;1"
+[iop:LOADFILE] path="cdrom0:\MCSERV.IRX;1"
+[iop:LOADFILE] path="cdrom0:\PADMAN.IRX;1"
+[iop:LOADFILE] path="cdrom0:\SIO2MAN.IRX;1"
+```
+8 total requests (well under the 32-line cap, so this is the complete set), and per `ps2_iop.cpp:619-654`
+**only a path containing `"ARKD_DVD"` ever gets a real load** (`ps2_iop_loadArkdIrx`) -- every other LOADFILE
+request, including `CRI_ADXI.IRX`, is bounded-logged and then intentionally falls through returning failure
+(comment: `"Phase 0 diagnostics ONLY ... returns -65540"`). PADMAN/SIO2MAN/MCMAN/MCSERV/LIBSD all get
+compensating direct sid-based RPC stubs elsewhere in `ps2_iop.cpp` (e.g. the padman block at line 676) that
+make their failed "load" harmless -- **`CRI_ADXI.IRX` has no such compensating stub for the bind-completion
+status this investigation is chasing**, only for its SJX/DTX sound RPC (`kIopSidSjx = 0x90000200`).
+
+**This connects to, and is explained by, an already-documented and deliberate architectural decision**
+(`Kernel/Stubs/SIF.cpp:131-146`, written for the older, separately-closed Stage 5.14/5.15 SFD-stream work):
+this runtime **never loads `CRI_ADXI.IRX` for real** -- "Running CRI_ADXI for real needs the IRX loader to
+host a second module alongside ARKD_DVD plus a libsd/SPU2 backend, so until that exists we answer the
+handshake here and the game gets no sound." `SIF.cpp:1744-1768` (`ackSjxStreamRingIfMatched`) says it
+outright for the sibling symptom: "only the IOP-side stream consumer ever advances ack. That consumer lives
+in CRI_ADXI.IRX, which this runtime never loads." That is memory `[[project_stage514_sjx_iop_heap]]` /
+`project_stage515_movie_sfd_gate.md`'s territory, previously tracked as a **separate** thread from the
+RANKING/GAME-OVER hang (Part 120-141).
+
+**Root cause, unified:** `handle+72`'s only real writer would be a reply from `CRI_ADXI.IRX`'s own IOP-side
+code completing a bind and pushing status back through the SIF command-interrupt path -- a module this
+runtime deliberately never loads, feeding a command-interrupt delivery pipe (Part 140/141) that as a direct
+consequence never gets a handler registered. The RANKING/GAME-OVER hang (Part 120-141) and the older,
+separately-closed Stage 5.14/5.15 SFD stream-ack gap are **the same root cause** (`CRI_ADXI.IRX` never
+loads) surfacing at two different call sites of the same CRI middleware -- not two bugs.
+
+**Not a bug in the recompiler or the EE-side translation** -- both (1) and (2) are genuine, deliberate
+properties of the current runtime (decoded MIPS for (1); an explicitly-commented simplification for (2)).
+Fixing the RANKING/GAME-OVER hang for real means either (a) actually hosting `CRI_ADXI.IRX` in the IOP
+interpreter (the SIF.cpp comment's own suggested path -- "needs the IRX loader to host a second module...
+plus a libsd/SPU2 backend"), or (b) adding a synthetic completion for this specific status word the same
+way SJX/DTX's RPC is already synthetically served -- a design decision, not something to charge into
+without direction. **No new run needed for this write-up; the next step, if the user wants to proceed, is
+choosing between (a) and (b).**
+
+## Part 141 (2026-09-20) -- RUN-CONFIRMED: `sceSifAddCmdHandler` is called **zero times** in a full 1287s run that spans the collapse window; SofDec/`mwPly`'s IOP module never even attempts to register for command-interrupt delivery
+
+**Trigger:** direct follow-through on Part 140's stated next step ("check whether SofDec's IOP module ever
+calls `sceSifAddCmdHandler` at all"). Log analysis only, no new run -- read the existing root-level
+`run_log.txt` (UTF-16LE, 51MB, most recent full run at time of investigation, mtime 2026-09-19 17:37).
+
+**Method:** converted `run_log.txt` UTF-16LE -> UTF-8 (`iconv`), then grepped for the exact `cerr` tag
+emitted by `SIF.cpp:1409` (`"[SifAddCmdHandler]"`) and separately for the Part 140 CRI string
+(`E99072103` / `"can't link stream"` / `mwPlyStartXX`).
+
+**Result: both zero hits.**
+- `[SifAddCmdHandler]` -- 0 occurrences anywhere in the 51126-line converted log.
+- `E99072103` / `can't link stream` / `mwPlyStartXX` -- 0 occurrences (consistent with Part 140's
+  "not yet run-confirmed" caveat; still zero as of this run).
+
+**Sanity-checked the capture pipe itself before trusting the zero:** confirmed `[thsync]` (5500 hits) and
+sibling probe tags (`[selectchk]`, `[f680disp]`, `[xferchk]`) all DO appear in this same converted log, so
+`std::cerr` output is genuinely captured into `run_log.txt` -- the zero for `[SifAddCmdHandler]` is not a
+logging/capture gap.
+
+**Confirmed the run covers the collapse window:** `[thsync]` ticks in this log run from `t=0s` to
+`t=1287s`, past the `t=1223s` collapse point documented in Part 132/HANDOFF_NOTE. So this is not a
+truncated-run false negative either (`[[feedback_run_window_false_negative]]`).
+
+**Conclusion -- this changes the Part 140 theory:** it is NOT "the IOP->EE command interrupt is registered
+but never dispatched" (that would require at least one `[SifAddCmdHandler]` hit). It is **"the
+registration call itself never happens."** Something upstream of `sceSifAddCmdHandler` -- either the
+EE-side `mwPly` bind sequence never reaches the point where it would register a handler, or (per
+`[[feedback_no_iop_faking]]`) the real, interpreted IOP-side SofDec/`mwPly` module never gets far enough
+in its own boot/bind sequence to ask the EE side to register one via RPC.
+
+**Not yet started:** tracing why the registration call is never reached -- e.g. checking whether
+`wrap_sif_is_bound_0(*(int*)(a1+60))` (the other operand gating `noop_wrapper___471`'s error branch, per
+Part 140) ever returns true at all during a run, and/or checking the IOP-side module's own boot log for
+whether SofDec's `.IRX` even loads/runs far enough to attempt the bind. Gated on further static analysis;
+no new run needed for the immediate next step.
+
+## Part 140 (2026-09-20) -- IDENTIFIED the code as CRI Sofdec's own `mwPly` middleware, and confirmed the gate is `mwPly`'s documented "stream link failed" error path; cross-referenced against the runtime source shows the IOP->EE SIF command-interrupt delivery pipe it depends on is registered but **never dispatched anywhere**
+
+**Trigger:** direct follow-through on Part 139's stated next step ("decode what sets `*(int*)(handle+72)`"),
+user said "go". Pure static work: live IDA decompile of `noop_wrapper___471` in full, `list_strings_filter`,
+and a source-tree grep of `ps2xRuntime/src` -- no run.
+
+**Re-read `noop_wrapper___471` (`0x154AE0`) in full, exactly.** The gate is
+`obj_field_load_call_z_21(*(int*)(a1 + 60), 1) == 3` -- so `a1` (the per-tick SofDec object) is NOT the
+handle; `*(int*)(a1+60)` is a pointer to a **separate stream-link/bind sub-object**, and `handle+72` on
+*that* sub-object is the raw status word. When the status isn't `3` and the object also isn't "bound" per
+`wrap_sif_is_bound`, the code calls `module_obj_init_z_51((unsigned int)aE99072103Mwply)`.
+
+**`aE99072103Mwply` decoded via `list_strings_filter`:** the literal string is
+**`"E99072103 mwPlyStartXX: can't link stream"`**. A filter for `mwply` turns up ~20 sibling strings
+(`mwPlyCreateSofdec`, `mwPlyGetHdrInf`, `mwPlyGetFrm`, `mwPlySetFrmSync`, ...) -- this is CRI Sofdec's own
+**`mwPly` ("Movie Player") middleware**, not game code, and this specific string is CRI's **own built-in
+diagnostic for exactly this failure**: the EE-side `mwPly` library's `mwPlyStartXX()` call failed to
+**link/bind its stream to the IOP-side decode module**. `module_obj_init_z_51` (`0x1548B8`) is confirmed to
+be a `va_start`-based message-dispatch/print helper (CRI's internal log-and-report function), not incidental
+code -- this is CRI's real error-reporting path firing on real failure, decoded from the game's own
+middleware semantics, not an inference layered on top of unlabeled code.
+
+**This independently confirms Part 139's reframing**: `*(handle+72)==3` really is "SIF-RPC stream link
+complete" in CRI's own vocabulary, and its failure mode is a first-party, named condition ("can't link
+stream"), not a made-up interpretation of an anonymous field compare.
+
+**Cross-checked against the runtime's actual C++ implementation of the mechanism this depends on:**
+- `sceSifCmdIntrHdlr` (`ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp:33`) is a bare `TODO_NAMED` stub -- it does
+  nothing. This is the syscall a real PS2 SDK/IOP module path uses to deliver an incoming SIF command
+  interrupt to EE-side handlers.
+- `sceSifAddCmdHandler` (`SIF.cpp:1395`) IS implemented for real: it records `g_sifCmdHandlers[cid] = handler`
+  (plus a pre-existing bounded diagnostic log from an earlier, unrelated investigation -- BUG-009,
+  `[[project_bug009_sifbindrpc_dead_code]]` -- about a *different* dispatcher, `sub_178068`). Grepped the
+  entire `g_sifCmdHandlers` map for every reference in the tree: it is written (registration) and erased
+  (teardown) but **never read/invoked anywhere else in the codebase** -- confirmed by exhaustive grep, only 3
+  hits total (declare, write, erase). Registrations go in; nothing ever comes out.
+- Net effect: **the guest-visible SIF command-interrupt delivery pipeline is entirely absent from this
+  runtime.** Any IOP-side completion notice that a real PS2 would deliver via that path (plausibly including
+  whatever normally flips `mwPly`'s stream-link status word to `3`) structurally cannot reach the game.
+
+**Not yet confirmed live:** grepped every existing run log and doc (`*.txt`/`*.log`/`*.md`, excluding this
+state file) for `E99072103` / `"can't link stream"` / `mwPlyStartXX` -- **zero hits** outside static
+disassembly export dumps (`idalib_export_all.txt`, `decompiles_SLUS_214_42.txt`). This specific CRI error
+print has never actually been observed firing in a captured run, so this remains a structurally-confirmed,
+but not yet run-confirmed, root cause. Next step (not started -- needs a new run, gated by
+`[[feedback_delegated_x64dbg_recomp_control]]`, user runs it): watch stderr/`run_log.txt` for
+`E99072103`/"can't link stream" during a `GATE-OPEN-BUT-DEAD` collapse, and/or check whether SofDec's IOP
+module ever calls `sceSifAddCmdHandler` at all (would show up in the existing bounded `[SifAddCmdHandler]`
+log already wired into `SIF.cpp:1401-1413`) to confirm it's actually this handler-dispatch gap and not a
+different stall inside the same `mwPly` bind sequence.
+
+## Part 139 (2026-09-20) -- decoded `sub_14F580`'s own callers + its two gate conditions: the wake attempt is **pumped every frame** (not event-driven as Part 138 concluded), gated on a single SIF-RPC status field never reaching 3
+
+**Trigger:** user asked to "decode sub_14F580's caller and the two conditions" -- direct follow-through on
+Part 138's stated next step. Pure static work (decomp.py cache + live IDA decompile/xrefs), no run.
+
+**The two gate conditions, decoded:**
+- `get_field_val_z_117(4980736)` is literally `*(int*)(dword_45F678 + 60)` -- `dword_45F678` is the
+  already-known global SofDec context pointer (`[[project_sofdec_init_never_runs_5618b4]]`'s `ctx`). The
+  literal argument `4980736` is dead: the real callee (`get_data_ptr`, `0x14E4D0`) takes no parameter and
+  just returns `dword_45F678` unconditionally -- an IDA-decompiled vestige, not a real selector.
+- `noop_sub_8a60(v5, 6, &v11)` (`v5 = *(int*)(a1+8)`... `*(int*)(a1+60)`, the movie object's own handle field):
+  if the handle is bound (`sif_is_bound(v5)`), it kicks an async SIF RPC and returns that RPC's status; if
+  *unbound* (the common case), it reads `dword_460F60[6]` (a local fallback table) into `v11` and **always
+  returns 0**. So in the ordinary unbound case, `sub_14F580`'s `if (noop_sub_8a60(...))` is always false, and
+  execution falls to the `else` arm: `v11[0] == *(int*)(a1+8)` -- comparing the fetched field-6 value against
+  the object's own target/expected state id.
+
+**`sub_14F580`'s own 2 callers, decoded:**
+1. `sub_14F000` (`0x14F0D4`) -- the movie object's own **init/"SofDec Start"** path. Calls
+   `array_state_dispatch_e(a1, *(char*)(a1+114))`, i.e. re-asserts whatever the *current* pause byte already
+   is at construction time -- a one-shot setup call, not a real transition, and already covered by the
+   existing init/teardown write-ups.
+2. `noop_wrapper___471` (`0x154AE0`) -- the actual **pause/resume request processor**. Gated on two request
+   flags (`*(int*)(a1+644)==1 || *(int*)(a1+676)==1`) and, critically, on
+   `obj_field_load_call_z_21(handle, 1) == 3`. Decoded `obj_field_load_call_z_21` (`0x1687B8`,
+   `wrap_sif_is_bound`): it pings `sif_bind_rpc` if the handle isn't yet bound, then returns
+   **`*(int*)(handle + 72)` -- a raw IOP-side SIF-RPC status code for this movie's SofDec module.** Only when
+   that status reads exactly `3` does `noop_wrapper___471` proceed to call `sub_14F580(a1, 0)` (the actual
+   un-pause), which cascades into `sub_155630` (Fix-B's boost bracket, Part 138) and wakes worker A.
+
+**Correction to Part 138 -- this is a per-frame POLL, not an event.** Traced `noop_wrapper___471`'s own
+caller chain up 3 more hops, all single-caller and live-confirmed: `obj_set_fields___4` (`0x154A98`, calls it
+unconditionally on every invocation) <- `sub_154E60` (per-object state dispatch: state==1 ->
+`obj_set_fields___4`) <- `sub_155320` (iterates the SofDec object list, gated on `dword_45F674==1`) <-
+`noop_sub_5210` (`0x155210`) <- `noop_wrapper___473`/`sub_154FA8` -- **this is the already-confirmed-live,
+every-frame SofDec pump entry point** named in `[[project_sofdec_pump_never_idle]]`. So the resume attempt
+runs every single frame the pump is alive; Part 138's "event-driven, matching fires twice in 300s" framing
+is **superseded** -- the rarity isn't in how often it's *tried*, it's in how rarely the SIF status gate
+actually reads `3`.
+
+**Reframed root cause question:** does the IOP-side SofDec module's SIF-RPC status field
+(`*(int*)(handle+72)`) ever report `3` for this movie handle during the `GATE-OPEN-BUT-DEAD` collapse? If it
+never does, the per-frame-pumped resume path is permanently gated shut with no "rare event" required --
+this is the first point in the whole investigation where the live suspect is IOP-side SIF/RPC status
+plumbing rather than pure EE scheduler logic (`[[feedback_no_iop_faking]]` territory). Not yet decoded: what
+sets `*(int*)(handle+72)`, and what value it actually holds during the stall (needs either a static trace of
+the SIF-RPC completion callback, or a probe reading that one field live -- next step, not yet started).
+
+## Part 138 (2026-09-20) -- decoded the FULL call graph from `RenderDispatch` down to the spinner's real trigger, live via IDA: the per-frame path (`sub_11FBB8`) is confirmed PROVABLY DEAD for BOTH worker A and worker B (same `==tid` bug on both branches); the only real wake trigger is an event-driven pause/resume state-change handler (`sub_14F580`), not a periodic poll -- Part 136's "could not statically trace who calls noop_sub_e690" is now SOLVED
+
+**Trigger:** user asked to "decode who calls the per-frame resume for worker A" -- follow-through on Part 137's
+open item and Part 136's unresolved tail-jump gap. Pure static work (decomp.py + live IDA decompile/xrefs),
+no run.
+
+**Step 1 -- confirmed the per-frame call site and its bug scope.** `RenderDispatch` (`0x1712D0`), when
+`rgate==1`, calls `sub_11FBB8` every single frame via `wrap_noop_wrapper_unk_z_b_b(0x14FF28) -> sub_11FCE8
+(0x11FCE8) -> sub_11FBB8`. Live IDA decompile of the full function (not just the worker-A branch Part 135
+looked at):
+```c
+sub_11FBB8(a1, a2) {
+    if (thread_resume_if_suspended(dword_44198C, a2) == dword_44198C)   // dword_44198C == [thsync]'s wA
+        array_state_dispatch_b(dword_44198C);                          // WakeupThread-if-blocked, worker A
+    if (get_global_var_b_2() == 1) {
+        if (thread_resume_if_suspended(dword_441990, v3) == dword_441990)  // dword_441990 == [thsync]'s wB
+            return array_state_dispatch_b(dword_441990);                  // worker B
+    }
+}
+```
+`dword_44198C`/`dword_441990` are **exactly** `[thsync]`'s existing `wA`/`wB` fields. Both branches gate the
+actual wake call behind `ResumeThread(...) == tid`, and per Part 132/Thread.cpp, `ResumeThread` returns a
+0/negative status code, never the tid -- so **this per-frame path contributes zero wakes for either worker,
+confirmed for both branches now, not just worker A**. Since Part 136 already proved the identical bytes are
+equally dead on PCSX2, this closes the "per-frame resume" question outright: **there is no working per-frame
+poll on either platform.** The game does not rely on one.
+
+**Step 2 -- found the real (rare, event-driven) trigger.** Traced `wrap_noop_sub_e690`'s registration
+(`noop_wrapper___361(6, wrap_noop_sub_e690, 0)`, called from both `ADX_Init`/`0x11F268` and
+`struct_multi_field_read_b`/`0x11FE90`) into a small 8-slot indirect-call table at `0x54EBA0` (stride 8,
+distinct from the 8-list `0x54E960` callback system Step 3 below uses). `sub_13C448(a1)` is the generic
+"invoke registered slot a1" trampoline (`if (dword_54EBA0[2*a1]) call it(dword_54EBA0[2*a1+1])`) -- this is
+what makes the spinner's two thin wrappers look caller-less to static xref (`get_xrefs_to` on the wrapper
+itself finds nothing; the real call is indirect through this table, resolved only by finding who calls
+`sub_13C448(6)`). Live IDA xrefs on `sub_13C448` -> exactly 2 wrappers (slot 6 = spinner, slot 7 =
+`wrap_noop_sub_e690_b`) -> both called from exactly one place, `sub_155630`
+(`wrap_noop_wrapper_unk_z_z_95(); set flag=1; call spinner-trigger; clear flag=0; wrap_noop_wrapper_unk_z_z_96()`
+-- this is **the exact bracket Fix-B's comment already names**, `0x155648`/`0x15565c`, confirming `sub_155630`
+*is* the boost bracket FixB patches around).
+
+**Step 3 -- found `sub_155630`'s only 2 callers, and which one is live during `GATE-OPEN-BUT-DEAD`.**
+- `sub_14F428` (`0x14F428`) -- **already CLOSED** (`[[project_sofdec_idle_loop_wall]]`): the SofDec **STOP**
+  handler (`module_obj_init_z_51(aE2003Mwsfdstop)`, literally an "SFD STOP" debug string), gated on a
+  stop-request flag. Not relevant here -- `rgate` stays `1` (SofDec still considered active, never stopped)
+  throughout the whole `GATE-OPEN-BUT-DEAD` window.
+- `sub_14F580` (`0x14F580`, i.e. `array_state_dispatch_e`) -- a **pause/resume state-CHANGE handler** for a
+  SofDec-class object (`a1`): outer gate `if (*(BYTE*)(a1+114) || a2)` (no-op unless currently paused OR a
+  new pause/resume request `a2` is being made -- an edit-triggered call, not a poll), then only calls the
+  spinner-trigger when `get_field_val_z_117(4980736)==1 && *(int*)(a1+8)==1 && (noop_sub_8a60(...) ||
+  v11[0]==*(int*)(a1+8))`. This is the **only remaining candidate** for waking worker A during our collapse.
+
+**Conclusion:** the wake mechanism is **event-driven** (a pause/resume state transition), **not** a periodic
+per-frame poll on either platform -- matching Part 136's "fires only twice in 300s" comment exactly. The
+open question is no longer "does our per-frame resume call work" (answered: it never did, on either
+platform, harmlessly) -- it's **"does whatever game-logic event is supposed to call `sub_14F580(movieObj, 0)`
+(un-pause) during the RANKING screen actually fire in our runtime, and if it fires, are its three inner gate
+conditions (`get_field_val_z_117(4980736)`, `*(a1+8)==1`, `noop_sub_8a60(...)`) satisfied?"** Not yet decoded:
+`get_field_val_z_117`, `noop_sub_8a60`, and who calls `sub_14F580` itself (its caller is the actual pause/
+unpause API surface -- next static lane, no run needed).
+
+## Part 137 (2026-09-20) -- read Part 136's queued `req=`/`dTick=` check against the EXISTING `run_log.txt` (no new run): `req` never sticks at 1 (it's essentially always 0, so that check is moot on a 1Hz sample), but the same read finds a much sharper signature -- `[cblist]`'s list-6 tick freezes at 2 for the entire 82s collapse while sibling lists keep ticking at full frame rate, and worker A (tid 6) cycles `WAIT`<->`WAITSUSPEND` without ever reaching RUN
+
+**Trigger:** Part 136's own recommended next step -- re-read `[thsync]`'s existing `req=`/`dTick=` fields
+from a `run_log.txt` that already existed (09-19 17:37, 51 MB, UTF-16LE) instead of launching a new run.
+[[feedback_write_probes_dont_ask]] / no new instrumentation was needed or added.
+
+**`req` check, answered but not useful as framed:** across all 1288 `[thsync]` samples in the file
+(the whole run, not just the collapse), `req`(`0x441924`) reads 0 in 1287/1288 of them -- it does not
+"stick at 1" during the 83 `GATE-OPEN-BUT-DEAD` samples (t=386..468) either; it's just 0 there like
+everywhere else. This isn't the negative result it looks like: `ps2_runtime.cpp:5304-5308`'s own comment
+(already on file, predates this session) says the spinner (`sub_11E690`) "fires only twice in a 300s run" --
+a 1s poll essentially cannot land on the transient window where `req=1`, on EITHER platform. Part 136's
+planned check was under-specified for a rare, sub-second event; closing it as inconclusive rather than
+"refuted", and not repeating it with finer-grained polling since a sharper signal was already sitting in
+the same log (next paragraph).
+
+**The sharper signal: `[cblist]`'s per-list tick counters, same window.** `[cblist]` (armed unconditionally,
+`ps2_runtime.cpp:5580+`) logs all 8 callback-dispatch lists' tick counts every second. At t=384 (right as
+`rgate` flips to 1) list 6 -- the one holding `fn=0x154fa8`, the SofDec pump (`[[project_sofdec_pump_never_idle]]`) --
+ticks 0->1->2, then **freezes at 2 for the entire remaining 82+ seconds of the collapse window**, while
+L0/L2/L4/L5 keep incrementing at ~24/s (full frame rate) for the whole window:
+```
+t=384 L6=1   t=385 L6=2   t=386..468 L6=2 (frozen)     -- meanwhile L0: 1 -> 23 -> 47 -> ... -> 266
+```
+This directly proves the general per-frame callback dispatcher is alive and well; only the call site that
+invokes list 6 specifically (i.e. the `0x13c6e8` thunk -> `sub_13c4f8(6)`) stops being reached after the
+2nd tick. This is a materially different, more precise statement than "the worker did not tick" -- it says
+WHICH dispatch stopped and exactly when, using data the code was already printing.
+
+**Cross-read against the thread table, same rows:** the `wA=6` field (already read by `[thsync]`) identifies
+worker A as **tid 6**. Thread 6's row for every one of the 83 dead samples alternates between
+`st=4,wt=1,pc=0x174bc8` (`THS_WAIT`) and `st=12,wt=1,pc=0x174bc8` (`THS_WAITSUSPEND`) -- it never once
+reaches `st=1`/`st=2` (RUN/READY). Per the resume-dispatch logic already decoded in this file's own Part 136
+section (`0x11ed28`: `WakeupThread` fires when status is 4 or 0xc; `0x11ed90`: `ResumeThread` fires when
+status is 8 or 0xc), a thread cycling 4<->0xc without ever reaching RUN means the per-frame resume call IS
+being reached and IS doing something every frame (unlike a simple "never called" gap) -- but whichever half
+of the wake needs to land (the actual wait-condition satisfy, not just the suspend-bit clear) never
+completes. This reads as a **repeated, only-partially-successful retry**, not a single missed wakeup --
+different in character from Part 125/126's thread-4 "sleeps once, never toggles again" signature.
+
+**FixB cross-check:** `s_savepriFixOn` (`ps2_runtime.cpp:5422`, active by default) targets exactly worker-A
+priority pinning (`[[project_savepri_poisoned_by_nested_boost]]`). In this run, worker A's priority holds
+at 25 throughout the dead window (never pinned at 1) -- FixB is confirmed active and doing its job here,
+so the WAIT/WAITSUSPEND oscillation is a **separate, still-open** mechanism, not a recurrence of the
+priority-pinning bug FixB already fixes.
+
+**Not yet done:** decode the actual per-frame call site that drives worker A's resume each frame (analogous
+to `sub_11E8D0` from Part 125/126, but for RANKING's worker A / tid 6 / list 6) to see which half of the
+4<->0xc cycle fails to stick -- this is the concrete next lane, and it's a static-analysis task (decomp.py +
+disassembler), not a new run.
+
+## Part 136 (2026-09-20) -- oracle check REFUTES Part 135's Finding 2 as a red herring; live PCSX2 tracing finds the REAL wake protocol (`noop_sub_e690` spinner / `sub_11EAC8` acker, req@0x441924) that Part 135 didn't know to look at
+
+**Trigger:** user had PCSX2 (DebugServer + Pine both connected, live gameplay, not the ELF/IDB) running;
+did exactly what Part 135 said was needed -- checked the `sub_11FBB8` hypothesis against real hardware
+before treating it as a fix target. [[feedback_reproduce_on_oracle_before_root_cause]] earns its keep
+again here.
+
+**Tooling note:** breakpoints at `0x1712d0` (RenderDispatch), `0x11fbd8` (the suspect comparison), and
+even the memory's own documented "known-good" positive control `0x13c448` all failed to fire across
+several minutes of confirmed real execution (cycle counter climbing 1.69B->2.21B->2.94B, `[thsync]`'s
+own tick field at `0x441960` visibly advancing `0x00100d07`->`0x001031ec`). This is the DebugServer
+unreliability [[reference_pcsx2_debugger_quirks]] already documents, not a frozen emulator (ruled out
+via the documented positive-control/monotonic-cycles checks) -- switched to pure memory polling
+(`pcsx2_read_memory` / `pcsx2_get_threads`), which the same memory file says is the safer, preferred
+method anyway.
+
+**What polling showed:** with `rgate=1` (SofDec active) and `wAtid=0x5e=94` confirmed live, `pcsx2_get_threads()`
+caught tid 94 at `status=4` (`THS_WAIT`, PC=`0x174bc8`, the `SleepThread` stub) on one poll and
+`status=1` (`RUNNING`, PC=`0x174cc8`) on the very next -- **the oracle's worker genuinely cycles out of
+`THS_WAIT`, and the tick counter keeps advancing.** Real hardware is not stuck.
+
+**Why this kills Finding 2 as framed:** `sub_11FBB8`'s `thread_resume_if_suspended(tid)==tid` check is
+original ELF bytes, bit-identical on both platforms -- and per `ResumeThread`'s universal 0/negative
+return convention (confirmed against `EeScheduler::resumeThread`, `EeScheduler.cpp:2225`, and standard
+PS2 SDK semantics), that comparison is just as unsatisfiable on PCSX2 as it would be in our runtime. A
+guest-code bug that is provably inert on hardware that DOESN'T hang cannot be the reason our runtime
+DOES hang. Finding 2 downgrades from "candidate root cause" to **red herring, closed**.
+
+**The real mechanism, found by following live IDA xrefs to the same primitive:** `array_state_dispatch_b`
+(`0x11ED28`, the function that actually issues `WakeupThread`) has FOUR callers, not one --
+`noop_wrapper_unk_d`/`sub_11FBB8` (the broken/inert one) plus THREE more, including `noop_sub_e690`
+(`0x11E690`) and `fn_cond_large_0011eac8` (`0x11EAC8`). These are not new names to this investigation --
+they are **exactly** `sub_11E690`/`sub_11EAC8`, already named in `EeScheduler.cpp`'s own Fix-B/savepri
+comments as "spinner"/"acker" and in `[thsync]`'s arm line (`spinner=sub_11E690 acker=sub_11EAC8`).
+Decompiled live:
+
+- **`noop_sub_e690` (spinner, `0x11E690`)**: sets `dword_441924=1` (this IS `[thsync]`'s `req` field),
+  boosts the target thread's priority (`syscall_stub_u`), then spins up to 200,000,000 iterations
+  calling `array_state_dispatch_b(tid)` (`WakeupThread` if status is `WAIT`/`WAITSUSPEND`) **and**
+  `thread_resume_if_suspended(tid,...)` (`ResumeThread` if `SUSPEND`/`WAITSUSPEND`) **every iteration,
+  unconditionally** -- not gated behind the broken `==tid` check at all -- until `req` clears or it
+  times out into a callback.
+- **`sub_11EAC8` (acker, worker thread's own entry point -- found only as a DATA xref inside
+  `ADX_unk_d`, i.e. installed as a `StartThread` entry, confirmed why static callers were invisible)**:
+  the worker's real loop -- `++qword_441960` (the tick counter) every iteration, does the real work,
+  and **clears `dword_441924` back to 0** the moment it notices it's set, which is what lets the
+  spinner's 200M-iteration wait exit early.
+
+This is the actual req/ack protocol the whole `[thsync]` probe was already named after, and it fully
+explains why real hardware doesn't get stuck: the spinner's wake calls are unconditional, unlike
+`sub_11FBB8`'s. **Could not statically trace who calls `noop_sub_e690`** -- its two thin wrappers
+(`0x11e798`, `0x11e7c0`) show self-referential xrefs only, the same tail-jump/indirect-call blind spot
+already on file ([[feedback_tail_jump_hides_the_caller]], [[feedback_eeref_static_xref]]).
+
+**Revised next step (not yet done):** stop looking at `sub_11FBB8`. The productive target is whether
+OUR runtime ever correctly drives the `noop_sub_e690`/`sub_11EAC8` req/ack pair to completion during
+the `GATE-OPEN-BUT-DEAD` window -- i.e. is `req`(`0x441924`) ever set to 1 without being cleared, on
+our side, while the collapse is happening? That's a live run question (`[thsync]`'s own `req=`/`dTick=`
+fields already capture exactly this, no new probe needed) -- re-read the next `run_log.txt` for `req=1`
+persisting across samples during the collapse window, instead of writing any new instrumentation. This
+also plausibly reconnects to the EXISTING Fix-B/savepri thread (`[[project_savepri_poisoned_by_nested_boost]]`)
+since that fix already targets this exact spinner/acker priority interaction -- the `GATE-OPEN-BUT-DEAD`
+collapse may be a recurrence of that same family of bug rather than a new one.
+
+## Part 135 (2026-09-20) -- static read of the `rgate==1` resume-dispatch chain finds a concrete candidate bug (`ResumeThread()==tid` comparison never true); also CORRECTS Part 132: `st=16` is `THS_DORMANT`, not `THS_SUSPEND`
+
+**Trigger:** `/anthropic-skills:ps2-recomp-agent-skill "Search code for errors"`, following directly
+from Part 134's pivot recommendation (root-cause the `GATE-OPEN-BUT-DEAD` collapse itself instead of
+more blind `-Repeat` reruns). Pure static analysis this session -- `decomp.py` (IDA pseudo-C by
+address) plus `mips_r5900_disassembler.py` for the raw MIPS where the pseudo-C's register variables
+were ambiguous, cross-checked against our own runtime source. No build, no run.
+
+### Finding 1 -- correction to Part 132's headline (memory: `[[project_ranking_screen_worker_shutdown_hang]]`)
+
+Part 132 claimed thread 1's `st=16` in `[thsync]` decodes to `THS_SUSPEND` via `rawThreadStatus()`
+(`Kernel/Syscalls/Thread.cpp:280`) and is a *valid* status, not corruption. The "not corruption" part
+holds -- but the specific status is wrong. `ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h:10-15`:
+
+```
+THS_RUN=0x01  THS_READY=0x02  THS_WAIT=0x04  THS_SUSPEND=0x08  THS_WAITSUSPEND=0x0c  THS_DORMANT=0x10
+```
+
+`0x10 == 16`, which is **`THS_DORMANT`**, not `THS_SUSPEND` (`0x08`). Thread 1 isn't sitting
+suspended waiting for a `ResumeThread` that never comes -- it went **Dormant**, the terminal state
+after a thread exits (or has never been started). This changes what "never resumed" means: a Dormant
+thread isn't waiting on a wakeup at all; something would have to `StartThread()` it again, which is a
+different, and probably more final, failure mode than a missed resume. Re-open the question "does
+anything call `StartThread(1, ...)` after t=1223s" in place of the old `WakeupThread(1,...)` framing
+-- `PS2X_WAKETRACE_ID=1` (queued since Part 132) only instruments the wake path and would show nothing
+even if the real gap is a missing restart.
+
+### Finding 2 -- candidate root cause for `GATE-OPEN-BUT-DEAD` (rgate==1, worker tick frozen)
+
+`RenderDispatch` (`0x1712D0`) when `rgate==1` (`[0x500728]`, per Part 111) calls, every frame, into a
+chain ending at `noop_wrapper_unk_d` (**`0x11FBB8`**, IDA-misnamed -- it is not a no-op):
+
+```c
+if (thread_resume_if_suspended(wAtid /*0x44198C*/) == wAtid)   // wAtid, NOT a status/error code
+    array_state_dispatch_b(wAtid);                              // -> iReferThreadStatus + WakeupThread(wAtid)
+// (same pattern gated on a second flag for worker B / 0x441990)
+```
+
+`thread_resume_if_suspended` (`0x11ED90`, raw MIPS confirms the trace) is: call `iReferThreadStatus`
+(syscall `0x30`) into a stack buffer; if the status word is `8` or `12`, call `ResumeThread(tid)`
+(syscall `0x39`, stub at `0x174c30` verified `li v1,0x39`) and **return its return value** -- not the
+tid. `ResumeThread` in our runtime (`EeScheduler::resumeThread`, `EeScheduler.cpp:2225`) returns
+`KE_OK` (0) on success or a negative `KE_*` constant on failure, standard PS2 SDK convention. So the
+caller's `== wAtid` check compares a small signed status code against a real thread id (e.g. 14) --
+this is essentially never true for a live, nonzero tid. Consequence: `array_state_dispatch_b`'s
+`WakeupThread(wAtid)` call -- the only thing in this whole per-frame dispatch that can pull a worker
+out of a genuine `WAIT` block -- never fires. If the SofDec worker is parked in `WAIT` (not merely
+`SUSPEND`) at the moment `rgate` flips to 1, `ResumeThread` alone (`SUSPEND->READY` transition only)
+would not be enough to un-block it, and the tick counter (`0x441960`) would sit frozen forever --
+exactly the `GATE-OPEN-BUT-DEAD` signature logged 4/4 times in Parts 132-134.
+
+**This is a hypothesis, not a confirmed fix**, per [[feedback_no_guessing]] /
+[[feedback_reproduce_on_oracle_before_root_cause]]. It is guest code (from the original ELF, not a
+recompiler artifact) -- the exact same comparison exists on real hardware, so either (a) real
+hardware's worker is never actually in `WAIT` at this point (making the broken check harmless there,
+and something else in our scheduler puts the worker into `WAIT` when it shouldn't be), or (b) this
+genuinely is a latent bug in the original game that real hardware's scheduler timing happens not to
+trigger. Needs an oracle check before touching anything: sample the worker thread's status word right
+before `rgate` flips to 1 on PCSX2 (Pine, `pcsx2_sampler.py`, or a DebugServer breakpoint at
+`0x11fbd8`) -- if it's ever `4` (`THS_WAIT`) there too, this stops being a candidate and Finding 2 is
+closed as a red herring; if PCSX2's worker is only ever `8`/`SUSPEND` at that point while ours reaches
+`WAIT`, that pinpoints an actual divergence in our scheduler's state machine as the real bug, one level
+up from this comparison.
+
+**Not touched:** `runner/*.cpp` (this logic lives in generated guest code, never edited per standing
+rule), no `game_overrides.cpp` override written -- fix target undetermined until the oracle check
+above discriminates between (a) and (b).
+
+## Part 134 (2026-09-19) -- `-Repeat 3` rerun: 3/3 runs reproduce Part 133's exact shape, not Part 132's -- `sub_11F680` firing from the `GATE-OPEN-BUT-DEAD` collapse is now a CONFIRMED reproducible correlation (4/4), but the queued thread-1-wake question is still untested (0/4)
+
+**Run:** same env vars as Part 133 (`PS2X_TEARDOWNCHK=1 PS2X_WAKETRACE=1 PS2X_WAKETRACE_ID=1`),
+`-Determinism 1 -RunSeconds 1300 -NoDebugger -Repeat 3 -Exe ...RelWithDebInfo\ps2EntryRunner.exe`.
+All 3 completed normally (no crash), archived as `run_log.20260919-165346.txt`,
+`run_log.20260919-171539.txt`, and the live `run_log.txt` (t=1288s of 1300s requested).
+
+**All three landed on the identical failure shape as Part 133 -- not Part 132's:**
+
+| run | GATE-OPEN-BUT-DEAD onset | collapse to RENDER-GATE-CLOSED | `[teardownchk]` ENTER line | collapse line |
+|---|---|---|---|---|
+| 165346 | t=387s (nTh=6) | t=582s (nTh=2) | 32002 | 32019 |
+| 171539 | t=378s (nTh=6) | t=416s (nTh=2) | 25215 | 25234 |
+| run_log.txt (live) | t=386s (nTh=6) | t=469s (nTh=2) | 27138 | 27155 |
+
+In every single run, `[teardownchk] seq=0 ENTER tid=4 stopFlag=1 ackFlag=0` fires 1-19 log lines
+before `[thsync]`'s VERDICT flips `GATE-OPEN-BUT-DEAD` -> `RENDER-GATE-CLOSED` and the live thread
+count drops 6->2 -- the same tight correlation Part 133 found once, now reproduced independently
+3 more times with different absolute onset timings (378-387s) and different collapse delays
+(38-204s). `[waketrace]` (id=1) and `[f680disp]`: **zero hits in all three runs**, same as Part 133.
+After the collapse, all three runs barely dispatch again (matching Part 133's "4 more `[selectchk]`
+hits" starvation) and never approach RANKING or Part 132's t=1223s mark.
+
+**This upgrades Part 133's hypothesis from "possible, single observation" to a confirmed
+correlation:** `sub_11F680`'s worker-teardown wait-loop is entered as a direct, reliable
+consequence of the `GATE-OPEN-BUT-DEAD` SofDec-stall's own give-up/recovery path, independent of
+RANKING and independent of run-to-run timing -- 4/4 runs since this probe combination was armed
+(Part 133 + these 3) show the exact same ENTER-at-collapse signature. Part 131's opening-movie
+stalls and the RANKING-teardown-hang thread (Parts 120-133) sharing one root cause is now well
+supported, not just plausible.
+
+**But the original queued question is now LESS testable, not more:** Part 132's "game keeps
+rendering past the teardown attempt, all the way to t=1223s" outcome has not reproduced in 4
+consecutive attempts (0/4) since this diagnostic build was armed -- across the 5 total runs that
+have exercised `[teardownchk]`/`[thsync]` (Part 132 + Part 133 + these 3), Part 132 looks like the
+outlier, not the norm. `[waketrace]`/`[f680disp]` being 0/0 every time is now expected, not
+informative -- the scheduler has nothing left alive to test the hypothesis against by the time the
+run would need to. Continuing to `-Repeat` hoping for another Part-132-shaped outlier has a
+demonstrated ~20% hit rate at best (1/5) and burns a full `RunSeconds` each attempt for a coin flip.
+
+**Recommendation -- pivot, don't just repeat again:** the reproducible 4/4 finding (teardown fires
+from the SofDec-stall collapse) is now the tractable target. `[thsync]`'s own VERDICT string names
+the fix location for the *collapse itself*: `RenderDispatch 0x1712d0` takes the `sub_1721E0` branch
+because `rgate!=1`, pointing at `0x113f28`/`0x113fd8` as the code to inspect next -- fixing why the
+SofDec worker never recovers from `GATE-OPEN-BUT-DEAD` would likely let runs proceed past this
+point far more often, which is a prerequisite for ever reaching Part 132's territory again anyway.
+Chasing the rarer thread-1-wake question head-on (more blind `-Repeat` batches) is lower-value until
+that gate is understood. See [[project_sofdec_worker_resume_chain]] and [[project_sofdec_pump_never_idle]]
+for prior work on this same gate.
+
+## Part 133 (2026-09-19) -- the queued `PS2X_WAKETRACE_ID=1` rerun came back inconclusive for its own question, but caught `sub_11F680`'s teardown firing directly out of the `GATE-OPEN-BUT-DEAD` SofDec stall, not RANKING-specific -- possible shared root cause with Part 131
+
+**Run:** `PS2X_TEARDOWNCHK=1 PS2X_WAKETRACE=1 PS2X_WAKETRACE_ID=1`, `-Determinism 1 -RunSeconds 1300
+-NoDebugger -Exe ...RelWithDebInfo\ps2EntryRunner.exe`. Completed normally (`[run] exiting loop`,
+no crash), reached t=1288s of the requested 1300s.
+
+**Timeline (`[thsync]` VERDICT/nTh transitions, `run_log.txt` line 32150 for the teardownchk hit):**
+- t=1-375s: `RENDER-GATE-CLOSED`, nTh=2 -- ordinary pre-movie boot state.
+- t=376-574s: `GATE-OPEN-BUT-DEAD`, nTh=6 -- the known SofDec-movie worker-resume stall
+  ([[project_sofdec_worker_resume_chain]], Part 128/131 pattern).
+- **t~574-575s: `[teardownchk] seq=0 ENTER tid=4 stopFlag=1 ackFlag=0` fires at line 32150 --
+  the EXACT same moment `[thsync]`'s verdict flips back to `RENDER-GATE-CLOSED` and the live
+  thread count drops 6->2** (line 32153-32154: `[selectchk] picked=4 ... t4status=1` immediately
+  followed by `picked=1 ... t4status=-1`, same disappearance signature as Part 132).
+- t=575-1288s (remaining ~714s): `RENDER-GATE-CLOSED`, nTh=2, and the scheduler barely dispatches
+  at all -- only **4** more `[selectchk]` hits in the entire remaining run (picked ids 4/3/1, all
+  within moments of the teardown ENTER), vs. 983 `[selectchk]` hits over Part 132's comparable
+  ~780s tail where the game kept rendering. Final `[watchdog]` line: `gif/s=0 dma/s=0 vbl/s=0` --
+  a genuine flatline, not merely a slow/quiet frame.
+
+**`[waketrace]` with `PS2X_WAKETRACE_ID=1`: zero hits for the entire run.** `[f680disp]`: zero hits
+again (thread 1 still never observed resuming inside `sub_11F680`'s PC range, consistent with
+Part 132). **Why this doesn't settle the queued question:** the zero result only means something if
+the game keeps running long enough that something would plausibly try to wake thread 1 -- that
+precondition held in the Part 132 run (game rendering fine through t=1223s) but not here, where
+the scheduler essentially stopped dispatching within moments of the teardown ENTER. Cannot
+distinguish "nobody ever calls `wakeupThread(1,...)`" from "nothing was left alive to call it."
+
+**New finding, independent of the queued question:** `sub_11F680`'s worker-shutdown wait-loop is
+reachable directly from the `GATE-OPEN-BUT-DEAD` SofDec-stall's own recovery/give-up path -- this
+run never got anywhere near the RANKING/GAME-OVER screen (t~574s is deep in the opening-movie
+phase per Part 131's timeline), yet the same teardown function fired at the same failure signature
+(`[selectchk]` picks the target thread, then it's `t4status=-1` one dispatch later) as the
+RANKING-screen occurrences in Parts 124-132. **Working hypothesis, not yet confirmed:** Part 131's
+opening-movie `GATE-OPEN-BUT-DEAD` stalls and this file's whole RANKING-teardown thread may be the
+SAME underlying bug -- something on a timeout gives up waiting on a stalled SofDec/render worker
+and invokes this same `sub_11F680` shutdown path, which then never completes, in both contexts.
+
+**Next step:** rerun with the same env vars, ideally `-Repeat 2` or more, to try to reproduce
+Part 132's sustained-gameplay outcome (game still rendering well past the teardown ENTER) rather
+than this run's near-immediate flatline -- confirmed run-to-run nondeterministic which specific
+failure shape a given run lands in ([[feedback_remeasure_the_premise]] -- a single run, green or
+not, does not close this).
+
+## Part 132 (2026-09-19) -- thread 4 wakes correctly then vanishes from the scheduler without `sub_11F680` ever seeing a RETURNED; separately, much later in the same run, thread 1 itself permanently transitions to a real (not corrupted) Suspended status and is never resumed -- next step needs no new code
+
+**Source: a run that had already happened.** `game_overrides.cpp`/`EeScheduler.cpp` already carried
+uncommitted Part 132 probes (`[selectchk]`, `[f680disp]`, `[xferchk]`) from a prior session, wired
+and exercised, but their output in `run_log.txt` (last written 2026-09-19 01:12 AM) had never been
+read. `run_log.txt` is UTF-16LE ([[project_stage516_srd_completion]]) -- converted with
+`iconv -f UTF-16LE -t UTF-8` before any of the greps below would match anything.
+
+**Thread 4's exact fate after the wake (lines 25436-25441 of the converted log):**
+`[teardownchk]` ENTER (tid=4, stopFlag=1, ackFlag=0) -> `[xferchk]` willThrow=0 -> `[waketrace]`
+confirms a fully correct wake (`s4=0x4419b8` exact, `stopFlagRaw=0x1`, `makeReady` branch,
+matching Part 129) -> `[xferchk]` willThrow=1 (a preemption throw is about to fire) ->
+`[selectchk]` picks thread 4 (Ready, pri=1) -> the VERY NEXT `[selectchk]` call, one dispatch
+cycle later, shows thread 4 already GONE (`t4status=-1`). `[f680disp]` (armed to catch thread 1
+resuming anywhere inside `sub_11F680`'s own PC range `0x11f680`-`0x11f750`) **never fires once**
+across the remaining ~780s of the run (4044 `[xferchk]` hits, 983 `[selectchk]` hits) -- thread 1
+is never observed resuming inside `sub_11F680` after the throw. `g_ps2x_teardownActive` also never
+flips back to `false` for the rest of the run, consistent with (not yet proven) the preemption
+exception unwinding past `workerShutdownWrapper`'s own stack frame, not just its callee, so its
+post-call `.store(false, ...)` line never executes.
+
+**A separate, later event in the same run: thread 1 permanently Suspends at t=1223s.**
+`[thsync]` shows thread 1 healthy through t=1222s (`st=1`=Ready, `pc` varying normally across the
+preceding seconds), then at t=1223s permanently reads `st=16` with `pc=0xd0d4d400`, frozen for the
+rest of the captured run (69 samples through at least t=1290s). **This was initially misread
+within this same session as memory corruption ("invalid enum value") -- corrected before reporting
+to the user.** `[thsync]`'s `st=` field is printed through `rawThreadStatus()`
+(`Kernel/Syscalls/Thread.cpp:280`), which maps the internal 0-5 `EeThreadStatus` enum to the real
+PS2 SDK `THS_*` bitmask -- `16` is `THS_SUSPEND`, a completely valid status. So thread 1 genuinely,
+validly became Suspended and nothing ever resumed it: a real, explicable freeze mechanism, not
+corrupted memory. The `pc=0xd0d4d400` value is not a placeholder either -- `EeScheduler::
+publishSnapshot()` sets `snapshot.pc = item.activeContext().pc` from the live thread object -- so
+it reflects a genuinely implausible saved context, still unexplained on its own.
+
+**Checked `run_probe.jsonl` for an explicit cause, found none (with a caveat).** The `THLIFE`
+lifecycle probe (`Thread.cpp:710`, `ps2x_probe_kv`, queried via `analyze_run.py --probe THLIFE`,
+**not** `--tag` -- [[feedback_probe_sink_vs_log_tag]]) logs every `SuspendThread`/`ResumeThread`
+syscall. Zero records for `thid=1` with `op=U` or `op=R` in the whole run. Caveat: the probe's
+budget is 1500 unconditional + 24/s after that, and thread 3's own suspend/resume ping-pong
+([[project_resume_no_preemption]], a known-benign priority-ceiling mutex) fires constantly and
+likely saturates that 24/s window, so this is suggestive, not conclusive
+([[feedback_capped_probes_false_negatives]]). Leading alternative: `EeScheduler::wakeupThread()`'s
+`makeReady()` has a silent bail -- if `target->suspendCount != 0` it sets `status=Suspended` and
+returns without enqueueing, and that call site never goes through `suspendThread()`/`THLIFE` at
+all. `[waketrace]` already logs exactly this branch, gated on `id == waketraceTargetId()` (env
+`PS2X_WAKETRACE_ID`, this run's default was 4) AND `g_ps2x_teardownActive` -- the latter is very
+likely still true at t=1223s per the finding above, so **no new code is needed**: rerunning with
+`PS2X_WAKETRACE_ID=1` added directly tests whether `wakeupThread(1, ...)` is ever called near
+t=1223s and which branch it takes.
+
+**Working hypothesis, not yet verified:** the two events above could be one causal chain --
+whatever normally resumes thread 1 (plausibly thread 4's own periodic cycle) has itself been gone
+since t≈441s, so the next time thread 1's own cycle tries to suspend-and-wait-for-resume (t=1223s,
+~780s later), nothing is left alive to deliver it. The `PS2X_WAKETRACE_ID=1` rerun settles this.
+
+**Next step:** rerun with `PS2X_TEARDOWNCHK=1 PS2X_WAKETRACE=1 PS2X_WAKETRACE_ID=1` (no rebuild
+needed, env-var only) and read `[waketrace]` hits for `id=1` near t=1223s (cross-check line numbers
+against `[thsync]`'s t=1223s line, same discipline as Part 127). See
+`memory/project_ranking_screen_worker_shutdown_hang.md` for full detail.
+
+## Part 131 (2026-09-18) -- PS2X_MESHDUMP (3D model-capture Stage 1) built and verified code-correct, but 0/5 unattended runs ever reached triangle-drawing content; every run dies in the same GATE-OPEN-BUT-DEAD stall from Part 128, now confirmed via live screenshot to recur during the opening-movie phase, not just RANKING teardown
+
+**Goal (separate task from Parts 119-130):** capture Trunks/Vegeta/Goku 3D models as a standalone
+`.obj` via a new env-var-gated dump, `PS2X_MESHDUMP=<path>`, hooked into `GSRasterizer::drawTriangle`
+(`ps2xRuntime/src/lib/ps2_gs_rasterizer.cpp`), following the existing `PS2X_GSDUMP` pattern. Plan:
+`C:\Users\mwlab\.claude\plans\humming-fluttering-hellman.md`, Stage 1 of 3.
+
+**Build fix needed first.** The build failed on an unresolved external, `g_vsync_tick_counter` --
+a dead `extern` declaration (`Kernel/Syscalls/Interrupt.h`) with no definition anywhere in the
+codebase, unlike its sibling globals in the same struct which were properly defined. The real,
+live vsync tick counter is `PS2Runtime::eeScheduler().currentVSyncTick()`, already used internally
+by `ps2_syscalls::GetCurrentVSyncTick`. Switching to it required two follow-on fixes: (1) the dump
+helper is a free function, not a `GS` friend, so it cannot read `gs->m_runtime` directly -- fixed
+by reading the tick inside `GSRasterizer::drawTriangle` (which IS a friend) and passing it down as
+a plain `uint64_t` parameter; (2) `ps2_runtime.h` only forward-declares `EeScheduler`, so calling
+`.eeScheduler().currentVSyncTick()` needed `#include "runtime/ee_scheduler.h"` added. All three
+fixes `cl /Zs`-clean; build succeeded and linked.
+
+**Mesh-dump hook itself verified correct, not the blocker.** Statically read
+`GSRasterizer::drawPrimitive`'s dispatch switch: `GS_PRIM_TRIANGLE`/`TRISTRIP`/`TRIFAN` -> the
+hooked `drawTriangle`; `GS_PRIM_SPRITE` -> `drawSprite` (no hook). So a run showing only sprite/2D
+content (logos, UI, memcard prompt) legitimately produces zero mesh-dump hits by design -- that
+alone doesn't indicate a code bug. Added unconditional `std::cerr` diagnostics (env value at
+lazy-init, a counter on every `drawTriangle` call) to get hard proof-of-invocation independent of
+the env var; **still present in the code, not yet cleaned up** -- remove once a capture succeeds.
+
+**5 unattended run attempts, 0 meshdump hits total.** Runs of `-RunSeconds` 60 (killed manually,
+still alive at 592s -- the `launch_recomp.ps1` auto-stop sampler is not 100% reliable), 900, and
+1300 (x2) all eventually hit the exact `[thsync]` `GATE-OPEN-BUT-DEAD` verdict text from Part 128,
+at highly variable onset: t=529s, t=883s, t=1230s, t=390s. Two keypress-injection methods were
+tried, per the user's reminder that the game needs a real X/Space press to pass the memory-card
+check screen (`ps2_pad.cpp:106-107`, `PAD_CROSS`): (1) `SendKeys` + `SetForegroundWindow` (25
+rounds) -- unreliable in principle since `SendKeys` needs real OS input focus and background
+`SetForegroundWindow` calls aren't guaranteed to succeed; (2) direct `PostMessage` with
+`WM_KEYDOWN`/`WM_KEYUP` sent straight to the window handle (60 rounds) -- doesn't need OS focus,
+should reach raylib/GLFW's window proc regardless. Neither method changed the outcome class.
+
+**Root cause of the "no captures" symptom (verified, not guessed): the GATE-OPEN-BUT-DEAD stall,
+not missing/mistimed pad input.** A live `PrintWindow` screenshot taken at the exact moment of the
+t=390s stall (process confirmed still alive via `tasklist`) showed a **solid black screen** -- not
+the memory-card-check UI, which renders visible text/icon per Stage 5.12. t=390s also lines up
+closely with the reference boot timeline's "opening movie BLACK ~t=370-580s" window (09-15 run,
+`project_charselect_reached_0915.md`). Watchdog data across both the 1230s-onset and 390s-onset
+runs shows `gif/s`/`dma/s` essentially flat from as early as t=10s through the stall, with `progress`
+climbing linearly the whole time -- consistent with either a long logo/movie boot phase or a stuck
+screen; the screenshot is what resolved the ambiguity directly instead of guessing from timing.
+
+**Conclusion:** the mesh-dump hook needs no further code changes. The blocker is the pre-existing
+`GATE-OPEN-BUT-DEAD` SofDec worker-resume stall (Part 128, and the RANKING-teardown angle in Parts
+124-130) recurring during the opening-movie phase too, well before any 3D content would render.
+Fixing that stall is a separate, larger reverse-engineering effort, explicitly out of scope for the
+mesh-capture plan -- stopped here rather than continuing to spend run attempts re-guessing at
+keypress timing against a premise the screenshot evidence doesn't support. See
+`memory/project_meshdump_blocked_by_sofdec_stall.md` and the Part 128 addendum in
+`memory/project_ranking_screen_worker_shutdown_hang.md` for full detail and next-step guidance.
+
+## Part 130 (2026-09-18) -- Sky dome orientation CLOSED (not a bug, PCSX2-confirmed); new candidate bug found -- recomp's RANKING highlight clip is static (always Vegeta/Trunks) vs PCSX2's varied footage, and Trunks' slide-off-stage animation looks broken
+
+**Oracle check performed (Stage 1 of the sky-dome investigation plan).** Connected live to PCSX2
+(DebugServer, SLUS-21442) via `mcp__pcsx2__pcsx2_connect`, resumed from the title screen, let the
+attract loop run to RANKING, paused and saved to slot 5 (repeatable checkpoint, no need to replay
+the ~10min attract loop again). User visually compared both: **the sky looks the same in PCSX2 and
+the recomp.** This directly falsifies "upside down" as a recompiler bug -- whatever the dome's
+orientation is, it matches the reference emulator, i.e. matches the original game. Per the
+investigation plan's Branch A, this closes the item with no code changes. (Supersedes the "not yet
+confirmed as a bug" caveat carried since Part 119.)
+
+**New finding, not part of the original ask.** While comparing, the user noticed the RANKING/
+GAME-OVER screen's *content* differs structurally between the two:
+- **PCSX2**: always shows different gameplay-highlight footage and character pairings each time
+  the screen is reached (user: "pcsx2 always shows different gameplay and character load screens").
+- **Recomp**: always shows the identical clip -- Vegeta and Trunks -- every time (user: "the recomp
+  always shows the same one"). In that clip, Trunks slides off the stage, which the user confirmed
+  **"looks broken"** (not normal knockback/ring-out) when asked directly.
+
+The user could not confirm whether the two runs were seeded/synced the same way (recomp and PCSX2
+were separate, unsynced boots), so the character-identity mismatch alone (Trunks vs Goku) is not
+by itself proof of a bug -- PCSX2's own footage already varies run to run. But the recomp being
+**invariant** (always the exact same clip) while the oracle is never invariant is itself suspicious,
+independent of which characters appear: it suggests the recomp isn't correctly driving whatever
+selects/varies the highlight-reel content (e.g. stuck reading a fixed/first entry from a buffer
+that real hardware populates from actual match history or an RNG seed), and that the one clip it
+does show contains a real animation/physics bug.
+
+**Status:** candidate bug, not yet root-caused. No static analysis, decompilation, or probes have
+been aimed at this yet -- needs its own investigation plan (likely: locate what drives RANKING's
+highlight-clip selection for `CAppDemoMain`/`0x632b90`, and separately what animates Trunks' exit
+in that clip) before any fix is attempted, per the project's "reproduce on oracle first, no
+guessing" rule -- already partially satisfied here (oracle comparison done), but root cause is not.
+
+## Part 129 (2026-09-18) -- RANKING screen REACHED (user-confirmed, sky dome still upside down per Part 119); first correctly-scoped [waketrace] hit REFUTES BOTH surviving hypotheses; sub_11F680 still never returns despite a confirmed-correct wake; thread 4 vanishes from the active-thread table by t=888 with no RETURNED ever logged
+
+Rerun (interactive, `runSeconds=0`/no fixed duration, launched 00:35:36) reached the RANKING
+screen for real this time -- user confirmed visually, sky dome still upside down (pre-existing,
+Part 119, unrelated cosmetic bug, still open). `[teardownchk]` ENTER at t~472s (line 26835);
+immediately next line (26836) is the first `[waketrace]` hit that is actually correctly scoped
+(after ENTER, inside the real shutdown loop, thanks to the Part 127 fix) -- and only one hit
+total, ever, this whole run.
+
+That one hit is maximally informative: `s4=0x4419b8` (exact -- GPR20 fine, hypothesis (a) stays
+dead) **and `stopFlagRaw=0x1`** (the write IS visible at the moment of the wake -- hypothesis (b)
+is now ALSO refuted, not just unverified). Both of Part 126's surviving explanations for "why
+doesn't thread 4's loop-bottom check see stopFlag=1" are now dead: the wake was real, correctly
+targeted, and the value it should observe upon waking was already correctly set and visible.
+
+Yet: `[teardownchk]` never logs a RETURNED, even as the run continued past t=888s (400+ seconds
+after ENTER, still growing as of this check) -- `sub_11F680`'s call is either still genuinely
+stuck, or its C++ call frame never got the chance to complete. Meanwhile the game itself keeps
+running fine (frame/DMA/GIF activity continues climbing at t=888, RANKING screen visibly
+rendering per the user) -- this is NOT a total scheduler halt in this run, contradicting the
+original Part 120 framing. And by t=888 thread 4 has disappeared entirely from `[thsync]`'s active
+thread table (`nTh` dropped 6->2) with no `[teardownchk]` RETURNED ever printed -- ambiguous:
+either thread 4 exited/went dormant through some path that doesn't route back through
+`sub_11F680`'s own return, or it's still alive but excluded from that particular table for an
+unrelated reason. Needs a direct check, not an assumption.
+
+### Revised hypothesis
+Since the wake mechanism and the stopFlag memory read are now both confirmed correct at the
+moment of the wake, the bug must be downstream of that point -- in what thread 4 actually does
+after waking, before it would reach the loop-bottom check again. Per the Part 126 static read of
+`sub_11E8D0`'s loop body, the two callees invoked through runtime-registered function pointers
+(`func_1201F0` via `dword_54BF38`, `func_13C688` via the `dword_54E964[35]` callback table) are
+the prime remaining suspects -- their real targets are invisible to static analysis, and thread 4
+could be looping/blocked inside one of them instead of ever reaching the `stopFlag` recheck at
+all.
+
+### Open question for the user
+Does the RANKING screen actually respond to input (does pressing a button to leave it work), or
+does it sit static/never advance? The original bug reports describe a "black screen" -- today's
+run shows the screen rendering fine while `sub_11F680` is provably still stuck in the background.
+It's possible the visible freeze only happens when trying to LEAVE this screen (which may depend
+on this teardown completing), not on arriving at it.
+
+### Next step
+A probe bound directly to instructions inside `sub_11E8D0` itself (not just the `wakeupThread()`
+wrapper) is needed to see what thread 4 actually executes after this wake -- specifically whether
+it re-reaches the loop-bottom `stopFlag` check at all, or gets stuck inside one of the two
+indirect-call callees first.
+
+---
+
+## Part 128 (2026-09-18) -- rerun of the Part 127 probe fix did NOT reach RANKING/GAME-OVER this time; stalled earlier at a known/previously-documented SofDec worker-resume gate; zero new [waketrace] data, need another rerun
+
+Built+ran the Part 127 fix (`PS2X_TEARDOWNCHK=1 PS2X_WAKETRACE=1 -RunSeconds 600`, exe written
+00:06:17). The log this time ends abruptly at t=592s with no closing `[hostprof]` report and no
+`[run] exiting loop` line (unlike the Part 126/127 run, which had both) -- process was not still
+running when checked afterward. `[teardownchk]` shows only its `enabled=1` line; **no ENTER** --
+`sub_11F680` was never reached this run, so the re-gated `[waketrace]` fix got zero exercise
+(neither confirmed nor invalidated).
+
+What actually happened: the run stalled well before the RANKING screen, on a *different*,
+previously-documented stall -- `[thsync]` VERDICT=`GATE-OPEN-BUT-DEAD` (`rgate==1` yet the SofDec
+worker thread never ticks; `ResumeThread` reaching the call and failing to progress it), handle
+`0x1b12cc0`, worker thread 6 parked at `st=12` (WAIT+SUSPEND). This is the exact same
+handle/pattern as `[[project_sofdec_worker_resume_chain]]` (Part 111, 2026-09-11, marked
+"superseded" in the memory index) -- a SofDec movie/cutscene worker-resume gate, not the
+RANKING-screen shutdown bug. That memory's own history shows later sessions (09-13 onward)
+routinely got PAST this point to the title screen and character select, so this reads as
+run-to-run timing variance (SofDec/audio real-time scheduling) rather than a new regression --
+but it means this particular run simply never got far enough to test Part 127's fix.
+
+### Next step
+Rerun the identical command -- no code changes needed, the probe fix is untested, not
+disproven:
+```
+$env:PS2X_TEARDOWNCHK="1"; $env:PS2X_WAKETRACE="1"; & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 600 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+If this SofDec worker-resume stall recurs repeatedly (not just this once), it may itself be worth
+promoting back to an active investigation -- it would mean something now blocks progress earlier
+than the already-known RANKING/GAME-OVER hang.
+
+---
+
+## Part 127 (2026-09-17) -- Part 126's data was real but MEASURED THE WRONG WINDOW; the 64-hit cap exhausted on pre-shutdown gameplay wakeups; [waketrace] re-gated to the actual sub_11F680 retry loop, syntax-checked, NOT yet built/run
+
+### 0. User report vs what the run_log actually shows
+User reported "game crashed just after reaching title screen" after the Part 126 build+run.
+The `run_log.txt` from that run (launched 23:40:02, `PS2X_TEARDOWNCHK=1 PS2X_WAKETRACE=1
+-RunSeconds 600`) shows no crash/exception/access-violation of any kind -- it ran the full
+session, `[hostprof]` produced its normal end-of-run report, and the log ends on the ordinary
+`[run] exiting loop` line at t=592-600s. What it DOES show is the same known RANKING/GAME-OVER
+worker-shutdown hang from Part 124-126 (`[teardownchk]` ENTER at line 32312 with no matching
+RETURNED) -- the game reached well past the title screen (deep into gameplay per `[sofdec]`/
+`[st4]`/`[warn]` stat lines throughout) before the freeze. "Crashed just after title screen" was
+not substantiated by this log; flagging the discrepancy rather than assuming it -- this may
+describe a different/earlier observation, or "crashed" may just mean "went black/unresponsive",
+which the known hang would produce.
+
+### 1. Part 126's result was measured from the wrong window
+Re-reading the new `s4`/`stopFlagRaw` fields: `s4=0x4419b8` on all 64 hits (exact match --
+hypothesis (a), GPR20 drift, is dead) and `stopFlagRaw=0x0` on all 64 hits (looks like hypothesis
+(b), confirmed). But cross-checking line numbers in `run_log.txt` invalidates the whole
+measurement: all 64 `[waketrace]` hits are at lines 22581-23586; `[teardownchk]`'s ENTER (marking
+the actual start of `sub_11F680`, the shutdown retry loop) is at line 32312 -- **~9000 lines and
+several minutes later**. The `id==4` filter that Part 126 added was never enough by itself:
+thread 4 is a general worker thread, woken routinely during ordinary gameplay (per `[thsync]`'s
+running dump, "goes to sleep once at t=405s and never toggles again" in Part 125 was itself
+describing a LATER, single-shot sleep -- distinct from the many earlier wake/sleep cycles this
+run's `[waketrace]` actually captured). The 64-hit cap exhausted entirely on that unrelated
+traffic before `sub_11F680` was ever called. Zero of the 64 samples describe the shutdown loop.
+This is the capped-probe false-negative trap (`[[feedback_capped_probes_false_negatives]]`) in a
+new shape: the cap wasn't too small for the phenomenon, it was spent on the wrong phenomenon
+entirely because the filter (thread id) didn't scope to the code path (the shutdown call site).
+
+### 2. Fix: gate the trace on being inside the shutdown call, not just on thread id
+Added `std::atomic<bool> g_ps2x_teardownActive` at true global scope in `EeScheduler.cpp` (outside
+its anonymous namespace, right before `EeScheduler::wakeupThread`). `wakeupThread`'s `trace`
+condition now additionally requires this flag. `workerShutdownWrapper` in `game_overrides.cpp`
+sets it `true` immediately before calling the real `sub_11F680`, and `false` immediately after
+(dead code today since it never returns, but correct if a future fix makes it return). The 64-hit
+cap is now spent only on `WakeupThread(4)` calls issued from inside the actual retry loop.
+
+One build error surfaced and was fixed before handoff: the first `extern` declaration for the
+flag was placed inside `game_overrides.cpp`'s own file-wide anonymous namespace (C7631,
+"variable with internal linkage declared but not defined") -- an `extern` declared inside an
+anonymous namespace still gets that namespace's internal linkage and can never bind to a
+global-scope symbol in another TU. Fixed by declaring it at true file scope, following the
+existing `ps2xTraceCallsInstall` cross-TU pattern a few lines above. `cl /Zs`-clean on both TUs
+after the fix.
+
+### 3. Next step
+Build, run with `PS2X_TEARDOWNCHK=1 PS2X_WAKETRACE=1 -RunSeconds 600` (matches this session's
+proven repro timing), reproduce the RANKING/GAME-OVER freeze, then read `[waketrace]` again --
+this time every captured hit should have a line number **at or after** `[teardownchk]`'s ENTER
+line. If `stopFlagRaw` is still `0x0` across those correctly-scoped hits, hypothesis (b) (the
+`qword_4419B8=1` write from `sub_11F680` isn't visible/landing at thread 4's read) is confirmed
+for real this time, and the next step is finding why that specific write doesn't propagate. If it
+flips to `0x1` at some point and the loop still doesn't exit, the bug is downstream of the read
+(e.g. in the loop-bottom branch/comparison itself, not the memory value).
+
+---
+
+## Part 126 (2026-09-17) -- an unread [waketrace] run FALSIFIES "lost wakeup"; static decode of both sides of the handshake narrows the hang to one register/one memory read; [waketrace] extended and syntax-checked, NOT yet built/run
+
+### 0. The Part 125 run had already been executed and was sitting in `run_log.txt`
+Session start found `run_log.txt` (launched 06:36:22, exe written 06:28:14 -- postdates the
+`EeScheduler.cpp`/`game_overrides.cpp` edits at 06:22/05:59) already containing the
+`PS2X_WAKETRACE=1` run Part 125 asked for and had not read. `analyze_run.py --tag waketrace --log
+run_log.txt` (the sink is `std::cerr`, not `ps2x_probe_kv`, so `--tag`+`--log` against the raw
+console log is the right query, not the jsonl sink) returned all 64 capped hits.
+
+### 1. Result: "lost wakeup" is FALSIFIED
+Every one of the 64 hits reads:
+```
+[waketrace] n=<1..64> id=4 branch=makeReady statusBefore=2 reasonBefore=1 wakeupCountBefore=0 interruptSafe=1 eeCycle=<...>
+```
+`branch=makeReady` on **all 64/64** -- `EeScheduler::wakeupThread()` (`EeScheduler.cpp:2321`)
+always takes the real-wake path (`makeReady(*target, ...)`), never the `++wakeupCount`-only no-op
+branch. `statusBefore=2`/`reasonBefore=1` decode (via `ee_scheduler.h`'s enums) to `Waiting`/`Sleep`
+-- consistent with `[thsync]`'s `wt=1 (Sleep)`. The `eeCycle` deltas between consecutive hits are
+extremely regular, ~96,500-103,000 cycles apart -- this is `sub_11F680`'s own retry loop firing,
+not organic wakeup traffic. **Part 120's and Part 125's "genuine lost wakeup, aimed at thread 4"
+theory is dead**: the scheduler correctly wakes thread 4 every single time it's asked to.
+
+### 2. Both sides of the handshake, decoded from the real recompiled `.cpp` (not just IDA pseudo-C)
+`sub_11F680` (`ps2xRuntime/src/runner/sub_0011F680...` via `decomp.py get 0x11f680 --callees` +
+cross-checking the generated syscall-stub `.cpp`s in `output_scratch_210regen_v2/` for the actual
+syscall numbers baked into each thunk, since IDA's pseudo-C only shows symbolic wrapper names):
+```
+if (qword_4419C0) return;              // already acked, nothing to do
+do {
+    qword_4419B8 = 1;                  // stopFlag = 1 -- every iteration, not just once
+    ChangeThreadPriority(dword_441980, 1);   // syscall 0x29, confirmed via Dispatcher.cpp:106
+    WakeupThread(dword_441980);              // syscall 0x33, confirmed via Dispatcher.cpp:137
+    thread_resume_if_suspended(dword_441980);  // ReferThreadStatus(0x30)+ResumeThread(0x39) if Suspended/WaitSuspended
+} while (!qword_4419C0);               // ackFlag
+qword_4419C0 = 0; dword_441980 = 0;
+```
+`dword_441980` is the target id (this run: 4). This loop is the source of the regular retry
+cadence in section 1 -- it never stops calling `WakeupThread(4)`, and `[teardownchk]` (uncapped,
+just ENTER/RETURN) confirms it never sees `qword_4419C0` become true across the full 600s run.
+
+Thread 4's own body is `sub_11E8D0` (`0x11e8d0`-`0x11e9d4`, IDA name `fn_cond_large_0011e8d0`,
+read directly from `ps2xRuntime/src/runner/sub_11E8D0_0x11e8d0.cpp` -- a single targeted `Glob`
+for that one filename, not a directory scan, per rule 5). Decoded shape:
+```
+if (*(u64*)0x4419B8) goto exit;        // fast pre-check, FAST_READ64 (literal address)
+s4 = &qword_4419B8;                    // computed ONCE, cached in callee-saved $s4/GPR20
+do {
+    ++qword_441950;                                    // heartbeat counter
+    array_state_dispatch_c(dword_44198C deref'd);       // sub_11EDF8 -- checks a DIFFERENT thread's status
+    if (dword_441A08) sub_1201F0();  dword_441A08 = 0;  // sub_1201F0 -- conditional INDIRECT call via dword_54BF38 fnptr
+    if (get_global_var_b_2()==1) array_state_dispatch_c(dword_441990 deref'd);  // sub_11F230 is a trivial global read
+    array_state_dispatch_d();          // sub_11FC40 -- see section 3, touches dword_44193C ("mreq")
+    dword_441928 = 1; sub_13C688(); dword_441928 = 0;   // 5-slot INDIRECT callback dispatch (dword_54E964 table)
+    SleepThread();                     // sub_11ED78 -- UNCONDITIONAL, every iteration, no argument
+} while (!*(u64*)s4);                  // READ64 through the CACHED register, not a fresh constant
+qword_4419C0 = 1;
+ExitThread-or-similar();               // func_174AE0
+```
+The loop-bottom check (`0x11e994`: `ld $v0, 0($s4)`) is a genuine register-indirect `READ64`, not
+a hoisted/constant-folded load -- so at the C++ source level this is not the classic "check
+optimized away" bug. It reads through GPR 20, which was set from the literal constant `0x4419B8`
+exactly once, at function entry, and never recomputed on the switch/goto re-entry path that
+resumes execution after the blocking `SleepThread()` call (case label `0x11e994` is one of the
+function's declared re-entry points). By design this should terminate on the very next wake after
+`sub_11F680` sets `stopFlag=1` -- it does not, across 64 observed wakes and the full run.
+
+### 3. A notable cross-reference, not yet evaluated
+`array_state_dispatch_d` (`sub_11FC40`, called every loop iteration) reads `dword_44193C` --
+**the exact same global Part 122 named `mreq` and flagged as thread 1's stuck spin condition**
+(later falsified for thread 1 specifically by the PCSX2 oracle, Part 123). Here it gates a
+DIFFERENT action: `if (dword_44193C==1) { check ReferThreadStatus(dword_441988); if
+Waiting/WaitSuspended, WakeupThread(dword_441988); dword_44193C=0; }` -- i.e. thread 4's loop
+itself conditionally wakes yet ANOTHER thread (`dword_441988`, a third id, not 4 and not whatever
+`dword_44198C` is) when `mreq==1`. Never read in this context before. Not yet static-traced
+further; flagged so the next session doesn't have to re-discover the connection.
+
+### 4. Two live hypotheses, and the probe built to separate them
+(a) **Register-preservation bug**: `$s4`/GPR20 in thread 4's persisted `R5900Context` has drifted
+off `0x4419B8` by the time the loop-bottom check runs -- possible if one of the 6 callees (esp.
+`sub_1201F0` or `sub_13C688`, both of which call through INDIRECT function pointers that
+`decomp.py`/IDA cannot resolve statically) fails to preserve a callee-saved register it's supposed
+to leave alone.
+(b) **Write-visibility bug**: `$s4` is fine and still points at `0x4419B8`, but the raw memory
+read there genuinely still comes back 0 despite `sub_11F680` writing 1 -- would point at something
+in the runtime's memory model, not the recompiler's register handling.
+
+`[waketrace]` (`EeScheduler.cpp:2321`+, inside the existing `makeReady` branch) extended to log
+three new fields on every hit: `s4` (`GPR_U32` of GPR 20 from `target->activeContext()`),
+`stopFlagRaw` (`Ps2FastRead64(m_rdram, 0x4419B8u)`), and `pcBefore` (`activeContext().pc`, to
+confirm the context is actually parked at the expected resume point when sampled). `activeContext()`
+returns `invocations.back().context` if non-empty else `context` -- checked
+`GuestThread`/`GuestInvocation` in `ee_scheduler.h`: invocations are for interrupts/HLE/syscall
+overrides, NOT ordinary guest `jal`, so this should just be the thread's one real context, but
+logging through the same accessor the scheduler itself uses removes that as a variable.
+`cl /Zs`-verified clean (two iterations: first attempt mis-used the `GPR_U32(&expr, n)` macro --
+`ctx_ptr->r[n]` substitutes textually, so `&target->activeContext()` produces `&x->r[n]` which
+binds as `&(x->r[n])`, not `(&x)->r[n]`; fixed by binding a real `R5900Context *` local first).
+
+**Next step (build+run is user's, not mine):** build, then run with `PS2X_WAKETRACE=1
+PS2X_TEARDOWNCHK=1`, reproduce the RANKING/GAME-OVER freeze, read the new `s4`/`stopFlagRaw`/
+`pcBefore` fields with `analyze_run.py --tag waketrace --log run_log.txt`. `s4 != 0x4419b8` proves
+hypothesis (a); `s4 == 0x4419b8` with `stopFlagRaw == 0` proves (b) and shifts the hunt to why the
+write isn't landing/visible.
+
+---
+
+## Part 125 (2026-09-17) -- [teardownchk] CONFIRMED the hang; [waketrace] armed to catch it at the exact wakeupThread() call
+
+### 1. `[teardownchk]` result: `sub_11F680` entered once, never returns
+Built + ran with `PS2X_TEARDOWNCHK=1` (+`PS2X_WAKECHK=1`, harmless). Full `run_log.txt`:
+```
+[teardownchk] enabled=1 hook=0x11f680(hooked) ...
+[teardownchk] seq=0 ENTER tid=4 stopFlag=1 ackFlag=0
+```
+**No `RETURNED` line anywhere in the rest of the ~600s log.** This is exactly Part 124's predicted
+signature -- confirmed, not falsified. The worker thread this run is **id=4** (`dword_441980=4`),
+not thread 1 (Part 120's `[wakechk]` target, `mtid=1` -- a separate, already-disproven subsystem;
+its wakeup lands correctly every time, it's just unrelated to this hang).
+
+### 2. `[thsync]`'s own per-thread table settles which failure mode this is
+Re-checked thread 4's row across the whole run: it appears exactly **once**, at **t=405s**,
+`st=4 (Waiting) wt=1 (Sleep) pc=0x174bc8`, and **never changes again** for the rest of the run --
+no Ready/Waiting toggling at all. Compare to thread 1 in the same runs (Part 122): it toggles
+Ready<->Waiting repeatedly, i.e. its wakeups DO land, it just never completes. Thread 4 shows no
+such toggling -- consistent with its wakeup(s) from `sub_11F680`'s do-while never actually landing
+(the `++wakeupCount`-only no-op branch in `EeScheduler::wakeupThread()`), which is the ORIGINAL
+Part 120 hypothesis, just aimed at the wrong thread the first time (mtid=1 instead of the real
+target, id=4).
+
+### 3. Why `THLIFE`/`WATCH` couldn't already answer this
+Confirmed directly: grepped the fresh `run_log.txt` for `WATCH` and `THLIFE` -- **zero hits**, only
+a `[runmeta]` line containing the substring "WATCH". Both route through `ps2x_probe_kv()` with a
+tag, which does not print to the console sink at all ([[feedback_probe_sink_vs_log_tag]] called
+this exact trap by name and it cost real time here re-confirming it). Any future probe that needs
+to show up in `run_log.txt` must use `std::cerr` directly, like `[semwatch:*]`/`[wakechk]`/
+`[teardownchk]`, not `ps2x_probe_kv`.
+
+### 4. New probe: `[waketrace]` (PS2X_WAKETRACE=1, PS2X_WAKETRACE_ID=<id>, default 4)
+Added direct instrumentation inside `EeScheduler::wakeupThread()` itself (`EeScheduler.cpp:2279`+),
+gated by `PS2X_WAKETRACE=1` and filtered to `PS2X_WAKETRACE_ID` (default 4, this run's known-stuck
+id -- override if a future run assigns the worker a different id, thread ids are deterministic
+per-run under `PS2X_DETERMINISM=1` but not guaranteed identical across different repro paths).
+Logs every call to `wakeupThread(4, ...)` with `std::cerr` directly (bypasses the broken sink):
+`branch=makeReady` or `branch=wakeupCountOnly`, plus status/reason/wakeupCount before and after.
+Capped at 64 hits for that id. This directly answers question left open by Part 124: does
+`sub_11F680`'s repeated `WakeupThread(4)` calls take the real-wake branch (and thread 4 still never
+progresses for some OTHER reason -- a dispatch/scheduling bug) or the no-op branch (a genuine lost
+wakeup, matching Part 120's original theory, now correctly aimed)? Syntax-checked clean (`cl /Zs`,
+`EXIT=0`).
+
+**Next step:** build + run with `PS2X_WAKETRACE=1` (keep `PS2X_TEARDOWNCHK=1` too, for the
+before/after frame) and reproduce the RANKING/GAME-OVER freeze; read `[waketrace]` in the resulting
+`run_log.txt`.
+
+---
+
+## Part 124 (2026-09-17) -- root cause TRACED to a specific function via static analysis + live oracle cross-check: `sub_11F680`'s worker-shutdown wait-loop likely never returns on our runtime. New probe armed (`PS2X_TEARDOWNCHK=1`)
+
+### 1. Static trace from the wake-check dispatcher up to the real trigger
+`decomp.py` (pseudo-C by address) traced the chain Part 123 called for:
+- `array_state_dispatch_d` (`sub_11FC40`, the Part 120 wake-check target) is called unconditionally
+  every pass of `sub_11E8D0`'s loop: `while (!qword_4419B8) { ...; array_state_dispatch_d(); ... }`.
+  This confirms the Part 120 comment ("called every pass by frame thread sub_11E8D0") was accurate.
+- The loop's exit flag `qword_4419B8` is set by `module_obj_unk_b` (`sub_11F3F8`, a flat flag-reset
+  function) and by `module_obj_unk_e` (`sub_11F680`):
+  ```c
+  __int64 sub_11F680()  // module_obj_unk_e
+  {
+      if (qword_4419C0) { result = &qword_4419C0; }
+      else {
+          do {
+              qword_4419B8 = 1;                        // tell the worker to stop
+              syscall_stub_u(dword_441980, 1);
+              syscall_stub_z_0(dword_441980, v1);       // WakeupThread(worker)  [syscall 0x33]
+              thread_resume_if_suspended(dword_441980, v1);  // ResumeThread-family
+              result = &qword_4419C0;
+          } while (!qword_4419C0);                      // wait for the worker to ack
+      }
+      *(QWORD*)result = 0; qword_4419B8 = 0; dword_441980 = 0;
+      return result;
+  }
+  ```
+  i.e. this is the worker-thread shutdown routine: it signals stop, repeatedly wakes/resumes the
+  worker (`dword_441980`), and busy-waits until the worker itself sets `qword_4419C0=1` (its own
+  code, at the tail of `sub_11E8D0`: `qword_4419C0 = 1; return syscall_stub_t();` -- an exit-type
+  syscall) to acknowledge.
+- Both callers of `sub_11F680` (`sub_11F448`/`sub_120080`, `module_obj_lazy_init*`) are reference-
+  count-to-zero module-teardown routines: `if (!--dword_4418E4) { module_obj_unk_b(); ...;
+  module_obj_unk_e(); ...; }`. This is a generic "last user of this module gone -> tear it down"
+  pattern, and the RANKING/GAME-OVER transition is exactly the kind of scene boundary that would
+  drop a module's refcount to zero.
+
+### 2. Live oracle cross-check confirms real hardware completes this teardown; ours (very likely) doesn't
+Read the same addresses live on PCSX2 at the RANKING screen (teardown already finished by the time
+of the read): `dword_441980=0`, `dword_4418E4=0` (refcount), `qword_4419B8=0`, `qword_4419C0=0` (the
+next word at +8) -- exactly the reset state `sub_11F680`'s tail writes on success. Also set an
+unconditional breakpoint at `array_state_dispatch_d` (`0x11FC40`) and let the game run **~12+
+seconds of real gameplay time at this exact screen without a single hit** -- on real hardware,
+`sub_11E8D0`'s loop (and therefore the whole wake-check subsystem) is not running here at all,
+consistent with the worker thread having already exited via a completed `sub_11F680` call.
+
+Our runtime, by contrast (from Part 120-122's `run_log.txt` evidence): `mreq` (a different flag,
+`0x44193C`, read by `array_state_dispatch_d` itself) stuck at 1 forever, `[wakechk]` firing 3621
+times with thread 1 (`mtid=1`) cycling Sleep<->Ready every single time without ever completing, and
+`[thsync]` VERDICT=GATE-OPEN-BUT-DEAD from t=428s to the end of a 600s run. This is everything you'd
+see if `sub_11F680`'s do-while never observes `qword_4419C0==1` and therefore never returns: the
+worker thread (likely thread 1) keeps getting told to wake and resume, keeps doing *something*, but
+never reaches the point in `sub_11E8D0` where it sets `qword_4419C0=1` and exits.
+
+### 3. New probe: `[teardownchk]` (PS2X_TEARDOWNCHK=1)
+Added `applySdbzWorkerShutdownProbe` in `game_overrides.cpp`, wrapping `sub_11F680` (`0x11F680`)
+the same way Part 120's `[wakechk]` wraps `sub_11FC40`: forwards to the original unconditionally,
+and when `PS2X_TEARDOWNCHK=1` logs `[teardownchk] seq=N ENTER tid=<dword_441980>
+stopFlag=<qword_4419B8> ackFlag=<qword_4419C0>` before calling the original, then `... RETURNED
+...` with the post-call flag values after. If the hypothesis is right, expect exactly one `ENTER`
+line around the RANKING/GAME-OVER transition with **no matching `RETURNED` line for the rest of the
+run** -- that would directly confirm `sub_11F680` is the function that hangs. If `RETURNED` does
+follow (even with `ackFlag` still 0, which would mean it gave up via some other exit path not
+visible in the decompile), that falsifies this specific hypothesis and the next lane is
+`sub_11E8D0` itself (why the worker thread never reaches its own `qword_4419C0 = 1` line).
+Syntax-checked clean (`cl /Zs`, `EXIT=0`).
+
+**Next step:** build + run with `PS2X_TEARDOWNCHK=1` (can leave `PS2X_WAKECHK=1` set too, harmless)
+and reproduce the RANKING/GAME-OVER freeze; read `[teardownchk]` in the resulting `run_log.txt`.
+
+---
+
+## Part 123 (2026-09-17) -- PCSX2 oracle check: real hardware NEVER shows the 6-thread burst or a stuck `mreq` at the RANKING screen
+
+### 1. Live PCSX2 comparison at the RANKING screen
+Connected live to PCSX2 (DebugServer + Pine, SLUS-21442) and drove it to the same RANKING/GAME-OVER
+screen that freezes our runtime. Read the exact same addresses `[thsync]` already tracks:
+- **Thread count stays at 3** the whole time (checked twice, ~200M EE cycles apart, game
+  running/not paused in between) -- our runtime bursts 2->6 at this scene.
+- **`mreq@0x44193C`==0** (cleared) -- our runtime gets it permanently stuck at 1.
+- `gate@0x4419D8`==0/0, `inWork@0x441934`==0 in both -- not distinguishing on their own.
+- `tick@0x441960` reached `0x2df0` and held steady across ~200M further cycles -- consistent with
+  the worker completing its job and going idle normally, not spinning.
+
+### 2. This reframes Part 122's conclusion
+The thread-1 livelock (sleep/wake/re-sleep on `sub_11E690`) is real and still the proximate freeze
+mechanism, but it is now clearly a **symptom**, not the root cause: real PS2 either never creates
+those extra 3 threads, or creates and retires them near-instantly (fast enough that two snapshots
+~3+ seconds apart, well past when our runtime's burst appears, never caught more than 3). Our
+runtime's version of whatever those threads run either (a) gets spawned when it shouldn't, or (b)
+gets spawned correctly but never completes/exits -- which would explain both the stuck `mreq` (never
+cleared because the worker never finishes) and thread 1's livelock (it's legitimately waiting on a
+completion signal that, on real hardware, arrives quickly and, on ours, never arrives).
+
+### 3. Next step -- identify what the burst threads actually run
+`THLIFE` (Thread.cpp:733, `probeThreadLifecycle`) already logs StartThread/SuspendThread/ResumeThread
+with `--tag`, but it never surfaced in `run_log.txt` this run -- confirm it's going to a structured
+sink rather than console before relying on its absence ([[feedback_probe_sink_vs_log_tag]]). Cleanest
+path: next repro, use `recomp_thread_table` (RecompDebugger MCP) at the freeze to read the entry PC
+of threads 3-6 directly, then `decomp.py get <entry>` each one to see what they're supposed to do and
+why it might never complete in our runtime specifically.
+
+---
+
+## Part 122 (2026-09-17) -- vblchain premise FALSIFIED; real mechanism is a guest-side livelock in thread 1 (main), not a scheduler/vblank halt
+
+### 1. `[semwatch:vblchain]` readout: `vblChain=0` for all 32 samples, entire run -- but that's not the bug
+Re-ran with the Part 121 probe armed. `vblChain=0` at every single `[semwatch:waitforever]`
+entering/woke pair, start to finish. Read at face value this looked like it confirmed reading (a)
+(the VBlank deadline-reschedule chain never ran even once). **It did, but for the wrong reason**:
+that code path (`processDueDeadlines()`'s VBlankStart->VBlankEnd->VBlankStart self-reschedule) is
+**intentionally dead for SDBZ** -- a comment already at `EeScheduler.cpp:922-928` (pre-existing,
+not written by me) says so explicitly: "SDBZ: do NOT self-seed the wall-clock vblank timer here
+... SDBZ's IRQ worker thread is the sole source of `EeEventType::VBlankStart` via `postEvent()`
+instead." I built and read an entire probe against a path this game never uses. Re-Measure the
+Premise: the premise ("vblank pacing must be scheduler-deadline-driven") was never checked against
+the code before the probe was written.
+
+### 2. The IRQ worker thread is alive and pacing normally throughout the freeze
+Checked the actual VBlank source (`Kernel/Syscalls/Interrupt.cpp`'s `interruptWorkerMain`, a
+separate OS thread) via the existing `vblSrc=q/i/s` field in `[watchdog]` (quantum/idle/stall tick
+counters, already wired, just never previously read closely). At t=583-592s -- deep inside the
+"frozen" window -- `vbl/s=~20-23` with `vblSrc=0/22/0`: the idle-tick path is firing ~22 times/sec,
+every second, the whole time. **This run never actually halted the way Part 121's run did.** `eeCyc`
+keeps climbing, `busy%~100%`, `intrSec` keeps climbing, right up to t=591s (this run completed its
+full 600s and exited via `[run] exiting loop`, not a permanent freeze). Only the render/worker
+lane is dead; the EE scheduler, VBlank pump, and interrupt delivery are all fine.
+
+**Correction to my own read of `[thsync]`'s `tick=`/`dTick=` field**: I initially misread this as
+`EeScheduler::m_vsyncTick` and concluded the vblank pump itself had stopped. It is not -- per
+`ps2_runtime.cpp:5454` it is a **guest memory read at `0x441960`**, part of the SofDec/render-worker
+`[thsync]` diagnostic (`req@0x441924 inWork@0x441934 gate@0x4419D8 tick@0x441960 boost@0x4418F0`),
+unrelated to VBlank. `[thsync]` VERDICT flips to `GATE-OPEN-BUT-DEAD` at **t=428s** and never
+recovers -- that IS real and IS the black-screen onset, just not for a vblank reason.
+
+### 3. `[wakechk]` (Part 120's probe) FIRED for real this run -- 3621 hits, and it disproves the lost-wakeup theory
+Unlike Part 121's run (0 real hits), this run's `[wakechk]` (hooked on `sub_11FC40`, logs when
+`mreq@0x44193C==1` on entry) fired **3621 times**. Every single hit has the identical shape:
+```
+mtid=1 mreq(before/after)=1/1(STILL SET) found=1/1 status(before/after)=Waiting/Ready
+reason(before/after)=Sleep/None wakeupCount(before/after)=0/0
+```
+This **disproves** Part 120's original hypothesis (that `WakeupThread(main)` silently takes the
+no-op `wakeupCount++` branch and the wakeup is lost) -- `status` transitions Waiting->Ready
+correctly on every one of the 3621 calls. The wakeup lands every time. What never happens is
+completion: `mreq` is never cleared, so the same wakeup fires again next tick, forever.
+
+### 4. Real mechanism: thread 1 is both the spinner and the sleeper, livelocked on its own poll condition
+Cross-reading `[thsync]`'s per-thread table across t=587-592s: thread 1 alternates between
+`st=1 (Ready) pc=0x11e670` (parked at the spinner, `sub_11E690`, per the `[thsync] armed` legend)
+and `st=4 (Waiting/Sleep) pc=0x174bc8` (parked inside `SleepThread()`, confirmed at
+`Kernel/Syscalls/Thread.cpp:943-948`). That is: thread 1 calls `SleepThread()`, gets woken by
+`sub_11FC40` (confirmed above, every time), resumes at the spinner address, re-checks whatever
+condition it's polling (almost certainly gated on `gate@0x4419D8`/`inWork@0x441934`, which are
+presumably meant to be set by one of the OTHER 5 threads that appeared at the t=462-463s six-thread
+burst -- several of which sit permanently in `st=4 wt=1 pc=0x174bc8` too, i.e. also just sleeping),
+finds the condition still unmet, and calls `SleepThread()` again. This is a **livelock between
+guest threads**, not a scheduler bug: the scheduler correctly wakes and reschedules thread 1 every
+single time it's asked to; thread 1's own poll loop (`sub_11E690`) never sees the state it's
+waiting for because whichever thread is supposed to produce it never runs (or runs and doesn't
+set it).
+
+### 5. Next step -- instrument `sub_11E690`, not the scheduler
+The scheduler-level probes (`[semwatch:*]`, `[wakechk]`) have done their job and can be considered
+closed leads. The open question is now purely guest-side: what does `sub_11E690` actually poll
+(`gate@0x4419D8`? `inWork@0x441934`?), and which of the other 5 threads from the burst (all
+candidates -- most are `st=4 wt=1 pc=0x174bc8`, i.e. also just asleep, none actively running) is
+supposed to set it. Candidate probe: log guest reads/writes to `0x4419D8` and `0x441934` (or trace
+`sub_11E690`/`sub_11EAC8`, the "spinner"/"acker" pair from the `[thsync] armed` legend) to find
+whether the producing thread ever runs at all after the burst, and if not, why it's never selected
+by `EeScheduler::selectReady()`.
+
+### 6. Housekeeping
+`[semwatch:vblchain]`/`g_vblankRescheduleCount` (Part 121) can stay in the tree -- harmless, cheap,
+and now documented as expected-always-zero for SDBZ rather than a live signal -- but it is NOT the
+next probe to extend. Do not re-chase the deadline-chain path further.
+
+**Next step:** add a guest-memory-write probe on `0x4419D8` (gate) and `0x441934` (inWork) to find
+which thread (if any) is supposed to set them post-burst, and whether it's ever scheduled.
+
+---
+
+## Part 121 (2026-09-17) -- black-screen freeze REPRODUCED on a fresh run, but at a different absolute time and with a different mechanism than Part 120's hypothesis: `waitForEvent()` falls into its unconditional-block branch because `m_deadlines` is empty, not because `WakeupThread` silently no-ops. New capped probe (`[semwatch:vblchain]`) added to `EeScheduler.cpp` to catch it live next time
+
+### 1. Same freeze class, same signature, new run -- `[wakechk]` from Part 120 never fired
+User reproduced the black screen on a completely fresh run (`PS2X_WAKECHK=1` set, per Part 120's
+handoff). The freeze happened at **t=463s** this time (not t=423-432s -- confirms the trigger is a
+relative scene/thread-count condition, not a wall-clock one), and every symptom from Part 120 is
+present again: `eeCyc` frozen solid from t=463 onward, `busy%=0`, `res/s=0`, `gif/s=0`, `dma/s=0`,
+`intrSec` frozen at 12340 (stopped incrementing exactly at t=463, was climbing normally before),
+`pc=0x104b30 ra=0x0` (Timer-0 IRQ dispatch idle slot) pinned forever, `[thsync]` VERDICT=GATE-OPEN-
+BUT-DEAD forever after.
+
+**But the `[wakechk]` probe built in Part 120 to catch this never logged a single real hit** -- only
+its startup banner (`enabled=1 hook=0x11fc40(hooked)`) appears in the whole 600s log. That probe only
+logs when `sub_11FC40` is entered with `mreq(0x44193C)==1`, and `[thsync]` shows `mreq` flipping from
+0 to 1 in the SAME one-second window the freeze happens (t=462 -> t=463). Two readings fit:
+(a) `sub_11FC40` never runs again after mreq flips (consistent with a total dispatch halt starting
+at the same instant), or (b) `sub_11FC40` isn't actually the function that reads `mreq`/`mtid` at all
+and Part 120's address ID was wrong (it was reached via a syscall-trampoline decompile, already
+flagged unverified). Either way, **Part 120's specific hypothesis ("WakeupThread(main) took the
+no-op wakeupCount++ branch") is now unconfirmed and de-prioritized** -- the new evidence below points
+somewhere more fundamental than a single syscall's branch choice.
+
+### 2. The exact freeze instant, second by second, from `run_log.txt`
+Grepped `[watchdog]`/`[thsync]`/`[sofdec]` at t=455..465s (exact match, not substring -- `t=45`
+matches `t=450`..`t=459` too, first pass gave the wrong window). The transition is a single tick:
+
+- **t=462s**: `nTh=2` (only 2 guest threads exist), `mreq=0`, `rgate=0`, everything nominal --
+  the game is still in `CAppDemoMain`'s earlier setup (same `RENDER-GATE-CLOSED` verdict seen
+  throughout the whole run up to here, not `GATE-OPEN-BUT-DEAD`).
+- **t=463s**: `nTh=6` -- a burst of 4 new threads is created in this single tick (thread IDs seen
+  before were 1 and 2; now 1,2,3,4,5,6 all exist). `rgate` flips to 1, `mreq` flips to 1, `mtid=1`.
+  Threads 1,4,5,6 land in `st=4` (Waiting) with `wt=1` (reason=Sleep); thread 2 is `st=4 wt=2`
+  (Waiting+Semaphore); thread 3 is `st=8` (Suspended). **All six threads are simultaneously
+  non-Ready** the instant they're created.
+- **t=464s onward**: `busy%=0`, `res/s=0`, `eeCyc` frozen at `162884567640` forever, `intrSec`
+  frozen at `12340` forever (was climbing ~18-40/s before). Dead.
+
+`watchdog`'s `sysNum=0x32` at the freeze is `SleepThread` (confirmed against
+`Kernel/Syscalls/Dispatcher.cpp:134`) -- thread 1 (main) is parked mid-syscall-trampoline
+(`sysPc=0x174bc8`, matches every other stuck thread's `pc`) having just called `SleepThread`.
+`SleepThread` -> `EeScheduler::sleepCurrent()` (`EeScheduler.cpp:2251`) is itself simple and
+race-free in a single-executor-thread model: if `wakeupCount!=0` (a wake already pending) it
+returns immediately without blocking, otherwise it calls `blockCurrent()`. Nothing here looks wrong
+by inspection -- the interesting part is what happens *after* all six threads are parked.
+
+### 3. Found it: `[semwatch:waitforever]` (a Part-34 probe already in the tree) caught the actual halt
+`EeScheduler.cpp` already had two probes from a **prior session (2026-08-30, Part 34)** that this
+session didn't know about until grepping the log: `[semwatch:blockcurrent]` (logs the last 32 times
+any thread blocks) and `[semwatch:waitforever]` (logs entry/wake of the *only* unconditional,
+no-timeout block in the scheduler -- `EeScheduler::waitForEvent()`'s `m_deadlines.empty()` branch,
+`EeScheduler.cpp:3765-3787`). Both fired, right at the freeze:
+
+```
+[semwatch:blockcurrent] #4 tid=1 reason=1 waitId=-1 invocationsSize=0 pc=0x174bc8 eeCycle=162884566584
+[semwatch:blockcurrent] #5 tid=6 reason=1 waitId=-1 invocationsSize=0 pc=0x174bc8 eeCycle=162884567640
+[semwatch:waitforever] #1 entering eeCycle=162884567640
+[semwatch:waitforever] #1 woke eeCycle=162884567640
+[async-stack] reserved [0xf4000, 0xf8000) stackTop=0xf7ff0
+```
+
+Reading this in order: threads 1 and 6 block last (reason=1=Sleep), the run() loop finds nothing
+Ready and no pending invocations, so it calls `waitForEvent()`. **`m_deadlines` is empty** at this
+point -- that's the precondition for the "entering" branch to be taken at all (the alternative
+branch, lines 3790-3808, times out against the earliest scheduled deadline; it was never reached).
+The wait then **wakes almost immediately** (`eeCycle` unchanged, so effectively the same instant) --
+so `m_eventCv` was signaled by something calling `postEvent()`, not a deadline. Then `run()`'s outer
+loop continues, drains `m_events`, finds no thread ready, but **does** find a pending invocation
+(`m_pendingInvocations` non-empty) and starts dispatching it -- that's what `[async-stack] reserved`
+is: a fresh stack carve for a new async callback invocation (`ps2_runtime.cpp:3004`,
+`KernelStackPool::carve`). **And that is the last line of guest activity in the entire log.**
+Whatever invocation was just handed a stack there either never runs, or runs and hangs on its very
+first instruction, because `eeCyc` never advances again after this line.
+
+### 4. The real open question: why was `m_deadlines` empty at all, this late into a 463s run?
+`m_deadlines` holds the host's VBlank pacing chain: `processDueDeadlines()`
+(`EeScheduler.cpp:3530-3613`) is supposed to be self-perpetuating forever -- every time a
+`VBlankStart` deadline comes due, it immediately schedules the matching `VBlankEnd` AND the *next*
+`VBlankStart` (lines 3602-3609) before processing the current one. For `m_deadlines` to reach empty,
+that reschedule has to have silently stopped firing at some point before t=463s -- **it's not
+something the newly-created 6 threads should be able to affect**, since `processDueDeadlines()` runs
+unconditionally at the top of every `run()` iteration regardless of guest thread state. Two
+competing readings, neither confirmed:
+- (a) the VBlank chain was *never* running to begin with, and this is simply the first time in the
+  whole 463s the scheduler ever had "nothing Ready and nothing pending" at once (games with an
+  always-busy dispatch loop can go their entire early boot without ever calling `waitForEvent()`) --
+  in which case `m_deadlines` being empty is normal/expected and NOT the bug; the bug is entirely in
+  why the invocation dispatched right after never runs.
+- (b) the chain WAS running (`vbl/s` in `[watchdog]` keeps incrementing even at t=600+, but that is
+  very likely a **separate host frame-presentation counter, not proof of guest VBlank delivery** --
+  not verified either way this session) and something cleared/starved it exactly at the six-thread
+  burst.
+⚠ **Both are unverified. Do not treat either as settled** -- this is exactly the class of premise
+that needs re-measuring, not assumed (see `feedback_remeasure_the_premise`).
+
+### 5. Probe added to settle (a) vs (b) on the next repro -- no build/run performed by me
+Added `[semwatch:vblchain]` to `EeScheduler.cpp` (syntax-checked clean, `EXIT=0`, only baseline
+C4996 warnings): a capped-nowhere, unconditional `std::atomic<uint32_t> g_vblankRescheduleCount`
+incremented every time the VBlankStart self-reschedule at `processDueDeadlines()` lines ~3602-3609
+actually fires, and both `[semwatch:waitforever]` log lines (entering/woke) now also print
+`vblChain=<count>`. This directly answers reading (a) vs (b) on the very next freeze:
+- If `vblChain=0` at the "entering" line -> the VBlank pacing chain **never ran once** in the whole
+  session (reading (a) confirmed) -- look at what's supposed to seed the first `VBlankStart`
+  schedule and why it never happened, independent of the six-thread burst.
+- If `vblChain` is large (hundreds+, consistent with ~60Hz over 463s) -> the chain WAS alive and
+  died at this exact moment (reading (b) confirmed) -- next step is finding what stopped
+  `processDueDeadlines()`'s due-event loop from ever seeing another due `VBlankStart` again, most
+  likely inside `processEvent()`'s `VBlankStart` handler (`EeScheduler.cpp:3616+`) or a stall inside
+  whatever the `[async-stack]`-reserved invocation turns out to be.
+
+### 6. Also worth a follow-up probe next time, not done this session
+The `[async-stack] reserved` line has no metadata about *which* invocation it's for (no pc/kind
+printed). If `vblChain` comes back large (reading (b)), the next probe should log
+`invocation.context.pc` and `invocation.kind` right where `run()` pops `m_pendingInvocations.front()`
+(`EeScheduler.cpp` ~955-974) so the exact guest function that never returns is known by address
+instead of inferred.
+
+### Next step
+Build + run again with `PS2X_WAKECHK=1` still set (harmless, just silent) and reproduce the freeze
+once more (same trigger: reach `CAppDemoMain`/`0x632b90`, the object shared with Part 119's upside-
+down sky dome). Send the `[semwatch:waitforever]` and `[semwatch:vblchain]`-tagged lines from
+`run_log.txt` around the freeze; that alone resolves §4's (a) vs (b) split and names the next file
+to read.
+
+---
+
+## Part 120 (2026-09-17) -- RANKING/GAME-OVER black-screen freeze: total scheduler halt, live-traced to WakeupThread(main) never landing. Same object as Part 119's upside-down sky dome, root cause NOT yet confirmed
+
+### 1. Two symptoms, same scene object, now proven to be a full dispatch halt
+Relaunched with the Recomp debugger attached (`launch_recomp.ps1` without `-NoDebugger`) to
+live-inspect the Part 119 "ranking screen sky dome upside down" open item. This run instead
+produced a **plain black screen** after reaching the same `CAppDemoMain` object at `0x632b90`
+(RANKING/GAME OVER flow, same object Part 119 named). Live + log evidence, cross-checked with
+`mcp__recomp__*` while the process was still running:
+
+- `A.step` (`[mtx:stat]` probe, `game_overrides.cpp`) advances 0 -> 1 -> 3 -> 4 -> 5, sticks at
+  **5** starting **t=422s** (last run's separate freeze stuck at step 7 -- different point in the
+  same sequencer, confirming this is a recurring class of bug in this object, not one-off).
+- `[thsync]` VERDICT flips `RENDER-GATE-CLOSED` -> `GATE-OPEN-BUT-DEAD` at **t=424s**, i.e. ~2s
+  after the step freeze. Part 119-era investigation ruled this verdict out as a trigger *for a
+  different freeze* because the gap there was ~1000s with `mat4_multiply` still counting fine in
+  between. Here the gap is ~2s -- tight enough that `GATE-OPEN-BUT-DEAD` is the leading suspect
+  for *this* freeze specifically.
+- `mat4_multiply` (`0x00108220`) call count freezes 9s later, at **t=432s** (63978 calls, frozen).
+- `loadscreen_tick` (`0x3E0E60`, a *separate* sub-state-machine, independently probed via
+  `[sofdec:stat]`) freezes at the **same instant**, t=424s (value 2739) -- proves this isn't a
+  slow decay of one subsystem, it's a synchronized halt across independent counters.
+- Diffed the `[thsync]` line byte-for-byte at t=425, 500, 800, 1200, 1500, 1536: **100% identical**
+  for 1100+ seconds. Every field (`req inWork gate tick boost rgate g724 g72C mreq mtid` and the
+  full per-thread `nTh` table) is frozen, not drifting. This is a **total scheduler halt**, not a
+  livelock that's still doing work.
+- `watchdog` shows `gif/s=0 dma/s=0` for the whole stuck tail -- nothing reaches the GS, which is
+  why the screen is black (as opposed to Part 119's frozen-but-visible upside-down frame).
+- Live-confirmed with the attached debugger while stuck (not just from the log): two consecutive
+  `recomp_read_memory_general` reads of `0x441960` (worker tick counter) both returned `1`,
+  back-to-back -- the freeze is real and current, not a log artifact from an earlier crash.
+- `[savepri:fix]` (the Part 111/112 priority-poisoning fix, `ps2_runtime.cpp:5394`) fired **0**
+  times this run -- ruled out as the cause; this is a different bug from that one.
+
+### 2. Live breakpoints are unusable once the process is already stalled
+Tried to catch `sub_11FC40` (the per-frame wake-checker, see below) live with
+`recomp_set_breakpoint(0x11fc40, slot=1)`. `recomp_wait_for_break` and `recomp_list_breakpoints`
+both kept reporting `bp_hit=true, bp_hit_addr=0x104b30` (the Timer-0 IRQ dispatch address, see
+`project_zero_pc_dormant_pump_pairing.md`) even after `recomp_clear_all_breakpoints` explicitly
+disabled every slot. This is consistent with the total-halt finding above: `CheckBreakpoint()`
+only runs once per dispatch iteration, and if the thread that owns that context never dispatches
+again, a stale `bp_hit` from before it died can never be serviced/cleared. **Takeaway for next
+time: arm the breakpoint *before* the freeze happens (at process start), not after -- live
+breakpointing a scheduler that has already gone fully idle cannot produce a fresh hit.**
+`recomp_read_memory_general` remained reliable throughout (it's serviced by a separate path that
+doesn't require guest dispatch to still be advancing).
+
+### 3. Static trace of the wake path -- root cause NOT yet confirmed
+`ps2_runtime.cpp:5356-5365` (pre-existing comment, Part 111) already named the mechanism:
+`RenderDispatch` (`0x1712d0`) branches on `rgate` (`0x500728`, confirmed live = 1, i.e. open) to
+decide whether to resume the SofDec workers, "written by exactly two sites (0x113f28 and
+0x113fd8)". `ps2_runtime.cpp:5371-5381` names the wake checker: `sub_11FC40`, called every pass
+by the frame thread `sub_11E8D0`. Decompiled it (`decomp.py get 0x11fc40 --callees`):
+
+```c
+__int64 sub_11FC40()
+{
+  if ( dword_44193C == 1 )                       // mreq
+  {
+    syscall_stub_x(dword_441988, &v2);            // ReferThreadStatus(mtid=1, &status)
+    if ( v2[0] == 4 || v2[0] == 12 )               // status == WAIT or WAIT|SUSPEND
+    {
+      result = syscall_stub_z_0(dword_441988, v1); // WakeupThread(mtid=1)
+      if ( result == dword_441988 )                // clear mreq only if this holds
+        dword_44193C = 0;
+    }
+  }
+}
+```
+
+`dword_441988` (mtid) is 1 for the whole run (oracle-confirmed in the existing comment), so the
+guest only clears its own wake-request latch if `WakeupThread(1)` returns exactly `1`. **This is
+suspect** -- our `WakeupThread` syscall (`Thread.cpp:950` -> `EeScheduler::wakeupThread`,
+`EeScheduler.cpp:2273`) returns `KE_OK = 0` on success, not the tid, which is normal PS2 SDK
+convention (0 = success). Per project memory (`feedback_verify_translations_by_decoding.md`,
+`feedback_no_failure_prediction_for_untried_tools.md`) IDA's pseudo-C variable naming across a
+raw `syscall` stub is exactly the kind of thing that misattributes a compared register -- did NOT
+get to a raw disassembly of `0x11fca4`'s `beql` to confirm what's really being compared. **Do not
+treat `result == dword_441988` as verified guest behavior; it needs decoding from bytes, not
+pseudo-C, before it's trusted.**
+
+Separately, `EeScheduler::wakeupThread()` (`EeScheduler.cpp:2273-2309`) only calls `makeReady()`
+(the call that actually wakes the thread) when `target->status` is `Waiting`/`WaitingSuspended`
+**and** `target->wait.reason == EeWaitReason::Sleep`; every other case just does
+`++target->wakeupCount` and leaves the thread asleep. **Working hypothesis, unverified:** thread 1
+(main) was not in that exact `Waiting + Sleep` state at t=423 when this `WakeupThread(1)` call
+landed, so our scheduler silently took the counter-increment branch instead of waking it -- main
+never runs again, and since `sub_11E8D0`'s per-frame checker only re-arms `mreq` through logic
+gated on the guest's own reading of `dword_44193C`, nothing retries the wake either. This would
+explain every observed symptom (single tick, single wake-request-set, then total halt) with one
+cause, but **it is a hypothesis, not a confirmed root cause** -- it was reached from static code
+alone, after live breakpointing failed for the reason in section 2.
+
+### 4. Next step
+Needs a fresh run with a probe on `EeScheduler::wakeupThread()`'s branch selection (or a
+conditional breakpoint at the `WakeupThread` syscall entry, `Thread.cpp:950`, filtered to
+`tid==1`) **armed before this scene is reached**, so it's live when the call actually happens,
+not after. That will show directly: which branch it took, what `target->status` /
+`target->wait.reason` were for thread 1 at that instant, and what the syscall actually returned
+to the guest. Until then this connects to but does not yet close the Part 119 open item (same
+object `0x632b90`, same RANKING/GAME-OVER flow, same SofDec-worker-resume subsystem) --
+treat as the same underlying bug family, different symptom depending on exactly where in the
+sequencer the wake fails to land.
+
+## Part 119 (2026-09-16) -- WARPED 3D SMEARING FIXED: two GS bugs (affine texturing + strip queue). Guest FP rounding made PCSX2-exact on the way, but it was NOT the cause
+
+### 1. Guest FP rounding -- made exact, then FALSIFIED as the warp
+- A/B on `mat4_multiply_0x108220`: host round-to-nearest gives proj2.z `0x44a00000` (1280); guest
+  round-toward-zero + FTZ + DAZ gives `0x449fe000` (1279) = PCSX2. Live PCSX2 read at `0x509010`
+  in CAppTitleMain gives proj0 `0x44332362`; host RN gives `0x4433236e`.
+- FIX (approved core edits): `Ps2ApplyGuestFpMode()` in `ps2_runtime_macros.h`, called once on
+  `gameThread` in `ps2_runtime.cpp` (logs `[fp] guest FP mode: MXCSR=0xffc0`). `PS2X_GUEST_FP=0`
+  turns it off.
+- Per-op rounding READ FROM PCSX2 SOURCE (curl+grep, `iFPU.cpp` is the live rec): EE `sqrt.s` =
+  nearest -> `FPU_SQRT_S` now `Ps2FpuSqrtS` (108 sites). EE `rsqrt.s` and all VU ops = chop (already
+  right). `PS2_VDIV` reverted to chop.
+- OPEN deviation: EE `div.s` is nearest in PCSX2 but the recompiler inlines raw `/` at 788 sites, so
+  ours chops. Needs a generator change. Negative-operand `sqrt.s` also differs (PCSX2 `sqrt(|x|)`).
+- **Run 09-16 05:38 (900 s): proj0 `0x44332362` + proj2.z `0x449fe000` bit-exact at the title (46
+  samples) -- and the user saw the 3D still smeared.** Rounding is correct and is not the warp.
+  (That run still had `PS2X_VUROUND=1` exported in the shell; does not affect the conclusion.)
+
+### 2. The real causes -- both in the GS, both verified by direct source read
+- **A. Affine texturing** -- `ps2_gs_rasterizer.cpp` `drawTriangle`, `fst==0`: each vertex was divided
+  by its own q, then `sampleTexture()` divided again. The two divides cancel exactly, leaving plain
+  screen-space UV interpolation. Invisible on 2D (q==1), which is why Stage 5.11's sprite-only replay
+  never caught it. Fix: interpolate raw s, t, q; `sampleTexture` does the one divide (`fabsQ` guard).
+- **B. Strip queue desync** -- `ps2_gs_gpu.cpp` `GS::vertexKick`: `if (!drawing) return;` skipped the
+  strip/fan rotation on ADC=1 / XYZ3 / XYZF3 kicks. The next vertex went to slot 3, which the
+  rasterizer never reads, so every strip join drew a stale triangle. Fix: rotate on every kick, guard
+  only the draw. Matches PCSX2 `GSState::VertexKick`.
+- `cl /Zs` EXIT=0 both, no new warnings. **Built 06:14, run 06:21: user reports NO smearing.**
+- My Q-latch hypothesis (ST->RGBAQ) was wrong: Q is carried.
+- Audited clean: GIF tag decode, PACKED lanes, XYZ 12.4 decode, REGLIST, VIF1 UNPACK, XGKICK.
+
+### 3. Found, NOT fixed (none match the smear)
+PRMODE ignored when PRMODECONT.AC==0 (`activeContext`); XYOFFSET applied as `>>4` on an already
+/16 vertex (sub-pixel); int truncation in sprite/line/point paths only; same pre-divide in the sprite
+path; no triangle guard-band reject; V4-5 unpack missing `<<3` (`ps2_vif1_interpreter.cpp`); Q reset
+to 1.0 per GIFtag; `PS2_IF_AGRESSIVE_LOGS` block in `vertexKick` uses non-existent `m_prim.type`.
+
+### 4. OPEN -- Ranking screen
+The game again reaches RANKING (scenes `0x632b90` / `0x6330d0` after title `0x632eb0`). User sees a
+cloud **sky dome that looks upside down**, no characters, no platform. User never saw characters in
+any build, so that is not from fix B. NOT yet confirmed as a bug -- no PCSX2 reference of this screen.
+Note: Part 118's `logs/vucap/demo10` is a PCSX2 capture of the **Ranking 3D background**.
+
+## Part 118 (2026-09-15) -- WARPED 3D: VIF1 UNPACK + VU1 interpreter EXONERATED by an offline PCSX2 capture replay
+
+### Tooling built
+- **PCSX2 capture build** at `F:\PCSX2-src` (HEAD `26c7b71b1`, Release AVX2, VS 18). New
+  `pcsx2/DebugTools/VuCapture.{h,cpp}` writes `.vucap`: VIF1 words, VU1 run start/end state + memory
+  CRCs, XGKICK bytes, vsync. DebugServer on 21512, commands `vucap` / `vucap_stop` / `vucap_status`.
+  Needs VU1 recompiler off and MTVU off (`Documents\PCSX2\inis\PCSX2.ini`).
+- `build_scripts/pcsx2_ee.py --vucap OUT --frames N [--fullmem FIRST LAST] --wait` starts a capture.
+- `build_scripts/vucap.py CAP [--runs N] [--vif]` = loss check + summary.
+- `ps2xTest/src/ps2_vu1_capture_replay_tests.cpp` + standalone exe target `ps2x_vucap_replay`
+  (because `ps2x_tests` no longer builds: 6 stale test files). Env: `PS2X_VUCAP`, `_MODE resync|free`,
+  `_OUT`, `_MAXRUNS`, `_CORRUPT_VIF`, `_CORRUPT_MICRO`.
+- Captures in `logs/vucap/`: `demo10` (Ranking 3D bg, 9531 runs), `fight20` (30136 runs),
+  `fight5full` (full memory per run), `test60` (no 3D), `demo.vucap` 2.5 GB (mistake, deleted 09-15).
+
+### Results (VERIFIED)
+- `fight20` free mode, 30,136 runs: **0 mismatches** in data memory, VF, VI, XGKICK bytes/count;
+  18 runs VF within 1e-3.
+- `fight5full` resync, 4,742 runs: **0 mismatches**.
+- Negative controls both fire: VIF byte flip -> data-CRC diff at run 169; micro byte 0x420 flipped
+  before every run -> VF/VI/kick diffs from run 91.
+- Harness trap found: MSCAL/MSCNT+UNPACK runs the program inside the PCSX2 VIF handler, so its VIF
+  record lands after the run. Harness reads ahead (164 / 1335 such kicks).
+
+### Open -- remaining suspects (hypotheses)
+- (a) A VIF command split across two DMA **starts**: our runtime parses each DMA start's buffer on
+  its own (chain concatenated, `ps2_memory.cpp` ~1951), no carry-over. Test WRITTEN, not built:
+  `DMASTART` record (type 10) at top of `dmaVIF1` (`Vif1_Dma.cpp`); `vucap.py` prints the pending
+  count. `cl /Zs` clean.
+- (b) EE COP2 translator bugs (VLQI/VSQI, VDIV /0, VSQRT, VFTOI) -- need regen; plan "Deferred".
+- (c) GS side.
+- Not tested: our UNPACK treats STCYCL wl==0 as 1, PCSX2 as 256.
+
+## Part 117 (2026-09-14/15) -- CHARACTER SELECT REACHED. Recovered-body resume freeze fixed; opening movie (CAppDemoMovie) wired to the host player
+
+### 1. Six gap functions recovered
+`sub_001AC6F0`, `sub_001AD0B0`, `sub_001AD5A0`, `sub_001AD6A0`, `sub_001AD700`, `sub_001AD760`
+regenerated in a scratch recompile (scratch config + output only) and copied into
+`ps2xRuntime/src/lib/Kernel/recovered/` -- 84 bodies total. Holes `0x1ac6f0` / `0x1ad5a0` gone;
+fight models for `p02`/`p12` then loaded. `ps2_iop_irx_loader.cpp` gained an uncapped
+`[ARKD:load] kind= name= dest=` line per job.
+
+### 2. Resume freeze at t=1451 -- root cause and fix (VERIFIED)
+- The dense function table has a slot per 4 bytes; the generated `register_functions.cpp` fills
+  every interior word. Recovered bodies were registered at their ENTRY only.
+- `EeScheduler.cpp` (~:1425) resumes a thread with `hasFunction(context.pc)`; a miss is
+  `reportMissingFunction("EE scheduler")` + `makeDormant`.
+- 09-14 22:00 run: thread 1 yielded in a vtable call at `0x1aca88` inside `sub_001AC6F0`; resume pc
+  `0x1aca90` had no slot -> freeze.
+- Fix: `build_scripts/funcmap/gen_recovered_header.py` parses each body's `// Address: START - END`
+  and emits `{addr, end, &fn}`; the `game_overrides.cpp` loop registers every interior word **only
+  where the slot is empty**. Latent for all 84 bodies.
+- Verified on exe `2026-09-14 23:38`: ran to t=1474 (user closed), zero `EE scheduler` holes.
+
+### 3. Run `2026-09-14 23:38` exe, det=1, `PS2X_FMV=host`, no time limit
+
+| t (s) | event |
+|---|---|
+| ~5-10 | ATARI (110 frames presented) + OKR (135) via host player |
+| 370-580 | CAppDemoMovie -- **black**. `vblSrc=0/28/0`, progress flat: guest idle on its own SofDec |
+| 779-843 | attract demo fight loads stage `s01`, fighters `p02` + `p12`, effects, voices |
+| 931, 1048 | menu screens (`dis/main_menu.pix`) |
+| 1111-1129 | gstate -> `1,1,0,1`; character select, `p01asel.*` (Goku, seen on screen) |
+| 1474 | user closed; clean shutdown |
+
+- 72 `[ARKD:load]`, **zero** missing-file errors (`sceCdSearchFile failed` / `fioOpen error` / `fopen error`).
+- Holes: only `0x1bde88` (x2) and `0x2b733c`, all `codeRegion=no` bad pointers -- known.
+- **Speed (measured):** menus/demo fight 4-5 vbl/s; char select ~45k progress/s = ~2 vbl/s from
+  quantum. Guest-idle column is 0 => CPU-bound; lowering the quantum should not help (hypothesis).
+  Not yet profiled.
+
+### 4. Opening movie wired (code done, `cl /Zs` clean, build + run PENDING)
+Found on PCSX2 paused at the opening:
+- `0x113AA0` (movie open) has exactly three callers: `0x420f40` (ATARI), `0x4217b0` (OKR),
+  `0x3e2f50` -- delay-slot `addiu 0x7a50` loads `movie/op_usa.sfd` (`0x4d7a50`).
+- `0x3E2E80` = open step machine (same shape as `0x420E70`); `0x3E2FF0` = tick/close (starts with
+  `jal 0x113920` like `0x420FC0`, plus a pad Start-skip -> `0x3e1d00` and the 83 s timeout arm).
+- Both in vtable `0x4f9a70` at `+0x38` / `+0x40` -- the CAppDemoMovie of Part 116. OP_USA.SFD is
+  256x448 mpeg1video, 81.35 s, ADX: fits the 83 s net.
+- `Kernel/Fmv/FmvHost.cpp`: third movie row, `openOpening`, `kOpenHooks[]`, banner `installed=N/6`.
+  `game_overrides.cpp`: comment only (the "not an opening logo, do not add" note corrected).
+- Side effect: the `3e2e80` sreg probe and `st4b.3e2ff0` sofdec probe go silent (FmvHost wins).
+- Tool lesson: a lui/addiu scanner missed even `atari.sfd` -- the `lui` sits in a delay slot 42
+  instructions before the `addiu`. Search the callee's `jal` word instead.
+
+### Open
+- Build + run the OP wiring; expect `installed=6/6`, `[fmvhost] OP ... 81.35s`, `OP: finished`.
+- `-HostProfile -RunSeconds 900` to name the CPU cost in the fight.
+- Not assessed this session: whether the 09-14 VIF1 image-desync fix (`ps2_vif1_interpreter.cpp`) changed the title visuals.
+- All recovered bodies, generator, FmvHost and override edits are **uncommitted**.
+
+## Part 116 (2026-09-13) -- THE GAME REACHES THE TITLE SCREEN: CAppDemoMovie's attract timeout expires and `CAppTitleMain` takes over
+
+Run `2026-09-13 06:12`, 650 s, det=1, exe `2026-09-13 04:26:14` (Part 114 fix), `PS2X_SKIPFMV=0`,
+`PS2X_FIX_SAVEPRI=0`, Part 113's `PS2X_TRACE_CALLS`/`PS2X_TRACE_WATCH`, `-Elf` passed explicitly.
+
+### Timeline
+
+| t (s) | event | evidence |
+|---|---|---|
+| 142 -> 152 | movie 1 plays, tears down | THCREATE 3-6; stop/dtor/sweep t~152; `nTh` 6 -> 2 |
+| 187 -> 201 | movie 2 plays, tears down | THCREATE 7-10; stop/dtor/sweep t~201 |
+| 202 | CAppLogoMain | vt `0x4fadf0` |
+| 354 | CAppLogoMain completes -> CAppCopyRight | `[st4:stat] ret1=1`; vt `0x4fae50` |
+| 392 -> 578 | CAppDemoMovie plays for the full attract window | THCREATE 11-14; vt `0x4f9a70`; `vbl/s` ~27 throughout |
+| **~580** | **attract timeout fires** | `[st4b:stat] ret1=1 accUp=4980 accLastF=83.0033`, substates 1..4 each run |
+| 578 | demo movie torn down | `0x14f428` stop x2, `0x14c8c8` dtor, `0x14e8b0` sweep; `nTh` -> 2 at t~577 |
+| **~580 -> 640** | **`CAppTitleMain`** | vt `0x4fa210`, `[lstick:stat]` gains `st=5` |
+
+Everything ran ~10 s later than the Part 115 run despite det=1; the 83 s expiry landed at t~580
+against a predicted ~570. Compare **order and tick counts**, not wall seconds, across runs.
+
+### `0x4fa210` is CAppTitleMain -- verified from the binary, not from IDA names
+
+- ELF vtable at `0x4fa210`: slot 2 = `0x3f9b50`, whose whole body is `return aCapptitlemain;`.
+  Identical layout to the known CAppDemoMovie: vt `0x4f9a70` slot 2 = `0x3e3280` -> `aCappdemomovie`.
+  Slots 4-9 (`0x3e0e00 .. 0x3e1430`) are the shared app base methods, same as CAppDemoMovie's.
+- `0x3f8830` (IDA `CAppTitleMain_Ctor`) stores `dword_4FA210` at `a1+0` and `dword_4FA238` at `a1+4`.
+- Secondary vtable `0x4fa238` holds `0x3f8a00` (Tick) and `0x3f8d80` (Update).
+- Tick, state 2 (`a1+52`): `if (!input_device_get_button_map_clone_01(0x10)) ...; else ++state` --
+  **the title screen waits for a button press.** No input was given; zero pad log lines after t=575,
+  as expected. The pad read path itself was fixed 2026-08-10 (Stage 5.12.2).
+
+**What is NOT verified:** that the title screen is correctly *drawn*. `gif/s` held 4-5 with
+`[gs:frame-change]` activity after t=580, but nobody has looked at the window or compared a
+capture against PCSX2. Rung 5's own row asks for that positive visual signature.
+
+### Health
+
+- No CHGPRI ping-pong: total `n` = 216,404 over 650 s, zero two-thread alternation. Fix B stays
+  off-able on the full path through the title screen.
+- `[guest-branch:missing-target]` 0, `dispatch-miss` 0, missing functions 0, exceptions 0.
+- `[ee:cold-resume]` the same 24 lines as every run.
+- `[ee:zero-pc-dormant]` 6,293 -- Timer-0 IRQ recycles, grows with run length. Not investigated.
+- **New:** `[schedwatch:skip]` fired **3 times** (corrected -- first written as one): t~481 pc=`0x178068`,
+  t~484 pc=`0x11e994`, t~529 pc=`0x174bc8`; all tid=12 (a SofDec worker), `checkpointPending=1`,
+  `reschedReq=0`, during CAppDemoMovie. The 450 s run (Part 115) had 1; the 04:42 and 09-12 runs had 0.
+  Capped probe (40), so the count is real. Playback continued normally. Noted, not investigated.
+
+### Next -- rung 6
+
+Interactive run (`-RunSeconds 900`). Watch the window: at the title (~t=580) confirm the title is
+drawn, then press Start. If the press does nothing, the first place to look is whether
+`scePadRead` is reached and what `input_device_get_button_map_clone_01(0x10)` reads.
+
+## Part 115 (2026-09-13) -- Fix B is NOT needed, and the game gets further than ever: CAppLogoMain completes, then CAppCopyRight, then CAppDemoMovie plays
+
+Run `2026-09-13 05:51`, 450 s, det=1, exe `2026-09-13 04:26:14` (Part 114 fix), `PS2X_SKIPFMV=0`,
+**`PS2X_FIX_SAVEPRI=0`**, Part 113's `PS2X_TRACE_CALLS`/`PS2X_TRACE_WATCH`.
+
+### Timeline
+
+| t (s) | event | evidence |
+|---|---|---|
+| 119 | warning screen done | `[warn:stat] sub=4` |
+| 132 -> 142 | movie 1 plays, tears down | THCREATE 3-6; `0x14f428` stop / `0x14c8c8` dtor / `0x14e8b0` sweep at t~142; `nTh` 6 -> 2 |
+| 175 -> 188 | movie 2 plays, tears down | THCREATE 7-10; stop/dtor/sweep at t~188; `nTh` 6 -> 2 |
+| 192 | CAppLogoMain | vt `0x4fadf0` |
+| **335** | **CAppLogoMain completes** | `[st4:stat] ret1=1` |
+| **340** | **CAppCopyRight** | vt `0x4fae50` |
+| **374** | **CAppDemoMovie**, third SofDec movie | vt `0x4f9a70`; THCREATE 11-14 at t~373 |
+| 443 | run ends, demo movie still playing | see below |
+
+App names are from `project_cappwarning_four_second_timer.md` (ctor-verified), not re-derived.
+
+### Fix B A/B -- verdict
+
+With Fix B **off**: zero two-thread strict alternation in CHGPRI, total `n` = 98,300 over 450 s,
+final `savepri=24 savetid=1` (main's real priority). The 4 CRI-exit restores to prio 1 by
+thread 6 appear identically with Fix B on (04:42 run) and off -- not a poisoning signature.
+**Part 113's poisoned priority save was a symptom of the Part 114 thunk bug.** Fix B stays in the
+tree for now by decision; it is a no-op on this path. `PS2X_FIX_SAVEPRI=0` remains the switch.
+
+### The demo movie is PLAYING, not walled
+
+t=373..442: `vbl/s` 27, `gif/s` 27, `[movie] stat=1 objSt=1`, `[mvgate] nLive=1 live=0`,
+`[sofdec] d5n` +27/s (48 -> 1,889), `w6tick` flat at 12.
+
+- `[sofdec] st0=1 pd0=1*` with `d5n` climbing and `w6tick` flat is **the normal playback signature**:
+  the 04:42 run shows exactly that for movies 1 and 2 (t=132-141, t=176-188), and both completed.
+  It is NOT Part 110's "stream handle stuck at st=1 pd=1" wall on its own -- that needs `d5n` frozen.
+- Host `progress` falling to ~830/s during a movie is normal: movies 1/2 did the same
+  (04:42 run, wd t=135 -> t=140: 15,823,308 -> 15,827,460).
+- `[st4b:stat]` (`sub_3E2FF0`, the **83.0 s attract-mode timeout**): `accUp=1767`, `accLastF=29.45`,
+  climbing ~25 ticks/s. Expiry needs `accUp` ~4,980 => **~t=570** at this rate. A 450 s run cannot
+  see what follows ([[feedback_long_guest_timer_reads_as_stall]]).
+
+### Health
+
+`[guest-branch:missing-target]` 0, `dispatch-miss` 0, missing functions 0, exceptions 0.
+`[ee:cold-resume]` the same 24 lines as every prior run. `[ee:zero-pc-dormant]` 3,185 -- the known
+Timer-0 IRQ recycles, scaling with run length and movie time (vbl-driven); not investigated.
+
+### Part 114's Open list, closed
+
+1. >= 450 s with Fix B off -- **done**: `ret1=1` at t~335, `nTh` returns to 2 after both movies.
+2. Rung 4.7 as defined (vt `0x4fae50`) -- **reached at t~340 and survived** (next app at t~374).
+3. The 4 CRI-exit restores to prio 1 by th6 -- present with Fix B on AND off; benign.
+
+### Launcher trap found on the way
+
+A run at 04:59 died in under a second: `[runmeta] elf=.` then `Failed to open ELF file: .`.
+A stray `.` after the pasted command bound to `-Elf`, the launcher's FIRST positional parameter,
+and `launch_recomp.ps1:207`'s `Test-Path` accepts `.` because it is a directory. Handover commands
+now pass `-Elf "F:\SDBZ Recomp\ELF\SLUS_214.42"` explicitly. Hardening the check to
+`Test-Path -PathType Leaf` is offered, not done.
+
+### Next
+
+**>= 650 s run**, same env (Fix B may stay off). Pass = `[st4b:stat]` reaches 83 (or the movie ends
+first), the demo movie tears down (stop/dtor/sweep, `nTh` -> 2), and `[lstick:stat]` shows a new vt.
+Whatever follows CAppDemoMovie is the rung-5 (title screen) candidate; confirm against the PCSX2
+title capture before claiming it.
+
+## Part 114 (2026-09-13) -- ROOT CAUSE OF THE SOFDEC WALL: the syscall thunk RE-ISSUED every thread-switching syscall. One-line fix; both opening movies now play through guest SofDec and the game reaches `CAppLogoMain`.
+
+### The defect
+
+`registerSdbzSyscallThunks` (`game_overrides.cpp` ~1897) replaces all 120 EE syscall stubs
+(`0x174880 + i*16`) with `sdbzSyscallThunk`. The thunk called `handleSyscall` with `ctx->pc`
+still equal to its OWN entry (`dispatchGuestBranch` sets `pc = target` before the call).
+
+A syscall that switches threads -- `ChangeThreadPriority` via `transferIfRequested`, and any
+other path that throws `EeDispatcherTransfer` -- unwinds out of `handleSyscall`. `EeScheduler`
+later resumes the thread at whatever `ctx->pc` held: the thunk entry. The resume re-enters the
+thunk and **issues the same syscall again, with the same a0/a1**.
+
+Regression: the thunk landed 07-17 (`f52e7eb4`); the throwing `EeScheduler` landed 08-26
+(`a45fe142`, Phase 3b). Under the old scheduler a stale pc was harmless.
+
+Tail-`j` callers were immune -- the generated code calls the generated stub directly
+(`syscall_stub_u_0x174b30(...)`), which sets `pc = syscall+4` before `handleSyscall`. That is
+why SleepThread waiters always sat at stub+8 (`0x174bc8`) while the `jal` callers sat at the
+stub ENTRY.
+
+### How Part 113's stall was really this (read from the 09-12 12:52 run, no new probe)
+
+- CHGPRI records with consecutive `n` strictly alternate ~4.8M times:
+  main `ChangeThreadPriority(6,1)` @`ra=0x11e6e8` <-> th6 `ChangeThreadPriority(6,25)` @`ra=0x11e670`.
+- Static disasm: `noop_sub_e690` issues that boost ONCE, at `0x11e6e0`, BEFORE its loop. Millions
+  of calls with no intervening restore is only possible if the syscall is re-issued.
+- th6 logs CRI **exit** records with no matching **enter** -- same signature.
+- Watchdog `sysPc=0x174b30` (the thunk entry; the generated stub would store `0x174b38`).
+- "No thread RUNNING, t1+t6 READY at `0x174B30`" is the snapshot `transferIfRequested` publishes
+  after clearing the running id -- a hand-off mid-ping-pong, not an idle kernel.
+
+**Part 113's "Next target: scheduler side" is WITHDRAWN.** The scheduler did exactly what it is
+coded to do. The equal-priority time-slice rotation in `checkpointDue` is upstream's and was
+NOT shown to matter here.
+
+### The fix
+
+```cpp
+SET_GPR_S64(ctx, 3, static_cast<int64_t>(kSdbzSyscallThunkNums[I]));
+ctx->pc = GPR_U32(ctx, 31);   // NEW: resume after the call, not back into the thunk
+runtime->handleSyscall(rdram, ctx);
+ctx->pc = GPR_U32(ctx, 31);
+```
+
+`$ra` is where the stub's `jr $ra` lands, and every jal/jalr return site is a resume entry.
+Non-transferring syscalls behave exactly as before. Side effect: the watchdog's `sysPc` now
+shows the return address. `cl /Zs` clean; exe `2026-09-13 04:26:14`.
+
+### Verification -- A/B against Part 113, identical env
+
+Run `2026-09-13 04:42`, 300 s, `PS2X_SKIPFMV=0` + Part 113's `PS2X_TRACE_CALLS`/`PS2X_TRACE_WATCH`.
+
+| | Part 113 (09-12 12:52) | Part 114 (09-13 04:42) |
+|---|---|---|
+| CHGPRI total `n` | 6,700,767 | **26,615** |
+| `ra=0x11e6e8` (one-shot boost) | millions | **4** (2 per movie) |
+| two-thread strict alternation | ~4.8M | **0** |
+| SofDec threads | 3-6 created t=120, wall forever | **3-6 t~133 -> torn down t~143; 7-10 t~177 -> torn down t~190** |
+| teardown traces (`0x14f428` stop / `0x14c8c8` dtor / `0x14e8b0` sweep) | never completes | **stop x6, dtor x2, sweep x2 at t~143 and t~190** |
+| app vt | parked at `0x4faeb0` | **`0x4faeb0` t133 -> `0x4faf10` t143 -> `0x4faf70` t178 -> `0x4fadf0` CAppLogoMain t192** |
+| `[savepri:fix]` (Fix B) | fired t=130 | **never fired** |
+| missing functions / missing targets / exceptions | 0 | 0 |
+
+`[ee:cold-resume]` is byte-identical between the runs (24 lines, same pcs) -- pre-existing, not
+the fix. `[ee:zero-pc-dormant]` 1,297 (vs 860): the known Timer-0 IRQ recycles; the runs took
+different paths, so no credit or blame is assigned.
+
+A skip-FMV run on the same exe (`04:32`, no TRACE env) also progressed normally: warn screen done
+t~118, CAppLogoMain t~163, third logo pass at t=297. **It did not exercise the fix** -- SofDec never
+initialised -- and must not be cited as verification.
+
+### Corrections carried forward
+
+- `[warn:stat] acc` stopping at 4.0167 with `sub=4` is the warning screen **FINISHING** (rung 4.5's
+  own signature), not a stall. Part 113 misread it.
+- Fix B is probably a symptom-patch of this bug. Unproven until the `PS2X_FIX_SAVEPRI=0` run.
+- `sdbzSyscallStub` (~line 1564) is dead code: line 1897 overwrites its three slots.
+
+### Open
+
+1. **>= 450 s run, `PS2X_SKIPFMV=0`, `PS2X_FIX_SAVEPRI=0`.** Pass = `[st4:stat] ret1=1` AND `nTh`
+   still returns to 2 after each movie. 300 s ended at CAppLogoMain pass ~1 (`accMax=3.03`, `ret1=0`).
+2. Rung 4.7 **as defined** (vt `0x4fae50`, the app AFTER CAppLogoMain) is **not yet reached** on
+   either path.
+3. CHGPRI shows 4 CRI-exit restores to prio 1 by thread 6 in the fixed run -- likely a legitimate
+   nested boost, not yet checked.
+
+## Part 113 (2026-09-12) -- ROOT CAUSE FOUND AND FIXED: the loadscreen wall is a priority-inversion livelock seeded by a single-global priority save. The SofDec teardown now completes and matches PCSX2.
+
+### The defect
+
+`sub_11E598` (CRI enter) / `sub_11E620` (CRI exit) boost the **current** thread to
+`[0x4418F0]` (=1) and stash its old priority in **one global**, `[0x449210]`, gated by the
+nest counter `[0x441920]`:
+
+```c
+// sub_11E598 @0x11E598   CHGPRI ra=0x11e5dc
+if (!nest) { me = GetThreadId();
+             [0x449210] = ChangeThreadPriority(me, [0x4418F0]);   // savepri = OLD prio
+             [0x449214] = me; }
+nest++;
+// sub_11E620 @0x11E620   CHGPRI ra=0x11e670
+if (!--nest) { ChangeThreadPriority(GetThreadId(), [0x449210]); }
+```
+
+That is only correct if nobody changes the thread's priority from outside the bracket.
+`noop_sub_e690` @0x11E690 -- the SofDec join-wait -- does exactly that, boosting its target
+from the caller at `CHGPRI ra=0x11e6e8`. `syscall 0x29` @0x174B30 = **ChangeThreadPriority**.
+
+### The measured poisoning (300 s trace run, seq-exact)
+
+| seq | CHGPRI ra | cur | thid | prio | old | meaning |
+|---|---|---|---|---|---|---|
+| 0x5a4 | 0x11f140 | 1 | 6 | 0x19 | 0x1 | th6 initialised to 25 |
+| 0x5fa/0x5fd | 0x11e5dc/0x11e670 | 6 | 6 | 0x1/0x19 | 0x19/0x1 | healthy enter/exit, saves+restores 25 |
+| **0x69e** | **0x11e6e8** | **1** | 6 | 0x1 | 0x19 | **main boosts th6 25->1 for the join** |
+| **0x6a0** | 0x11e5dc | 6 | 6 | 0x1 | **0x1** | **th6 enters CRI WHILE BOOSTED -> saves 1** |
+| 0x6a3+ | 0x11e670 | 6 | 6 | 0x1 | 0x1 | restores 1 -- 4,025 more times |
+
+Aggregate proof it is specific to the worker: thid 1/4/5 restore 0x18/0x10/0x12 correctly;
+**thid 6 restores 0x1**. `ra=0x11e6e8` fires only twice in a whole run.
+
+### Why that was THE wall (self-sustaining livelock)
+
+1. main is inside `sub_155630` after `0x155648 jal 0x1555A0(entry,1)` -> **g36=1**.
+2. g36=1 fires **BAIL C** (`0x1553a4`), so the SofDec idle proc returns NONZERO.
+3. th6's loop `sub_11EAC8` ORs that -> `bnez` at `0x11eb60` **skips SleepThread**.
+4. th6 pinned at pri 1 starves main (pri 24).
+5. main never reaches `0x15565c` to clear g36. Goto 2.
+
+So `a1[15]=0` in `sub_14F428` (the stop -- it holds `aE2003Mwsfdstop`) and `*slot=0` in
+`sub_14C8C8` (the destructor) never ran, and `[mvgate] nLive` stayed 1 forever.
+
+### Fix B -- landed, confirmed, and NOT sufficient
+
+`ps2xRuntime/src/lib/ps2_runtime.cpp`, inside the 1 Hz `[thsync]` sampler (~line 5360):
+writes `[0x449210] = [0x441908]` only when `savePri==boost && saveTid==wAtid && trueA` is
+sane. `[0x441908]` is the game's OWN original (the a1 that `0x11E778` hands
+`noop_sub_e690`); oracle reads 0x19 there. **`PS2X_FIX_SAVEPRI=0` disables it.**
+
+Fired **once** -- `[savepri:fix] t=130s n=1 tid=6 was=1 now=25 boost=1` -- and:
+
+| | before | after |
+|---|---|---|
+| `[mvgate]` final | g36=1 nLive=1 (latched t=135..690) | **g36=0 nLive=0** (nLive=0 @t=201, g36=0 @t=270) |
+| `w6tick` | 107,296,443 climbing 188k/s | **72,613 frozen** |
+| `[sofdec]` slots | `sl=[0x1b12cc0,0,...]` o0st=1 | **`sl=[0,0,0,0,0,0,0,0]` o0st=0** |
+| th6 priority | 1 (pinned) | **25** for t=140..275 |
+
+`sl=` all-zero + g36=0 is **exactly the PCSX2 loadscreen signature**. First time we match.
+
+### Limits -- the next gate, and a warning
+
+`[warn:stat]` advanced (`acc` 0.333->4.017, `samples` 304->566, `sub` 3->4) then **FROZE**:
+last change t~123, unchanged for the remaining 172 s. The freeze coincides with SofDec
+**init** (t=120), i.e. BEFORE the teardown completed -- so the teardown fixing itself does not
+restart it. **DO NOT "just run longer"**; a 2,000 s run re-measures 4.0167. (An earlier
+first-vs-last read called this "still climbing" and nearly cost that run -- compute rates
+over the ACTIVE window.)
+
+End-state: host `progress` collapses ~107,000/s -> **~1,600/s** after t=274, and the thread
+table shows **no thread in st=1 RUNNING** -- t1 and t6 both st=2 READY parked at `0x174B30`
+(ChangeThreadPriority), t2/t4/t5 WAIT, t3 SUSPEND. th6 is also re-boosted to pri=1 at t=296
+with `savepri=24 savetid=1` -- same single-global bug, thread 1 as the new victim, which the
+current guard cannot catch (it requires `saveTid == wAtid`).
+
+### Next target
+
+**Scheduler side.** Why does our runtime leave two READY threads parked inside
+ChangeThreadPriority, and why does it open the boost window hardware seemingly does not?
+Files: `ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp`, `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp`
+(both already locally modified -- diff before assuming current behaviour is upstream's).
+
+**Part 88's "THE EE SCHEDULER IS EXONERATED" is hereby qualified.** The guest code does say
+"don't sleep", but the reason it says so is a priority window we create. Re-open that lane.
+
+Also closed this part: `PS2X_SKIPFMV` is **EXONERATED** (the player leaks whether or not the
+FMV plays). `[thsync]`'s `VERDICT=WORKER-GATED` / `GATE-OPEN-BUT-DEAD` strings were written
+for the pre-fix livelock and are now **stale** -- they still print; re-derive before acting.
+
+## Part 112 (2026-09-11) -- separate diagnostic thread, root cause traced: `loadscreen_tick`'s own phase byte never reaches 5 because a global fade-animation byte parks at "2" forever
+
+Runs a **parallel** thread to Part 111 (`[0x500728]`/`RenderDispatch` worker-resume chain) --
+not yet reconciled with it. This one tracks `loadscreen_tick`'s (`0x3E0E60`) own phase byte
+(`a1+9`), which needs its slot-`+0x40` vtable call (`sub_420260`) to return 1 to advance
+phase 4->5. Higher-cap trace run (`0x420260:0x4000,0x2c1bb0:0x4000,0x2c1830:0x200`) gave full
+coverage of the parked `st=0xA` window for the first time (743/659/15 hits).
+
+**Traced, not inferred**: `camera_fade_is_active` (`0x2C1BB0`) takes no args, reads global
+byte `[0x500E50]`, returns "active" unconditionally when it equals `2`. At the exact call
+site inside `sub_420260` case 10, 60/61 stall samples show that byte pinned at `2`. The
+writer, `camera_fade_set` (`0x2C1830`), was called only 15 times in the whole run -- the
+last one (from `st4b` = `sub_3E2FF0`) sets the byte to "animating" (2) via a private
+accumulator only `camera_fade_set` itself ever touches (`get_xrefs_to` confirmed) -- so the
+animation can only complete if `camera_fade_set` is called again for that channel, and
+nothing ever does. `st4b` is a second victim of the same stuck global, not an independent bug.
+
+**Next, no build needed**: 4 candidate per-frame re-driver wrappers
+(`wrap_state_byte_transition_j` @0x3F9D68 and 3 clones @0x3FF5DC/0x41AC78/0x421408) were
+never reached with channel=2 during the stall -- decompile + `get_xrefs_to` each to find why.
+Full detail: `memory/project_sofdec_init_never_runs_5618b4.md`, section "cont. 5".
+
+## Part 111 (2026-09-11) -- the class-6 kick chain, end to end, CONFIRMED ON PCSX2. The SofDec workers are resumed ONCE PER FRAME by `RenderDispatch`, and that resume is gated on ONE word: `[0x500728]`
+
+No run, no build spent. Static only: `eeref.py` + `mips_r5900_disassembler.py`, plus a raw
+re-read of Part 109's own 417 s `run_log.txt`. This answers Part 110 open item 1 ("who posts
+the work request / wakes th6, and why does it stop after two ticks").
+
+### Two callback tables, not one -- these had been conflated
+
+| fn | role | table base | entry | index |
+|----|------|------------|-------|-------|
+| `0x13c3f0` register, `0x13c448` dispatch | **hook** -- exactly ONE `fn`+`arg` per class | `0x54EBA0` | 8 B | `class*8` |
+| `0x13c4f8` = `run_class` | **callback list** -- up to 6 entries per class | `0x54E960` | 12 B | `class*72` |
+
+`run_class` also bumps `[0x45EFC8 + class*4]` (class 6 -> `0x45EFE0` = `d6n`) and brackets each
+callback with `[0x45EFE8 + class*4]` (-> `0x45F000` = `d6in`). Both probe constants re-derive
+exactly from the decode, and `tshook = [0x54EBF8]` re-derives as hook class 11 -- so the
+`0x54EBA0` base is confirmed by an independently written probe
+([[feedback_verify_translations_by_decoding]]).
+
+The `[cblist]` table the probes read is the **list**, holding `0x154fa8`. The class-6 **hook**
+is a different slot and holds `sub_11E778`. Different mechanisms; no self-kick loop.
+
+Class wrappers, confirmed by decode: `0x13c670`=1, `0x13c688`=2, `0x13c6a0`=3, `0x13c6b8`=4,
+`0x13c6d0`=5, `0x13c6e8`=6, `0x13c700`=7 -- all `j 0x13c4f8`.
+
+### The worker model -- workers are created SUSPENDED, by design
+
+`ADX_Init` (and `sub_11FE90`, the two-worker variant) build it:
+
+```
+sub_11EE58  CreateThread(entry=sub_11E7E0, stk 0x441A10, 0x800)  -> tid [0x441978]
+            StartThread ; SuspendThread ; ChangeThreadPriority([0x441974])
+sub_11EFB8  CreateThread(entry=sub_11E8D0, stk 0x443210, 0x1000) -> tid [0x441980]
+            StartThread ; ChangeThreadPriority([0x44197C])          <- NOT suspended
+sub_11F0C8  CreateThread(entry=sub_11EAC8, stk 0x445210, 0x2000) -> tid [0x44198C]  worker A
+            StartThread ; ChangeThreadPriority([0x441908]) ; SuspendThread
+sub_11F160  ... same shape, entry sub_11EC00                     -> tid [0x441990]  worker B
+0x13c3f0(6, sub_11E778, 0)   install class-6 HOOK
+0x13c3f0(7, sub_11E7A0, 0)   install class-7 HOOK
+```
+
+### Who suspends -- every frame
+
+`sub_11E8D0` is a thread body (the one `sub_11EFB8` creates unsuspended). Its loop:
+
+```
+[0x441950]++
+SuspendThread-if-not-already([0x44198C])                      <- worker A
+if ([0x441A08]) sub_1201F0() ; [0x441A08]=0
+if ([0x4418E8]==1) SuspendThread-if-not-already([0x441990])   <- worker B
+sub_11FC40()          ; WakeupThread on a THIRD tid [0x441988], gated on [0x44193C]==1
+[0x441928]=1 ; run_class(2) ; [0x441928]=0
+SleepThread()
+while ([0x4419B8]==0)
+```
+
+It suspends and never resumes. The resume comes from elsewhere.
+
+### Who resumes -- also every frame, and this is the answer
+
+```
+SyncFrame 0x104c00
+  -> RenderDispatch 0x1712d0
+       if (lw -10568($gp) == 1)          ; $gp=0x503070  =>  [0x500728]
+            sub_14FF28 -> sub_11FCE8 -> sub_11FBB8
+                 ResumeThread-if-suspended([0x44198C])       <- worker A
+                 WakeupThread-if-waiting([0x44198C])
+                 if ([0x4418E8]==1) same pair for [0x441990] <- worker B
+            sub_11FBA0()
+       else
+            sub_1721E0()                                     <- workers NEVER resumed
+```
+
+`SyncFrame` calls `RenderDispatch` on **both** of its paths (`0x104c6c` inside the spin,
+`0x104cb8` on the early-out), so the call itself is unconditional per frame.
+**The whole thing hangs on `[0x500728]`.**
+
+`[0x500728]` has exactly two writers, both `sw -10568($gp)`:
+`singleton_lazy_init_e_0_clone_01+0x48` (`0x113f28`) and `sub_113F40+0x98` (`0x113fd8`). The
+same lazy-init calls `sub_11F448` at `0x113f1c`, so this word is the SofDec subsystem's
+"initialised" latch, and `sub_113F40` is the only thing that can clear it.
+
+### The class-6 hook is a flush barrier, NOT the pump driver
+
+```
+sub_154950 = call_hook(6) -> [0x54EBD0] = sub_11E778
+sub_11E778 -> sub_11E690([0x44198C], [0x441908])
+sub_11E690 -> [0x441924]=1 ; ChangeThreadPriority(worker, boost)
+              loop { WakeupThread-if-4/0xc ; ResumeThread-if-8/0xc }
+              until [0x441924]==0  (cap 199,999,999) ; restore priority on exit
+```
+
+All three callers of `call_hook(6)` are **stop / pause / close / retire** paths:
+
+| caller | what it is |
+|---|---|
+| `sub_14E8B0+0x84` | SofDec finalizer -- refcount `[0x45F670]` reaches 0, stops all 8 slots, tears down |
+| `sub_1543F8+0x3c` | retire one request: kick, `[obj+0]=0`, virtual destroy, `[obj+28]=0` |
+| `sub_155630+0x20` | reached from `sub_14F428` (close a stream) and `sub_14F580` (pause/resume, ends `sb a1,114(obj)`) |
+
+So it means "let the worker drain one pass and ACK before I tear this down". `sub_155630` even
+tails into `sub_1549C0` -> `sub_11FCE8`, the same resume-all -- a stop path leaves the workers
+*running*. Only `RenderDispatch` starts them.
+
+### What the t=342 wall actually is
+
+The thread table at the wall. **`analyze_run.py --tag thsync` had been silently dropping it** --
+see the tooling note below. Read raw from `run_log.txt`; identical t=342 through t=417:
+
+| tid | st | meaning | wt | pri | pc |
+|---|----|---------|----|-----|----|
+| 1 | 1 | RUN | -- | 24 | `0x174b30` -> `0x102994` |
+| 2 | 4 | WAIT | SEMA id3 | 0 | `0x174ce0` |
+| **3** | **8** | **SUSPEND** | -- | 8 | `0x11e7e0` |
+| 4 | 4 | WAIT | SLEEP | 16 | `0x174bc8` |
+| 5 | 4 | WAIT | SLEEP | 18 | `0x174bc8` |
+| **6** | **12** | **WAIT+SUSPEND** | SLEEP | 25 | `0x174bc8` |
+
+`st` is the guest `THS_` encoding (`rawThreadStatus`, `Thread.cpp:280`): 1 RUN, 2 READY, 4 WAIT,
+8 SUSPEND, 0xc WAITSUSPEND, 0x10 DORMANT. `pc=0x174bc8` is the instruction after `syscall` in
+the SleepThread stub at `0x174bc0`.
+
+- **th6 is worker A.** `st=0xc` = it slept (its own `sub_11ED78` -> SleepThread) and was then
+  suspended by `sub_11E8D0`. That is the designed sequence. It is stuck there only because
+  `RenderDispatch` never resumed it again.
+- **th3 never ran at all.** It is the `sub_11EE58` thread, still parked at its entry PC
+  `0x11e7e0` at t=417 -- suspended at creation, never resumed across the whole 417 s. Its body
+  spins on `[0x441998]` (writers `sub_11F3F8`, `sub_11F950`).
+- `w6tick=2`, `d6n=2`: worker A serviced exactly two passes ever, so `0x154fa8` (the SofDec
+  drain) ran twice in 417 s.
+- `req=[0x441924]=0` at every sample and `gate=[0x4419D8]=0` all run: the acker is **not
+  gated**; it is **not resumed**.
+
+### Correction to Part 110
+
+"th6 slept correctly and is never rewoken" is half right. It slept **and was suspended**, and
+the suspend is the guest's own per-frame design, not a runtime fault. The actionable statement
+is: **`RenderDispatch`'s resume branch is not being taken.**
+
+### Rung 4.7 target, restated
+
+Not "wake th6". **Find why `[0x500728] != 1` from t=342 on** -- or, if it is 1, why the resume
+branch still does not land.
+
+### PCSX2 ORACLE, 2026-09-11 -- `[0x500728] == 1` CONFIRMED, plus two more discriminators
+
+Live read against **real PCSX2 + original ISO** (`UUID de2df62d`, `PCSX2 d75a0ad`,
+SLUS-21442, Status Running) -- target verified per
+[[feedback_verify_pcsx2_target]]. Liveness verified by the two-read rule in
+[[reference_pcsx2_debugger_quirks]]: `[0x441960]` moved `0x7eb` -> `0x26d7`
+between samples. Polling only; no breakpoints, no watchpoints.
+
+The oracle was caught in the **same SofDec phase** as the stall: handle table slot 0
+`[0x461164] = 0x01b12cc0`, byte-identical to the handle our runner freezes on.
+
+| field | PCSX2 (SofDec live) | runner t=342..417 |
+|---|---|---|
+| **`[0x500728]` RenderDispatch gate** | **1** | **not yet measured -- this is the probe** |
+| `[0x54EBD0]` class-6 hook slot | **`0x0011e778`** | (decode confirmed; every other class slot is 0) |
+| `[0x44198C]` worker A tid | 14 | th6 |
+| **worker A thread status** | **`st=4` WAIT/SLEEP** | **`st=0xc` WAIT+SUSPEND** |
+| `[0x441908]` worker A priority | 25 | 25 (matches) |
+| `[0x4418F0]` boost priority | 1 | 1 (matches) |
+| **`[0x441960]` w6tick** | 2027 -> 9943 in one sample gap | **2, frozen 75 s** |
+| **`[0x45EFE0]` d6n** | 2090 | **2, frozen** |
+| `[0x4418E8]` worker-B-exists | 0 | -- |
+| `[0x441990]` worker B tid | 0 -- **never created; `ADX_Init` single-worker path** | -- |
+| **handle `0x1b12cc0` `+72`/`+68`** | **`st=4 pd=0`** (idle, request COMPLETED) | **`st=1 pd=1`** frozen |
+| `[0x45F670]` SofDec refcount | 1 | -- |
+| `[0x45F674]` / `[0x45F688]` | 1 / 0 | 1 / 0 (match) |
+| `[0x441924]` req / `[0x4419D8]` gate | 0 / 0 | 0 / 0 (match) |
+| `[0x441940]` tid-11 spin counter | 492,373 -- **running** | th3 never ran; pc still at entry `0x11e7e0` |
+| **main thread (tid 1)** | **`st=4` SLEEP at `0x174bc8`** | **`st=1` RUN at `0x102994`** |
+
+PCSX2 thread table at that moment: `0` idle, `1` SLEEP, `2` SEMA, **`11` SUSPEND at
+`0x11e810`** (inside its spin loop, not at its entry), `12` SLEEP, `13` SLEEP,
+**`14` SLEEP**.
+
+### What this settles
+
+1. **The gate is real and it is the right word.** `[0x500728]` reads 1 for the whole
+   time SofDec is live, and dropped to 0 (together with `[0x500724]` and `[0x50072C]`)
+   the moment the oracle tore SofDec down and deleted tids 11-14. It is precisely the
+   "SofDec subsystem initialised" latch that `RenderDispatch` branches on.
+2. **The hook-table decode is confirmed against live memory.** `[0x54EBD0]` holds
+   `0x11e778` and every other class slot is zero -- so class 7 / worker B are genuinely
+   unused, which also explains why `0x120180` is statically unreachable (Part 111 open
+   item 3: **closed, benign**).
+3. **Worker A on the oracle is `st=4`, never `st=0xc` at any sample.** `sub_11E8D0`
+   suspends it every frame on hardware too; `RenderDispatch` wins the race every frame.
+   Our runner loses it permanently.
+4. **The oracle completes the request our runner never starts.** `st=4 pd=0` on the
+   handle is the finished state; `st=1 pd=1` is one pending read that never returns.
+
+### New discriminator, not previously noted
+
+**On the oracle the main thread SLEEPS; on our runner it spins.** `sub_11FC40` (called
+by the frame thread `sub_11E8D0` every pass) does `WakeupThread([0x441988])` gated on
+`[0x44193C]==1` -- and on the oracle `[0x441988] = 1` and `[0x44193C] = 1`, i.e. **the
+frame thread wakes the MAIN thread once per frame**, and main is parked at SleepThread
+between frames. Our runner's th1 is `st=1` RUN at `0x102994` and never sleeps. Worth
+carrying into the next probe alongside `[0x500728]`.
+
+⚠ One caveat, stated rather than smoothed over: the oracle is running unattended and
+advanced between samples -- the final `get_threads` shows only tids 0/1/2, SofDec torn
+down. Every row above was read while tids 11-14 were present and `w6tick` was climbing,
+but they are single samples from a moving target, not a time series. Also observed after
+teardown: `d6n` kept climbing (to 11,813) with the workers gone, so **`d6n` has a second
+driver besides the acker** -- do not use `d6n` alone as a pump-liveness proxy; use
+`w6tick`.
+
+### Open
+
+1. **Read `[0x500728]` across the run.** One word, one instruction (`lw -10568($gp)` at
+   `0x1712dc`), [[feedback_bind_every_probe_to_an_instruction]]. If it is 0 or never written,
+   the next question is why `singleton_lazy_init_e_0_clone_01` did not latch it;
+   `sub_113F40+0x98` is the only other writer.
+2. ~~Cross-check on PCSX2~~ **DONE 2026-09-11 -- it reads 1.** See the oracle table
+   above ([[feedback_reproduce_on_oracle_before_root_cause]] satisfied).
+3. ~~The class-7 kick wrapper `0x120180` is statically UNREACHABLE.~~ **CLOSED, BENIGN.**
+   The oracle shows `[0x54EBD8]`(class 7)`= 0` and worker B tid `[0x441990] = 0` -- the
+   single-worker `ADX_Init` path is the one in use, so class 7 is genuinely dead.
+4. NEW from the oracle: our th1 spins at `0x102994` where hardware's main thread SLEEPS
+   at `0x174bc8`, woken once per frame by `sub_11FC40`. Probe `[0x44193C]`/`[0x441988]`
+   alongside `[0x500728]`.
+
+### Tooling defect found on the way -- NOT yet fixed
+
+`analyze_run.py --tag thsync` prints each record **truncated at `nTh=N`** and drops every
+`[tid:st=,wt=,wid=,pri=,pc=]` field after it. The data is present in `run_log.txt`. Part 110's
+thread-state reading was made from the truncated form. Same class as
+[[feedback_truncated_console_column]]: re-read raw before concluding anything about thread state.
+
+### eeref caveat, stated because it bit once here
+
+`refs 0x11e780` returned "UNREACHABLE -- nothing links to this address" because the func map
+folds the row; the real entry is `0x11e778`, which has two IMM refs. Every "unreachable" claim
+above was re-checked at the true row start before being believed
+([[project_eeref_static_xref]], [[project_ghidra_func_map_rebuilt]]).
+
+## Part 110 (2026-09-11) -- CORRECTION. Part 109's pairing is COMMON CAUSE, not causation. The wall is a stream handle stuck at `st=1 pd=1`
+
+No run, no build spent. Everything below is a static re-read of Part 109's own 417 s log
+(`run_log.txt`, 22:27) plus `mips_r5900_disassembler.py`. This is a
+[[feedback_remeasure_the_premise]] result: the premise was wrong, not the measurement.
+
+### The asked check came back clean
+
+Part 109 open item 1 asked whether the runtime pushes a return invocation before calling the
+guest fn. **It does.** `EeScheduler.cpp` pushes on four paths (`PushPending`,
+`PushDispatcher`, `PushInvoke`, `PushSequence`), and the `pc==0` path pops one *first* --
+it only falls through to `makeDormant()` when the invocation stack is genuinely empty.
+
+### Three facts that kill the `0x154fa8` theory
+
+1. **Every dormant is `tid=-1`.** 2,086 EXPECTED events, `tid=-1 entry=0x0` on all of them.
+   **Zero on tid=1. Zero SUSPECT** -- the single "SUSPECT" string in the 2,701-line dump is
+   the suppression notice, not an event. So this is neither "tid1 dies" nor a lost frame.
+   `tid < 0` is the pseudo-thread `acquireInvocationThread()` mints to host a pending
+   invocation; `EeScheduler.cpp` part 46 already marks its `pc==0` recycle as **designed**.
+
+2. **The hosted invocation is `0x104b30`, not `0x154fa8`.** Disassembled, it is the EE
+   **Timer-0 interrupt handler**:
+
+   ```
+   0x104b84  sw   $v0(0x83), 16($v1=0x10000000)   ; T0_MODE  = 0x83
+   0x104b8c  sw   $zero, 0($v1)                   ; T0_COUNT = 0
+   0x104bbc  jalr $ra, $v0                        ; hook [0x503230]
+   0x104bc4  jal  0x171320
+   0x104bdc  jr   $ra
+   ```
+
+   `[watchdog] trace=` confirms the entry path: `0x17ed60 -> 0x17edb0 -> 0x104b30`, i.e. the
+   INTC dispatcher. At t=345 the watchdog catches the EE at exactly `pc=0x104b30 ra=0x0`.
+
+3. **The pairing is common cause: one per vblank.** Per-second `d5n` delta == `vbl/s` ==
+   dormants/s, **second by second across all 76 samples**, including the truncated final
+   second (10 / 10 / 10). Both counters are 0 for the first 341 s and both start at t=342.
+
+   | t | d5n | d(d5n) | vbl/s | dormants that sec |
+   |---|---|---|---|---|
+   | 342 | 23 | 23 | 23 | 20 |
+   | 343 | 51 | 28 | 29 | 28 |
+   | 380 | 1077 | 28 | 28 | 28 |
+   | 416 | 2080 | 28 | 28 | 28 |
+   | 417 | 2090 | 10 | 10 | 10 |
+
+   Part 109 sampled both at 1 Hz and read the equality as a chain. It is two clocks ticking
+   off the same interrupt. [[feedback_never_convict_by_count_with_two_callers]].
+
+**The dormants are evidence the interrupt path is ALIVE during the quiesce.** They are not
+the failure; they are the one subsystem still working.
+
+### What the t=342 wall actually is -- frozen, not spinning
+
+The entire `[sofdec]` record is **identical from t=342 to t=417**. 76 samples, not one field
+transition:
+
+| field | value | reading |
+|---|---|---|
+| `h0=0x1b12cc0 st0=1 pd0=1*` | BUSY | one pending request, **never cleared**. PCSX2 idle = `st=4 pd=0` -- we never complete the FIRST read |
+| `w6tick=2  d6n=2` | frozen | th6 (`sub_11EAC8`) ran two ticks and stopped |
+| `[thsync] req=0 inWork=0 dTick=0` | 75 s | **nobody ever posts a work request** |
+| `savepri=24 savetid=1 nest=0` | healthy | **no priority latch**; matches PCSX2's `0x18`. The old `savetid=6 savepri=1` latch is absent |
+| `g36=0 g688=0 g674=1 tsflag=0` | open | every pump gate passes -- this is **not** the g36 wall |
+| `gif/s=28 dma/s=168 vblSrc=0/28/0` | moving | GIF and DMA still run; the vblank source moved from slot 0 to slot 1 at t=342 |
+
+**Deadlock, not spin.** `[h+68]` is cleared only by `sub_165300`, which is reachable only
+through the class-6 dispatch -- and that is not running, because th6 slept correctly (which
+is the *right* behaviour, [[project_resume_no_preemption]]) and is never woken again. Part
+61b already proved `sub_165300`'s own two guards both PASS at `st=1 pd=1`, so the servicer
+is simply never called. Nothing is broken at the servicer; the caller never arrives.
+
+### Correction to the rung-4.7 signature
+
+The ladder's exit test for 4.7 was "EE tid1 stays `st=1`; no `[ee:zero-pc-dormant]`". Both
+halves are wrong: tid1 never goes dormant in this run, and `[ee:zero-pc-dormant]` fires
+~28/s as normal timer behaviour. Replaced in the ladder above with a signature that
+discriminates: **`pd0` reaches 0**, or **`w6tick` advances past 2**.
+
+### Open
+
+1. **Who posts the work request / wakes th6, and why does it stop after two ticks?**
+   Find the word `[thsync] req` reads, then `eeref` its writers. Static, no run needed.
+2. Part 109 items 2 and 3 are unchanged.
+
+Memory: `project_zero_pc_dormant_pump_pairing` (rewritten as the falsification).
+
+## Part 109 (2026-09-10) -- ⛔ SUPERSEDED BY PART 110 -- 417 s run. ~~EVERY call to the SofDec drain callback `sub_154FA8` ends in a zero-PC dormant -- 1:1, five samples~~ (the pairing is real; the causal reading is FALSIFIED)
+
+`-Determinism 1 -RunSeconds 420 -NoDebugger -Exe ...RelWithDebInfo\ps2EntryRunner.exe`.
+Run ended t=417 s. This is the longer run Part 108 open item 3 asked for.
+
+### The finding: `d5n` == `dormant#`, exactly, at every sample
+
+`[sofdec] d5n` counts calls to the class-5 drain fn `0x154fa8`.
+`[ee:zero-pc-dormant] EXPECTED #N` counts guest PCs reaching 0 with no invocation to pop.
+Different subsystems, different tags, same number:
+
+| t | `d5n` | `dormant#` |
+|---|---|---|
+| 350 | 241 | 241 |
+| 360 | 521 | 521 |
+| 370 | 797 | 797 |
+| 380 | 1077 | 1077 |
+| 390 | 1358 | 1358 |
+| 417 | 2090 | 2090 |
+
+**Measured fact:** the pairing is exact, 1:1, across five independent samples at five
+different values. **Hypothesis (strong, not proven):** the runtime invokes `0x154fa8`
+without a proper invocation frame, so the callback returns into pc=0 and the EE goes
+dormant instead of resuming the interrupted thread. That is exactly Part 107's
+"EE tid1 goes DORMANT with pc=0" wall, now **bound to an instruction**
+(`feedback_bind_every_probe_to_an_instruction`) instead of floating.
+
+⚠ The dormants are tagged **EXPECTED** by the runtime, so they do **not** contradict the
+`project_irq_handler_stack_overlap` fix (which closed a different, unexpected class 234->0).
+An EXPECTED label is a runtime opinion, not a verdict -- 2,090 of them in 75 s is a number
+worth distrusting.
+
+### Part 107's wall REPRODUCED, with the host FMV player active
+
+| t | what |
+|---|---|
+| ~4 s | ATARI plays (host) |
+| ~40 s | OKR plays (host) |
+| 40-342 | app chain runs; `progress` ~100k/s, `vbl/s` 4-6, `pc` alternates `0x104c74`/`0x422660` |
+| **342** | **4 threads spawn (3,4,5,6) and a real SofDec stream OPENS** -- `h0=0x1b12cc0`, `o0st=1`, `cb6=0x11e778`, `d5fn=0x154fa8` |
+| 342-417 | quiesce: all 6 threads WAIT/SUSPEND, EE on the idle loop `0x104c74`, `progress` collapses ~100k/s -> ~900/s, `vbl/s` rises 4-6 -> 28 |
+
+t=342 here is Part 107's t=322 app `0x4fae50` -- the SofDec-class app **after** `CAppLogoMain`.
+**Now measured, not predicted: `PS2X_FMV=host` does NOT cover it.** The host player owns only
+the four logo phase fns; this app opens the stream itself and hangs.
+
+### The g36 wall did NOT reproduce
+
+`g36=0` for the whole run. `g688=0`, `g674=1`. `d5n` = 2,090 over 75 s = **~27/s**, not the
+183k/s acker spin of `project_sofdec_pump_never_idle`. So the park at `0x4fae50` in this run
+is a **quiesce, not a spin** -- a different failure shape from the parked SofDec wall, and the
+two should not be assumed to be the same bug.
+
+### Host FMV player, second run -- numbers hold
+
+```
+ATARI 256x448 mpeg1video 29.97fps 4.05408s audio=adpcm_adx 48000x2 -> ...\MOVIE\ATARI.SFD
+ATARI: finished after 4.14116s (91 presented, 122 decoded)  retired after 4.27363s
+OKR:   finished after 5.14241s (119 presented, 152 decoded)  retired after 5.21227s
+```
+
+Player span within +2.1% / +1.7% of the movie's own duration -- real-time, same as the 200 s
+run. Presented/decoded 75% and 78% (was 75% / 74%). The ~25% drop is stable and still
+untuned.
+
+### Open
+
+1. ~~**The `0x154fa8` -> zero-PC-dormant pairing.**~~ **CLOSED 2026-09-11 -- the
+   hypothesis was FALSIFIED. See Part 110.** The dispatch does push a return invocation;
+   the dormants are the Timer-0 IRQ recycling on the pseudo-thread, one per vblank.
+2. **`OP.SFD` phase addresses still not derivable.** Unchanged from Part 108 item 2.
+   ⚠ The `0x4fae50` app opening a stream at t=342 is *probably* that movie -- but
+   `[moviegate:stat]` shows `dvci130ef0.calls=0` and `open12cc20.calls=0`, so the two
+   movie-open probes never fired. Either the probes are mis-sited or the app opens by a
+   third path. **Hypothesis, with counter-evidence on the record.**
+3. The guest's SofDec filename is runtime-assembled: `[movie] objFile=0x4597b0` reads as
+   96 zero bytes in the static ELF, so the file cannot be named without a live read.
+
+Memory: `project_zero_pc_dormant_pump_pairing` (the finding), `project_fmv_host_player`,
+`project_sofdec_pump_never_idle`, `project_irq_handler_stack_overlap`.
+
+## Part 108 (2026-09-10) -- THE OPENING MOVIES PLAY. Host-side FFmpeg player, detached from upstream
+
+First feature in a long time that worked on the first run. Original ask: *"modify the
+program so it runs the FMV — something we can detach so it doesn't mess with the
+recomp upstream."* Both halves delivered.
+
+### What was built
+
+The guest's own SofDec path stays parked (the `g36` class-6 wall is untouched). Instead
+the four logo phase-machine slots are intercepted, the real `.SFD` is decoded on the
+**host** with the FFmpeg already linked into `ps2_runtime`, presented over raylib, and
+only then does the stub report "phase complete".
+
+| File | Lines | Contains |
+|---|---|---|
+| `src/lib/Kernel/Fmv/FmvHost.h` | 136 | module-internal interface; leaks neither FFmpeg nor raylib types |
+| `src/lib/Kernel/Fmv/FmvHost.cpp` | 708 | anchor TU: 4 hooks, state machine, player thread, movie table, 3 exports |
+| `src/lib/Kernel/Fmv/FmvDecoder.cpp` | 465 | FFmpeg only; `#if PS2X_HAS_FFMPEG` with an `#else` stub so the symbols always link |
+| `src/lib/Kernel/Fmv/FmvPresent.cpp` | 224 | raylib only; Texture2D + AudioStream |
+
+**Detachment is literal.** `game_overrides.cpp`: untouched. `CMakeLists.txt`: untouched
+(the existing `GLOB_RECURSE ... CONFIGURE_DEPENDS` over `src/lib/Kernel/*.cpp` picks the
+new directory up for free). `ps2_runtime.cpp` takes 4 small edits, ~24 lines total: three
+`extern "C"` decls, `ps2x_fmv_host_install(this)`, `ps2x_fmv_host_draw()`,
+`ps2x_fmv_host_shutdown()`.
+
+Installing from `PS2Runtime::run()` rather than a self-registering descriptor beats two
+hazards at once: cross-TU static-init order is unspecified, and `ps2_runtime` is a STATIC
+lib with no `/WHOLEARCHIVE`, so a TU reachable only via static-init self-registration is
+silently dead-stripped at link time.
+
+### The run -- `PS2X_FMV=host`, det=1, 200 s, 2026-09-10 21:00
+
+```
+[skipfmv] ACTIVE ... installed=4/4
+[fmvhost] ACTIVE -- host FFmpeg player owns 0x420e70/0x420fc0/0x4216e0/0x421830,
+          OVERRIDING [skipfmv]'s stubs. installed=4/4
+[fmvhost] first tick: ATARI open 0x420e70                                  (t~125s)
+[fmvhost] ATARI 256x448 mpeg1video 29.97fps 4.05408s audio=adpcm_adx 48000x2
+          size=737280   -> ...\SDBZ ISO 2\MOVIE\ATARI.SFD                (t~125s)
+[fmvhost] OKR   256x448 mpeg1video 29.97fps 5.05609s audio=adpcm_adx 48000x2
+          size=2424832  -> ...\SDBZ ISO 2\MOVIE\OKR.SFD                  (t~162s)
+[fmvhost] abort requested: shutdown                                        (t=199s)
+[run] exiting loop
+```
+
+No `watchdog at`, no `outer watchdog`, no `decode error`, no `open failed`, no
+`LoadAudioStream failed`.
+
+**Confirmed on screen by the user.** The log cannot show that a picture appeared and
+`vbl/s` must never be used to infer it -- this rung rests on direct observation, which is
+the correct evidence for "did a picture appear". Audio audibility was **not** separately
+confirmed; the ADX stream opened cleanly but nobody has said they heard it.
+
+### The polling contract is PROVEN -- and the probe built for it was never needed
+
+The entire design rested on one unverified assumption: that the guest **re-polls** the
+logo phase slot, so a stub can answer `$v0 = 0` ("still working") for many ticks and
+`$v0 = 1` once. The 10-slot logo vtable is a different table from the `+0x38..+0x44` CApp
+driver verified in part 106, so it could not be inherited.
+
+`PS2X_FMV_PROBE=N` was written specifically to settle it. It never had to run. **OKR
+opening after ATARI is the proof**: the ATARI phase can only be retired by the stub
+answering 1, and that answer only ever happens on a *later* tick than the one that
+started playback. The natural sequence discriminated for free.
+
+Generalised into memory as `feedback_natural_sequence_beats_a_probe`: if B cannot happen
+without A, observing B proves A -- check for that before building a counter. One-
+directional only; B *absent* still proves nothing.
+
+### Pre-build syntax checking, new capability
+
+`cl /Zs` syntax-checks any runtime TU in seconds without emitting an `.obj`, writing into
+`build/`, or spending one of the user's build cycles. All four new TUs plus the `#else`
+no-FFmpeg branch and the edited `ps2_runtime.cpp` came back EXIT=0 before the build was
+ever handed over -- which is why this landed first try. Recipe in
+`project_syntax_check_without_building`. `/Zs` never links, so `extern "C"` signatures
+still have to be diffed by hand.
+
+### Container facts, now measured three ways
+
+`reference_iso_layout.md` said "MPEG-2 video + ADX audio". Raw byte parse, then `ffprobe`,
+then the runtime's own libavformat open all agree:
+
+| File | Video | Audio | Duration |
+|---|---|---|---|
+| ATARI.SFD | `mpeg1video` 256x448 @ 30000/1001 | `adpcm_adx` 48 kHz stereo | 4.054 s |
+| OKR.SFD | `mpeg1video` 256x448 | `adpcm_adx` 48 kHz stereo | 5.056 s |
+| OP.SFD | `mpeg1video` 512x448 | `adpcm_adx` 48 kHz stereo | 40.358 s |
+
+So the video half was wrong (MPEG-**1**, pack header nibble `0b0010`) and the ADX half was
+right. Note the trap: the audio PES id **is** `0xC0`, the standard MPEG-audio slot, but the
+payload is ADX. A stream-ID parse reads the slot, not the codec.
+
+### Open
+
+1. **MEASURED 2026-09-10 21:49 — the player is NOT the 37 s.** 37 s elapsed between
+   ATARI's first tick and OKR's, for a 4.05 s movie. Since it looked right on screen the
+   ~33 s is *probably* guest work between the two logo apps -- still an inference. Two
+   lines added 2026-09-10 and RUN:
+
+   ```
+   [fmvhost] ATARI: finished after 4.14021s (92 frames presented, 122 decoded)  movie=4.05408s  sinceFirstTick=4.16827s
+   [fmvhost] ATARI: retired after 4.23264s since first tick
+   [fmvhost] OKR:   finished after 5.14232s (113 frames presented, 152 decoded)  movie=5.05609s  sinceFirstTick=5.18063s
+   [fmvhost] OKR:   retired after 5.26421s since first tick
+   ```
+
+   They split the gap into three spans with different owners: first tick -> finished is the
+   **player**; finished -> retired is the **guest** taking one more tick to accept
+   `$v0 = 1`; retired -> the next movie's first tick is **guest work between the logo apps**.
+   `presented` counts the `UpdateTexture` in `FmvPresent.cpp`, `decoded` counts
+   `publishFrame` -- they differ because the present loop takes only the newest frame, so
+   never quote `decoded` as evidence a frame was drawn.
+
+   **Result.** Player span = **4.14 s** for a 4.054 s movie (+2.1%) and **5.14 s**
+   for a 5.056 s movie (+1.7%) — real-time. Guest retirement latency = **0.09 s**
+   and **0.12 s**. So of the 37 s, the player owns ~4.2 s; the remaining **~33 s is
+   guest work between the two logo apps**, which was the standing inference and is
+   now measured. The FMV player is closed as a performance suspect.
+
+   **New open number: 25% of decoded frames never reach the GPU.** ATARI presented
+   92 of 122 (75%), OKR 113 of 152 (74%) — ~22 fps against a 29.97 fps source. The
+   present loop takes only the newest frame, so this is the frame-pacing gap, not a
+   decode failure. Not yet a visible complaint; log it before tuning.
+
+   Audio decodes as **`adpcm_adx` 48000x2**, confirming ADX — the plan's
+   "MPEG audio on PES 0xC0" reading was wrong.
+2. **`OP.SFD` is BLOCKED, not merely unwired — its phase addresses are not derivable
+   statically (checked 2026-09-10).** Three independent attempts, all negative:
+
+   - **Structural twin match works for the logos and only the logos.** ATARI and OKR are
+     identical shapes in the func map — `Ctor` 0x4c → `obj_set_fields___` 0x40 →
+     **open** 0x140 → `return_const_1` 0x8 → **close** 0x170, at `0x420DE0` and
+     `0x421650`. That twinning is *why* their four addresses were known.
+     `CAppDemoMovie_Ctor` (`0x3E3290`), the only other plausible movie app, has none of
+     those neighbours — it is not a third clone.
+   - **String xref is blind here.** `eeref refs` on all three `movie/*.sfd` VAs
+     (`0x4D7A50` `op_usa`, `0x4DCD80` `atari`, `0x4DCDC8` `okr`) reports
+     **UNREACHABLE** — including `atari`, which PCSX2 proved is used. The filenames are
+     assembled at runtime, so absence here is not evidence
+     ([[feedback_capped_probes_false_negatives]]).
+   - **The stream-open has no static callers.** `eeref up 0x130EF0` finds zero `jal`
+     sites; it is reached only through a **data word at `0x44E728`** (a vtable slot).
+
+   ⚠️ **The ELF contains `movie/op_usa.sfd`, never `movie/op.sfd`** — only
+   `0FLIST.DIR` names the latter. A third table entry should probably target
+   `OP_USA.SFD` (46.4 MB), not `OP.SFD`.
+
+   **How to unblock (cheap, but needs the oracle):** attract mode plays *after* the title
+   screen, which no run has reached (rung 4.7 is still the wall) — so there is nothing to
+   verify a guess against either. Settle it on PCSX2: break on `0x130EF0`, let the title
+   screen idle into attract mode, and the **third** hit names the app; the caller's return
+   address gives the phase machine. Until that exists, adding a table entry would be a
+   guess ([[feedback_no_guessing]]).
+3. ~~**The run did not reach the title in 200 s.**~~ **CLOSED by Part 109** -- the 417 s
+   run was executed. It does not reach the title either, but it is no longer "needs more
+   seconds": at t=342 it reaches the SofDec-class app `0x4fae50` and quiesces there. Rung 4.7
+   is still the wall; the wall now has a bound instruction (`0x154fa8`).
+
+Memory: `project_fmv_host_player` (full detail), `project_syntax_check_without_building`,
+`feedback_natural_sequence_beats_a_probe`, `reference_iso_layout`.
+
+## Part 107 (2026-09-10) -- `CAppLogoMain` COMPLETES at t=322. The new wall is the app AFTER it: EE tid1 goes DORMANT with pc=0
+
+`-Determinism 1 -RunSeconds 420 -NoDebugger`.
+
+### Rung 4.6 closed
+
+`[st4:stat]` (hook `0x420260`, obj `0x632df0`) reached the modelled exit exactly:
+
+| t | subChanged | b161 | b162 | subAfter | note |
+|---|---|---|---|---|---|
+| 273 | 14 | 2 | 0 | 1 | pass 3 begins (`b161` loads 2) |
+| 307 | 17 | 2 | 0 | **0xa** | `sub=3` sets state **10** -- the exit state |
+| **322** | 17 | 2 | 0 | 0xa | **`ret1=1`** -- app complete |
+
+The three-pass model from part 104 is now **re-verified on a second run**, not inherited.
+
+### The app chain, off `[lstick:stat] vt=`
+
+| t | vt | app |
+|---|---|---|
+| 24 | `0x4fa400` | `CAppWarning` -- done |
+| 128 | `0x4f99a0` | brief |
+| 133 | `0x4faf10` | unlabeled, ctor `0x42122c` |
+| 163 | `0x4f99a0` | brief again |
+| 168 | `0x4fadf0` | `CAppLogoMain` -- done at t=322 |
+| **322** | **`0x4fae50`** | **NEW. SofDec-class. This is where we die.** |
+
+### What `0x4fae50` is (read statically out of the ELF)
+
+| slot | addr | name from `output/` |
+|---|---|---|
+| +0x08 | `0x420dc0` | `gp_field_get_z_410` -- `jr $ra; lw $v0, -10756($gp)` |
+| +0x14 | `0x3e1280` | `loadscreen_reset` |
+| +0x1c | `0x3e12f0` | `loadscreen_cancel` |
+| +0x34 | `0x420720` | `obj_set_fields_z_252` |
+| **+0x38** | **`0x420780`** | **`CAppCRISofdec_Tick_clone_02`** |
+| +0x3c | `0x4208b0` | `wrap_camera_set_mode_b` |
+| +0x40 | `0x4208f0` | `CAppRankingBase_Tick_clone_02` (inherited label, NOT re-verified) |
+| +0x44 | `0x3e0c20` | `return_const_1_z_127` |
+
+`vt+0x38` being a `CAppCRISofdec` tick is what makes this a **movie app**.
+
+### ⚠ The FMV skip does NOT cover it
+
+`kSkipFmvFns` replaces exactly four functions -- `CAppLogoAtari` open/close (`0x420E70`,
+`0x420FC0`) and `CAppLogoOkrtron` open/close (`0x4216E0`, `0x421830`). `0x4fae50` is a
+different app class and runs **for real**. `[skipfmv] ACTIVE installed=4/4` in this run.
+
+### The death
+
+| t | event |
+|---|---|
+| 322 | app switches to `0x4fae50` |
+| **326** | a **single** `[ee:zero-pc-dormant] SUSPECT` (tid=1, entry=`0x100008`) |
+| **327** | `[thsync]` tid1 `st=1` -> **`st=16` (THS_DORMANT)**, `pc=0x0` |
+| 327-417 | idle: `busy%=0`, `gif/s=0`, `dma/s=0`, `progress` frozen, `stuckSecs` climbing to 90 |
+
+⚠ The 909 `[ee:zero-pc-dormant]` lines are **one** multi-line dispatch-ring dump, not 909
+events. Exactly one SUSPECT fired, at t=326 ([[feedback_capped_probes_false_negatives]] shape
+inverted -- do not read the line count as an event count).
+
+### What is NOT the cause -- ruled out by reading the generated code
+
+`GameMain` = `0x422630`, `GameUpdate` = `0x421ea0`, `GameInit` = `0x421b70`,
+`GameShutdown` = `0x421a80`. `$gp = 0x503070` (from `.reginfo`).
+
+`GameMain`'s loop is:
+```
+0x422658  jal   GameUpdate(0x421ea0)
+0x422660  lui   $v0, 0x64            <- MID-RESUME lands here
+0x422668  lw    $v0, -0x20C($v0)     ; [0x63FDF4] = current app ptr
+0x422670  bne   $v0, $v1, 0x422658   ; $v1 = $gp-0x281C = 0x500854 (sentinel)
+```
+`output/GameMain_0x422630.cpp` is **complete and correct** -- every path sets `ctx->pc`, and
+the file is not truncated. So this is **not** the truncated-function class.
+
+It is also **not** a clean shutdown: the dispatch ring's newest entry is still `0x422660`
+(the loop resume). `GameShutdown` (`0x421A80`) never dispatched. An earlier reading of this
+run as "the game exited normally" was **wrong and is retracted**.
+
+### Open
+
+The exact instruction that produced `pc=0` is **not yet established**. Candidate worth
+checking first: `GameUpdate`'s opening indirect call
+`lw $a0,-3572($gp)` (= `[0x50227C]`) -> `lw $t9,0($a0)` -> `lw $t9,20($t9)` -> `jalr $t9`.
+
+## RESTORED 2026-09-13 -- the original file header (as of 2026-09-09) and Parts 105 and 104
+
+> Recovered from the unreachable git blob `bb633a6b02568b68d587d21e79ff41509beb5069` while checking a `git prune` on 2026-09-13.
+> This text was destroyed on 2026-09-10, when this file was truncated to 0 bytes by an
+> `open(path, 'w')` (see STOP rule 14), and it had never been committed -- the blob was the only copy.
+> A raw copy is kept at `_backup_recovered_2026-08-31/prune_rescue_2026-09-13/`.
+>
+> **The header below is HISTORICAL.** Its "ACTIVE STAGE" banner and its milestone ladder are
+> superseded by the header and ladder at the top of this file; its headings are demoted one level
+> so they do not read as current sections. **Parts 105 and 104 are verbatim**, placed newest-first
+> (the snapshot held them in the order 104, 105). Part 106, cited by the ladder, was not in the
+> blob and remains lost.
+
+### [historical header] ACTIVE STAGE (2026-09-08): Stage 6 -- TITLE SCREEN. The FMV is no longer the goal.
+
+> **Read this before anything else. The objective changed on 2026-09-08.**
+> "Make the opening FMV play" is **retired** as the active stage. It was a boot blocker,
+> which coupled 100% of project progress to the single hardest subsystem in the game
+> (CRI SofDec + ADX + IPU + CDVD streaming + a two-thread handshake), at roughly one bit
+> of information per build+run cycle, for months.
+> The opening logo movies are now **SKIPPED by default** (`PS2X_SKIPFMV`, default ON) and
+> the FMV is a feature to be finished later, not a gate. The root-cause work is **parked
+> with its resume point named**, not abandoned -- see part 103.
+
+#### Why this is not giving up
+
+- The method was sound. The measurement discipline caught **8** wrong headlines before any
+  of them became load-bearing. What was wrong was the **objective's shape**, not the work.
+- The title screen is **provably reachable**: `path_holes.py` closure from a live PCSX2
+  title-screen backtrace found **zero** remaining direct-branch holes between the Atari
+  screen and the title screen (validated, run 47).
+- The SofDec question is in better shape than it has ever been, and it is **one function
+  wide**: class 6 has exactly one registered handler (`0x154FA8`), `[0x45F688]` is 0 in
+  every sample so that handler always takes `return 0x155210()`, and `0x155210` returns
+  nonzero for us where hardware returns 0. That is the resume point.
+
+#### The skip switch
+
+`PS2X_SKIPFMV` -- **default ON**. `PS2X_SKIPFMV=0` restores the real movie path exactly
+(the override becomes fully inert and replaces nothing).
+
+Implemented in `ps2xRuntime/src/lib/game_overrides.cpp` as `applySdbzSkipFmv`, registered
+**last** on purpose because `applySdbzSregProbe` also replaces `0x420E70`. It stubs four
+vtable phase-machine slots to their own documented done-path (`[obj+48]=0; return 1`):
+
+| app | vtable | open (+0x08) | close (+0x10) |
+|---|---|---|---|
+| CAppLogoAtari | `0x4FAEE0` | `0x420E70` | `0x420FC0` <- the hang |
+| CAppLogoOkrtron | `0x4FAFA0` | `0x4216E0` | `0x421830` |
+
+Not stubbed: the third app of the same vtable shape (`0x3E2E80`/`0x3E2FF0`, vt `0x4F9AA0`).
+Its `+0x0C` is `wrap_effect_mgr_set_flag` rather than a return-1 stub, so it is a different
+app class, not an opening logo.
+
+Every run prints `[skipfmv] ACTIVE ... installed=N/4` or `[skipfmv] disabled`. **A run whose
+log has neither line did not pick up the override.** `installed` below 4 is a broken install,
+not a quiet guest.
+
+#### MILESTONE LADDER -- progress is measured in how far the game gets
+
+Replaces "which probe fired" as the unit of progress. Each rung needs an assertable signature.
+
+| # | Milestone | Signature | State |
+|---|---|---|---|
+| 1 | Boot to EE entry | dispatch table populated, no `dispatch-miss` | DONE |
+| 2 | IOP modules + SIF RPC up | ARKD_DVD.IRX loaded, RPC bound | DONE |
+| 3 | Atari loading screen | reached and rendered | DONE |
+| 4 | Past the opening logos | `[skipfmv] ACTIVE installed=4/4`, no `savepri=1 savetid=6` latch | ✅ **DONE 09-08** |
+| 4.5 | Past the `CAppWarning` screen | `[warn:stat] sub=4` then the app returns 1 | **IN PROGRESS** -- needs `-RunSeconds 240`, see part 104 |
+| 5 | **Title screen** | ⚠️ `[0x5e6b3c]==0x00` is **NOT** discriminating -- it reads 0 at t=1s. Needs a positive signature off the PCSX2 title capture. Keep: GS frames, zero `dispatch-miss`, zero `[guest-branch:missing-target]` | NEXT |
+| 6 | Main menu navigable | pad input reaches the menu state machine | later |
+| 7 | Character select | -- | later |
+| 8 | In-game | -- | later |
+
+Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
+independent of each other and individually far smaller than the SofDec stack. Re-run
+`path_holes.py` from a fresh PCSX2 backtrace whenever a new screen is reached -- that method
+already converted an open-ended 144-item grind into a bounded 5-item batch, and it was right.
+
+
+---
+
+## Part 105 (2026-09-09) -- SofDec: the g36 chain RE-DERIVED INDEPENDENTLY (already in part 90), plus three genuinely new links -- and PCSX2 was killed by a hot-loop breakpoint
+
+### 0. READ THIS FIRST -- most of this session was a duplicate
+
+Parts 89 and 90 (2026-09-07) already established, first-hand, everything I "found" today:
+the `0x155630` bracket and its straight-line shape, `0x154950: a0 = 6`, table `0x54EBA0`
+slot 6 = `0x11e778`, the tail jump into `0x11e690`, the wbusy handshake, the 2:1
+open/close ratio, **and the oracle capture** (1803 PCSX2 samples: hardware runs the
+bracket 15-68x/second, microseconds per pass, `g36 = 0` in every sample).
+
+I re-derived it from scratch via `eeref` because I did not grep this file for `g36`
+first. **This file is 1.5 MB / 18,000+ lines: it is a SEARCH target, not a read target.**
+The one upside is that part 90's chain is now independently confirmed by a second method.
+
+### 1. What IS new -- three links parts 89/90 did not have
+
+**(a) `sub_165300` @ 0x165300 is the SOLE drainer of the stream handle.** `eeref field
+68:79` over the whole image, plus the decompile. Its body holds the only clear of
+`h[68]` and the only advance of `h[72]` that exists anywhere:
+
+    v2 = h[72];
+    if ((unsigned)(v2 - 1) < 4) {
+        if (h[68]) { h[68] = 0; ...dispatch on state...; h[72] = new; }
+    }
+
+Its only live caller chain (`eeref up`; the other caller `sub_1652A8` has zero callers):
+`0x155210 -> 0x155320 -> 0x165250 -> 0x165300`.
+
+**(b) g36's READER is now bound to an instruction -- `0x1553a4`.** Part 90 bound g36's
+*writer* (`0x1555a0`). The consumer was still unbound, which is exactly what
+[[feedback_bind_every_probe_to_an_instruction]] warns about. `sub_155320` has five gates,
+and four of them are already printed by the live `[sofdec]` line -- all four PASS:
+
+| # | instruction | test | run-4 field | verdict |
+|---|---|---|---|---|
+| 1 | 0x155358 | `*(0x45F674) == 1` | unprobed; PCSX2 read = 1 | pass |
+| 2 | 0x155360 | `obj != 0` | `o0h=0x1b12cc0` | pass |
+| 3 | 0x155384 | `obj[0] == 1` | `o0st=1` | pass |
+| 4 | 0x155394 | `obj[96] != obj[0]` | `o0lock=0` | pass |
+| 5 | **0x1553a4** | **`g36 != obj[0]`** | **`g36=1`** | **FAIL** |
+
+So the class-6 starvation part 90 measured (d6n 0.17/s vs hardware 15.7-67.9/s) now has
+its mechanism named: gate 5 switches the pump off.
+
+**(c) The g36 timeline across a full run, correlated with watchdog progress.** Part 90 had
+the 2:1 bracket ratio from a TRACE run; this is the 885 s picture from run 4:
+
+    t=1..158    g36=0  (157 [sofdec] samples)
+    t=159..885  g36=1  (727 samples)
+    exactly ONE transition, never returns
+
+    t=157 progress=15,108,853   +417/s
+    t=158 progress=15,109,270        <- last d5n increment
+          prog=15,109,279            <- CHGPRI th6 25 -> 1
+    t=159 progress=15,174,025   +64,755/s  (155x)  <- g36 latches
+
+`run=` after that: `run=6` x727, `run=1` x157. Threads 1/4/5 sit READY for 726 s.
+
+### 2. Correction to my own earlier framing (not to part 90)
+
+`ra=0x11e6e8` and `ra=0x13c478` are **not** a boost/restore pair, and their 2x-vs-1x
+CHGPRI count mismatch is not on its own a smoking gun:
+
+* `0x11e6e8` = return from `jal 0x174b30` in `0x11e690`'s **prologue**.
+* `0x13c478` = return from the **`jalr`** inside the generic dispatcher `0x13c448` --
+  a different call site in a different subsystem.
+
+### 3. UNVERIFIED hypothesis -- do not act on it
+
+Threads 1 and 6 are both at priority 1 after the boost, and our scheduler may never
+round-robin thread 1 back in, so it cannot observe the wbusy flag that thread 6 **does**
+clear every iteration (`0x11eb5c`, ungated; `d6n = 111,969,810` iterations prove the loop
+runs). This is a guess. It contradicts nothing measured, but nothing measured requires it
+either. Part 90's framing -- class 6 starved upstream -- remains better supported.
+[[feedback_reproduce_on_oracle_before_root_cause]]
+
+### 4. PCSX2 was killed, by me
+
+Arming the test crashed the emulator (PID gone, both ports ECONNREFUSED). Cause: a
+**conditional breakpoint at `0x11e704`** -- the head of a 200,000,000-iteration spin loop,
+so the condition is evaluated on every execution -- followed by a **`write` watchpoint on
+`0x441960`**, a counter incremented every loop iteration. `ECONNRESET` on that second
+call. Full write-up in [[reference_pcsx2_debugger_quirks]].
+
+Also established there: the emulator had been UI-halted the whole time (cycles frozen at
+`1731361776` across four `pcsx2_status` calls, **before** anything was armed), and
+`pcsx2_continue` **genuinely resumed it** -- `PC 0x81fc0 -> 0x13bb2c`, `Cycles +581 M`,
+`*(0x441960)` +299. The older "continue lies" note is too strong; try it first.
+
+### 5. Resume point
+
+Part 90's question is still the open one: **why is class 6 starved upstream.** If the g36
+path is revisited, do it by POLLING `pcsx2_read_memory` on `0x45F69C`, `0x441924` and
+`0x441960` -- no breakpoints, no watchpoints, no crash risk, and it sidesteps the
+"hit counts stay 0 even when fired" quirk.
+
+---
+
+## Part 104 (2026-09-08) -- ***THE GAME BOOTS.*** THE SKIP WORKS, WE REACH GameMain, AND THE NEXT SCREEN IS A TIMER, NOT A STALL
+
+**Two runs. Rung 4 is DONE.** `[skipfmv] ACTIVE ... installed=4/4`, and from **t=1s** the PC is
+in the game's real main loop, sustained for the whole run.
+
+Clean in both runs: **0** `dispatch-miss`, **0** `[guest-branch:missing-target]`,
+`savepri=0 savetid=0` (the SofDec priority latch **never engages**), `nTh=2` with no spinning
+thread, every SofDec probe zero, `stuckSecs=0`, `gif/s` 5-8. The entire th6 deadlock class went
+away with the movie. Months of wall, gone the moment it stopped being a boot blocker.
+
+### The engine top level, measured
+
+```
+GameMain   0x422630 : 0x171AE0(); GameInit(0); if(v0&0x80000000) bail;
+                      do { GameUpdate(); } while ([0x63FDF4] != $gp-0x281C);
+                      GameShutdown();
+GameUpdate 0x421EA0 : a0=[$gp-3572]; (a0->vtable[+0x14])(a0, -1);   <- the app tick
+                      then EngineUpdate 0x199840, CFileLoadMng_Update 0x1AEDB0,
+                      GameState_ReadInput 0x327F90, GameState_Update 0x3280C0,
+                      GameState_Draw 0x328160
+```
+
+`GameMain` looping `GameUpdate` forever is **correct** -- the compare is a quit flag. A watchdog
+`pc=0x422660` or `pc=0x421Exx` is the game **running**.
+
+### `0x3E0E60` is the GENERIC CApp phase machine, not "loadscreen_tick"
+
+The func-map name and the `[lstick:stat]` tag are both misleading. It drives **every** CApp:
+`[obj+9]` is the state byte, states 2/3/4/5 call vtable `+0x38`/`+0x3C`/`+0x40`/`+0x44`, and each
+arm advances only when its handler returns nonzero. Any probe reading fields off its `a0` must
+gate on the object's class or it blends unrelated apps together.
+
+### The screen after the logos is `CAppWarning` (vt `0x4FA400`, obj `0x6330D0`)
+
+The health/legal warning -- the plain white Atari screen. `CAppWarning_Update 0x3FC0C0` is itself
+a 5-state machine on `[obj+48]`: alloc -> wait for asset `0x4076A0` -> `camera_fade_set` and wait
+for the fade -> **a 4.0-second timer** -> fade out and return 1.
+
+### It is NOT stalled. The run window was ~0.2 s too short.
+
+```
+[warn:stat] subHist=0:4, 1:198, 2:61, 3:235     <- advanced 0 -> 1 -> 2 -> 3 cleanly
+            dt=0.0166667                         <- exactly 1/60, frame delta is correct
+            fadeMode=0x0 fadeState=0x0           <- fade IDLE; fadeBusy=75 only while in sub 2
+            acc: 0.4 -> 0.92 -> 1.43 -> 1.93 -> 2.45 -> 2.97 -> 3.48 -> 3.9
+```
+
+Threshold is **4.0**. The run ended at **t=119s with acc=3.9**. `acc` climbs ~0.5/s wall
+(~30 ticks/s, half real-time under the `PS2X_DET_VBLANK_QUANTUM` throttle), so a 4-second warning
+screen costs ~8 wall-seconds and the run died a fifth of a second before it would have returned 1.
+
+**NEXT ACTION: rerun with `-RunSeconds 240`.** Nothing to fix.
+
+### Two side results
+
+- ✅ **The `0x2C1830` skip risk is CLEARED.** The stub bypasses `camera_fade_set` in the logo
+  close paths, and a black/silent next screen was the named first suspect. Measured: `CAppWarning`
+  calls `camera_fade_set` itself at `0x3FC190` and both fade bytes return to 0. Fine.
+- ⚠️ **The skip created one blind spot.** It replaces `0x420E70`/`0x4216E0`, which the sreg probe
+  also wraps, so `[sreg]` now always prints `AtariLogo{calls=0} OkrtronLogo{calls=0}`. That is the
+  override winning, **not** a silent guest. Add a counter inside the stub before reading those.
+
+---
+
+## Part 96 (2026-09-07) -- SofDec: BOTH GUARDS PASS. We stop INSIDE the chain, and 0x113c60 is TEARDOWN
+
+*** Parts 94 and 95 both framed this as "which guard blocks us". Neither guard blocks us.
+*** We enter 0x113c60 with guard 1 already satisfied, and past guard 1 reaching 0x14c8c8
+*** is UNCONDITIONAL. The failure is a call that never returns, not a branch not taken.
+
+--- 1. WHO WRITES [0x54BE2C] -- answered, exactly two writers
+
+Seven functions materialize the base 0x54BD60 (`eeref refs 0x54bd60`). Disassembling all
+seven and filtering for stores at +0xCC gives exactly two:
+
+    0x00113bc4  sw  $v0,   204($s0)    in obj_set_fields___30_0 (0x113aa0)   <- ARM
+    0x00113cd4  sw  $zero, 204($s0)    in 0x113c60                           <- DISARM
+
+The arming write is the DELAY SLOT of `bne $v0, $zero, 0x113c30` at 0x113bc0, so it
+stores either way. $v0 is the return of `jal 0x114a50` at 0x113bb8, which returns
+`$gp + 0xffffd6c0` = 0x500730 on success and 0 on failure.
+
+Note `eeref refs 0x54be2c` says UNREACHABLE. That is the known negative-lo16 coverage
+gap (same as 0x54BD90 in part 94), NOT evidence. The base-then-offset route above is the
+way to ask this question for any field in this struct.
+
+--- 2. OUR RUNTIME ARMS THE LATCH CORRECTLY -- part 95's question 1 answered YES
+
+200 s run, 198 samples. Every one of the four new watch cells is BIT-IDENTICAL to the
+hardware reading, and all four turn on together at t=117 and stay on to the end of the run:
+
+    field   t=1..116     t=117..198    hardware (part 95)
+    mcc     0x0          0x500730      0x500730
+    m30     0x0          0x45f6e4      0x45f6e4
+    p730    0x0          0x3b          0x3b
+    p734    0x0          0x3c          0x3c
+    o0st    0x0          0x1           0x1
+
+So the latch IS armed, the object pointer IS present, and the run ended still in-phase
+(82 in-phase samples, no teardown). Part 95's "is mcc ever nonzero" is answered: yes.
+
+--- 3. PART 95'S QUESTION 3 WAS MALFORMED -- p730 is a HANDLE, not a counter
+
+`sub_114A50` is an INITIALIZER, not a per-frame updater:
+
+    0x114a70  jal 0x10e7a0            ; allocate
+    0x114a7c  sw  $v0, -10560($gp)    ; [0x500730] = handle #1   (0x3b)
+    0x114a90  jal 0x10e7a0            ; allocate
+    0x114a9c  sw  $v0, -10556($gp)    ; [0x500734] = handle #2   (0x3c)
+
+Two consecutive allocator returns, 59 and 60. Part 95 speculated "frame counters,
+UNVERIFIED"; they are handles, and "does p730 drain to 0" was the wrong question.
+
+--- 4. THE REAL SHAPE: 0x113d08 IS A RELEASE-AND-LOOP-BACK, NOT A SKIP
+
+Part 94 read `bnez a0 -> 0x113D08` as "skips the call site". It does not:
+
+    0x113cb0  bnez $a0, 0x113D08      ; handle #1 live -> go release it
+    ...
+    0x113d08  jal  0x10e6c0           ; RELEASE handle #1
+    0x113d10  b    0x113cbc           ; loop BACK into the teardown
+    0x113d14  lw   $a0, 4($s1)        ; delay slot: handle #2
+    0x113cbc  beqz $a0, 0x113CCC
+    0x113cc4  jal  0x10e6c0           ; release handle #2
+    0x113ccc  lw   $a0, 48($s0)
+    0x113cd0  jal  0x14C8C8           ; DESTROY -- reached either way
+
+Once guard 1 passes, `0x14c8c8` is UNAVOIDABLE. Guard 2 only chooses the order in which
+the two handles are released. There is no waiting and nothing to drain.
+
+Consequence: 0x113c60 is the stream CLOSE/TEARDOWN routine, not a per-frame routine.
+0x14c8e0 fits -- lock, call the gate, `sw zero,(s0)` on the stream object, unlock. And
+our TRACE shows `0x113c60 n=1`: entered exactly once in 200 s.
+
+--- 5. WHERE WE ACTUALLY STOP
+
+Three TRACE records, one instant (progress=14869440, tid=0x1709), then silence:
+
+    seq=5423  addr=0x113c60  ra=0x4210d0  m30=0x45f6e4 mcc=0x500730 p730=0x3b
+    seq=5424  addr=0x14f500  ra=0x113c9c   <- the jal at 0x113c94, correct place
+    seq=5425  addr=0x14f428  ra=0x14f558   <- inside 0x14f500's body, at 0x14f550
+
+m30 is NONZERO in the entry record, so guard 1 passes for us too. 0x14c8c8 was in
+PS2X_TRACE_CALLS for this run and has ZERO records, and part 94 established it has
+slot=yes with 5 jal callers and no j -- the zero is real.
+
+The chain after the 0x14f428 at 0x14f550:
+
+    0x14f558  daddu $a0, $s0
+    0x14f55c  jal   0x153768          ; <- NEXT CALL, never observed
+    0x14f564  sw    $zero, 116($s0)
+    0x14f568  lw    $a0, 72($s0)
+    0x14f574  j     0x134530          ; tail jump; 0x134530's return lands at 0x113c9c
+
+So we stop somewhere in {inside 0x14f428, inside 0x153768, inside the 0x134530 subtree,
+inside 0x10e6c0}. We never get back to 0x113c9c.
+
+--- 6. THE NEXT RUN -- a clean 3-way, no rebuild
+
+    PS2X_TRACE_CALLS = 0x113c60,0x14f428,0x153768,0x10e6c0,0x14c8c8
+
+All five are func-map entries with slot=yes. Caller shapes checked with eeref:
+
+  0x153768  3 callers; ours (0x14f55c) is a jal -> visible.
+  0x10e6c0  3 jal callers, TWO of them are the sites we care about (0x113cc4, 0x113d08).
+  0x14c8c8  5 jal callers, no j (part 94).
+
+Read it as:
+
+  - 0x153768 ZERO      -> we never return from 0x14f428. The gate itself is the wall.
+  - 0x153768 fires,
+    0x10e6c0 ZERO      -> we die in 0x153768 or in the 0x134530 subtree.
+  - 0x10e6c0 fires,
+    0x14c8c8 ZERO      -> contradicts section 4; re-derive, do not theorise.
+
+DELIBERATELY EXCLUDED: 0x134530. Our edge into it is the `j` at 0x14f574, which bypasses
+the function table, so a zero on it would be structurally meaningless
+([[feedback_tracer_blind_to_tail_jumps]]). It also has 6 unrelated jal callers that would
+muddy a nonzero. Do not add it.
+
+## Part 95 (2026-09-07) -- SofDec: the mcc latch is a SELF-DISARMING ONE-SHOT; guard 1 passes on hardware
+
+*** [0x54BE2C] is armed by someone else and cleared by the call itself. The question
+*** is no longer "which guard fails" -- it is "does our runtime ever ARM the latch".
+
+Measured on PCSX2, Atari-logo movie phase. Positive control 0x13c448 was set FIRST and
+fired (PC=0x0013c448, paused, cycles 4058765807) before anything below was read. Not a
+UI-paused false negative.
+
+--- 1. GUARD 1 PASSES, and m30 is a POINTER not a flag
+
+Breakpoint at 0x113ca0 (the `beqz v0` of guard 1) fired. PC-confirmed 0x00113ca0.
+Registers at branch time:
+
+    v0 = 0x0045F6E4      <- m30 = [0x54BD90]. NONZERO. Guard 1 PASSES.
+    s0 = 0x0054BD60      <- base confirmed (0x550000 - 0x42A0)
+    ra = 0x00113C9C      <- arrived via the jal 0x14F500 at 0x113c94
+
+0x0045F6E4 is not an arbitrary value: it is the SAME SofDec stream object we already
+watch as `o0st`. So [0x54BD90] holds the object pointer. Part 94 listed m30 as a
+candidate failing guard; on hardware it is satisfied, and satisfied with an address we
+already sample.
+
+--- 2. mcc is CONFIRMED 0x500730 (part 94 had this as an inference only)
+
+Read in the same in-phase window:
+
+    [0x54BE2C]   = 0x00500730     <- mcc. MEASURED, no longer inferred.
+    [0x500730]   = 0x0000003b     <- p730
+    [0x500734]   = 0x0000003c     <- p734
+    [0x500738]   = 0x00000001
+    [0x50073C]   = 0x0045F6E4     <- back-pointer to the stream object
+
+Guard 2 is `bnez a0 -> 0x113D08`, and a0 = *(s1) = p730. At this sample p730 = 0x3b,
+so guard 2 was BLOCKING at that instant.
+
+CAUTION: this is ONE sample. p730 must be 0 at the instant guard 2 passes, and I did
+not catch that instant. "p730 was nonzero once" is NOT "guard 2 always blocks."
+0x3b/0x3c = 59/60 look like frame counters. That reading is UNVERIFIED speculation.
+
+--- 3. THE NEW STRUCTURAL FACT: the edge disarms itself
+
+Fresh native disassembly of the call site:
+
+    0x00113ccc:  lw   a0, 0x30(s0)
+    0x00113cd0:  jal  ->$0x0014C8C8       <- the missing edge
+    0x00113cd4:  sw   zero, 0xCC(s0)      <- DELAY SLOT: clears mcc to ZERO
+
+The delay slot of the very jal we are chasing zeroes [0x54BE2C]. So the latch is a
+one-shot: it fires once per arming and immediately disarms. Some OTHER writer must
+store a pointer into [0x54BE2C] to re-arm it.
+
+Consequence for our runtime. If nothing ever arms the latch, then `lw s1, 0xCC(s0)`
+yields s1 = 0, `lw a0,(s1)` reads address 0, and guard 2 decides on whatever sits at
+[0x00000000] -- forever. That is a different and much more findable bug than "a counter
+never drains."
+
+--- 4. Teardown observed live (evidence the phase turns over, not stalls)
+
+Seconds later, free-running, the whole structure went to zero:
+
+    [0x54BD90]  0x0045F6E4 -> 0        (m30 cleared)
+    [0x54BE2C]  0x00500730 -> 0        (mcc disarmed)
+    [0x500738]  0x00000001 -> 0
+    [0x50073C]  0x0045F6E4 -> 0
+
+This is a live transition. It also means the in-phase window is NARROW and hand-polling
+PCSX2 will not reliably land inside it -- the runtime sampler is the right instrument
+for these four cells, not manual reads.
+
+--- 5. NOT ANSWERED
+
+- Who writes [0x54BE2C]. A write watchpoint was the next call; PCSX2 dropped the
+  connection (ECONNRESET, then ECONNREFUSED) before it could be armed. Unmeasured.
+- Whether p730 ever reaches 0 on hardware. Single sample only.
+- What 0x3b/0x3c mean. Speculation.
+
+--- 6. THE NEXT RUN -- same command, sharper question
+
+No rebuild needed; PS2X_TRACE_WATCH is generated by presets.py at launch. m30, mcc,
+p730 and p734 are already in the sofdec preset (added part 94).
+
+    PS2X_TRACE_CALLS = 0x113c60,0x14c8c8,0x14f500,0x14f428
+
+Read the sampler in this order:
+
+  1. Is `mcc` EVER nonzero in our run? If it is always 0, the latch is never armed and
+     that is the bug -- find the writer, not the counter.
+  2. If mcc IS nonzero, is `m30` nonzero at the same sample? Hardware says it should be
+     (0x45F6E4).
+  3. Only then does p730 matter: does it ever reach 0?
+
+Question 1 is new to this part and comes first. Parts 93/94 both framed this as a
+counter/guard problem; the delay-slot store at 0x113cd4 says it may be an arming
+problem instead.
+
+--- 7. TOOL NOTE
+
+pcsx2_step latched the DebugServer into single-step mode: every subsequent
+pcsx2_continue advanced exactly one instruction (cycles +1) and breakpoints never
+fired. pause -> clear_all_breakpoints -> continue cleared it. Prefer a breakpoint at
+the target address over stepping toward it; a step here also fell straight through a
+context switch into unrelated code at 0x425380.
+
+## Part 94 (2026-09-07) -- SofDec: the missing edge is NAMED AND MEASURED on hardware
+
+*** 0x113c60 calls 0x14c8c8 on hardware. Our runtime enters 0x113c60 and never does.
+
+Measured on PCSX2, in the movie phase, with the positive control armed FIRST:
+0x13c448 was set, fired twice (cycles 2085720156 and 3349179081), and only then was
+anything concluded. This is not a UI-paused false negative.
+
+Three hits, each with registers and a stack walk:
+
+  hit 1  PC=0x14f428  ra=0x14F220  a0=0x45F6E4 a1=0x4DCD80 a2=0 a3=0xFFFFFFFF
+         stack: 0x54bb18 -> 0x14f1e0 (jal at 0x14f220) -> 0x14f428
+         This is OUR OWN chain 1, argument for argument, identical to TRACE
+         seq=0x6a4. Where we do run, we match.
+
+  hit 2  PC=0x14f428  ra=0x14C904  (conditional BP: ra != 0x14f220 && ra != 0x14f558)
+         stack: 0x14c8e0 (jal at 0x14c8fc) -> 0x14f428
+         A THIRD caller, one we never take.
+
+  hit 3  PC=0x14c8c8  ra=0x113CD8
+         stack: 0x54bb18 -> 0x113c60 (jal at 0x113cd0) -> 0x14c8c8
+         The caller of that third caller is 0x113c60 -- a function our runtime
+         demonstrably enters (TRACE seq=0x153d).
+
+### Why the zero on 0x14c8c8 is real evidence, not a tail-jump blind spot
+
+  eeref refs 0x14c8c8  -> slot=yes, call=5, ALL jal:
+      0x113bd4  in 0x113aa0 + 0x134
+      0x113cd0  in 0x113c60 + 0x70
+      0x14c660  in 0x14C328 + 0x338
+      0x14e910  in 0x14E8B0 + 0x60
+      0x15237c  in 0x152338 + 0x44
+  eeref refs 0x14c8e0  -> call=1, the j at 0x14c8d4 only, "inside sub_14C8C8
+                          (folded body)"
+
+0x14c8c8 is a thunk: addiu sp,-0x10 / sd ra / ld ra / j 0x14C8E0 / addiu sp,0x10.
+The body at 0x14c8e0 has exactly ONE reference in the whole image, so the thunk is
+the only door in. The thunk has a dispatch slot and every static caller reaches it
+by jal, so feedback_tracer_blind_to_tail_jumps does NOT apply: our tracer armed
+0x14c8c8 and read zero, and that zero means the call never happened.
+
+Two of the five callers, 0x113aa0 and 0x113c60, are the two functions at the head of
+OUR chains 1 and 2. We enter both. We take neither jal.
+
+### Where the divergence has to be -- two guards, both now watchable
+
+  0x113c94  jal  0x14F500          <- we DO take this (our ra=0x113c9c proves it)
+  0x113c9c  lw   v0, 0x30(s0)      s0 = 0x54BD60, so this reads [0x54BD90]
+  0x113ca0  beqz v0, ->0x113CF0    GUARD 1 -- skips the call site entirely
+  0x113ca8  lw   s1, 0xCC(s0)      reads [0x54BE2C]
+  0x113cac  lw   a0, (s1)
+  0x113cb0  bnez a0, ->0x113D08    GUARD 2 -- skips the call site entirely
+  0x113cb8  lw   a0, 4(s1)
+  0x113cbc  beqz a0, ->0x113CCC
+  0x113cc4  jal  0x10E6C0
+  0x113ccc  lw   a0, 0x30(s0)
+  0x113cd0  jal  0x14C8C8          <- THE MISSING EDGE
+
+Reaching 0x113cd0 FORCES *(s1) == 0 by branch semantics -- that one is not inference.
+s1 == 0x500730 IS inference: it is what s1 held at the 0x14c8c8 entry with nothing
+writing s1 in between. Post-hoc reads disagree with the branch-time values --
+[0x54BE2C] read 0 and [0x500730] read 0x3b AFTER the call -- so both cells are
+volatile and must be sampled in-phase. 0x10E6C0 at 0x113cc4 is the likely writer.
+
+0x14f500 is also a thunk (j 0x14F518). Its body calls 0x1505D0, requires v0==1, then
+jal 0x14F428 at 0x14f550 -- ra 0x14f558, matching our TRACE seq=0x153f exactly. It
+does NOT write s0->0x30; it writes 0x74(s0) on a DIFFERENT object. So whatever clears
+guard 1 is downstream: 0x153768, or the tail j 0x134530.
+
+### What this session could NOT answer -- stated so it is not mis-read later
+
+By the time the 0x14c8c8 chain was captured, PCSX2 had run on past the movie. With
+unconditional breakpoints armed, neither 0x14f428 nor 0x113c60 fired again across
+several seconds of emulated time. That is a RUN-WINDOW result and proves NOTHING
+about per-frame behaviour -- the phase was already over. Do not read it as
+"hardware does not call 0x14f428 per-frame".
+
+Evidence the phase turned over rather than stalled: 0x14c8e0 does sw zero,(s0) with
+s0 = 0x45F6E4, which zeroes o0st -- yet o0st reads 1 again afterwards, and [0x45F6E8]
+moved 0 -> 2. A new stream opened. GameMode [0x5E6B3C] reads 0x00, but 0x00 is also
+the zero default, so on its own that is weak.
+
+The gate data itself matched hardware exactly at hit 1: o0st=1, o0bsy=0,
+o0slt=0x1B12CC0 -- the same values part 92 read live and the same values all 78
+in-phase WATCH samples of the part-93 run carried.
+
+### The probe is already written
+
+build_scripts/presets.py, preset sofdec, gains four fields (44 of the 48-field cap):
+
+  m30   0x54BD90   s0->0x30, guard 1; oracle in-phase 0x45F6E4
+  mcc   0x54BE2C   s0->0xCC, guard 2 base; inferred 0x500730
+  p730  0x500730   *(s0->0xCC); must be 0 to reach the call
+  p734  0x500734   [s1+4]; gates the 0x10E6C0 call at 0x113cc4
+
+Suggested TRACE_CALLS set for the next run -- all four are func-map entries:
+  0x113c60, 0x14c8c8, 0x14f500, 0x14f428
+Set PS2X_TRACE_WATCH as well, or the WATCH columns are stripped off the TRACE
+records too (feedback_trace_watch_required_with_trace_calls).
+
+The run answers one question: at the sample where we are in-phase, is m30 zero
+(guard 1 fails) or is p730 nonzero (guard 2 fails)? Those are different bugs.
+
+### Corrections to parts 92 and 93
+
+Part 92's "nothing CALLS 0x14f428" stands, but it was the symptom, not the level to
+work at: 0x14f428 has callers we DO take. What we never take is 0x14c8c8, one level
+up, and the reason is a guard inside 0x113c60.
+
+Part 93 listed 0x14c8c8 among "the three that never fired" and weighted its zero as
+WEAK on the grounds that a tail j could hide it. That weighting was wrong -- eeref
+now shows slot=yes with five jal callers and no j into it. It was the strongest of
+the three zeros, not the weakest. 0x14f378 and 0x14f278 are untouched by this.
+
+Tool note: eeref refs 0x54bd90 returned "UNREACHABLE in the static image". That is a
+COVERAGE GAP, not evidence -- the access is lui v0,0x55 plus lw v0,-0x4270(v0), a
+negative lo16 its lui+lo matcher does not pair. Third time a zero from this tool has
+been a missing coverage entry.
+
+## HANDOFF part 93 (2026-09-07) -- THE TWO CALLERS WE DO TAKE ARE ONE-SHOT SETUP. THE PER-FRAME CALLER IS STILL UNTAKEN.
+
+Part 92 named the starved edge and listed five candidate callers of 0x14f428.
+This run armed all five plus the two grandparents and answers which fire.
+
+Run: PS2X_TRACE_CALLS over 8 addresses + the 40-field sofdec WATCH preset,
+-Determinism 1, 200 s, RelWithDebInfo. run_log.txt / run_probe.jsonl of
+2026-09-07 19:08. Arming confirmed in the log: "[trace] 8 address(es) armed,
+40 watch field(s)".
+
+### 1. *** 0x14f428 was entered exactly TWICE, and both are phase-open setup
+
+    #  chain                                                ra
+    1  0x420f48 -> 0x113aa0 -> 0x14f140 -> 0x14f428        0x14f220
+    2  0x4210d0 -> 0x113c60 -> 0x14f500 -> 0x14f428        0x14f558
+
+This reproduces part 91's "2 entries in 200 s" and now names both chains end
+to end. Both fire at the instant the phase opens and never again:
+
+    phase span (WATCH, 1 Hz)   progress 15,042,625 .. 21,214,875
+    78 contiguous in-phase samples  => ~78 s in-phase
+    0x14f428 entry #1          progress 15,041,918
+    0x14f428 entry #2          progress 15,049,871
+
+Both land in the first ~0.1% of the phase. That is SEVENTY-EIGHT SECONDS
+in-phase with zero further entries, while hardware runs the drain barrier
+continuously (part 92, section 1). These two callers are setup/teardown, not
+the per-frame path.
+
+### 2. The three that never fired
+
+    addr        static callers   Run F hits
+    0x14c8c8    5                0
+    0x14f378    3                0
+    0x14f278    0  <- runtime    0
+
+0x14f278 was part 92's prime suspect and it read ZERO.
+
+### 3. Weighting those zeros -- only ONE of them is real evidence
+
+Per feedback_tracer_blind_to_tail_jumps: the T1 tracer hooks function-TABLE
+slots, so a guest tail `j` bypasses the hook and reads zero while running.
+That caveat applies UNEVENLY here:
+
+  - 0x14f278 -- zero is MEANINGFUL. It has no static callers at all, so it is
+    reachable only through the runtime table at 0x54EBA0, and a table dispatch
+    goes THROUGH the slot the tracer hooks. This is inference from the call
+    mechanism, not a second measurement; label it as such.
+  - 0x14c8c8, 0x14f378 -- zero is WEAK. Either could be entered by tail `j`
+    from one of its static callers and read zero while provably running.
+
+### 4. The gate match re-confirmed on a fresh run
+
+All 78 in-phase WATCH samples, without exception:
+
+    o0st=1   o0bsy=0   o0slt=0x1b12cc0   h44=1   h48=1
+
+Identical to the hardware values read live in part 92. The beqzl at 0x14f440
+would PASS. The posted request is correct. Nothing is calling the function
+that contains the gate. The wall remains exactly one edge wide.
+
+### 5. Next step -- ONE PCSX2 measurement closes this
+
+We know hardware sits INSIDE 0x14f428 (the ra=0x14f450 seen at the 0x155630
+hit in part 92). We have never seen who CALLS it. With PCSX2 reloaded to the
+Atari logo:
+
+    1. arm 0x13c448 as the POSITIVE CONTROL and require it to fire first
+    2. break at 0x14f428
+    3. read ra
+
+That ra names the missing edge directly. Do not skip step 1: a UI-paused
+PCSX2 answers every probe with a confident false negative (see
+reference_pcsx2_debugger_quirks.md). The movie phase is gone from the current
+PCSX2 session -- sl0 reads 0 and all of obj0 reads zero -- so a reload to the
+Atari logo is required before any of this.
+
+### 6. Measurement note
+
+The first pass at this run reported zero hits on all eight addresses. That was
+a bad query filter keying on `tag`/`fn` fields the TRACE records do not carry;
+the records were present throughout. TRACE records land in run_probe.jsonl as
+probe=TRACE, NOT in run_log.txt, despite the log line describing the sink.
+Query them by probe type, never by guessing at key names.
+
+## HANDOFF part 92 (2026-09-07) -- THE STARVED EDGE IS NAMED: THE GATE PASSES, NOTHING CALLS 0x14f428.
+
+First PCSX2 oracle session in-phase with breakpoints ACTUALLY FIRING. Everything
+part 91 could only infer is now measured on hardware.
+
+### 1. The hardware chain, read off four live backtraces
+
+    ??? -> 0x14f428                 ra=0x14f450 observed at the 0x155630 hit
+             gate: beqzl s1,0x14F4F0  ; s1 = lw [s0+0x3C], s0 = 0x45F6E4
+           -> 0x155630              THE DRAIN BARRIER -- runs constantly on hardware
+             -> 0x154950  [tail j -- ELIDED from the stack walk]
+               -> 0x13c448          class dispatch, a0=6
+                 -> 0x11e690        wake worker: a0=0x0E (id 14), a1=0x19 (pri 25)
+
+s1 = 0x01B12CC0 (the SofDec handle) is held live across every frame.
+0x154950 is invisible to the walker because it is entered by `j`, not `jal`.
+
+### 2. The gate is a DATA gate, one level ABOVE the driver
+
+Part 91 was right that there is no gate INSIDE the driver. It sits at 0x14f428,
+and it tests a POSTED POINTER, not a flag:
+
+    0x14f440  beqzl s1, 0x14F4F0    ; s1 = [0x45F720] -> skip the drain if null
+    0x14f448  jal   0x00155630      ; the drain barrier
+    0x14f450  sw    zero, 0x4(s0)   ; consume
+    0x14f454  sw    zero, 0x3C(s0)  ; clear the posted request
+
+0x45F678 is get_data_ptr() -- its ONLY static ref is get_data_ptr+0x8 -- which
+pins the offsets: obj0 = +0x6C = 0x45F6E4, posted slot = +0xA8 = 0x45F720,
+g36 = +0x24, done = +0x188C. Matches build_scripts/presets.py exactly.
+
+### 3. *** The gate is SATISFIED on our side, so the gate is NOT the bug
+
+Run E, 597 in-phase samples, vs. hardware read live at the same phase:
+
+    field           ours          hardware
+    o0st  (+0x00)   1             1           OK
+    o0bsy (+0x60)   0             0           OK
+    o0slt (+0x3C)   0x1b12cc0     0x1b12cc0   OK
+
+o0slt was already watched by part 84; its recorded oracle expectation is now
+CONFIRMED against real hardware rather than inherited.
+
+So the posted request is correct, the gate would pass, and the barrier plus
+everything below it are correct. Part 91 measured 0x14f428 entered 2x in 200 s;
+hardware enters it many times per second. NOTHING CALLS IT.
+
+The wall is exactly one edge wide: the callers of 0x14f428.
+
+### 4. The five callers -- all slot=yes, all traceable
+
+    0x14c8c8  sub_14C8C8           5 static callers   (Run E: 0 hits)
+    0x14f140  sub_14F140           2                  (Run E: 1 hit, ra 0x14f220)
+    0x14f278  sub_14F278           0  <- runtime slot  (Run E: 0 hits)
+    0x14f378  obj_set_fields_k_2   3                  (Run E: 0 hits)
+    0x14f500  sub_14F500           1                  (Run E: 1 hit, ra 0x14f558)
+
+0x14f278 has callers=0, i.e. reachable ONLY through a runtime table -- the same
+construction that hid the per-frame driver from eeref all along. Prime suspect
+for the per-frame path hardware uses and we never take.
+
+One level up (both slot=yes, both reached by jal, so counts will be trustworthy):
+0x14f140 <- 0x113aa0 obj_set_fields___30_0 (3 callers);
+0x14f500 <- 0x113c60 wrap_wrap_obj_set_flags_clone_01 (3 callers).
+
+### 5. Next run -- NO REBUILD, env-var only
+
+    $env:PS2X_TRACE_CALLS = "0x14f428:4096,0x14c8c8:4096,0x14f140:4096,0x14f278:4096,0x14f378:4096,0x14f500:4096,0x113aa0:4096,0x113c60:4096"
+    $env:PS2X_TRACE_WATCH = (python "F:\SDBZ Recomp\build_scripts\presets.py" sofdec)
+    & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+
+WARNING: a zero on any of these is only evidence if that function is entered by
+`jal`; a tail `j` bypasses the function-table hook and reads zero while running.
+
+### 6. RETRACTED from the part-91 session -- all three were dead-probe artifacts
+
+The emulator was paused at PCSX2's OWN UI level while the DebugServer happily
+answered. pcsx2_continue reported "Resumed" and did NOT restart the frame loop.
+Every negative taken in that window is void:
+
+  - "0x14f428 never fires on hardware"   -- it fires; its ra is how we found the caller.
+  - "0x155630 is not driven per-frame"   -- it is, constantly.
+  - "0x11e690 never fires on hardware"   -- it fires 26 cycles later.
+
+Caught by a POSITIVE CONTROL: 0x13c448 (the class dispatcher, which must run
+constantly) also failed to fire. Tells that the machine is frozen rather than
+quiet: EE PC pinned at 0x00081fc0 (a nop-slide ending in `b 0x81fc0`, the kernel
+idle thread), memory identical across two reads of a toggling field,
+get_backtrace returning "No stack frames" right after a successful pause, and a
+non-monotonic cycle counter. ALWAYS arm a positive control before trusting a
+negative from this debugger.
+
+SURVIVES INDEPENDENTLY (a disassembly reading, not an emulator measurement):
+w6tick/d6n are bumped inside th6's OWN loop at 0x11eb30/0x11eb3c, so the 15-68/s
+rate measures th6 looping, not the barrier. Part 90's headline stands corrected;
+the barrier's hardware rate is still unmeasured in absolute terms, but it is now
+OBSERVED RUNNING in-phase.
+
+### 7. Session end state
+
+PCSX2 ran past the movie: sl0 = 0 and all of obj0 reads zero, so the phase is
+gone. Re-catching hardware's CALLER of 0x14f428 needs a reload to the Atari logo.
+
+---
+
+## HANDOFF part 91 -- NO GATE INSIDE THE DRIVER. THE WHOLE SofDec CLUSTER IS ENTERED TWICE IN 200 s.
+
+### 1. Run E result
+
+PS2X_TRACE_CALLS=0x155630:2048,0x14f428:2048,0x14f580:2048,0x11ed78:2048
+525 TRACE records, no cap.
+
+    ('0x11ed78','0x11e994') 258    thread 4 loop
+    ('0x11ed78','0x11ea88') 258    thread 5 loop
+    ('0x11ed78','0x11ebbc')   2    th6 completion sleep
+    ('0x11ed78','0x11eb60')   2    th6 wbusy-ack sleep
+    ('0x155630','0x14f450')   2    <- the barrier; site 0x14f448 in sub_14F428
+    ('0x14f428','0x14f220')   1    <- from sub_14F140+0xd8
+    ('0x14f428','0x14f558')   1    <- from sub_14F500+0x50
+    ('0x14f580','0x14f0dc')   1    <- from sub_14F000+0xd4
+
+Only ONE of the three 0x155630 call sites is live: 0x14f448. The two sites in
+sub_14F580 (0x14f614, 0x14f628) never fire.
+
+### 2. The gate is NOT inside sub_14F428
+
+sub_14F428 ran twice and called the barrier twice. 1:1. It is faithful.
+Every level of the tree runs once or twice:
+
+    0x155630 x2   <-  0x14f428 x2   <-  {sub_14F140 x1, sub_14F500 x1}
+    0x14f580 x1   <-  sub_14F000 x1
+
+Hardware drives the barrier 15-68 times per SECOND (part 90 sec.3).
+=> The starvation is ABOVE everything traced so far. The whole SofDec/CRI
+   driver cluster is simply not being ticked.
+
+All call sites involved are `jal` with no tail jumps (eeref: call=5 ptr=0 for
+0x14f428, call=3 ptr=0 for 0x14f580), so these counts are trustworthy and the
+tracer is NOT structurally blind here.
+
+### 3. Why the next step must be PCSX2, not more static work
+
+0x13c448 dispatches through a table at 0x54EBA0 that is BUILT AT RUNTIME.
+eeref sees the static image only, so it cannot enumerate whoever installs or
+invokes those slots. The per-frame driver of this cluster is therefore not
+recoverable statically -- it must be observed.
+
+DECIDED EXPERIMENT (one breakpoint, one backtrace):
+  - PCSX2 at the Atari-logo movie phase; confirm phase by sl0 == 0x1B12CC0
+  - breakpoint at 0x14f428
+  - read the BACKTRACE (NOT the hit count -- PCSX2 BP/WP counters read 0 even
+    when firing, see reference_pcsx2_debugger_quirks)
+  - hardware hits this 15-68x/s so it fires immediately
+
+That names the per-frame driver on hardware. Then check whether that driver
+exists and runs in our runtime.
+
+FALLBACK if PCSX2 is unavailable: another trace run one level up --
+sub_14F140 (0x14f140), sub_14F500 (0x14f500), sub_14F000 (0x14f000) and their
+callers. Costs several runs of guessing versus one backtrace.
+
+### 4. Ruled out this run
+
+"Run with no timer" will NOT help. The freeze is total, not slow: d5n froze at
+257 for the final 72 s and the deadlock is mutual and self-sustaining. The 200 s
+window already contains the entire ~12 s active window. More wall-clock only
+buys more spin at ~195k ticks/s.
+
+
+## HANDOFF part 90 -- THE DEADLOCK IS A SYMPTOM. THE REAL BUG IS UPSTREAM: CLASS 6 IS NEVER DRIVEN, SO A PENDING COMMAND (h4c=3) SITS UNCONSUMED UNTIL main's BARRIER SLAMS THE GATE ON IT.
+
+### 1. Run D: the g36 bracket is named, first-hand
+
+PS2X_TRACE_CALLS=0x1555a0:4096,0x11ed78:4096 + sofdec WATCH. 523 TRACE records, no cap.
+
+    ('0x11ed78','0x11e994') 258     thread 4 loop
+    ('0x11ed78','0x11ea88') 258     thread 5 loop
+    ('0x11ed78','0x11ebbc')   2     th6 completion sleep
+    ('0x11ed78','0x11eb60')   2     th6 wbusy-ack sleep
+    ('0x1555a0','0x155650')   2     g36 = 1   <- SET
+    ('0x1555a0','0x155664')   1     g36 = 0   <- CLEAR
+
+Two sets, one clear -- the same 2:1 as CHGPRI, now bound to an instruction.
+The other two 0x1555a0 caller pairs (0x14e92c/0x14e940, 0x154a1c/0x154a30)
+NEVER FIRE AT ALL. Only sub_155630 is live.
+
+    1698  ra=0x155650 a1=1  savetid=1 savepri=0x18  h4c=1  d5n=1    done=1   bracket 1 OPEN
+    1708  ra=0x155664 a1=0                          h4c=1  d5n=1    done=1   bracket 1 CLOSED
+    5949  ra=0x155650 a1=1  savetid=1 savepri=0x18  h4c=3  d5n=257  done=0   bracket 2 OPEN, never closes
+
+Same site, same thread, same h44/h48. Differences at entry: h4c 1 -> 3, done 1 -> 0.
+
+### 2. sub_155630 is a DRAIN BARRIER, and it is straight-line
+
+    0x15563c  jal 0x14ff40                 ; enter
+    0x155648  jal 0x1555a0(s0, 1)          ; g36 = 1        OPEN
+    0x155650  jal 0x154950                 ; <<< the body
+    0x15565c  jal 0x1555a0(s0, 0)          ; g36 = 0        CLOSE
+    0x155664  jal 0x14ff58                 ; leave
+    0x155678  j   0x1549c0                 ; tail
+
+NO branches, NO conditional escape. Exactly one call sits between open and close.
+
+    0x154950:  a0 = 6 ; j 0x13c448
+    0x13c448:  table = 0x54EBA0 ; fn = [table + class*8] ; arg = [table + class*8 + 4]
+               if (fn == 0) return ; else jalr fn(arg)
+    slot 6 fn = 0x11e778   (matches the c6fn WATCH field exactly)
+    0x11e778:  a0 = [0x44198c] ; a1 = [0x441908] ; j 0x11e690     <- TAIL JUMP, tracer-blind
+    0x11e690:  wbusy = 1 ; boost th6 25 -> 1 ; spin until wbusy == 0
+
+So main deliberately blocks waiting for th6 to drain, WHILE HOLDING the exact flag
+(g36) that stops th6 from ever draining. The bracket cannot be escaped early.
+
+### 3. ORACLE: hardware runs this same bracket per-frame, in microseconds
+
+All three PCSX2 captures, 1803 samples, same slot pointer sl0 = 0x1B12CC0 (phase-matched):
+
+    g36    = 0 in ALL 1803 samples
+    wbusy  = 0 in ALL 1803 samples
+    done   = 0 in ALL 1803 samples
+    h44    toggles 0/1 freely (366/235, 394/207, 279/254)
+    h48    in {0,2,4,6}; h48 == 1 in exactly 1 of 1803 samples
+    w6tick == d6n EXACTLY, in all three captures
+
+w6tick/d6n rate on hardware: 15.7, 53.8, 67.9 per second -- FRAME-RATE SHAPED.
+
+This RETIRES the standing "no oracle capture ever reaches g36=1" debt. It is not
+that hardware avoids the bracket; hardware runs it 15-68 times a SECOND and each
+pass lasts microseconds, so a 1 Hz sampler can never catch g36=1. wbusy=0 always,
+for the same reason. The oracle is CONSISTENT with our code path, not divergent on it.
+
+### 4. The real divergence, with the window computed correctly
+
+WARNING -- an earlier rate comparison this session was WRONG because it divided by
+the whole 200 s run. The first 115 seconds are DEAD: sl0=0, w6tick=0, d6n=0, d5n=0,
+h44=0, h48=0. The active window is only ~12 s (t~115 -> t~127).
+
+Recomputed over the correct window:
+
+                  ours        hardware
+    d5n (class 5) ~21/s       2.1 - 14.5/s     <- ours is FASTER than hardware
+    d6n (class 6) 0.17/s      15.7 - 67.9/s    <- ours is 100-400x UNDER
+
+main is not slow. Class 5 is healthy. CLASS 6 ALONE IS STARVED.
+
+### 5. h4c=3 is pending from the slot's BIRTH
+
+presets.py line 132-134: h4c is the COMMAND word read by the state-1 handler
+0x165458; state 1 advances to 2 only when h4c is in {2,3,4,6}.
+
+Our h4c = 3 in the VERY FIRST WATCH sample in which the slot exists (index 120),
+with g36 still 0. So a VALID pending advance-command existed for ~12 seconds
+before main ever set g36. The command was never consumed because th6 never ran
+the pump. Then main opened bracket 2 and gated the pump permanently.
+
+Ordering, from the sleep census: th6 ticked TWICE at the very start of the window
+(d5n = 0, 1), slept via ra=0x11eb60, and stayed asleep for the whole 12 s while
+main ran 256 class-5 iterations. 256 class-5 iterations, ZERO barrier entries.
+
+### 6. Who wakes th6 -- the search is closed
+
+eeref refs 0x11ed28 (the WakeupThread helper) = 4 call sites:
+    0x11e6f0  jal   in 0x11e690        <- main's drain barrier
+    0x11eb90  jal   in 0x11eac8        <- th6 itself, wakes the OTHER worker [0x441990]
+    0x11fbe0  jal   in 0x11fbb8
+    0x11fc24  j     in 0x11fbb8
+
+0x11fbb8 is NOT a general per-frame ticker. Decoded 0x11ed90:
+    returns the tid ONLY if status is 8 (SUSPEND) or 0xc (WAIT|SUSPEND)
+    returns 0 otherwise
+and 0x11fbb8 gates its wake on `bne v0, v1` against the same tid. So 0x11fbb8
+wakes a worker only when that worker was SUSPENDED. A plainly sleeping th6 is
+deliberately NOT woken there.
+
+=> The ONLY routine waker of a sleeping th6 is main's drain barrier at 0x11e6f0.
+=> Therefore hardware MUST enter sub_155630 per-frame. We entered it TWICE in 200 s.
+
+CORRECTION to a statement made earlier this session: s1 in th6's loop is the
+constant 1 (addiu s1,zero,1), NOT a tid. The wake at 0x11eb90 targets [0x441990],
+the second worker -- not main.
+
+### 7. THE QUESTION FOR THE NEXT RUN
+
+Why does main not enter sub_155630 per-frame?
+
+eeref refs 0x155630 = 3 call sites, all jal:
+    0x14f448  in sub_14F428+0x20
+    0x14f614  in sub_14F580+0x94
+    0x14f628  in sub_14F580+0xa8
+
+All four proposed targets verified slot=yes (func-map entries, safe to trace):
+    0x155630 slot=yes   0x14f428 slot=yes   0x14f580 slot=yes   0x11ed78 slot=yes
+
+    PS2X_TRACE_CALLS=0x155630:2048,0x14f428:2048,0x14f580:2048,0x11ed78:2048
+
+Reads:
+  - 0x14f428 / 0x14f580 firing at ~21/s but 0x155630 at 0.17/s
+        => the gate is INSIDE those two functions; disassemble the guard.
+  - 0x14f428 / 0x14f580 also at ~0.17/s
+        => the starvation is further up; walk the tree from part 90 section 7.
+  - ra on 0x155630 names which of the 3 sites is the per-frame one.
+
+### 8. COVERAGE CAVEATS
+
+  - "the only routine waker" rests on eeref, which sees the STATIC image only.
+    A runtime-installed dispatch slot calling WakeupThread would be invisible.
+    0x13c448's table at 0x54EBA0 is exactly such a runtime table.
+  - 0x11e778 reaches 0x11e690 by TAIL JUMP, so the tracer is structurally blind
+    to 0x11e690 itself. Do not read a zero there as "never ran".
+  - The oracle captures are phase-matched by sl0 = 0x1B12CC0 and by w6tick==d6n,
+    not by an explicit scene marker.
+
+
+## HANDOFF part 89 -- THE DEADLOCK IS CLOSED AND FULLY DECODED. main HOLDS g36 WHILE WAITING FOR th6, AND th6 CANNOT FINISH WHILE g36 IS HELD.
+
+### 1. Run C: the first COMPLETE sleep census
+`PS2X_TRACE_CALLS=0x11ed78:4096` -> **520 records, no `[cap]`**. Every
+SleepThread through that slot, for the whole 200 s run.
+
+```
+('0x11ed78','0x11e994') 258   thread 4 loop
+('0x11ed78','0x11ea88') 258   thread 5 loop
+('0x11ed78','0x11ebbc')   2   th6, completion sleep  (0x11ebb4, s0==0 path)
+('0x11ed78','0x11eb60')   2   th6, wbusy-ack sleep   (0x11eb58, clears wbusy)
+```
+**th6 slept exactly 4 times in 200 seconds.** wk6rdy=4 -> 4 sleeps, 4 wakes,
+ends awake. Fully consistent, no lost events.
+
+### 2. New progress meter: d5n
+`d5n` (0x45EFDC, run_class(5)) ran ~28/s until t=125 and then **FROZE at 257
+for the remaining 72 s** while d6n/w6tick ran to 13.7 M. main makes literally
+zero forward progress after the bifurcation. Use d5n, not w6tick, to ask
+"is main alive".
+
+### 3. Two brackets, one exit -- reproducible for the 3rd run running
+Whole-run CHGPRI: `0x11e6e8` (boost) **x2**, `0x13c478` (restore) **x1**.
+After the last th6 sleep, `cur` is 0x6 for **3846** consecutive records and
+nothing else ever runs.
+
+```
+5942  CHGPRI ra=0x11e6e8 cur=0x1 thid=0x6 prio=0x1 old=0x19  <- main boosts th6 25->1
+5943  TRACE  ra=0x11ebbc  wbusy=1  w6tick=2                  <- th6 completion-sleeps, wbusy NOT cleared
+5946  TRACE  ra=0x11eb60  wbusy=0  w6tick=3                  <- th6 clears wbusy, sleeps
+5947+ CHGPRI ra=0x11e5dc cur=0x6 ... old=0x1  forever         <- th6 awake at pri 1, never restored
+```
+th6's own critsec pair reads `prio=0x1 old=0x1` -- a **no-op**, because main
+already boosted it to 1. Thread 4's pair two lines earlier is a real
+`0x1 / 0x10` raise+restore. Good contrast for spotting the boosted state.
+
+### 4. main's spin and th6's loop, both decoded
+```
+main 0x11e690:                       th6 0x11eac8 loop @0x11eb30:
+  0x11e6d4 sw 1 -> wbusy               0x11eb38 w6tick++
+  0x11e6e0 jal ChangeThreadPriority    0x11eb3c jal 0x13c6e8 = run_class(6); s0 = ret
+  loop:                                0x11eb4c if (wbusy == 1)
+    0x11e6f0 jal 0x11ed28                0x11eb58 jal SLEEP ; delay slot: wbusy = 0
+    0x11e6f8 jal 0x11ed90              0x11eb60 bne s0, zero -> 0x11ebbc   (SKIP the sleep)
+    0x11e704 lw wbusy                  0x11eb68..0x11eb90 (s0==0 path only)
+    0x11e708 beq 0 -> exit+restore     0x11ebb4 jal SLEEP
+    0x11e710 loop (max 199,999,999)    0x11ebbc loop tail
+```
+`0x11ed28(tid)` = ReferThreadStatus; if status 4 (WAIT) or 0xc -> **WakeupThread**.
+`0x11ed90(tid)` = ReferThreadStatus; if status 8 (SUSPEND) or 0xc -> ResumeThread
+                  -- a **no-op** on a plainly sleeping thread.
+
+⚠ **CORRECTS part 88's warning.** I said "do NOT arm 0x11ed28, th6 calls it
+196k/s". That was inferred, not measured, and it is WRONG: 0x11eb90 sits on the
+`s0==0` fall-through, which the spin never takes. **The spin path calls ONLY
+run_class(6).** Arming 0x11ed28/0x11ed90 is safe.
+
+### 5. THE CLOSED LOOP -- every link disassembled first-hand this session
+```
+0x1651d8  sweep of 8 slot pointers at 0x461164 (== the preset's sl0..sl7):
+            for i in 0..7:  p = slots[i]
+              if 0x15b560(p) != 0: continue          ; excused
+              if 0x1651b0(p) == 0: return 0          ; INCOMPLETE
+            return 1
+0x15b560  p==NULL -> -1 (excused);  p->h48==0 -> -1 (excused);  else 0
+0x1651b0  (unsigned)(p->h48 - 1) >= 4 -> 1 (complete);  else return (p->h44 == 0)
+```
+Our sl0=0x1b12cc0 has **h48=1, h44=1**; sl1..sl7 are NULL and excused. So the
+whole sweep reduces to one bit: **h44**.
+
+```
+h44 is cleared in exactly ONE place:
+  0x165300(slot):  if ((unsigned)(h48-1) >= 4) return
+                   if (slot->h44 == 0) return
+                   slot->h44 = 0            <<< the write
+  reachable only:  0x165300 <- 0x165250 <- 0x155320 <- 0x155210 <- 0x154fa8
+                   (0x1652a8, the other caller, is UNREACHABLE dead code)
+0x155320(slot):    if (g674 != 1)         return 0
+                   if (slot == NULL)      return 0
+                   if (slot->[0] != 1)    return 0
+                   if (slot->[96] == 1)   return 0
+                   if (ctx->g36 == 1)     return 0     <-- 0x1553a4, THE BAIL
+                   ... -> 0x165250 -> 0x165300
+ctx = 0x14e4d0() = 0x45F678 ;  g36 = ctx+36 = 0x45F69C  (matches presets)
+```
+
+**The deadlock, stated exactly:**
+1. main sets g36=1, sets wbusy=1, boosts th6 25->1, spins on wbusy.
+2. th6 runs run_class(6) -> slot 0 -> 0x155320 -> **bails because g36==1**.
+3. h44 stays 1 -> 0x1651d8 = INCOMPLETE -> slot 0 returns 1 -> run_class(6) != 0.
+4. `bne s0, zero` at 0x11eb60 skips th6's sleep -> th6 spins at pri 1.
+5. main (pri 24) never runs again -> never reads wbusy==0 at 0x11e704 ->
+   never closes the g36 bracket -> back to (2).
+Each side is blocked by the other. Self-sustaining.
+
+⚠ COVERAGE: the "exactly ONE place" and "dead code" claims rest on `eeref`,
+which sees the **static image only**. A dispatch slot installed at runtime that
+reaches 0x165300 would be invisible to it. 0x154fa8 itself is such a slot, and
+eeref did resolve it -- but that is not proof there is no other.
+
+### 6. NEXT RUN -- name the bracket that latched g36 (no rebuild)
+g36 is written by **0x1555a0(slot, val)**: `slot->[92] = val` if non-null, and
+**always** `ctx->g36 = val`. It has three caller PAIRS -- three set/clear
+brackets:
+```
+0x14e92c / 0x14e940   in sub_14E8B0
+0x154a1c / 0x154a30   in sub_1549C0
+0x155648 / 0x15565c   in sub_155630     (memory already flags 0x154950 here)
+```
+TRACE records carry a0..a3, so tracing 0x1555a0 gives **both** the site (`ra`)
+and the value (`a1`). The last `a1=1` with no matching `a1=0` names the bracket
+that never closed.
+```
+PS2X_TRACE_CALLS=0x1555a0:4096,0x11ed78:4096
+expected ra: 0x14e930 0x14e944 0x154a20 0x154a34 0x15564c 0x155660
+```
+
+### 7. The oracle debt is now the decisive question
+No PCSX2 capture has EVER reached g36=1 (g36=0 in all 1,803 samples of all
+three captures). If hardware never enters this bracket in this phase, then
+**entering it at all is the divergence** and the deadlock inside it is a
+downstream consequence, not the bug. Get an in-phase capture.
+
+---
+
+## HANDOFF part 88 -- HYPOTHESIS REFUTED: THE EE SCHEDULER IS EXONERATED. th6 NEVER SLEEPS BECAUSE THE GUEST CODE SAYS NOT TO.
+
+### 1. The part-87 patch worked, and it killed the part-87 hypothesis
+`slpfast slpblk wk6acc wk6rdy wk6cnt wk6slp wk1acc wk1rdy` emitted in all 198
+WATCH samples. Bifurcation reproduced at **t=135** (t=139, t=131 in prior runs).
+
+```
+slpfast = 0     for the ENTIRE run -- sleepCurrent's wakeupCount fast path
+                was NEVER taken, not once
+wk6acc  = 0     for the ENTIRE run -- main's spin never bumped th6's
+                wakeupCount; every WakeupThread landed on a WAITING th6
+wk6cnt  = 0     wk6slp = 0        wk1acc = 0
+wk6rdy  = 4     main made th6 Ready exactly 4 times in 200 s
+slpblk  climbs to 777 and FREEZES at t=135
+```
+
+**The unbounded-`++wakeupCount` theory is dead.** `EeScheduler` is behaving
+correctly: no accumulation, no fast-path returns, no lost wakeups. This was
+branch 4 of part 87's decision table, not the predicted branch 1.
+
+### 2. What the timeline actually shows
+```
+t     w6tick    g36  wbusy wk6rdy slpblk savepri savetid h44 h48
+119-125    0    0    0     0      0      0x0     0x0     0   0
+126        2    0    0     1      52     0x18    0x1     1   1   <- slot 0 born, th6 parks
+127-134    2    0    0     1      722    0x18    0x1     1   1   <- NINE SECONDS asleep
+135      122    1    0     4      777    0x1     0x6     1   1   <- bracket 2 opens
+136+  196728+   1    0     4      777    0x1     0x6     1   1   <- 196k/s forever
+```
+`slpblk` freezing means **no thread in the system calls SleepThread after
+t=135**, not just th6. DISPATCH's last record is the same second.
+
+### 3. main is the spinner -- confirmed, with its normal priority
+```
+CHGPRI ra=0x11e6e8  cur=0x1  thid=0x6  prio=0x1  old=0x19   x2   <- the BOOST
+CHGPRI ra=0x13c478                                          x1   <- the RESTORE
+```
+`cur=0x1` -> main (tid 1) is the thread inside `0x11e690`. `old=0x19` -> th6
+normally runs at **priority 25, LOWER than main's 24**. So th6 cannot starve
+main on its own; the starvation exists **only** because main deliberately
+boosts it to 1 and then busy-waits. Two entries, one exit: pass 1 completed,
+pass 2 never returned. (Same 2:1 as part 87.)
+
+### 4. The reframe: this is not a scheduler bug at all
+th6's loop is doing exactly what the guest instructs. `run_class(6)` returns
+nonzero because class-6 slot 0 reports **INCOMPLETE** (`0x1651d8() == 0` while
+`h48 in 1..4 && h44 != 0`), so `bne s0, zero, 0x11ebbc` at `0x11eb60` takes the
+no-sleep branch on every pass. A worker with outstanding work is *supposed* to
+keep working. Everything downstream of that is a correct consequence.
+
+⚠ So parts 86 and 87 both framed this as "th6 fails to sleep". It does not
+fail -- it is told not to. The defect is upstream of the sleep decision.
+
+### 5. The two questions that are actually open
+**(a) The nine-second park, t=126..134.** Slot 0 was already INCOMPLETE and
+work was outstanding, yet th6 sat parked with `wk6rdy` stuck at 1 and nothing
+woke it. On hardware `w6tick` moves in bursts, so *something* pumps th6
+periodically. Identify that waker and check whether it runs here. This window
+is the cleaner failure -- g36 was 0 the whole time, so the gate was open and
+nothing was blocked.
+
+**(b) The single second t=135.** main opened bracket 2, woke th6 three times
+(`wk6rdy` 1 -> 4, every one landing on a Waiting thread), and never got control
+back. Sub-second ordering is required; 1 Hz cannot resolve it.
+
+### 6. The cap problem that blocked parts 86 and 87 is GONE
+**Total sleeps for the whole 200 s run = 777** (`slpblk` final, `slpfast` 0).
+So `0x11ed78:4096` now captures **every SleepThread call in the entire run**
+without saturating -- the chronological-cap trap
+([[feedback_tracer_blind_to_tail_jumps]] corollary) does not apply at this
+volume. Its `ra` separates th6's two sleep sites (`0x11eb60` = the wbusy path,
+`0x11ebbc` = the s0==0 path), and every record now carries the sched counters.
+
+**Do NOT arm `0x11ed28`** -- th6's own loop calls it at `0x11eb90`, 196k/s.
+
+**Decision table:**
+```
+th6 sleeps repeatedly through t=126..134           -> it IS being pumped; the park
+                                                      is not a park, re-read (a)
+th6 has NO record between t=126 and t=135          -> confirms the 9 s park; find
+                                                      the missing periodic waker
+at t=135, ra=0x11eb60 fires then w6tick climbs     -> th6 cleared wbusy and main
+  with no further record                              still failed to see 0 -- main's
+                                                      0x11e704 read is the target
+at t=135, ra=0x11ebbc fires 3x then stops          -> th6 slept on s0==0 without
+                                                      clearing wbusy; main's spin
+                                                      is waiting on a flag th6 only
+                                                      clears on the other branch
+```
+
+### 7. Unchanged, still owed
+An oracle capture that actually reaches `g36=1`. All three captures have g36=0
+in every one of their 1,803 samples, so `h48=1` still has no in-phase hardware
+comparison and remains a symptom, not a proven cause.
+
+---
+
+## HANDOFF part 87 -- THE LOOP IS CLOSED: run_class(6) REPORTS "INCOMPLETE" FOREVER, SO th6 NEVER REACHES EITHER SLEEP
+
+### 1. What the run answered
+Armed `0x11ed78:64,0x11e690:16` + full sofdec watch set. 200 s, RelWithDebInfo.
+Bifurcation reproduced at **t=139** (was t=131 last run).
+
+- `0x11ed78` saturated (`[cap] tag=trace addr=0x11ed78 saturated at 64`) at
+  probe line 4160, i.e. **between t=130 and t=131 -- BEFORE the explosion.**
+  Every conclusion from the TRACE list is therefore about the QUIET window only.
+- `0x11e690` traced **ZERO** -- and that zero is **structural, not evidence**.
+  `0x11e778` ends in `j 0x11e690`, and the generated body emits that tail jump as
+  a DIRECT C++ call (`noop_sub_e690_0x11e690(rdram, ctx, runtime); return;`),
+  bypassing the function table the tracer hooks. See [[feedback_tracer_blind_to_tail_jumps]].
+
+### 2. The 64 TRACE records (quiet window)
+| ra | who | n | meaning |
+|----|-----|---|---------|
+| `0x11eb60` | th6 | **1** | the `wbusy==1` sleep, at w6tick 1->2, with g36=1 |
+| `0x11ebbc` | th6 | 1 | the `s0==0` sleep, earlier, g36=0 |
+| `0x11e994` | th4 | 31 | normal work/sleep cycle |
+| `0x11ea88` | th5 | 31 | normal work/sleep cycle |
+
+**Pass 1 of the handshake COMPLETES CORRECTLY.** main opened the bracket at
+t~129, th6 woke, ran one pass, saw `wbusy==1`, cleared it in the `0x11eb5c`
+delay slot, slept and blocked; main's spin then read `wbusy==0`, exited, and
+restored priority (savepri/savetid `0x19/6` -> `0x18/1`). g36 back to 0 by t=130.
+
+### 3. run_class(6) decoded -- `0x13c4f8`
+```
+s1 = 0x45EFE8 + idx*4        ; idx=6 -> 0x45F000  == d6in   (verified)
+s0 = 0x54E960 + idx*72       ; idx=6 -> 0x54EB10  <- class-6 handler table
+s2 = 5                       ; 6 slots, 12 bytes each {fn, arg, _}
+  sw 1,(s1) ; jalr fn(arg) ; sw 0,(s1) ; s3 |= v0
+[0x45EFC8 + idx*4] += 1      ; idx=6 -> 0x45EFE0  == d6n    (verified)
+return s3                    ; OR of every handler's return
+```
+presets' legacy field name `d5fn` (0x54EB10) is **class 6 slot 0**, as its own
+comment already says. Its value is `0x154fa8`, arg `0x4bd7d0`.
+
+### 4. Why run_class(6) never returns 0 -- the last link
+```
+0x154fa8(a0):  if (0x154ff0(a0) == 1) return 0;  return 0x155210(a0);
+0x155210 -> 0x155228:
+    if (g674 != 1) return 0
+    s1obj = 0x14e4d0();  if (0x1548a0(s1obj+0x58) != 1) return 0
+    if (0x1556f8() != 1) { for (8 slots @ s1obj+0x6c step 0x304) 0x155320(slot) }
+    0x1554d0()
+    s1 = (0x1556f8() != 1) && (0x1651d8() == 0)
+    if (s1 == 1) return 1        <-- "work outstanding"
+    ...
+    return 0
+```
+`0x1651d8` is the completion predicate presets already records: it returns 0
+(**INCOMPLETE**) while `h48 in 1..4 && h44 != 0`. Our slot 0 sits at
+**`h44=1 h48=1` from birth to the end of the run**. So `0x155210` returns **1**
+forever, `run_class(6)` ORs it into a nonzero result forever, and th6's
+`bne s0, zero, 0x11ebbc` at `0x11eb60` takes the **no-sleep** path every pass.
+
+### 5. CORRECTS part 86's "two distinct blocks back to back"
+It is **ONE** block. `0x155320` -- and therefore `0x165250` -- is reachable
+**only** from th6's slot walk at `0x155298`. So:
+
+- **t=130..138:** g36 == 0, gate wide open, but **th6 was asleep** (w6tick
+  pinned at 2) so nobody walked the slots. `0x165250` zero.
+- **t>=139:** th6 runs at 200k/s, but g36 == 1 so every slot bails at
+  `0x1553a4`. `0x165250` still zero.
+
+The completer only ever runs on the one thread that is either parked or
+starving the thread that holds the gate. That is the whole deadlock.
+
+### 6. main entered the spin twice and escaped once -- exact
+CHGPRI `ra` histogram over the whole run:
+```
+0x11e5dc 2489   0x11e670 2489    <- th6's own CriLock/CriUnlock ceiling pair
+0x11e6e8    2                    <- jal 0x174b30 at 0x11e6e0 = the BOOST, entry to 0x11e690
+0x13c478    1                    <- j 0x174b30 at 0x11e744 = the RESTORE (tail jump
+                                    carries the CALLER's ra), i.e. the only exit
+0x175b48 2  0x11f3bc 2  0x11eeec/0x11f030/0x11f0b8/0x11f140 1 each
+```
+Two entries, one exit. **Pass 2 never left the spin.** `s0 = s3 = 0x441924` in
+`0x11e690` (re-verified), so main provably executed `sw 1 -> wbusy` on pass 2.
+
+Note `savepri/savetid = (1,6)` at t=139 is **th6's own CriLock**, not main's
+boost -- 0x11e5dc/0x11e670 write those too. Do not read it as main's.
+
+### 7. What the stall state actually is
+Diff of all watch fields t=138 -> t=139 -> t=198:
+```
+changed:   d6n 2 -> 0x10811 -> 0xb16732     w6tick identical to d6n
+           d6in 0 -> 1 -> 1                 (stuck: th6 is inside a jalr ~100% of the time)
+           g36 0 -> 1 -> 1                  wdisp 0 -> 1 -> 1
+unchanged: h44=1 h48=1 h4c=3 sl0=0x1b12cc0 o0st=1 o0bsy=0 wbusy=0 wexit=0
+           boost=1 c6fn=0x11e778 done=0 g674=1 svmnest=1
+```
+THLIFE after t=139 is **only** `me=6` resume(0x52)/suspend(0x55) of thid=3 via
+`0x11edd8`/`0x11ee3c`. Before t=139 threads 1, 4 and 5 do the identical thing.
+So th6 poking th3 is **normal handler behaviour**, not the fault -- part 86
+over-weighted it. The fault is only that th6 does it without ever yielding.
+
+### 8. The one link still unmeasured
+`wbusy` reads **0 in all 60 post-stall samples**, and the only writer of 0 is
+th6's `0x11eb5c` delay slot, which is paired with `jal 0x11ed78`. So th6 called
+SleepThread once at t=139 and **did not park**:
+
+- `DISPATCH` is emitted **from `sleepCurrent`** (64-event batch, 1 s gate).
+  It stops at t~138 while w6tick climbs unbroken => th6 calls SleepThread
+  fewer than 64 times/s afterwards. It is not sleeping in a loop.
+- If it had *blocked*, main would have been scheduled and read `wbusy==0`
+  and exited. It did not (only one restore, section 6).
+
+Measured `fast=0`, `blocked` 126 -> 766 across all 8 DISPATCH records -- but
+**all 8 are pre-explosion**, so that is NOT evidence about t>=139.
+See [[feedback_capped_probes_false_negatives]].
+
+**Hypothesis, now instrumented:** `EeScheduler::wakeupThread`'s else branch does
+`++target->wakeupCount` with **no ceiling**, and main's spin calls WakeupThread
+once per iteration (`0x11e6f0` -> `0x11ed28`). Every call landing on an
+already-Ready th6 bumps the count. th6's single SleepThread then consumes ONE
+via `sleepCurrent`'s fast path and returns immediately. EeScheduler.cpp's own
+header comment predicted exactly this: *"blocked==0 with fast climbing
+identifies the wakeupCount fast path as the reason thread 6 never parks."*
+
+### 9. Patch written (needs a rebuild)
+Host-side scheduler state has no guest address, so it cannot ride
+`PS2X_TRACE_WATCH`. And the tracer's cap is consumed chronologically with no
+time or caller gate, so arming `0x11ed28` cannot reach t=139 either. The 1 Hz
+**WATCH sampler is the only probe that provably kept emitting through the
+stall** (198/198 samples), so the counters were routed there.
+
+- `src/lib/Kernel/EeScheduler.cpp` -- `g_wakeAcc[]`, `g_wakeReady[]`,
+  `g_wakeCountLast[]`, `g_sleepCountLast[]`; new `extern "C" ps2x_sched_diag()`.
+- `src/lib/ps2_runtime.cpp` -- WATCH now also emits
+  `slpfast slpblk wk6acc wk6rdy wk6cnt wk6slp wk1acc wk1rdy`.
+
+Neither is a runner file; both are runtime lib.
+
+**Decision table for the next run:**
+```
+slpfast climbs after t=139, slpblk flat     -> fast path CONFIRMED; fix is a wakeup ceiling
+wk6acc large (>>1) at the stall             -> main's spin is the accumulator, as predicted
+wk6acc ~0 but slpfast climbs                -> the count came from somewhere else; find that writer
+slpfast AND slpblk both flat after t=139    -> th6 truly stops calling SleepThread;
+                                               the question moves to 0x11eb50's wbusy read
+```
+
+### 10. Also still owed
+An oracle capture that actually reaches `g36=1`. All three existing captures
+have g36=0 in every one of their 1,803 samples, so `h48=1` still has **no
+in-phase hardware comparison**. h48=1 is a legal state in the 1..5 jump table
+and remains a SYMPTOM of the un-ticked pump, not a proven cause.
+
+---
+
+## HANDOFF part 86 -- THE BISECT LANDED: A PRIORITY-1 WORKER THAT NEVER SLEEPS STARVES MAIN, AND THE PUMP HAS NEVER TICKED ONCE
+
+Run: 200 s, `PS2X_TRACE_CALLS=0x165250:512,0x1555a0:512`. 198 WATCH samples, 78 live.
+
+### 1. The bisect: `0x1553a4` IS a real bail (0x165250 = ZERO calls)
+
+`0x165250` armed (`orig` non-null, no `[cap]`, single `jal` caller) -> **0 records**.
+Decoded `0x155320` confirms why:
+
+```
+0x155358  bne a1,v1,ret0     ; g674 != 1        ours=1 PASS
+0x155384  bne s0,a1,ret0     ; [obj+0x00] != 1  ours=1 PASS
+0x155394  beql v0,s0,ret0    ; [obj+0x60] == 1  ours=0 PASS
+0x15539c  jal 0x1555e8       ; v0 = g36
+0x1553a4  beq v0,s0,0x155374 ; g36 == 1 -> return 0     <-- BAIL
+          fallthrough -> j 0x1553d8 -> 0x15542c jal 0x165250
+```
+
+### 2. g36 is a RE-ENTRANCY BRACKET, not a state flag
+
+`0x1555a0` fired **3 times in 200 s**, all from one function:
+
+| n | ra | a1 | meaning |
+|---|----|----|---------|
+| 1 | 0x155650 | 1 | open |
+| 2 | 0x155664 | 0 | close |
+| 3 | 0x155650 | 1 | open -- NEVER CLOSED |
+
+```
+0x155630(obj):  jal 0x14ff40 ; jal 0x1555a0(obj,1) ; jal 0x154950
+                jal 0x1555a0(obj,0) ; jal 0x14ff58 ; j 0x1549c0
+```
+
+### 3. The unclosed bracket, all the way down
+
+`0x154950` -> `0x13c448(6)` -> callback table `0x54EBA0[6]` -> `jalr` **`0x11E778`** -> `0x11E690`.
+`[0x54EBD0]=0x11E778, [0x54EBD4]=0` is already our `c6fn`/`c6arg` -- registered by
+`0x13c3f0(6, 0x11E778, 0)` at ADX_Init+0x160. Both generated bodies
+(`sub_0013C448_0x13c448.cpp`, `noop_wrapper____0x154950.cpp`) are COMPLETE; the `jalr`
+goes through `dispatchGuestBranch(IndirectCall)` and there is **no** missing-target line
+in the log. A failed dispatch would `return` and g36 WOULD still be cleared -- it wasn't.
+
+`0x11E690(tid6, origpri)` = boost worker to `boost`(=1), then **busy-wait** up to
+199,999,999 iterations for `wbusy`(=`[0x441924]`) to clear, then restore priority.
+
+### 4. t=131: the system bifurcates
+
+| t | w6tick | rate | d5n | wdisp | g36 | savepri/tid |
+|---|--------|------|-----|-------|-----|-------------|
+| 121-130 | **2** | **0/s** | climbing | 0 | 0 | 0x18 / tid1 |
+| 131 | 140,141 | **+198,000/s** | frozen 257 | 1 | **1** | 0x1 / tid6 |
+| 197 | 13,101,828 | +198,000/s | 257 | 1 | 1 | 0x1 / tid6 |
+
+Probe activity, before vs after t=131:
+
+```
+BEFORE: THLIFE CHGPRI VSYNCREG PSEUDOTID SLOTENTRY GSENTRY WATCH RASLOT STACKOOB DISPATCH ...
+AFTER : CHGPRI(3264) THLIFE(1608) WATCH(67)          <-- everything else STOPS
+```
+
+Main gets zero cycles. Thread 6 called `ChangeThreadPriority(6,1)` **26,196,244** times
+(`ra` alternating 0x11e5dc / 0x11e670 = CriLock/CriUnlock, `old=1`, `cur=6`).
+`old=1` is CORRECT -- THCREATE shows th6 was created at prio 1. **Not a priority-save bug.**
+
+### 5. The circle -- every link measured
+
+```
+main sets g36=1, sets wbusy=1, boosts th6 to pri 1, busy-spins
+ -> th6 (pri 1) runs; slot0 incomplete -> never sleeps -> 198k/s
+   -> main (pri 24) never rescheduled
+     -> g36 never cleared
+       -> 0x1553a4 bails -> 0x165300 never runs -> h44 never cleared
+         -> slot0 stays incomplete (0x1651b0: incomplete iff h48 in 1..4 AND h44 != 0)
+```
+
+Syscalls decoded from the stub block at 0x174b30 (16-byte stubs):
+`0x174b30`=0x29 ChangeThreadPriority, `0x174ba0`=0x30 ReferThreadStatus,
+**`0x11ed78` -> `0x174bc0` = 0x32 SleepThread**, `0x174bd0`=0x33 WakeupThread,
+`0x174c10`=0x37 SuspendThread, `0x174c30`=0x39 ResumeThread.
+
+### 6. !! THE PUMP HAS NEVER TICKED -- this narrows the target, and corrects part 85
+
+```
+t=  1  sl0=0x0        h44=0 h48=0 h4c=0
+t=121  sl0=0x1b12cc0  h44=1 h48=1 h4c=3     <- born
+t=197  sl0=0x1b12cc0  h44=1 h48=1 h4c=3     <- IDENTICAL
+```
+
+Slot 0 never changes in its entire life. And for **t=121-130 g36 was 0** -- the gate was
+OPEN -- and `0x165250` STILL recorded zero calls, because th6 was ASLEEP (w6tick pinned
+at 2) so `0x155320` was never called at all. **Two different blocks back to back:**
+
+- t=121-130: gate open, worker asleep -> pump never invoked
+- t=131+:    worker running 198k/s -> pump invoked constantly -> g36=1 bails it
+
+The worker only runs while main holds the bracket that blocks it.
+
+### 7. Thread 6 should have slept on its FIRST pass
+
+```
+0x11eb30  w6tick++ ; wdisp=1 ; s0 = run_class(6) ; wdisp=0
+0x11eb4c  lw v0,[0x441924]
+0x11eb50  bne v0,1 -> 0x11eb60
+0x11eb58  jal 0x11ed78          ; SleepThread
+0x11eb5c  sw zero,[0x441924]    ; delay slot -> wbusy=0
+0x11eb60  bne s0,zero -> loop   ; NO sleep on this path
+0x11ebb4  jal 0x11ed78          ; SleepThread (only on s0==0)
+```
+
+main sets `wbusy=1` BEFORE waking th6, so th6's first pass MUST take the 0x11eb58 branch
+and block. It did 13 million passes instead. **SleepThread did not block.**
+
+Th6 spends those iterations resuming+suspending **thread 3**: THLIFE `op 0x52`
+(st 0x8->0x2, ra=0x11edd8, ResumeThread) alternating `op 0x55` (st 0x2->0x8, ra=0x11ee3c,
+SuspendThread), `me=6 mypri=1 tpri=8`, n=26,196,244. Th3 never gets a slice.
+
+### 8. Oracle status -- NO in-phase comparison exists yet
+
+All three captures (`sofdec_oracle*.csv`, 1,803 samples) have **g36=0 throughout**, so they
+cannot answer "what is h48 when g36=1". What they DO establish:
+
+| field | hardware | ours |
+|-------|----------|------|
+| h48 | 0, 2, 4, 6 -- **never 1** | 1, frozen |
+| h44 | alternates 0/1 constantly | 1, frozen |
+| w6tick | bursts then holds (~22/s avg) | +198,000/s |
+| sl0 | 0x1B12CC0 (same handle) | 0x1B12CC0 |
+
+So on hardware **the pump runs freely with g36=0 and the worker mostly asleep**. Ours never
+ran even during its own g36=0 window. h48=1 is a legal state (jump table has 1..5) that
+hardware passes through too fast to sample -- it is a SYMPTOM of the un-ticked pump, and
+must not be called the cause.
+
+### 9. Next run -- discriminates why th6 does not sleep
+
+Small caps ON PURPOSE: we want the FIRST records (t~131), and the `[cap]` line itself
+proves saturation. Both addresses are func-map ENTRIES.
+
+```
+$env:PS2X_TRACE_CALLS = "0x11ed78:64,0x11e690:16"
+$env:PS2X_TRACE_WATCH = (python "F:\SDBZ Recomp\build_scripts\presets.py" sofdec)
+```
+
+| result | reading |
+|--------|---------|
+| `0x11ed78` ra=0x11eb60 once at t~131 then stops | th6 slept once; the wake/sleep handshake broke after |
+| `0x11ed78` ra=0x11eb60 NEVER | th6 never saw wbusy==1 -- main's store vs the wake is misordered |
+| `0x11ed78` ra=0x11ebbc saturates | th6 IS calling SleepThread every pass; syscall 0x32 is not blocking |
+| `0x11e690` fires 3x | confirms the bracket count matches the three g36 writes |
+
+Also owed, independent of the above: an oracle capture that actually reaches g36=1.
+
+
+## HANDOFF part 85 -- THREE GATES CLEARED, 0x165300 CONFIRMED UNREACHED, AND A
+## CORRECTED DECODE OF THE LAST GATE
+
+Run 09-06 01:10, 200 s, `PS2X_TRACE_CALLS=0x165300:512` + the extended `sofdec`
+watch preset. 197 WATCH samples, 77 of them live (`sl0 != 0`), t=121..197.
+
+### 1. The three unmeasured gates are CLEAN and match hardware exactly
+
+    field   ours (all 77 live samples)   hardware in-phase   gate
+    o0st    0x1  (77/77)                 1                   0x155384  PASS
+    o0bsy   0x0  (77/77)                 0 except servicing  0x155394  PASS
+    o0slt   0x01b12cc0 (77/77)           0x01b12cc0          0x165250  live ptr
+
+Also frozen across all 77: `h44=1`, `h48=1`, `h4c=3`, `done=0`, `g674=1`,
+`svmnest=1`, `wbusy=0`. `tsflag` toggles 40/37 between 0 and 1, so `0x155210`
+IS being entered and IS acquiring its lock -- the pump loop is reached.
+
+Three of the four unknowns from part 84 are therefore eliminated. `0x155320`
+gets past `0x155358`, `0x155384` and `0x155394` on obj0.
+
+### 2. `0x165300` was never called -- and the probe is sound
+
+    [trace] armed 0x165300 orig=0x7ff652dfb970 cap=512 slot=0
+    probe=TRACE records in run_probe.jsonl: 0
+    no [cap] line
+
+`slot=0` is the TRACER's own array index (`const std::size_t index =
+g_slotCount++`, trace_calls.cpp:337), NOT "no dispatch slot". `orig` is a real
+non-null body and `replaceFunction` returned true, so the thunk was installed.
+`eeref refs 0x165300` = 2 callers, both `jal`, slot=yes. Zero is real evidence.
+
+Combined with part 84: `0x165300`'s own two gates PASS on our frozen h44=1 /
+h48=1, so if it ever ran it would clear h44. It never runs. The bail is
+upstream of it.
+
+### 3. g36 is the only diverging gate -- but not cleanly
+
+    g36 = 0x1 in 68/77 live samples, stable at 1 since t=130
+    g36 = 0x0 in  9/77 live samples, t=121..129
+
+`h44` is stuck at 1 through the g36=0 window too. At 1 Hz the sampler cannot
+rule out g36 toggling faster than it samples, so this neither confirms nor
+refutes the `0x1553a4` bail. It stays a CONTRIBUTOR, not a proven sole gate
+(consistent with the -092702 caution).
+
+### 4. CORRECTION to part 84: `0x15B560` is not a SIF call
+
+`sif_is_bound` / `sif_bind_rpc` are misleading auto-labels. Decoded:
+
+    0x15b560(slot):                      ; "sif_is_bound" -- SLOT VALIDITY
+       if (slot == 0)        return -1
+       if ([slot+0x48] == 0) return -1   ; [slot+0x48] IS h48
+       [0x460F58] = slot                 ; <-- writes `cur`
+       return 0
+
+    0x165250(slot):
+       if (slot_invalid(slot) != 0) tail j 0x15B340(0, 0xFF000138)   ; error report
+       else                         jal  0x165300(slot)              ; service
+
+`0x15B340` has 156 callers, nearly all tail `j`, and is invoked here with
+`(0, 0xFF000138)` -- an assert/panic id, not an RPC bind. Our `h48=1` and
+`o0slt` nonzero mean this gate would PASS.
+
+`cur` == `o0slt` == 0x01b12cc0 for the whole live phase, and `0x15b578` is a
+writer of `cur`. That LOOKS like proof `0x165250` ran -- but `eeref refs
+0x460f58` returns "UNREACHABLE", failing to see the `lui 0x46` + `sw 3928`
+pair, so its writer list is incomplete and no such claim can be made.
+(Known eeref lui+lo coverage gap; see [[project_eeref_static_xref]].)
+
+### 5. The g36 setter, found
+
+    0x1555a0(obj, val):                  ; wrap_get_data_ptr_p, slot=yes
+       base = 0x14e4d0()                 ; = 0x45F678
+       if (obj != 0) [obj+0x5C] = val
+       [base+0x24] = val                 ; g36 = val   ALWAYS
+
+So `g36` mirrors `[obj+0x5C]`. Six callers, all `jal`:
+`0x14e92c`, `0x14e940` (in `sub_14E8B0`), `0x154a1c`, `0x154a30` (in
+`sub_1549C0`), `0x155648`, `0x15565c` (in `noop_seq_noop_wrapper___414`).
+Getters: `0x1555e0` = `[a0+0x5C]`, `0x1555e8` = `g36`.
+
+### 6. Next run -- bisect the bail, and attribute g36
+
+TRACE records carry `ra` + `a0..a3` (trace_calls.cpp:212-227), so the setter
+probe is fully attributable; no count-based conviction is needed.
+
+    trace 0x165250  -- 1 caller (0x15542c, jal, slot=yes). Did we clear g36's gate?
+    trace 0x1555a0  -- who writes g36, to what value (a1), from where (ra)?
+
+    0x165250 count == 0                -> the 0x1553a4 g36 bail IS the story;
+                                          fix = whoever should have set g36=0
+    0x165250 fires, 0x165300 still 0   -> slot_invalid() diverting; re-read h48
+    0x1555a0 a1 always 1               -> nothing ever clears g36; find hw's clearer
+    0x1555a0 never fires in-phase      -> g36=1 is stale from before the phase
+
+## HANDOFF part 84 -- THE h44 PUMP PATH, FULLY DECODED ON THE ORACLE
+
+Phase re-validated first: all 8 of part 80's fingerprint fields matched exactly
+(d5fn=0x154fa8, d5arg=0x4bd7d0, sl0=0x1b12cc0, cur=0x1b12cc0, h40=0x4000,
+h48=0x4, c6fn=0x11e778, boost=1). PCSX2 paused on the Atari logo movie.
+
+### 1. Both h44 writers caught on hardware, by write watchpoint on 0x1B12D04
+
+    SETTER   0x169F40   sw v0,0x44(s1)     v0=1     in sub_169DE8
+    CLEARER  0x165338   sw zero,0x44(s1)            in sub_165300
+
+h44 is a "tick me" request flag: 0x169DE8 raises it, 0x165300 consumes it.
+
+### 2. The clear happens INSIDE 0x155210 -- the very function whose return diverges
+
+Hardware backtrace at the clearing store:
+
+    #0 0x165300  pc=0x165338   sw zero,0x44(s1)      <- the clear
+    #1 0x165250  pc=0x165290
+    #2 0x1553D8  pc=0x155434
+    #3 0x155228  pc=0x1552a0   [= 0x155210's framed body]
+    #4 0x154FA8  pc=0x154fd4   [= d5fn, the SofDec worker]
+    #5 0x13C4FC  pc=0x13c568
+    #6 0x11EAC8  pc=0x11eb44
+
+So the pump and the completeness test live in the SAME call, pump first.
+On hardware 0x155210 clears h44, then 0x1651D8 sees h44==0 => complete =>
+s1=0 => return 0 => the worker sleeps. That is the whole pacing mechanism.
+
+### 3. 0x155210 decoded end to end (single exit at 0x155308 -> 0x155318 jr ra)
+
+    s2 = g674 [0x45F674]
+    if (s2 != 1) return 0
+    base = 0x14E4D0() = CONSTANT 0x45F678
+    s0 = 0x1548A0(base+0x58) -> 0x13C880(0x45F6D0)     ; TEST-AND-SET on tsflag
+    if (s0 != 1) return 0                              ; lock busy
+    0x155148()
+    if (0x1556F8() != 1)                               ; 0x1556F8() == [0x460F04] == `done`
+        for i in 0..7: 0x155320(0x45F6E4 + i*0x304)    ; <-- THE PUMP LOOP
+    0x1554D0(0); s1 = 0
+    if (0x1556F8() != 1)
+        s1 = (0x1651D8() == 0)                         ; 1 => some slot INCOMPLETE
+    0x155178()                                          ; releases the lock
+    if (s1 == 1) return 1                               ; caller keeps spinning
+    0x1555E8(); if (== 1) return 0
+    0x1551E0(); return 0
+
+0x13C880 is an atomic test-and-set: reads [p], writes 1, returns (old == 0).
+Hook ptr at 0x54EBF8 (`tshook`) is 0 on BOTH sides, so both take this path.
+
+### 4. The pump's gate chain -- five gates, in order
+
+obj_i = 0x45F6E4 + i*0x304. Hardware: obj0 is the ONLY live one
+([obj0+0]=1, [obj0+0x3C]=0x1B12CC0); obj1 and obj2 read all-zero.
+
+    0x155358   g674 == 1                       ours 1   hw 1   OK
+    0x155384   [obj+0x00] == 1                 ours ?   hw 1   <- UNMEASURED
+    0x155394   [obj+0x60] != 1                 ours ?   hw 0*  <- UNMEASURED
+    0x1553a4   0x1555E8() != 1                 ours 1   hw 0   <- g36 BAIL
+    0x165250   0x15B560([obj+0x3C]) == 0       ours ?   hw ok  <- UNMEASURED
+    0x165320   ([slot+0x48]-1) <u 4            ours 1   hw 4   passes both
+    0x165330   [slot+0x44] != 0                ours 1   hw 1   passes both
+    0x165338   sw zero,0x44(s1)                             THE CLEAR
+
+    * [obj+0x60] is a re-entrancy flag set to 1 by 0x155518 for the duration
+      of 0x1553D8 and cleared after; it read 1 only because we were paused
+      inside that window.
+
+Gates 6 and 7 PASS with our own frozen values (h48=1 is inside 1..4, h44=1
+is nonzero). So if 0x165300 ever ran on our side it WOULD clear h44.
+h44 stuck at 1 therefore proves 0x165300 is never reached -- corroborated
+independently by h48 frozen at 1, since 0x165300 is also what advances the
+state via the jump table at 0x4BF4F0.
+
+### 5. 0x1553a4 is the g36 bail that part 66 could not find
+
+0x1555E8() == [0x45F678+0x24] == [0x45F69C] == `g36`, already in the preset
+since part 63. Its consuming branch was never located; it is 0x1553a4, and
+it sits directly on the pump path. Closes [[feedback_bind_every_probe_to_an_instruction]].
+
+g36 across our archived live-phase samples:
+
+    -010017  13x0 / 39x1      -030734  15x0 / 51x1
+    -021414  13x0 / 51x1      -031719  12x0 / 63x1
+    -023602  14x0 / 42x1      -032623  11x0 / 107x1
+    -091815  11x0 / 8251x1    -092702  4456x0 / 76x1   <-- g36=0 yet h44 STILL 1
+
+Hardware in-phase: g36 = 0.
+
+CAUTION: run -092702 clears the g36 gate 4,456 times and h44 is stuck anyway,
+so g36 is a CONTRIBUTOR, not the sole gate. Do not headline it.
+
+### 6. Ruled OUT this session (measured on both sides, they agree)
+
+    done  [0x460F04]  = 0  both   -> the pump loop IS entered
+    g674  [0x45F674]  = 1  both
+    tshook[0x54EBF8]  = 0  both   -> same TAS path
+    h40               = 0x4000 both
+
+Also: the `noop_` prefix on noop_sub_5210 / noop_sub_c880 / noop_wrapper___
+is a decompiler AUTO-LABEL, not behavior. 2,579 such names exist in the func
+map and NO override is registered on any of these addresses. Not stubs.
+
+### 7. NEXT -- one watch-only run, no rebuild, no cap risk
+
+presets.py `sofdec` now emits three new fields (added this session):
+
+    o0st  = 0x45F6E4   [obj0+0x00]   must be 1
+    o0bsy = 0x45F744   [obj0+0x60]   must be 0 except while servicing
+    o0slt = 0x45F720   [obj0+0x3C]   must be a live slot ptr (hw 0x1B12CC0)
+
+Trace only 0x165300. Both its callers (0x165288, 0x1652d8) use `jal` and it
+owns a dispatch slot, so a ZERO count is real evidence
+([[feedback_tail_jump_hides_the_caller]] satisfied). Do NOT trace 0x155228 or
+0x1553D8 -- check_trace_addrs reports both FOLDED
+([[feedback_trace_only_funcmap_entries]]).
+
+Decision table for the run:
+
+    o0st  != 1              -> bail at 0x155384; find who writes 0x45F6E4
+    o0bsy == 1 persistently -> 0x1553D8 never returned; a lock leak
+    o0slt == 0 or its +0x48 == 0 -> 0x165250 diverts to 0x15B340
+    all clean and g36 == 1  -> the 0x1553a4 g36 bail is the whole story
+    all clean and g36 == 0  -> re-open; the pump ran and something re-set h44
+
+PCSX2 is paused in-phase with the watchpoint removed, so more oracle reads
+are cheap while it stays there.
+
+## HANDOFF part 83 -- ROOT CAUSE, ORACLE-REPRODUCED: h44 is stuck at 1
+
+  Source: live PCSX2 (SLUS-21442) session of 2026-09-06, DebugServer, plus a
+  re-read of three archived runs.  CLOSES part 82's section 7 caveat: the oracle
+  has now been read, and it does NOT do what we do.
+
+### 1. PHASE VALIDATED FIRST
+
+  All 8 of part 80's fingerprint fields matched at the moment of measurement:
+    d5fn=0x154fa8  d5arg=0x4bd7d0  sl0=0x1b12cc0  cur=0x1b12cc0
+    h40=0x4000     h48=0x4         c6fn=0x11e778  boost=1
+  (PCSX2 later ran the movie to completion and tore the session down --
+   sl0..sl7 and d5fn all went to 0, and 0x1B12CC0 was reallocated as float
+   data.  Every reading below predates that.  Re-enter the movie before
+   reusing this connection.)
+
+### 2. 0x155210 HAS ONE EXIT, AND HARDWARE RETURNS BOTH VALUES
+
+  Native disasm confirms part 82 section 5 instruction-for-instruction, and all
+  five paths converge on 0x155308 -> `0x155318 jr ra`.  ONE breakpoint reads it.
+
+    sample 1  v0 = 1   ra = 0x154fd4
+    sample 2  v0 = 0   ra = 0x154fd4
+    sample 3  v0 = 0   ra = 0x154fd4
+
+  ra=0x154fd4 is the `jal` at 0x154fcc -- slot 0's call site, as predicted.
+  REFINES part 82 section 4: hardware does not return 0 *every* iteration, it
+  returns 0 *often enough* to pace at 53.87/s.  Ours returns non-zero ~always.
+  (3 samples -- enough to prove "both values occur", NOT enough for a ratio.)
+
+### 3. THE GATE, FULLY DECODED (two tiny leaf functions)
+
+  0x1651B0(slot) -- the per-slot completion test:
+      v1 = [slot+0x48]                 ; h48
+      if ((v1 - 1) >=u 4) return 1     ; h48 outside 1..4 => COMPLETE
+      return ([slot+0x44] == 0)        ; else complete IFF h44 == 0
+
+  0x15B560(slot) -- the validity test:
+      if (slot == 0)      return -1    ; null    => slot SKIPPED
+      if ([slot+0x48]==0) return -1    ; state 0 => slot SKIPPED
+      [0x460F58] = slot                ; <-- this is what writes `cur`
+      return 0                         ; valid => run the completion test
+
+  0x1651D8 -- the 8-slot scan @0x461164 (confirms the presets.py comment):
+      for i in 0..7: s = slots[i]
+        if (0x15B560(s) != 0) continue
+        if (0x1651B0(s) == 0) return 0     ; any incomplete slot => EARLY OUT
+      return 1                              ; all 8 complete => worker SLEEPS
+
+### 4. THE DIVERGENCE -- ONE FIELD
+
+  Ours, 211 live samples (sl0!=0) across three independent runs
+  20260905-032623 / -091815 / -092702:
+
+    h44   = 0x1  ONE distinct value, frozen, 62 + 76 + 73 samples
+    h48   = 0x1  ONE distinct value, frozen
+    h40   = 0x4000                     (matches hardware)
+    w6tick  meanwhile races to millions
+
+  Hardware at a sleeping sample:  h48 = 4,  h44 = 0.
+
+  Feed each through 0x1651B0 -- both sides take the SAME branch, because 1 and 4
+  are both inside 1..4, so h48 is NOT what decides.  h44 is:
+
+    ours      h48=1 in range -> return (h44==0) = (1==0) = 0  -> INCOMPLETE
+              -> 0x1651D8 = 0 -> s1 = 1 -> 0x155210 returns 1 -> NEVER SLEEPS
+    hardware  h48=4 in range -> return (h44==0) = (0==0) = 1  -> COMPLETE
+              -> 0x1651D8 = 1 -> s1 = 0 -> 0x155210 returns 0 -> SLEEPS
+
+  This predicts EXACTLY part 82 section 3's measurement: fewer than 64
+  SleepThread calls against 11.75M loop iterations.  Chain closed.
+
+  ==> ROOT CAUSE: [handle+0x44] ("h44") is stuck NON-ZERO in our runtime.
+      Secondary, unexplained: h48 is stuck at 1 where hardware reaches 4.
+
+### 5. WHAT IS NOT YET KNOWN -- who clears h44
+
+  `eeref field 0x44` is NON-SELECTIVE: +0x44 is a generic struct offset, 397
+  functions touch both +0x44 and +0x48 image-wide (vectors/matrices dominate).
+  Do not fish there again.
+
+  The SELECTIVE handle is the slot array address itself.  `eeref refs 0x461164`
+  returns exactly NINE functions -- the entire slot subsystem:
+
+    0x15B268  0x1651D8(known)  0x1652A8  0x1661D0  0x166290
+    0x166390  0x166850         0x1688B0  0x169DE8
+
+  0x1556F8 is NOT one of them -- it is `return [0x14E4D0()+0x188C]`, a global
+  flag read, so part 82 section 8's "which of 0x1556F8 / 0x1651D8" framing is
+  answered: 0x1651D8 is the one that matters.
+
+### 6. NEXT -- one PCSX2 watchpoint, no rebuild, no 200 s run
+
+  Get PCSX2 back into the movie phase (fingerprint in section 1 must match),
+  then catch the writer on hardware:
+
+    watchpoint  write  0x1B12D04..0x1B12D08   (h44)
+    watchpoint  write  0x1B12D08..0x1B12D0C   (h48, for the 1->4 transition)
+
+  Read the breaking PC and its `ra`; bucket by `ra`, never by count
+  (feedback_never_convict_by_count_with_two_callers).  Then compare that writer's
+  path against ours -- our side is the one that never runs it.
+
+  NOTE: the object is only at 0x1B12CC0 for a given movie session; re-read sl0
+  after re-entering the phase rather than assuming the address.
+
+## HANDOFF part 82 -- CONFIRMED at 0x11eb60, and the culprit is now ONE function
+
+  Source: the 198 s run of 2026-09-05 10:18 (run_probe.jsonl, 11,342 records).
+  Confirms part 81 section 6 by a SECOND, independent, uncapped argument, and
+  RETRACTS part 81 section 5.  Narrows the divergence from "some slot" to a
+  single function, 0x155210.
+
+### 1. RETRACTION -- part 81 section 5 read a boot-only dataset as the wall
+
+  All 8 DISPATCH records land in seq 0x127c..0x1736.  The 0x154ff0 TRACE at
+  seq 0x1737 still reads w6tick=0x2.  So every DISPATCH record predates the
+  wall entirely.  The "blocked 0x7e -> 0x2fe, ~96 sleeps/s then flat" decay and
+  the "d1/d4/d5 0x20 -> 0x15 starvation" in part 81 describe BOOT, not the
+  stall.  They were never evidence about thread 6's loop.
+  The t6=0x2 reading survives, but for the reason in section 3, not that one.
+
+### 2. RETRACTION -- the 0x155228 trace was a probe-design false negative
+
+  PS2X_TRACE_CALLS hooks g_ps2RecompiledFunctionTable slots.  The func map has
+  ONE function spanning 0x155210..0x155320 (`noop_sub_5210`), so 0x155228 is an
+  INTERIOR address with no slot.  output/noop_sub_5210_0x155210.cpp compiles the
+  0x15521c tail jump to a plain `goto label_155228` that never leaves the
+  function.  The tracer could not have fired.  Its 0 is an artifact, not data.
+  (`noop_` is an inherited Ghidra name; both bodies are fully populated. Not a
+  codegen problem.)
+  RULE: before tracing an address, confirm it is a func-map ENTRY, not an
+  interior label.
+
+### 3. THE MEASUREMENT -- silence is the evidence (uncapped, airtight)
+
+  EeScheduler.cpp:68  `if (++g_dispatchSinceClock < 64u) return;`
+  The counter is incremented INSIDE maybeEmitDispatch(), and sleepCurrent()
+  calls maybeEmitDispatch() on BOTH the fast and the blocking path
+  (EeScheduler.cpp:2092).  So ANY 64 SleepThread calls -- fast or blocking --
+  arm the clock, and it then emits once per second.
+
+    last DISPATCH record  seq 0x1736, at which point w6tick = 0x2
+    w6tick at end of run  0xb34e3d = 11,750,461  over 198 s  (~59,000/s)
+    DISPATCH records in the remaining ~190 s: ZERO
+
+  ==> FEWER THAN 64 SleepThread CALLS IN 190 SECONDS, against 11.75M loop
+      iterations.  Thread 6 never reaches 0x11ebb4.
+
+  This is independent of the 0x11ed78 tracer, which is USELESS here: its 256-cap
+  was consumed by seq 0x14bb (w6tick=0x2) by two unrelated callers (0x11e994
+  x127, 0x11ea88 x127).  Only 2 thread-6 hits were logged before saturation
+  (ra=0x11ebbc x1, ra=0x11eb60 x1), so it is blind for the entire wall
+  (feedback_capped_probes_false_negatives).  It does refute part 81's predicted
+  "zero calls" -- the pace point is reached at least once, during boot.
+
+### 4. THE CHAIN, now closed to a single function
+
+  <64 sleeps / 11.75M iterations
+    ==> the branch at 0x11eb60 (`bne $s0,$zero -> 0x11ebbc`) is taken ~always
+    ==> the class-6 dispatch returns NON-ZERO
+    ==> and c61..c65 = 0 for all 198 samples: ONLY SLOT 0 IS REGISTERED
+        (c60 = 0x154fa8, latched once and never changed)
+    ==> so slot 0 itself returns non-zero
+    ==> 0x154fa8 returns non-zero ONLY via label_154fd4 (`a1 = v0`), which
+        requires the 0x154fc4 beq NOT taken, i.e. 0x154ff0 returned != 1
+    ==> 0x155210 IS being called ~59,000/s AND IS RETURNING NON-ZERO
+
+  Hardware runs the same loop at 53.87/s (part 80 oracle) -- i.e. there
+  0x155210 returns 0 and thread 6 sleeps every iteration.
+  THE ENTIRE DIVERGENCE IS THE RETURN VALUE OF 0x155210.
+
+### 5. Where inside 0x155210 a non-zero return can come from (static)
+
+  Every exit sets $v0 from $s1 except the two early gates, which return 0:
+    0x155248 bne (g674 != 1)          -> v0 = 0   [g674 measured = 1, gate passes]
+    0x155268 bne (0x1548a0(s1+0x58)!=1) -> v0 = 0
+    0x1552e4 beq $s1,1                -> v0 = s1
+    0x1552f4 beq                      -> v0 = s1
+    0x155304 fallthrough              -> v0 = s1
+
+  $s1 is zeroed at 0x1552b4, then:
+    0x1552b8  jal 0x1556F8 ; if ret == 1 -> skip to 0x1552dc with s1 = 0
+    0x1552cc  jal 0x1651D8 ; s1 = ((ret ^ 1) != 0), i.e. s1 = 1 iff ret != 1
+    0x1552e4  beq $s1,1    ; s1==1 -> RETURN 1  (never reaches 0x1555e8)
+
+  So the non-zero return requires BOTH:
+      0x1556F8() != 1   AND   0x1651D8() != 1
+  Note part 78 measured 0x1555e8 called 4094 times in an earlier run, which is
+  past the 0x1552e4 beq -- i.e. s1 was 0 there.  Different phase; do not merge
+  the two runs.
+
+### 6. Other solid readings from this run
+
+  w6tick   0 -> 0xb34e3d, 65 sampler changes   ; d6n = w6tick - 1 throughout
+  d5n      FROZEN at 0x101 (257) after 12 changes  ; class-5 dispatch stopped
+  wbusy    0 on all 198 samples ; wexit 0 ; boost 0 -> 1 ; g674 0 -> 1 ; g36 0 -> 1
+  0x154fa8 256 hits, ALL ra=0x13c568 -- confirms the dispatcher's slot-0 call site
+  0x154ff0 256 hits, 254 from ra=0x154f74 and only 2 from slot 0's ra=0x154fbc
+           -- a second, hotter caller ate the cap
+           (feedback_never_convict_by_count_with_two_callers)
+
+### 7. CAVEATS
+
+  - The oracle has NOT been re-read for 0x155210's return value.  Section 4 is a
+    measured mechanism on OUR side plus part 80's hardware rate; PCSX2 has not
+    been shown to return 0 there.  Until it is, this is not a root cause
+    (feedback_reproduce_on_oracle_before_root_cause).  PCSX2 was disconnected
+    at last check.
+  - EVERY candidate below has 2-4 static callers (eeref refs), so raw counts are
+    meaningless -- bucket by `ra`, exactly as section 6 did.
+  - Caps are set high because competing callers demonstrably starve a small cap.
+
+### 8. NEXT RUN -- env-var only, NO REBUILD
+
+  Goal: which of 0x1556F8 / 0x1651D8 returns != 1.  The tracer logs calls, not
+  returns, so read it from REACHABILITY:
+    - 0x1651D8 called at ~59k/s (from ra=0x1552d4)  ==> 0x1556F8() != 1
+    - 0x1555E8 NOT called from ra=0x1552f4 at that rate ==> s1 == 1 ==> the
+      0x1552e4 beq returns 1, which is the non-zero the whole chain rests on.
+  Compare rates as (last_progress - first_progress) / n over each address's own
+  window; do not compare raw totals across different cap-out times.
+
+  $env:PS2X_TRACE_WATCH="w6tick=0x441960,wbusy=0x441924,wexit=0x4419D8,g674=0x45F674,g36=0x45F69C,d6n=0x45EFE0,d5n=0x45EFDC,boost=0x4418F0,c60=0x54EB10"
+  $env:PS2X_TRACE_CALLS="0x155210:16384,0x1554D0:16384,0x1556F8:16384,0x1651D8:16384,0x155178:16384,0x1555E8:16384"
+  & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+
+  0x155228 is REMOVED -- it is not a function (section 2).
+  0x11ed78 is REMOVED -- section 3 answers it without a probe.
+  PS2X_TRACE_WATCH stays MANDATORY alongside PS2X_TRACE_CALLS
+  (feedback_trace_watch_required_with_trace_calls).
+
+## HANDOFF part 81 -- STATIC CLOSE: the worker never reaches SleepThread
+
+  Fully static + one re-read of the EXISTING run_probe.jsonl.  No new run, no
+  rebuild.  Supersedes the framing of BOTH part 79 (priority value) and part 80
+  (a missing wait inside the callback): the wait exists, it is implemented
+  correctly, and it is simply never reached.
+
+### 1. The class-6 dispatcher, decoded (0x13c4f8, a0=6)
+
+  0x13c4f8  sll/addu/sll          ; v0 = ((a0*8)+a0)<<3 = 0x1B0
+  0x13c520  addiu $s1, 0xffffefe8 ; s1 = 0x45EFE8 + (a0*4=0x18) = 0x45F000  (d6in)
+  0x13c544  addiu $s0, 0xffffe960 ; s0 = 0x54E960 + 0x1B0       = 0x54EB10  (base)
+  0x13c52c  addiu $s2, $zero, 5   ; 6 slots, counted 5..0
+  0x13c558  addiu $s0, $s0, 0xc   ; STRIDE 12  (fn @ +0, arg @ +4, unused @ +8)
+  0x13c55c  sw    $s5, 0($s1)     ; d6in = 1
+  0x13c560  jalr  $ra, $v0        ; call slot fn
+  0x13c568  sw    $zero, 0($s1)   ; d6in = 0
+  0x13c56c  or    $s3, $s3, $v0   ; OR the return values
+  0x13c5b0  sw    $v1, 0($a0)     ; a0 = 0x45EFC8+0x18 = 0x45EFE0 (d6n)  ++
+
+  No early exit.  No yield.  No blocking wait anywhere in the dispatcher.
+  Returns the OR of all six slot return values in $v0.
+
+  ** presets.py IS MISLABELLED. **  d5fn=0x54EB10 is class SIX's slot-0 function
+  pointer, not class 5's; d5arg=0x54EB18 is slot 0's UNUSED third word, not its
+  arg (arg is +4).  The six slots are 0x54EB10, EB1C, EB28, EB34, EB40, EB4C.
+  Left unpatched deliberately -- renaming it now would break the field-name join
+  in differential.py against the part-80 oracle CSV.  Fix both together.
+
+### 2. Slot 0 is the SofDec bracket -- the chain is closed end to end
+
+  thread6 loop 0x11eb3c  jal 0x13c6e8
+  0x13c6e8   j   0x13c4f8 (a0=6)                 ; tail jump
+  0x13c560   jalr [0x54EB10] = 0x154FA8          ; slot 0; matches the oracle
+  0x154fb4   jal 0x154ff0  -> [0x14e4d0()+0x10]; if ==1 return 0
+  0x154fcc   jal 0x155210  -> j 0x155228         ; THE BRACKET
+  0x155298   jal 0x155320   ra=0x1552a0          ; part 78's 4088 calls, EXACT
+  0x1552ec   jal 0x1555e8   ra=0x1552f4          ; 2nd caller; part 78's 4094
+                                                 ;   came from ra=0x1553a4
+
+  The ra=0x1552a0 match is what binds part 78's measurement to this code path.
+  It is an 8-iteration loop (s1=7..0) over (s1+0x6c), stride 0x304.
+
+  Two whole-function gates found, both new:
+    lw $s2, -2444($v0) -> 0x45F674 (g674); if != 1 return 0 immediately
+    jal 0x1548a0($s1+0x58);                if != 1 return 0 immediately
+
+### 3. The pace point is SleepThread, and it is on the IDLE path only
+
+  0x11ed78  j 0x174bc0
+  0x174bc0  addiu $v1, $zero, 0x32 ; syscall     ==> SleepThread
+
+  Thread 6's loop (entry 0x11eac8), full:
+    0x11eb30  w6tick++
+    0x11eb3c  jal 0x13c6e8            ; dispatch class-6
+    0x11eb48  s0 = $v0                ; OR of all six slot returns
+    0x11eb50  bne wbusy,1 -> 0x11eb60 ; wbusy==1: clear it, then SleepThread
+    0x11eb60  bne $s0, $zero -> 0x11ebbc   ; <== WORK DONE: loop, NO SLEEP
+              ...idle path (0x11f230, 0x11ed90, 0x11ed28, 0x1201f0)...
+    0x11ebb4  jal 0x11ed78            ; SleepThread()   <== THE PACE POINT
+    0x11ebc0  beq [0x4419D8],0 -> 0x11eb30
+
+### 4. Our sleepCurrent is CORRECT -- the banking hypothesis is dead
+
+  EeScheduler.cpp:2092 sleepCurrent() implements real PS2 semantics: consume a
+  banked wakeupCount and return KE_OK, else blockCurrent(Sleep).
+  wakeupThread() does ++wakeupCount unboundedly when the target is not asleep,
+  which WOULD produce a free-run -- but the existing DISPATCH probe already
+  measures it, and it is not happening.
+
+### 5. THE MEASUREMENT (existing run_probe.jsonl, part-79 run, 8 records)
+
+  probe=DISPATCH, emitted from maybeEmitDispatch(); probeDispatch(item.id) is
+  called from EeScheduler::makeRunning(), so `id` IS the guest thread id and
+  d6/t6 count TRANSITIONS INTO Running.
+
+    fast     = 0x0 on ALL 8 records     -> SleepThread NEVER took the fast path
+    blocked  = 0x7e -> 0x2fe            -> ~96 sleeps/s, ALL threads, then flat
+    t6       = 0x2, cumulative, frozen  -> thread 6 entered Running TWICE, ever
+    d6       = 0x2 then 0               -> and never again after t~8s
+    d1/d4/d5 = 0x20 -> 0x15 in the last record   -> everything else starving
+
+  Emission STOPS at seq 0x2722.  Bracket 2's loop is seq 0x2744.  The run went
+  to seq ~15142 (200 s).  maybeEmitDispatch needs 64 accumulated events before
+  it even reads the clock, so no records for the remaining ~190 s means FEWER
+  THAN 64 CONTEXT SWITCHES IN 190 SECONDS.  The scheduler goes silent exactly
+  at the wall.
+
+  No contradiction with w6tick rising 62,510/s: makeRunning fires ONCE and
+  thread 6 then holds the CPU for 190 s.
+
+### 6. MECHANISM (bound to instruction 0x11eb60)
+
+  blocked flat + fast=0  ==> thread 6 never calls SleepThread
+                         ==> it never reaches 0x11ebb4
+                         ==> it takes the `bne $s0,$zero -> 0x11ebbc` branch at
+                             0x11eb60 on EVERY iteration
+                         ==> the class-6 dispatch returns NON-ZERO forever
+
+  So the loop never idles, never sleeps, never yields; at priority 1 (boosted by
+  sub_11E690 at 0x11e6e0) it starves the machine.
+
+  Hardware runs the SAME loop at 53.87/s ~= vblank (part 80 oracle), i.e.
+  hardware's dispatch returns 0 and the thread sleeps every iteration.
+  THE DIVERGENCE IS A SLOT'S RETURN VALUE, NOT THE SCHEDULER.
+
+  Retracts part 80's "our runtime turns the wait into a no-op" -- it does not;
+  the wait is correct and unreached.
+  Retracts part 79's "the priority VALUE is the bug" -- the latch is downstream.
+
+### 7. CAVEATS -- what is NOT measured
+
+  - WHICH slot returns non-zero is unknown.  Slot 0 is 0x154FA8 in both ours and
+    the oracle; slots 1..5 are UNREAD on either side.
+  - PCSX2 is no longer connected (pcsx2_status: both channels down), so
+    hardware's slot table needs a relaunch to the same phase.
+  - The g36 oracle row from part 80 remains INCONCLUSIVE: a 10 Hz sampler cannot
+    catch a bracket entered ~3 times per run.
+  - differential.py did NOT flag savepri (ours frozen 0x1, oracle cycles 5 values
+    ending 0x19).  It compares change-PRESENCE, not value sets.  A `both-move`
+    verdict is untrustworthy on any field whose VALUE is the question.  TOOL GAP.
+
+### 8. NEXT RUN -- env-var only, NO REBUILD
+
+  Decisive test: trace 0x11ed78.  Zero calls while w6tick races confirms the
+  0x11eb60 branch reading DIRECTLY.  c60..c65 read the six slot pointers so we
+  finally see which slots are populated.
+
+  $env:PS2X_TRACE_WATCH="w6tick=0x441960,wbusy=0x441924,wexit=0x4419D8,g674=0x45F674,g36=0x45F69C,d6n=0x45EFE0,d5n=0x45EFDC,boost=0x4418F0,c60=0x54EB10,c61=0x54EB1C,c62=0x54EB28,c63=0x54EB34,c64=0x54EB40,c65=0x54EB4C"
+  $env:PS2X_TRACE_CALLS="0x11ed78:256,0x154FA8:256,0x154ff0:256,0x155228:256"
+  & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+
+  ALL FOUR CAPS ARE LOW BECAUSE THESE ARE HOT.  A count of exactly 256 is
+  SATURATION, not a measurement (feedback_capped_probes_false_negatives).
+  PS2X_TRACE_WATCH is MANDATORY alongside PS2X_TRACE_CALLS -- unset, it strips
+  the watch columns off every TRACE record too
+  (feedback_trace_watch_required_with_trace_calls).
+
+## HANDOFF part 80 -- ORACLE READ: the worker loop is 1,160x TOO FAST
+
+pcsx2_sampler.py --preset sofdec --hz 10 --duration 60, PCSX2 running
+SLUS-21442 in the same phase as our run (d5fn=0x154FA8, sl0=cur=0x1B12CC0,
+h40=0x4000, h48=0x4, c6fn=0x11E778, boost=1 -- all match ours).
+
+differential.py: 5 field(s) DIVERGE.
+
+  field    ours                    oracle          ratio
+  w6tick   62,510/s                53.87/s         1,160x TOO FAST
+  d6n      62,510/s                53.87/s         1,160x TOO FAST
+  d5n      frozen since t=134      29.14/s         DEAD vs alive
+  g36      0 -> 1, latched         frozen 0        (see caveat)
+  tsflag   27 changes -> 1         4 changes -> 0
+
+### VERIFIED
+
+  53.87/s on a 59.94 Hz NTSC machine == the worker is VBLANK-PACED on hardware.
+  Ours free-runs at 62,510/s (194,000/s in the post-latch window).
+  d5n is FROZEN in ours from t=134 while w6tick races -- the worker is spinning
+  and doing NO work per iteration.
+  0x13c6e8 is a tail jump to 0x13c4f8(6), the callback-LIST dispatcher, and the
+  watchdog's cb= field is 0x0 on every line -- nothing is stuck in a callback.
+  So class 6's list is running to completion each time and accomplishing nothing.
+
+  PCSX2 savepri (0x449210) ends 0x19 with 5 distinct values, changing 0.47/s.
+  Ours is FROZEN at 0x1 since t=134.  Hardware never latches thread 6 at pri 1.
+
+### REVISED ROOT-CAUSE CANDIDATE (supersedes part 79's framing)
+
+  The bug is not the priority VALUE.  It is that our worker thread never yields:
+  on hardware its per-iteration wait blocks until vblank (53.87/s); in our
+  runtime that wait is a no-op, so thread 6 -- boosted to priority 1 by
+  sub_11E690 at 0x11e6e0 -- spins 194k/s and starves the bracket thread that is
+  waiting on wbusy at 0x11e704.  g36 then never clears.
+  The priority latch (part 65/79) is a CONSEQUENCE of the missing yield, not the
+  cause.
+
+### CAVEATS -- do not overread
+
+  * g36 oracle "frozen 0" over 601 samples is NOT proof hardware never sets it.
+    Part 68 measured only ~3 bracket entries per run and the bracket is brief;
+    a 10 Hz sampler would miss all of them.  This row is INCONCLUSIVE.
+  * differential.py did NOT flag savepri, even though ours is frozen at 0x1 and
+    the oracle cycles 5 distinct values ending 0x19.  It compares
+    change-PRESENCE, not value sets.  TOOL GAP -- fix before trusting a
+    'both-move' verdict on a field whose VALUE is the question.
+
+### NEXT
+
+  Find the blocking wait inside the class-6 callback list (0x13c4f8 with a0=6)
+  and check whether our runtime turns it into a no-op.  Static first: dump
+  0x13c4f8 and the class-6 list entries, then compare the callback set against
+  what PCSX2 has installed at the same table.
+
+# RETRACTED CLAIMS -- read this before reusing any headline below
+
+Append-only. A claim lands here the moment its MEASUREMENT is shown to be
+unsound, and it is never edited out, because the same wrong idea keeps being
+re-derived from the same still-true observations. Each entry names what was
+claimed, and -- more importantly -- which specific measurement error produced
+it, so the same shape can be recognised next time.
+
+The observations in these entries are generally still real. What was retracted
+is the INFERENCE.
+
+| Date | Claim | Why the measurement was unsound |
+|------|-------|--------------------------------|
+| 09-04 | part 64: `w6tick=18`, a ~100x collapse in the worker loop | The console line was clipped at terminal width. The real value was 13,296,567. Nothing had collapsed. |
+| 09-04 | part 65: a priority latch pinning th6 at 1 is the ROOT CAUSE | Onset ordering was never checked. `savepri` latches at t=143; `h44`/`h48` had already stopped moving at t~134. A cause cannot start after its effect. |
+| 09-04 | part 66: a circular deadlock between the worker and the pump | Never reproduced on PCSX2 first. Hardware showed the same shape. |
+| 09-04 | part 67: `d6n` vs `w6tick` ratio proves the g36 bracket is never entered | The counter is bumped at `0x13c5b0`, inside dispatcher `0x13c4f8`. The path under test reaches `0x13c448`, which bumps nothing. `d6n ~= w6tick` holds either way, so the test discriminated nothing. |
+| 09-04 | part 68: `h92=0` proves the latching bracket was A, not C | `sub_14E8B0` walks 8 objects at stride `0x304`, so bracket C can be open on a different object while the sampled handle's `+92` reads 0. (Superseded by the [trace] result, which named bracket C directly via `ra`.) |
+| 09-04 | (standing note) `registerFunction` only intercepts dispatch-loop calls; direct C++ `fn_` calls bypass it | Stale for the current codegen. Every `jal`/`jalr` in generated output goes through `runtime->dispatchGuestBranch()` -> `lookupFunction()` -> the function table. Verified against `output/CAppCRISofdec_Tick_0x3f9c10.cpp`. This is what makes `Kernel/Diag/trace_calls.cpp` possible. |
+
+## Rule for new headlines
+
+A headline may claim VERIFIED only if it names both:
+
+  1. the probe that produced it, and
+  2. the guest instruction whose behaviour that probe is bound to.
+
+A printed field nobody has traced to the branch that reads it is decoration.
+`g36` sat in every `[sofdec]` line from part 63 to part 66, already differing
+from the oracle, while the bail it controls (`0x1553a4`) went unfound.
+
+Anything that cannot name both goes under HYPOTHESIS.
+
+Two checks are now one command each, so there is no excuse for skipping them:
+
+    python build_scripts/analyze_run.py --onset            # onset ordering
+    python build_scripts/differential.py --oracle X.csv    # oracle agreement
+
+---
+
+## HANDOFF part 79 -- the callback chain is fully resolved; the mechanism is a SELF-INFLICTED priority inversion
+
+Run: PS2X_TRACE_CALLS="0x11ed28:4096,0x11ed90:4096,0x154950:64,0x11e778:64,0x174b30:512"
+     + PS2X_TRACE_WATCH (presets.py sofdec).  200 s, det=1.  Wall reproduced:
+     g36 latched t=134, never cleared; watchdog stuckSecs=63 at t=197.
+
+### VERIFIED, instruction-bound (static + sampler agree)
+
+  0x155650  jal  0x154950
+  0x154950  j    0x13c448        (a0 = 6)                      <- tail jump
+  0x13c448  slot = 0x54EBA0 + 6*8 = 0x54EBD0 ; jalr [0x54EBD0], a0 = [0x54EBD4]
+  0x13c470  jalr 0x11e778        (ra = 0x13c478)               <- TRACED, 2 calls
+  0x11e798  j    0x11e690        (a0 = [0x44198C] = tid 6)     <- tail jump
+  0x11e6e0  jal  0x174b30        ChangeThreadPriority(6, boost=[0x4418F0]=1)
+  loop:
+  0x11e6f0  jal  0x11ed28        ReferThreadStatus(6); WAIT/WAITSUSPEND -> WakeupThread
+  0x11e6f8  jal  0x11ed90        ReferThreadStatus(6); SUSPEND/WAITSUSP -> ResumeThread
+  0x11e704  lw   [0x441924]      ; 0x11e708 beq 0 -> EXIT at 0x11e720
+  exit:     restore regs ; 0x11e744 j 0x174b30 (restore pri) -> unwinds to 0x155658
+
+  run_callbacks(6) is a SINGLE-SLOT dispatcher, not a list.  Confirmed by the
+  sampler independently: c6fn (0x54EBD0) = 0x11e778, c6arg (0x54EBD4) = 0.
+  Syscall wrappers decoded: 0x174ba0 = 0x30 ReferThreadStatus,
+  0x174bd0 = 0x33 WakeupThread, 0x174c30 = ResumeThread, 0x174c10 = SuspendThread.
+
+  Worker thread 6's loop is the function at 0x11eac8/0x11eb00:
+    0x11eb34 [0x441960]++ (w6tick) ; 0x11eb40 wdisp=1 ; jal 0x13c6e8 ; 0x11eb44 wdisp=0
+
+### MEASURED
+
+  w6tick rises 194,000/s FLAT from t=134 to t=197 -- the worker is healthy.
+  wbusy (0x441924) = 0 on all 197 samples.
+  0x11ed28 traced 3 calls TOTAL, cap 4096, NOT saturated -> sub_11E690's poll
+    loop ran 1 iteration in bracket 1 and 2 in bracket 2, then STOPPED.
+  sysNum = 0xffffffff on every watchdog line -> nothing blocked in a syscall.
+  watchdog trace= ring is busy the whole time (0x155320/0x1555e8/0x154fa8/...)
+    -- all of it is thread 6 running dispatch5's callbacks.
+  THLIFE tail: me=0x6 mypri=0x1, 24.3M Suspend/Resume of thid 3 (tpri=8).
+  savepri (0x449210) = 0x1, savetid = 0x6, frozen since t=134.
+    PCSX2 (part 65) holds savepri = 0x18 -> thread 6 rests at 0x18 on hardware
+    and at 1 here.
+
+### HYPOTHESIS (not yet oracle-confirmed)
+
+  Self-inflicted priority inversion:
+    1. bracket thread sets g36=1, enters sub_11E690
+    2. sub_11E690 boosts thread 6 to priority 1 (highest) at 0x11e6e0
+    3. thread 6 at pri 1 runs 194k iter/s and never blocks
+    4. the bracket thread never gets CPU again -> never reads wbusy==0 at
+       0x11e704 -> never reaches the restore at 0x11e744 -> g36 never cleared
+  Consistent onset: savepri, savetid and g36 all first-write at t=134, so the
+  part-65 onset objection no longer applies.
+
+### RETRACTED / CORRECTED this part
+
+  * "wdisp stuck at 1 => dispatch5(6) never returned" -- the pre-committed
+    reading key at ps2_runtime.cpp:5615 is WRONG on that clause.  w6tick rises
+    194k/s while wdisp reads 1 on 61/61 samples: the worker spends ~100% of each
+    iteration inside 0x13c6e8 and the rest of the body is a handful of
+    instructions.  wdisp=1 is a DUTY-CYCLE artifact, not a stall.
+  * "sub_11E690 is parked inside a thread syscall" -- killed by sysNum=0xffffffff
+    and by the live trace= ring.  It is not parked; it is not scheduled.
+  * 0x11ed90 (cap 4096) and 0x174b30 (cap 512) BOTH saturated -- 0x11ed90 at
+    seq 0x2640, before bracket 2's loop.  Neither can answer a count question.
+    0x11ed28 (3/4096) and 0x154950 (2/64) and 0x11e778 (2/64) are clean.
+
+### NEXT -- the oracle, per the hard rule
+
+  python build_scripts/pcsx2_sampler.py --preset sofdec --hz 10 --duration 60 --out logs/oracle.csv
+  python build_scripts/differential.py --preset sofdec --oracle logs/oracle.csv
+  The question bound to an instruction: on PCSX2, does [0x449210] (savepri, the
+  old priority returned by ChangeThreadPriority at 0x11e5d4) ever read 1, and
+  does w6tick keep rising while g36 is set?  If PCSX2 also boosts thread 6 to
+  pri 1 and still escapes, the bug is our scheduler's, not the priority value.
+
+## HANDOFF part 78 -- the bail is PROVEN; part 76's downstream chain is RETRACTED
+
+Run: PS2X_TRACE_CALLS="0x1555e8:4096,0x155320:4096,0x165250:256,0x1555a0:64"
+     PS2X_TRACE_WATCH = presets.py sofdec   (198 WATCH rows, sampler healthy)
+     200 s, det=1. 18,930 probe records; TRACE 8,195.
+
+### Both part-77 questions answered, and both bound to an instruction
+
+Q1 "after g36 latches, is 0x155320 still called?"  -> YES.
+    4,096 calls, ALL ra=0x1552a0; 4,088 of them AFTER the latch. The caller at
+    0x1552a0 keeps calling. So the mechanism is the bail, not a stopped caller.
+
+Q2 "does 0x1555e8 return 1?"  -> YES, unanimously.
+    4,096 calls; 4,094 return to ra=0x1553a4 (the `beq $v0,$s0` bail branch).
+    Post-latch: g36 == 0x1 on 4,094 / 4,094 records. ZERO exceptions.
+    Pre-latch: exactly 2 records, g36 0x0 and 0x1.
+
+    Both counts EQUAL their 4096 cap, so this is a saturated sample -- but the
+    whole cap burned AFTER the latch (prog 0xe9e8a8), so the sample covers
+    precisely the window in question and is 100% homogeneous inside it.
+
+### The g36 bracket, now fully disassembled -- sub_155630
+
+  0x155648  jal 0x1555a0 ; a1=1   -> SET g36        (ra = 0x15564c+4 = 0x155650)
+  0x155650  jal 0x154950 ; nop    -> run_callbacks(6)
+  0x15565c  jal 0x1555a0 ; a1=0   -> CLEAR g36      (ra = 0x155664)
+  0x155664  jal 0x14ff58
+
+  Traced 0x1555a0 -> exactly 3 calls, matching the part-68 oracle:
+    #1 prog 0xe9c998 ra=0x155650 a1=1  g36 0->1   (bracket 1 OPEN)
+    #2 prog 0xe9c998 ra=0x155664 a1=0  g36 1->0   (bracket 1 CLOSE)
+    #3 prog 0xe9e8a8 ra=0x155650 a1=1  g36 0->1   (bracket 2 OPEN, never closed)
+
+  *** Therefore the stuck instruction is `jal 0x154950` at 0x155650. ***
+  Bracket 2 entered it and never came back to 0x15565c. Everything downstream
+  of the g36 read is a CONSEQUENCE; this call is the frontier.
+
+### RETRACTED -- part 76 steps 5,6,7 (the wbusy / sub_11E690 chain)
+
+  Claimed: no pump => worker never clears `wbusy` => sub_11E690's poll never
+  exits at 0x11e710 => the restore never runs.
+
+  Measurement that kills it: **wbusy (0x441924) == 0x0 on ALL 198 WATCH samples**
+  (`--onset`: "CONSTANT for the whole window").
+
+  Disassembly of sub_11E690 shows why that is fatal to the claim:
+    0x11e6d4  sw $v0, 0($s0)      ; s0 = 0x441924, wbusy = 1  ON ENTRY
+    0x11e700  slt $v1, $s2, $s0   ; s0 REUSED as iteration counter, s2 = 0xbebc1ff
+    0x11e704  lw $v0, 0($s3)      ; s3 = 0x441924
+    0x11e708  beq $v0, $zero, 0x11e720   ; wbusy == 0 -> EXIT
+    0x11e710  beq $v1, $zero, 0x11e6f0   ; else loop (bounded, ~200M)
+  A thread parked in that loop would hold wbusy == 1. It is 0 at every sample
+  across 66 s past the latch. The spinner is NOT parked there.
+  Also: `w6tick` and `d6n` are "still moving" (0xb967c8 ~ 12.2M) -- the class-6
+  worker is alive, not dead. That also weakens part 64's "dead worker thread".
+
+  Corollary: the spinner's OWN priority pair is 0x11e6e0 (`jal 0x174b30`, a1 =
+  [0x4418F0] = boost) and the tail restore `j 0x174b30` at 0x11e744. Neither has
+  ever been traced. The CHGPRI records at ra=0x11e5dc / 0x11e670 are a DIFFERENT
+  function's balanced boost/restore pair (thid 6: 1806 boosts vs 1805 restores,
+  and its `old` is 0x1 -- so tid 6's resting priority genuinely IS 1, which is
+  NOT the same thing as "poisoned").
+
+### Onset ordering (analyze_run.py --onset)
+
+  h44/h48/h4c/sl0/cur  first written t=123, never moved again
+  savepri/savetid/d5n  frozen since t=132
+  g36                  0 -> 1 at t=132, never cleared
+  w6tick/d6n/tsflag    still moving at t=198
+
+  h44/h48 stop BEFORE g36 latches (t=123 vs t=132) -- same caveat as part 69.
+  But here it is not a freeze: the pump never ran ONCE, so those fields were
+  written at init and never had anything to advance them.
+
+### NEXT PROBE -- is the spinner even in its loop?
+
+  0x11ed28 and 0x11ed90 are `jal`-ed INSIDE the poll loop (0x11e6f0 / 0x11e6f8).
+  0x174b30 is `jal`-ed ONCE before the loop at 0x11e6e0.
+    - 0x11ed28/0x11ed90 saturating after the latch => the spinner IS looping and
+      wbusy=0 means our WATCH address 0x441924 is the WRONG address for it.
+    - Zero calls to them after the latch => sub_11E690 is not where 0x154950
+      hangs, and the hunt moves inside run_callbacks(6) itself.
+  0x154950 and 0x11e778 are both `jal`/`jalr` reachable; 0x11e690 and 0x13c448
+  are TAIL-JUMPED, so a zero on those two is an artifact, not evidence.
+
+## HANDOFF part 77 -- run INVALID for its main question: TRACE_WATCH was not set
+
+Run: PS2X_TRACE_CALLS="0x1553d8:64,0x155320:64,0x1652a8:16,0x165250:32,0x15b560:16"
+
+The run DID reach the latch: last record is
+  CHGPRI thid=6 prio=1 old=1 ra=0x11e5dc n6=0x1519d6b   (~22M CriLock spins)
+so this is not a window miss. But:
+
+  probe=WATCH rows: 0        <-- PS2X_TRACE_WATCH was NOT set
+  TRACE records:   80 total
+
+*** OPERATIONAL RULE (new): PS2X_TRACE_WATCH must be set on EVERY run that
+*** sets PS2X_TRACE_CALLS. Without it the sampler is silent AND the TRACE
+*** records lose their g36/h44/h48 columns -- exactly the state that makes a
+*** TRACE record interpretable. This run's records carry only addr/ra/a0..a3.
+
+RESULTS, with what each is worth
+  0x155320  64 = THE CAP. All ra=0x1552a0, progress 0xe3aae2..0xe3ce0a --
+            i.e. the cap burned in one early burst. Says NOTHING about the
+            movie window. [Capped Probes Are False Negatives]
+  0x15b560  16 = THE CAP, all ra=0x1688f4, unrelated caller. Same.
+  0x1553d8  0  -- NOT EVIDENCE. sub_155320 reaches it by the TAIL JUMP
+            `j 0x1553d8` at 0x1553b8, which never passes through the
+            dispatch table. [Tail Jump Hides The Caller]
+  0x165250  0  -- this one IS evidence: its only caller is `jal` at 0x15542c.
+            Consistent with part 76's 0x165300 = 0. The pump path was never
+            taken during the traced window.
+  0x1652a8  0  -- mildly informative. An indirect `jalr` from a runtime-built
+            table WOULD route through dispatchGuestBranch and hit the thunk.
+            It did not. This WEAKENS part 76's "sub_1652A8 is the missing
+            async ticker" hypothesis; it is looking like dead code.
+
+STATE OF THE ARGUMENT (unchanged from part 76, not advanced)
+  Still verified: the g36 cycle closes on itself, every edge bound.
+  Still unverified: that hardware avoids it, and what completes the handle
+  on hardware while the bracket is held.
+
+NEXT PROBE -- trace the GATE READ itself, not the gated function
+  0x1555e8 is the g36 getter, `jal`-ed at 0x15539c, and its return value at
+  0x1553a4 IS the bail decision. Every call to it after the latch with
+  g36=1 in the same record is a PROVEN bail, bound to the instruction.
+  Caps must be large enough to survive the early burst (0x155320 burned 64
+  before the movie even started).
+
+  $env:PS2X_TRACE_WATCH = "<presets.py sofdec output>"
+  $env:PS2X_TRACE_CALLS = "0x1555e8:4096,0x155320:4096,0x165250:256,0x1555a0:64"
+
+  Question 1: after g36 latches, is 0x155320 still being called at all?
+              (If it stops entirely, the bail is not the mechanism -- the
+              caller at 0x1552a0 is.)
+  Question 2: for each such call, does 0x1555e8 return 1?
+
+## HANDOFF part 76 -- CLOSED CYCLE: g36 gates the very pump the g36 bracket waits on
+
+Run: PS2X_TRACE_CALLS="0x165300:64,0x165458:64,0x1651b0:16,0x11e690:16", 200s, det=1.
+Movie DID start (47 WATCH rows with g36=1), so this is not a part-74 window miss.
+
+MEASURED
+  0x1651b0  16 records (== the cap of 16; treat as CAPPED, absence beyond is unknown)
+            every one: ra=0x16521c, a0=0x1b12cc0, g36=1, h44=1, h48=1, h4c=3
+            -> h48 in 1..4 AND h44 != 0 -> returns 0 = INCOMPLETE, every time
+  0x165300  ZERO calls   <-- the pump never ran
+  0x165458  ZERO calls
+  0x11e690  ZERO calls   (known tail-jump artifact, not evidence)
+
+The 0x165300 zero is NOT a tail-jump artifact: eeref refs 0x165300 shows both
+callers are `jal` (0x165288 in sub_165250, 0x1652d8 in sub_1652A8), so the
+tracer would have seen either. It genuinely never ran.
+
+THE CYCLE, every edge bound to an instruction
+  1. 0x1555a0(obj,1) at ra=0x155650   sets g36 = [0x45F678+36] = 0x45F69C
+     (bracket C = sub_155630, entered from ra=0x14f450)
+  2. sub_155320 calls 0x1555e8 (the g36 GETTER: lw $v0,36($v0) after 0x14e4d0)
+     and at 0x1553a4 `beq $v0,$s0` with $s0==1 RETURNS 0 when g36==1,
+     so it never falls through 0x1553ac -> 0x1553d8.
+  3. sub_1553D8 is the only live path to the pump: `jal 0x165250` at 0x15542c,
+     and 0x165250 does `jal 0x165300` at 0x165288.
+     => g36==1 means the pump is never called.
+  4. Pump not called => h44 never cleared (0x165338), h48 never advanced
+     (0x1653d4 via jump table 0x4BF4F0) => 0x1651b0 returns INCOMPLETE forever.
+  5. INCOMPLETE => the class-6 worker never clears wbusy.
+  6. wbusy never clears => sub_11E690's poll loop (0x11e710) never exits =>
+     the priority RESTORE at ra=0x13c478 never runs (part 75) =>
+     tid 6 stays at priority 1 and every later CriLock saves old=1
+     (that IS savepri=1/savetid=6).
+  7. g36 is cleared only at 0x155664, AFTER that same poll loop returns.
+     => closed cycle.
+
+CORRECTION to part 75's read of eeref output: eeref labels 0x15542c/0x15546c
+as "sub_155320+0x10c/+0x14c", but sub_155320's body ENDS at 0x1553d0. Those
+addresses are in sub_1553D8, reached by the tail `j 0x1553d8` at 0x1553b8.
+The g36 bail conclusion survives; the function attribution was coarse.
+
+ORACLE STATUS -- NOT YET A ROOT CAUSE
+  sofdec_oracle3.csv: g36 == 0 in ALL 601 rows, wbusy == 0 in all 601,
+  h48/h4c cycle {0,4,6}. Hardware is never observed inside this cycle.
+  BUT a 1 Hz sampler cannot distinguish "hardware never sets g36" from
+  "hardware sets and clears it between samples" -- and our own bracket #1
+  did exactly that. So the honest claim is:
+    VERIFIED: the cycle above exists in our runtime and is self-closing.
+    NOT VERIFIED: that hardware avoids it by never entering it.
+  Do not promote this to a root cause until we know what completes the
+  handle on hardware while the bracket is open.
+
+LEADING HYPOTHESIS (not established)
+  The in-bracket wait is designed to be satisfied ASYNCHRONOUSLY -- something
+  periodic ticks the 8 handle slots at 0x461164 while g36 is held. sub_1652A8
+  is exactly that shape (walks all 8 slots, pumps each incomplete one) and
+  eeref reports it UNREACHABLE in the static image: call=0 ptr=0. Either it is
+  dead code, or it is installed into a table built at runtime that we never
+  populate. If the latter, that missing registration is the root cause and
+  everything in this file since part 63 is downstream of it.
+
+NEXT PROBE
+  PS2X_TRACE_CALLS="0x1553d8:64,0x155320:64,0x1652a8:16,0x165250:32,0x15b560:16"
+  Question 1: does sub_1553D8 run at all before the latch (i.e. was the pump
+              ever reachable), and how many times?
+  Question 2: does sub_1652A8 EVER execute? A single hit reclassifies it from
+              dead code to the missing async ticker.
+
+## HANDOFF part 75 -- LOCALISED: the priority RESTORE at ra=0x13c478 never fires on bracket #2
+
+Run: 200 s, PS2X_TRACE_CALLS="0x1555a0:32,0x155630:32,0x154950:32,0x11e778:32,0x13bde8:8".
+9 TRACE records, no [cap], 0x13bde8 = 0. Movie started at WATCH row 140,
+g36 latched at row 151. Part 73's decision table, outcome #1, exactly.
+
+The two brackets, side by side (CHGPRI + TRACE interleaved by seq)
+------------------------------------------------------------------
+BRACKET #1 -- WORKS (seq 0x6b4..0x6c0), h4c=1
+  0x6b4 TRACE  0x155630  ra=0x14f450
+  0x6b5 TRACE  0x1555a0  ra=0x155650 a1=1      SET g36
+  0x6b6 TRACE  0x154950  ra=0x155658
+  0x6b7 TRACE  0x11e778  ra=0x13c478
+  0x6b8 CHGPRI thid=6 prio=1    old=0x19 ra=0x11e6e8   BOOST tid6 25 -> 1
+  0x6ba CHGPRI thid=6 prio=1    old=1    ra=0x11e5dc   CriLock   (during boost)
+  0x6bd CHGPRI thid=6 prio=1    old=1    ra=0x11e670   CriUnlock (during boost)
+  0x6bf CHGPRI thid=6 prio=0x19 old=1    ra=0x13c478   RESTORE 1 -> 25   <== KEY
+  0x6c0 TRACE  0x1555a0  ra=0x155664 a1=0     CLEAR g36, bracket CLOSED
+
+BRACKET #2 -- LATCHES (seq 0x156d..), h4c=3
+  0x156d TRACE  0x155630  ra=0x14f450
+  0x156e TRACE  0x1555a0  ra=0x155650 a1=1     SET g36
+  0x156f TRACE  0x154950  ra=0x155658
+  0x1570 TRACE  0x11e778  ra=0x13c478
+  0x1571 CHGPRI thid=6 prio=1 old=0x19 ra=0x11e6e8    BOOST tid6 25 -> 1
+  0x1572.. CHGPRI thid=6 prio=1 old=1 ra=0x11e5dc / 0x11e670, alternating,
+           FOREVER (n6 climbs 0x9,0xa,0xb,... for the rest of the run)
+  -- no CHGPRI ra=0x13c478
+  -- no TRACE 0x1555a0 ra=0x155664
+  -- no 0x13bde8
+
+VERIFIED (not inferred)
+-----------------------
+1. The whole chain is live and identical on both brackets:
+   0x155630 -> 0x1555a0(set) -> 0x154950 -> [tail j] 0x13c448 -> 0x11e778 ->
+   [tail j] 0x11e690 -> ChangeThreadPriority(6, 1) at 0x11e6e8.
+2. The single missing event is the priority RESTORE, CHGPRI thid=6 prio=0x19
+   ra=0x13c478. Bracket #1 proves that record is what the healthy path emits.
+3. After the boost, CriLock/CriUnlock keep running on tid 6 forever, each
+   saving old=1 and restoring 1, because tid 6 IS at 1. That is precisely the
+   savepri=1 / savetid=6 latch -- the boost value has become tid 6's baseline.
+4. 0x11e778's TRACE a0=0x0 is the INCOMING a0, snapshotted before
+   `lw $a0, 0($v0)` at 0x11e790 loads [0x44198C]=wtid=6. Not a contradiction
+   with part 73's 0x11ed28 a0=6. (feedback_register_snapshot_is_not_an_argument)
+5. sub_11E690 decoded: ChangeThreadPriority(tid6, [0x4418F0]=boost) at 0x11e6e0,
+   poll loop 0x11e6f0..0x11e710 until [0x441924] wbusy clears, restore via tail
+   `j 0x174b30` at 0x11e744. Syscall 0x29 = ChangeThreadPriority, confirmed by
+   watchdog sysNum=0x29 sysPc=0x174b30.
+
+ORACLE (sofdec_oracle3.csv, 601 hardware samples) -- the check parts 58/66 skipped
+---------------------------------------------------------------------------------
+  boost    == 1        in ALL 601   <- the boost VALUE is not the bug; hardware
+                                       boosts to 1 too.
+  savepri  in {24,25,16,18}          <- NEVER 1. Ours latches to 1.
+  savetid  in {1,38,36,37}           <- ours latches to 6.
+  g36      == 0        in ALL 601
+  wbusy    == 0        in ALL 601
+  h48/h4c  cycle {0,4,6}             <- ours pinned at 1 / 3
+Hardware always issues the restore. We issue it once (bracket #1) and then
+never again. The divergence is real and reproduces on our side across three
+runs (parts 72, 73, 75); the oracle does not exhibit it.
+
+OPEN -- one question, sharply posed
+-----------------------------------
+Why does bracket #2's poll loop never see wbusy clear, when bracket #1's did?
+Candidates, in the order worth testing:
+  (a) tid 6 is boosted to 1 and never blocks, so the BOOSTING thread (pri 0x18)
+      is never scheduled again to observe wbusy or run the restore. Bracket #1
+      escaped because the worker completed fast. This is a scheduler-fairness
+      question about EeScheduler, and it is the leading hypothesis -- NOT yet
+      established, because we have not shown which thread is spinning.
+  (b) the worker genuinely cannot finish because h4c=3 vs h4c=1 makes state 1
+      take a different branch at 0x165458.
+Distinguishing probe (no rebuild):
+  PS2X_TRACE_CALLS="0x165300:64,0x165458:64,0x1651b0:16,0x11e690:16"
+  plus read the `me`/`mypri` fields already present in THLIFE records --
+  bracket #1 shows me flipping 0x1 -> 0x6 -> 0x1 mid-bracket, bracket #2 does
+  not, which is (a)'s fingerprint if it holds up.
+Do NOT "fix" ChangeThreadPriority's self-boost reschedule on this evidence:
+see project_resume_no_preemption.md, where a similar-looking bail was correct.
+
+## HANDOFF part 74 -- NON-REPRODUCTION: the movie never started, probe says nothing
+
+Run: 200 s, PS2X_TRACE_CALLS="0x1555a0:32,0x155630:32,0x154950:32,0x11e778:32,0x13bde8:8".
+All 5 armed OK ([trace] armed ... slot=0..4, no null slots, no [cap]).
+
+RESULT: **zero TRACE records, and the SofDec subsystem never initialised.**
+This is a run-window false negative (feedback_run_window_false_negative), NOT
+an answer to part 73's decision table. Do not read the table against it.
+
+Evidence that the window never opened:
+  - all 198 WATCH rows: every SofDec field 0 for the whole run -- w6tick, wbusy,
+    svmnest, d5fn, c6fn, sl0, h40/h44/h48/h4c, d6n, g36, cur. Nothing but `t`
+    ever changed. (Parts 72/73 saw init at rows 137 / 146.)
+  - [movie] t=198s wrkAdr=0x0 wrkSiz=0x0 obj=0x0 -- SofDec work area never
+    allocated.
+  - [mvgate] t=198s en=0 g36=0.
+  - [watchdog] t=135..198: pc alternates 0x104c74 / 0x421ee4, stuckSecs=0,
+    gif/s=3-5, dma/s=6-10, progress advancing ~80k/s. The game is running
+    normally on the pre-movie path, not stalled.
+
+Is the tracer to blame? No evidence that it is, and it is transparent by
+construction:
+  - traceThunk<N> is `traceEnter(...); g_slots[N].orig(...);` -- no
+    reimplementation, no signature change.
+  - all five thunks were installed and NONE was ever entered, so no thunk code
+    executed at all this run.
+  - install is at the end of applyMatching, on the host table only; the guest
+    tables the game reads (0x54EBD0 etc.) are untouched.
+  The two newly-armed tail-jump functions (0x154950, 0x11e778) are the only
+  things here never armed before, so they remain the one hypothesis worth
+  ruling out -- but nothing observed points at them.
+
+Env was otherwise identical to the part-73 run (checked [runmeta]: same exe,
+same ISO, DETERMINISM=1, DET_VBLANK_QUANTUM=20000, same probe file).
+Note: PS2X_DETERMINISM=1 did NOT make the boot trajectory repeat -- vbl/s 5 vs
+4, intrSec 5853 vs 6179, bsschg 22 vs 7. Determinism is not run-to-run
+reproducibility of *guest progress*; treat "the movie starts around t=140" as
+probabilistic, not guaranteed.
+
+The [iop:unhandled] lines (intrman 17/18, thsemap 6, libsd, loadcore 5) are the
+doubling-counter background log and were not shown to be new. Do not chase them
+off this run.
+
+ACTION: re-run the part-73 config verbatim. If the movie starts, part 73's
+decision table applies as written. If it does not start a second time, THEN the
+two tail-jump arms become the suspect and the control is to drop them
+(PS2X_TRACE_CALLS="0x1555a0:32,0x155630:32,0x13bde8:8"), and after that a fully
+unarmed control run -- which is the T1 non-destructive check the tooling plan
+still owes.
+
+## HANDOFF part 73 -- the "parked thread" model is DEAD; this is a LIVE-LOCK
+
+Run: 200 s, PS2X_TRACE_CALLS="0x11e690:16,0x11ed28:8,0x11ed90:8,0x155630:16".
+13 TRACE records. Only 0x11ed90 hit its cap (8, all pre-movie, ra=0x11e5f4).
+
+TRACE result
+------------
+  0x155630  bracket C            2 of 16   ra=0x14f450          g36=0 on BOTH
+  0x11ed28  poll-loop callee     3 of  8   ra=0x11e6f8  a0=6    NOT capped
+  0x11ed90  poll-loop callee     8 of  8   ra=0x11e5f4          CAPPED (init only)
+  0x11e690  park spinner         0 of 16                        SEE CAVEAT
+
+CAVEAT on 0x11e690 == 0: it is reached by `j 0x11e690` from 0x11e778, a TAIL
+JUMP, so it never passes through the dispatch table the tracer wraps. Its
+absence is a probe artifact, NOT evidence. (feedback_tail_jump_hides_the_caller)
+We nonetheless KNOW we were inside it: ra=0x11e6f8 on the 0x11ed28 records is
+the `jal 0x11ed28` at 0x11e6f0, which is sub_11E690's loop head. Verified by
+disasm.
+
+What this settles: the spinner is NOT spinning
+----------------------------------------------
+sub_11E690's loop (0x11e6f0..0x11e710, limit $s2=0xBEBC1FF, exits when wbusy
+at [0x441924] clears) ran THREE iterations in the entire run -- one at bracket
+entry #1, two at #2. Cap 8, used 3, so absence past that IS evidence. A parked
+thread would have saturated the cap in microseconds.
+
+Corroborated independently by the [watchdog] 32-deep call ring at t=178..197:
+0x11ed28 appears in ZERO rings. The rings instead show two loops running HOT --
+  main/CRI:  0x155320 x7-8 consecutive -> 0x1554d0 -> 0x1556f8 -> 0x1651d8 ->
+             0x15b560 -> 0x1651b0 -> 0x155178 -> 0x13c6e8 -> 0x154fa8 ...
+  worker:    0x11ed90 -> 0x174ba0 -> 0x174c30 -> 0x13bc28 -> 0x11e620 -> 0x11edf8
+progress advances ~78,000/s throughout. Nothing is blocked. Nothing is parked.
+
+=> RETRACT the "circular deadlock / thread parked in the spinner" framing that
+   part 72 left open as its leading hypothesis. The wall is a LIVE-LOCK:
+     g36 == 1  ->  sub_155320 bails at 0x1553a4 every call (the x7 runs of
+     0x155320 in the ring ARE those bails)  ->  pump sub_165300 never runs  ->
+     h44 never cleared at 0x165338, h48 never advanced at 0x1653d4  ->
+     0x1651b0 returns INCOMPLETE forever  ->  worker loops at ~137k/s forever.
+
+Callee identification (disasm, this session)
+--------------------------------------------
+  0x11ed28(a0=tid): 0x174ba0 -> status; if status==4 (THS_WAIT) or 0xC
+                    (THS_WAITSUSPEND) -> jal 0x174bd0   [release-wait]
+  0x11ed90(a0=tid): 0x174ba0 -> status; if status==8 (THS_SUSPEND) or 0xC
+                    -> jal 0x174c30, returns its value  [resume]
+  So sub_11E690 is "while worker busy, poke tid 6 awake". a0 = 6 = wtid. ✔
+
+Onset (197 WATCH rows) -- REPRODUCES part 72 exactly, shifted +9 rows
+--------------------------------------------------------------------
+  h40/h44/h48/h4c/svmnest/d5fn/d5arg/c6fn/g674/sl0/cur/boost/wtid:
+      written ONCE at row 146, never again  => INIT, not a freeze
+  g36:     0->1 at row 158, never cleared        (part 72: row 148)
+  wdisp:   0->1 at row 158
+  savepri/savetid: -> 1 / 6 at row 158
+  w6tick/d6n: 40 changes, final 0x647029 / 0x647028, lockstep
+  wbusy, done, h92, sl1..7, g688, tshook: never nonzero
+  tsflag (0x45F6D0): 17 changes, final 1 -- live test-and-set traffic, NEW
+Part 69's onset caveat stays dead. g36 is upstream of everything.
+
+Still NOT established
+---------------------
+1. WHY bracket C call #2 never reached its close at 0x155664. The poll loop
+   exited (3 iterations, no 0x13bde8 timeout, no cap) so control SHOULD have
+   run 0x11e690's tail `j 0x174b30` (0x11e744) and returned to 0x155660.
+   It did not clear g36. The lost span is: loop exit 0x11e720 -> 0x174b30 ->
+   return to 0x155660 -> jal 0x1555a0(s0,0).
+   0x174b30 is far too hot to trace directly (it is in nearly every ring).
+2. Whether the two 0x11ed28 calls at bracket #2 correspond to loop iterations
+   1 and 2, i.e. whether the loop exited normally or the thread left it by
+   some other path.
+
+Next probe
+----------
+Trace the bracket's own internals, all cold, so caps are safe:
+  PS2X_TRACE_CALLS="0x1555a0:32,0x155630:32,0x154950:32,0x11e778:32,0x13bde8:8"
+Decision table:
+  0x11e778 fires 2x, 0x1555a0 fires 3x   -> confirms the chain and that the
+      close call is never made; loss is inside 0x11e690's tail path.
+  0x11e778 fires <2x                     -> 0x154950 does not reach it on call
+      #2; the divergence is earlier than believed.
+  0x1555a0 fires 4x                      -> the close IS made and g36 is being
+      RE-SET by a fourth caller; re-open the ra histogram.
+
+Oracle: unchanged. g36 == 0 in all 533 hardware samples; h48 cycles {0,4,6}.
+Hardware's handler returns; ours does not. Mechanism, not yet root cause --
+the instruction that loses control is still unnamed.
+
+## HANDOFF part 72 -- bracket C is 1:1 with the class-6 handler; call #2 never returns
+
+MEASURED 2026-09-05, `PS2X_TRACE_CALLS="0x155630:16,0x11e778:16,0x13bde8:8"`,
+200 s, Determinism 1. Counts 2 / 2 / 0 -- well under the caps, so no `[cap]`
+marker and absence IS evidence here.
+
+| # | addr | ra | g36 at entry | w6tick |
+|---|------|----|--------------|--------|
+| 1 | 0x155630 (bracket C) | 0x14f450 | 0 | 1 |
+| 1 | 0x11e778 (class-6 handler) | 0x13c478 | 1 | 1 |
+| 2 | 0x155630 | 0x14f450 | **0** | 2 |
+| 2 | 0x11e778 | 0x13c478 | 1 | 2 |
+| - | 0x13bde8 (spinner timeout) | -- | never fired | -- |
+
+Three things this settles:
+
+1. **1:1 pairing.** Every bracket-C entry reaches the class-6 handler. The
+   tail-jump chain 0x154950 -> 0x13c448 -> [0x54EBD0] = 0x11E778 is confirmed
+   live, and `ra=0x13c478` is the dispatcher's own `jalr`, exactly as the
+   static read predicted.
+2. **Call #1 CLOSED.** Bracket #2 is entered with g36 == 0. So bracket C is a
+   working scope guard under this same instrumentation -- call #2 latching is
+   not a probe artifact. That is the control part 68 lacked.
+3. **The spinner did not time out.** 0x13bde8 (the 199,999,999-iteration
+   give-up path) never fired in ~48 s of wall time after the latch.
+
+### Onset ordering -- part 69's caveat is DEAD
+
+`analyze_run.py`-style onset over the 197 WATCH rows:
+
+| field | first nonzero | last change | changes | final |
+|-------|---------------|-------------|---------|-------|
+| h40 h44 h48 h4c svmnest | 137 | 137 | 1 | 0x4000 / 1 / 1 / 3 / 1 |
+| d5n savepri savetid | 137 | 148 | 12 / 2 / 2 | 0x101 / 1 / 6 |
+| **g36** | **148** | **148** | **1** | **1** |
+| wdisp | 148 | 156 | 3 | 1 |
+| w6tick d6n | 137 | 196 | 50 | 0x7B493A / 0x7B4939 |
+| done | never | -- | 0 | 0 |
+
+h44/h48 are written ONCE, at movie start (t=137), and never again. There is no
+"they froze at t~134, before g36" reading available -- that was the init-vs-
+freeze trap. **Nothing freezes before g36 latches at t=148.** Part 69's
+coincident-or-downstream caveat is retracted; g36 is upstream.
+
+Everything after t=148 is the worker spinning: w6tick and d6n advance ~137k/s
+in lockstep, wdisp pinned at 1, h44=1 / h48=1 forever ==> 0x1651b0 returns 0
+(INCOMPLETE) forever.
+
+### Still NOT established
+
+`0x13bde8` never firing means we have NOT shown the parked thread is inside
+sub_11E690's poll loop. It could be blocked before the loop, or elsewhere
+entirely. w6tick is the WORKER (tid 6), not the spinner, so its motion says
+nothing about where the spinner is. Next probe:
+
+    PS2X_TRACE_CALLS="0x11e690:16,0x11ed28:8,0x11ed90:8,0x155630:16"
+
+- 0x11e690 fires  + 0x11ed28 fires thousands of times -> parked in the loop.
+- 0x11e690 fires  + 0x11ed28 fires 0 times            -> blocked at/before
+  0x11e6f0; wbusy was set but the first poke never returned.
+- 0x11e690 does NOT fire                              -> 0x11e778 blocks
+  before its own tail jump.
+
+### Oracle status
+
+g36 == 0 in all 533 hardware samples; h48 cycles {0,4,6}. On hardware the
+handler returns. Our side does not. The mechanism part 66 claimed now has its
+oracle -- but the block SITE is still unnamed, so this stays a mechanism, not
+a root cause.
+
+## HANDOFF part 71 -- the chain is closed, every link named by address
+
+VERIFIED 2026-09-05 by disassembly of ELF/SLUS_214.42 plus oracle capture 3.
+Nothing below is inherited; each claim names the instruction it rests on.
+
+THE PREDICATE, RE-DERIVED (0x1651b0) -- the load-bearing inherited claim
+    lw    v1,72(a0)     ; h48
+    addiu v1,v1,-1
+    sltiu v1,v1,4       ; h48 in 1..4 ?
+    beq   v1,zero,ret   ; no  -> return 1 (COMPLETE)
+    lw    v0,68(a0)     ; h44
+    sltiu v0,v0,1       ; return (h44 == 0)
+Returns 0 (INCOMPLETE -> worker spins) iff h48 in 1..4 AND h44 != 0.
+The part-63 reading was right. It is now verified, not inherited.
+
+THE PUMP (sub_165300, reached only via 0x165250)
+  0x165318  bail unless h48 in 1..4
+  0x165330  bail unless h44 != 0
+  0x165338  sw zero,68(s1)      <-- CLEARS h44, unconditionally, every run
+  0x165364  jump table 0x4BF4F0 + h48*4
+            state1 -> 0x165458   state2 -> 0x165488   state3 -> 0x165820
+            state4 -> 0x1658c0   state5 -> 0x165930
+  0x1653d4  sw s0,72(s1)        <-- writes the NEXT h48
+Therefore h44 frozen at 1 is not "slow": it is PROOF the pump never ran once.
+
+THE GATE (sub_155320, the only caller chain to the pump)
+  0x155340  lw a1,[0x45F674]   (g674); != 1 -> return 0
+  0x155384  [handle+0] != 1    -> return 0
+  0x155394  0x155520 (= lw [handle+96]) == 1 -> return 0
+  0x15539c  jal 0x1555e8
+  0x1553a4  beq v0,s0 -> return 0        <-- s0 == 1, so g36 == 1 BAILS HERE
+            fall through -> 0x1553d8 -> 0x15542c jal 0x165250 -> the pump
+
+  0x1555e8 = lw v0,36(0x14e4d0()) = [0x45F678+36] = [0x45F69C] = g36.  BOUND.
+  0x1555a0 = sw a1,36(...)                                = g36 setter. BOUND.
+
+THE BRACKET (sub_155630) -- g36 is a SCOPE GUARD, not a leaked flag
+  0x15563c  jal 0x14ff40         enter
+  0x155648  jal 0x1555a0(s0,1)   g36 = 1     (ra 0x155650)
+  0x155650  jal 0x154950         THE BODY
+  0x15565c  jal 0x1555a0(s0,0)   g36 = 0     (ra 0x155664)
+  0x155664  jal 0x14ff58         leave
+Part 68 saw call #3 with ra=0x155650 and no matching 0x155664.
+That does not mean g36 leaked. It means 0x154950 NEVER RETURNED.
+
+  0x154950 = `j 0x13c448` with a0=6  ==  run_class(6), the NESTED dispatcher.
+  0x13c448: tbl 0x54EBA0, fn=[tbl+cls*8], arg=[tbl+cls*8+4]; cls=6 -> 0x54EBD0.
+  !! It is a TAIL JUMP, so an ra-keyed probe attributes everything the class-6
+  !! handler calls to ra=0x155650. See [Tail Jump Hides The Caller].
+  c6fn/c6arg (0x54EBD0/0x54EBD4) added to presets.py so the next run names it.
+
+THE CHAIN, END TO END
+  something blocks inside class-6 handler [0x54EBD0]
+    -> 0x154950 never returns
+    -> g36 stays 1 (bracket C open)
+    -> every later call bails at 0x1553a4
+    -> sub_165300 never runs
+    -> h44 never cleared, h48 never advanced  (ours: h44=1, h48=1 forever)
+    -> 0x1651b0 returns 0 = INCOMPLETE
+    -> worker sub_11EAC8 spins at ~34,000/s instead of sleeping
+
+ORACLE (sofdec_oracle3.csv, 533 movie samples, zero unreadable)
+  g36  == 0 in ALL 533          ours: 0 -> 1 at t=161, never cleared
+  h48  in {0,4,6}, never 1      ours: 1 forever
+  h4c  in {0,4,6}, never 3      ours: 3 forever
+  h44  oscillates 0<->1, 23 transitions in 53.2s, 48% duty at 1
+  g674 == 1 on both -- that gate is NOT the difference
+
+PART 69'S ONSET CAVEAT DOES NOT SURVIVE
+Part 69 held g36 "coincident-or-downstream" because h44/h48 appeared to stop
+at t~134 while g36 flipped at t=143. analyze_run.py --onset on the current run:
+  t=150  h40/h44/h48/h4c/sl0/cur/g674/wtid  all "INIT, not a freeze"
+  t=161  g36 0->1                            "INIT, not a freeze"
+  t=160+ d5n, savepri/savetid, d6in, wdisp, nest -- the actual freezes
+h44/h48 never froze; they were written once when the movie opened and the pump
+never touched them again. The t~134 reading was the init-vs-freeze bug that
+--onset exists to kill. g36's onset precedes every real freeze.
+CAVEAT: this only clears g36 of being downstream. It does not prove the pump
+ran during t=150..161 -- h44/h48 are unchanged across that window too.
+
+OPEN, and it is now a single question
+  WHAT IS [0x54EBD0], AND WHY DOES IT NOT RETURN?
+  Next run: PS2X_TRACE_WATCH now carries c6fn/c6arg, so the handler names
+  itself. Then trace it with PS2X_TRACE_CALLS -- no rebuild needed.
+
+## HANDOFF part 70 -- FIRST ORACLE DIFF. g36 is the only real divergence (09-05)
+
+Tooling from the T1-T5 plan is landed and now VALIDATED against PCSX2.
+
+Probe -> instruction binding, per the rule above:
+  * g36 = [0x45F69C], the guard-3 gate. Set inside bracket C via 0x1555a0;
+    read by the bail at 0x1553a4. Bracket C = ra 0x155650 (open) / 0x155664
+    (close).
+
+VERIFIED (differential.py, our 198s run vs a 40s PCSX2 movie window):
+
+  field    ours                    hardware        verdict
+  g36      0 -> 1, never cleared   0 for all 408   DIVERGE
+  w6tick   +34,040/s               +40.6/s         DIVERGE (839x)
+  d6n      +34,040/s               +40.6/s         DIVERGE (same counter pair)
+  d5n      +1.3/s, then STOPS      +12.6/s         both-move (9.7x, under threshold)
+
+  Everything else is both-move, both-frozen, or ours-init.
+
+  The tracer reproduced the part-68 regression oracle exactly: 3 calls to
+  0x1555a0, ra = 0x155650 / 0x155664 / 0x155650.
+
+  Our transition is a SINGLE second, t=160 -> 161, and the third bracket-C
+  call sits inside it (TRACE seq=0x15cd, the t=160 WATCH sample is 0x15cc):
+  g36 0->1, savepri 0x18->0x1, savetid 1->6, d5n freezes at 0x101, w6tick
+  jumps 2 -> 169,271.
+
+HYPOTHESIS, NOT VERIFIED -- do not promote without a clean capture:
+  * The part-69 onset caveat (h44/h48 stopped at t~134, BEFORE g36 at t=143,
+    therefore g36 is downstream) DID NOT REPRODUCE. In this run h44/h48 were
+    written once at t=150 and never changed. The old "stopped at t~134"
+    reading may itself have been the init-vs-freeze bug that --onset had at
+    the time. Needs a re-run reaching that timeline to settle.
+  * The 09-05 oracle capture spanned a PCSX2 reset (w6tick 1329 -> 3) and
+    193 of 601 samples were unreadable. Only ~40s is usable, and gamemode
+    read 0 throughout on both sides, so "hardware never sets g36" is scoped
+    to THAT window -- it is not yet "hardware never sets g36, ever".
+
+FOUR TOOL DEFECTS FOUND AND FIXED BY THIS FIRST REAL USE (all would have
+produced confident wrong answers, which is the point of running them):
+  1. analyze_run.py --onset called a 0 -> value first write "frozen since
+     t=N". 11 init events read as freezes. Now labelled INIT.
+  2. presets.py "nest" collided with the [g36set] probe's "nest": different
+     addresses (0x441920 vs 0x45F670). Now crinest / svmnest. The apparent
+     nest=1 vs nest=0 contradiction was never real.
+  3. pcsx2_sampler.py recorded Pine's silent all-zero reads as data. 193 such
+     rows made w6tick non-monotonic, which disarmed differential.py's rate
+     test and printed the 839x gap as a bland "both-move". Rows are now
+     flagged `unreadable`, kept in the CSV, excluded from verdicts.
+  4. differential.py compared per-SAMPLE rates while labelling them "/s",
+     across samplers running at 1Hz and 10Hz -- a silent factor of 10 inside
+     a test whose only job is judging a ratio. Now per-second, and it
+     segments across counter resets instead of giving up on them.
+
+OPEN: the diff still needs a clean oracle capture (no reset, confirmed inside
+the movie) and a re-run of ours with the renamed crinest/svmnest fields.
+
+SECOND ORACLE CAPTURE (sofdec_oracle2.csv, 44s readable, full boot):
+
+  h44 = [0x1B12D04] = [handle+68] is now the sharpest divergence.
+    ours      written once at t=150, then 1 for the remaining 48s
+    hardware  oscillates 0<->1 continuously, 26 transitions in 44s,
+              longest runs 158 samples at 1 and 65 at 0
+  Read by the completion predicate at 0x1651b0, which per part-63 disasm
+  treats [h+72] in 1..4 AND [h+68] != 0 as slot INCOMPLETE -> worker spins.
+  (That predicate is an INHERITED conclusion and has not been re-derived.)
+
+  If it holds, h44 stuck at 1 is not a separate finding from the w6tick rate
+  gap -- it is its cause: a permanently-incomplete slot means the worker
+  never sleeps. Ours spins at 34,040/s, hardware at 73/s (464x).
+
+  g36 reproduced: frozen at 0 across 441 readable samples, a second
+  independent window. Hardware does not set it while the worker is live.
+
+  d5n also DIVERGE now: ours +1.3/s and then stops entirely at t=161,
+  hardware +29.1/s sustained (22x).
+
+NEXT QUESTION, and it is now cheap: who writes h44, and why does ours write
+it once where hardware writes it 26 times? PS2X_TRACE_CALLS on the writer, or
+a data breakpoint at 0x1B12D04.
+
+THIRD CAPTURE (sofdec_oracle3.csv) -- first fully clean one: 601 samples,
+ZERO unreadable, sentinel constant, 53.2s of movie before the handle is torn
+down at t=53.3s (h40 leaves 0x4000 and the fields fill with 0x43000000, which
+is reused memory, not state -- ignore every "last" value past that sample).
+
+  THE SHARPEST RESULT SO FAR IS A VALUE SET, NOT A RATE:
+
+    h48 = [0x1B12D08] = [handle+72]
+      ours      1, from t=150 to end of run, never anything else
+      hardware  {0, 4, 6} across 533 movie samples -- NEVER 1
+
+    h4c = [0x1B12D0C] = [handle+76]
+      ours      3          hardware  {0, 4, 6} -- never 3
+
+  Our runtime pins the slot in a state the real game does not produce. Per the
+  (still INHERITED, still not re-derived) predicate at 0x1651b0, [h+72] in
+  1..4 means INCOMPLETE: hardware alternates 4 (incomplete) with 0 and 6
+  (complete) and the worker sleeps between; ours holds 1 forever and it never
+  sleeps. That is the same fact as the 464x w6tick gap, seen from the side
+  that names a cause.
+
+  h44 = [handle+68]: hardware 23 transitions in 53.2s, 48% duty at 1; ours one
+  write and then constant. Not flagged by the tool -- the change-rate ratio is
+  7.9x, under the 10x threshold. Recorded here because the tool missing it is
+  a threshold artifact, not evidence of similarity.
+
+  g36 frozen at 0 for a THIRD independent capture (533 movie samples).
+
+  wtid DIVERGE (ours 6, hardware 0x26) is almost certainly benign -- thread id
+  allocation differs between the runtimes. Do not chase it.
+
+  differential.py now also flags DISJOINT VALUE SETS on flag/enum-shaped
+  fields. Without it h48 and h4c read as "both-move": both sides change, and
+  a rate test cannot see that the states never overlap.
+
+CAVEAT ON BOTH CAPTURES: the `unreadable` flags in oracle2 came from the
+superseded all-zero rule, which cannot tell a dead read from a legitimately
+zero pre-init field. pcsx2_sampler.py now settles it with a sentinel read of
+guest code (0x100008) in the same packet. Neither CSV on disk carries that
+column; a fresh capture is needed before any `both-frozen` here is trusted.
+
+## HANDOFF part 65 -- [RETRACTED AS ROOT CAUSE] a PRIORITY LATCH pins th6 at 1 and starves main (09-04)
+
+> **RETRACTED 09-04 -- see the ledger at the top of this file.** The
+> measurements below stand; the ROOT CAUSE claim does not. `savepri` latches at
+> t=143, but `h44`/`h48` had already stopped moving at t~134, so the suspect's
+> onset FOLLOWS the symptom's. Kept as a measured window marker, not an
+> explanation. `analyze_run.py --onset` now computes this ordering
+> automatically.
+
+STATUS: oracle-discriminated. PCSX2 does NOT reproduce it. Part 64's reading key
+was WRONG in both branches -- the console had truncated w6tick, and the real
+number inverts the conclusion.
+
+MEASURED (our run, t=198s):
+    w6tick  ~181,000 iterations/s, steady   (console showed "18" -- truncated!)
+    wbusy   = 0 always        wdisp = 1 always      wtid = 6
+    DISPATCH probe: t6 = 2 dispatches to thread 6, EVER; d1 (main) = 0;
+                    fast = 0; last DISPATCH record seq 0x14c4 -- after that
+                    ZERO sleeps and ZERO context switches for ~60s.
+    CHGPRI on thid=6: 3256 records; target prio 0x19 exactly THREE times,
+                    last at seq 0x62b; then ONE boost from ra=0x11e6e8
+                    (the park spinner) at seq 0x14e3; then 1624 CriLock +
+                    1624 CriUnlock pairs, EVERY ONE with old=1. Raw counter
+                    n6 reached 20,804,106.
+
+ORACLE (PCSX2, DebugServer + Pine):
+    [0x449210] = 0x18 (24)  <-- a real un-boosted priority
+    [0x449214] = 1          <-- lock last held by tid 1
+    [0x441920] = 0 (nest not held)   [0x4418F0] = 1   [0x441908] = 0x19 (25)
+    [0x54EBD0] = 0x11e778   (matches ours)
+    class-6 dispatch5 @0x54EB10 has exactly ONE slot: fn=0x154fa8 arg=0x4bd7d0
+    w6tick advances ~105/s on hardware vs ~181,000/s here -- a 1700x gap.
+  OURS holds [0x449210] = 1. Hardware does not latch; we do.
+
+DECODED (the latch, every step from the ELF):
+  sub_11E598 CriLock  : nest [0x441920]; on 0->1 boosts caller to [0x4418F0](=1)
+                        via ChangeThreadPriority and saves its RETURN -- the
+                        CURRENT priority -- at [0x449210], tid at [0x449214].
+  sub_11E620 CriUnlock: on 1->0 restores [0x449210]. Clamps negative nest to 0.
+  sub_11E690 spinner  : sets [0x441924]=1, boosts th6 to 1 (jal at 0x11e6e0,
+                        ra=0x11e6e8), then loops resuming th6 until the flag
+                        clears, up to 199,999,999 times.
+  THE RACE: once the spinner has boosted th6 to 1, th6's very next CriLock
+  captures 1 as the "original". Every later unlock restores 1. th6 is pinned
+  at priority 1 -- the highest -- forever. Main is 24. Nothing else ever runs.
+
+  Why it never sleeps: the worker skips its SleepThread (0x11ebb4, syscall 0x32)
+  iff dispatch5(6) returns NON-ZERO -- `bne $s0,$zero,0x11ebbc` at 0x11eb60.
+  The flat sleep counters against 181k iterations/s prove it takes that branch.
+
+NOT YET ESTABLISHED (do not overclaim):
+  WHICH runtime behaviour permits the interleaving. The guest code is identical
+  on both sides; only the ordering differs. EeScheduler::changePriority's Ready
+  branch DOES call requestPreemptionIfHigher, so that path is not obviously at
+  fault. The chgpri return value is correct (seq 0x57b shows old=0x19 captured
+  properly) -- project_chgpri_returns_old_priority.md still stands.
+
+PROBE ADDED (part 65, ps2_runtime.cpp [sofdec] sampler, brace final=0/min=0/max=12):
+    savepri=[0x449210]  savetid=[0x449214]  nest=[0x441920]
+    d5fn=[0x54EB10]     d5arg=[0x54EB18]
+    g688=[0x45F688]     g674=[0x45F674]
+  Read it as: savepri==1 is the latch, live. d5fn != 0x154fa8 is a separate bug.
+
+## HANDOFF part 64 -- the class-6 callback IS the spinner, and the wall is a dead worker thread (09-04)
+
+STATUS: static chain fully decoded and cross-checked against the PCSX2 image.
+Part 63's "ra match, not verified" caveat is now DISCHARGED -- it was a real
+identity, reached through a thunk.
+
+MEASURED (run to t=198s, PS2X_SOFDEC sampler):
+    cb6 = 0x11e778   (NOT 0x11e690)   cb6a = 0x0
+    g36 0 -> 1 at t=127s and never returns to 0
+    loadscreen_tick freezes at 1086
+    handle 0x1b12cc0 st=1 pd=1 from t=118s
+
+DECODED:
+  0x11e778 "noop_wrapper___" is a 2-instruction thunk:
+        a0 = [0x44198C] ; a1 = [0x441908] ; j 0x11e690
+  so the class-6 callback tail-jumps into the park spinner sub_11E690.
+  The ra=0x13c478 match recorded in earlier parts was correct.
+
+  sub_11E690(tid, x):
+        [0x441924] = 1                        ; "worker busy"
+        loop { sub_11ED28(tid);
+               thread_resume_if_suspended(tid) }
+        until [0x441924] == 0, or 0x0BEBC1FF (199,999,999) iterations,
+        after which it falls into wrap_mem_compare_n_c(0x4B8720) -- an
+        error/timeout path.
+
+  sub_11F0C8 CreateThread()s entry 0x11eac8 (stack 0x445210, size 0x2000)
+  and stores the new tid at 0x44198C -- exactly the word the thunk loads.
+  => the spinner is waiting on the sub_11EAC8 worker thread.
+  (sub_11EC00 is the same pattern for class 7, registered by sub_11F160.)
+
+  sub_11EAC8 worker loop (0x11eb30 .. 0x11ebc0):
+        [0x441960]++                          ; per-iteration tick counter
+        [0x441934] = 1
+        s0 = dispatch5(6)                     ; 0x13c6e8 -> 0x13c4f8,
+                                              ; 6 slots @ 0x54EB10, stride 12
+        [0x441934] = 0
+        if ([0x441924] == 1) { [0x441924] = 0 ; sub_11ED78() }   <-- WAKE
+        ... optional resume/yield work ...
+        if ([0x4419D8] == 0) loop
+        else [0x4419E0] = 1 ; j 0x174ae0 (exit thread)
+
+  The clear at 0x11eb5c is reached on EVERY iteration.  One single worker
+  iteration releases the spinner.  Therefore the wall is not a SofDec
+  logic problem at all: the worker thread is not completing iterations.
+
+  thread_resume_if_suspended (0x11ed90) ReferThreadStatus()es the target and
+  calls 0x174c30 only when status is 8 (SUSPEND) or 0xC (WAIT|SUSPEND).
+  That matches the status=12 recorded for th6 in part 58.  th6 IS the
+  sub_11EAC8 worker.
+
+STATIC COVERAGE NOTE: the writer scan for 0x441924 that anchors on
+lui/addiu found only the SET at 0x11e6d4.  Widening it to "any instruction
+with imm 0x1924 whose base came from lui 0x44" found two more
+materialisations (0x11eb1c, 0x11ec48) which is where the two clears live.
+Same failure mode as part 62 -- see [[feedback_silent_except_pass_empties_the_filter]].
+Do not trust a store scan that only walks back to a lui.
+
+TWO CALLBACK TABLES, do not confuse them:
+    run_callbacks  0x13c448  single slot  0x54EBA0 + class*8   (class6 = 0x54EBD0)
+    dispatch5      0x13c4f8  6 slots      0x54E960 + class*72  (class6 = 0x54EB10, stride 12)
+
+PROBE ADDED (ps2_runtime.cpp, [sofdec] sampler):
+    w6tick=[0x441960]  wbusy=[0x441924]  wdisp=[0x441934]
+    wexit=[0x4419D8]   wtid=[0x44198C]
+  Reading key:
+    w6tick RISING while g36=1  -> worker runs, clear is being skipped;
+                                  check wdisp stuck at 1 (dispatch5 hung).
+    w6tick FROZEN while g36=1  -> worker never scheduled.  Scheduler bug,
+                                  not a SofDec bug.  wtid names the thread.
+
+ORACLE: PCSX2 is UP this session (DebugServer 21512 + Pine 28011).
+Image verified against our ELF: [0x11e778] reads 27bdfff0 3c020044
+ffbf0000 3c030044, byte-identical.  At the main menu (GameMode=0) the CRI
+globals are all zero -- 0x54EBA0 and 0x441900 both read 0 -- so the oracle
+read must be taken DURING a loading screen, after loadscreen_reset.
+Owed measurement: does [0x441960] advance on hardware while [0x441924]==1?
+
+## HANDOFF 2026-09-04 part 63 -- RETRACTION + the SofDec wall IS the sub_11E690 spinner
+
+### RETRACTED: part 62's "[0x45F69C] has no writer in the static image"
+
+That headline is WRONG. The writer is `sw $s1, 36($v0)` at **0x1555c4**, inside
+**wrap_get_data_ptr_p @ 0x1555a0** -- the setter that pairs with the reader
+f_1555e8, exactly the getter/setter pair part 62 noted was "suspiciously absent"
+and then failed to find.
+
+HWWATCH named it in one run. How the four static scans missed it:
+
+  - Scan 4 (all 31 `jal 0x14e4d0` callers) disassembled only THREE instructions
+    past each call. The store sits four past, at jal+0x10.
+  - Scan 3 (the full-image EA scan) only tracks addresses materialized by
+    lui/addiu. Here the base arrives in $v0 as get_data_ptr's RETURN VALUE, so
+    there is no lui to anchor on. Structurally invisible to that method.
+  - Scan 2 is the one that actually lied. It DID find 0x1555c4 -- the raw scan
+    finds 44 `sw ?,36(?)` sites in 0x14C000..0x170000. It printed none of them
+    because the script read `r['address']` from sdbz_func_map_merged.csv, whose
+    real header is `name,start,end,size`. The KeyError went into a bare
+    `except: pass`, the function map stayed EMPTY, `fn()` returned None for
+    every address, and the print guard `if n and ...` then suppressed all 44
+    rows. A working scan behind a filter that ate 100% of its input.
+    The tell was on screen and I read past it: the script printed a nonzero
+    total and then not one row, not even an out-of-range one.
+
+  See [[feedback_silent_except_pass_empties_the_filter]].
+
+The "stray host store / memory corruption" hypothesis from part 62 is DEAD.
+g36 is set by ordinary guest code on the normal path.
+
+### What the write actually is
+
+0x155630 is a plain three-line bracket:
+
+    f_1555a0(obj, 1);    // [0x45F69C] = 1   (and [obj+92] = 1)
+    sub_154950();        // the work
+    f_1555a0(obj, 0);    // [0x45F69C] = 0
+
+and `sub_154950` is:
+
+    0x00154950  addiu $sp,$sp,-16
+    0x00154954  addiu $a0,$zero,0x6      <-- class 6
+    0x00154958  sd    $ra,0($sp)
+    0x0015495c  ld    $ra,0($sp)
+    0x00154960  j     0x13c448           <-- tail jump
+    0x00154964  addiu $sp,$sp,16
+
+i.e. **`sub_154950` == `run_callbacks(6)`**, reached by a TAIL JUMP -- which is
+why no caller-keyed search ever attributed it. [[feedback_tail_jump_hides_the_caller]]
+again, third time this project.
+
+`run_callbacks` (0x13c448) is a single-slot dispatcher, not a list:
+
+    tbl = 0x54EBA0
+    fnp = [tbl + class*8]
+    if (fnp == 0) return 0            ; beql annuls into the return
+    jalr fnp, a0 = [tbl + class*8 + 4]
+    return                            ; return address = 0x13c478
+
+So class 6 lives at **0x54EBD0** (fn) / **0x54EBD4** (arg), and the `jalr`
+returns to **0x13c478**.
+
+### The two investigations are one bug
+
+0x13c478 is precisely the `ra` the part-58/60 work recorded for the park spinner
+**sub_11E690** with target `a0=6`. Chain, end to end:
+
+    sub_14F500 / sub_14F140
+      -> sub_14F428
+        -> 0x155630          sets [0x45F69C] = 1
+          -> sub_154950      == run_callbacks(6)
+            -> 0x13c448      jalr [0x54EBD0]
+              -> the class-6 callback     <-- NEVER RETURNS after vbl 1030
+          (the clear at 0x15565c is never reached)
+
+and downstream of that stuck flag:
+
+    sub_155320 guard 3 ([0x45F69C] != 1) always bails
+      -> sub_165300 never runs
+        -> [h+68] never cleared
+          -> handle 0x1b12cc0 frozen at st=1 pd=1
+            -> loadscreen_tick dies ~17s later
+
+HWWATCH evidence, 7 hits total, all tid 0xd60:
+  #0-#3  vbl 754   newval=0   from sub_0018E408 (a bulk clear, 4 stores same RIP)
+  #4     vbl 755   newval=1   0x155630 via sub_14F428 <- sub_14F140
+  #5     vbl 755   newval=0   the matching clear -- and note its parent frame is
+                              EeScheduler::run, NOT dispatchGuestBranch, so the
+                              guest function was preempted mid-bracket and
+                              resumed. Bracketing survives preemption.
+  #6     vbl 1030  newval=1   0x155630 via sub_14F428 <- sub_14F500
+         ...and nothing after. No clear for the rest of the run.
+
+### Verified vs. inferred
+
+VERIFIED (disassembly + HWWATCH):
+  - 0x155630 brackets sub_154950 with the g36 set/clear.
+  - sub_154950 is run_callbacks(6) via tail jump.
+  - run_callbacks dispatches ONE slot at 0x54EBA0 + class*8; ra = 0x13c478.
+  - the vbl-1030 set has no matching clear in the remainder of the run.
+  - guard 3 of sub_155320 bails on g36 == 1.
+
+INFERRED, NOT VERIFIED:
+  - that the class-6 slot holds sub_11E690. This rests on an `ra` match
+    (0x13c478) recorded in earlier parts. An ra match is not an identity --
+    [[feedback_register_snapshot_is_not_an_argument]]. PROBE ADDED: the [sofdec]
+    sampler now prints `cb6=` / `cb6a=` straight from 0x54EBD0/0x54EBD4.
+
+STILL OUTSTANDING: the oracle. PCSX2 was down all session (DebugServer + Pine
+both disconnected), so [[feedback_reproduce_on_oracle_before_root_cause]] is NOT
+satisfied for any of this. Hardware must be shown to RETURN from run_callbacks(6)
+where we do not.
+
+### Reading the next run
+
+  cb6=0x11e690        -> confirmed, the two threads are one bug. All remaining
+                         effort goes to why sub_11E690 stops returning; the
+                         SofDec layer is a victim and needs no fix of its own.
+  cb6=<other>         -> the ra match was coincidence. Disassemble what prints.
+  cb6=0x0             -> the slot is EMPTY, run_callbacks(6) returns instantly,
+                         and we are NOT stuck inside it. Then the bracket was
+                         TORN rather than blocked -- something unwound past the
+                         clear -- and the question becomes what.
+
+Code touched: ps2_runtime.cpp only, the [sofdec] sampler (two ostream inserts +
+comment). Brace balance re-verified: 1266 braces, final depth 0, min 0, identical
+to pre-edit.
+
+## HANDOFF 2026-09-04 part 62 -- the bail is guard 3, and NOTHING should be able to set it
+
+MEASURED (extended [sofdec] sampler, 290 records, run ends ~t=290s).
+
+Timeline, all from one run:
+
+    early           done=0 cur=0     o0st=0 o0lock=0 o0h=0x0        g36=0  live=0 busy=0
+    handle appears  done=0 cur=0x1b12cc0 h0=0x1b12cc0 st0=1 pd0=1*
+                                     o0st=1 o0lock=0 o0h=0x1b12cc0  g36=0  live=1 busy=1
+    ~10s later      ... identical ...                               g36=1
+    to end of run   ... identical, frozen ...                       g36=1
+
+loadscreen_tick climbs 571 -> 811 -> 1059 -> 1089 and then FREEZES AT 1089
+in the same sampler window in which g36 goes 0 -> 1.
+
+DECODE, re-verified against the instruction stream at 0x155320:
+
+    0x0015538c  jal 0x155520          ; lw $v0,96($a0)   -- guard 2, [obj+96]
+    0x00155394  beql $v0,$s0,0x1553c0 ; $s0 = [obj+0] = 1 -> bail if lock==1
+    0x0015539c  jal 0x1555e8          ; lw $v0,36($v0) off get_data_ptr
+    0x001553a4  beq  $v0,$s0,0x155374 ; bail if [0x45F69C] == 1
+
+So the three guards resolve as:
+
+    guard 1  [obj+0]     == 1   PASSES   (o0st=1)
+    guard 2  [obj+96]    != 1   PASSES   (o0lock=0)
+    guard 3  [0x45F69C]  != 1   FAILS    (g36=1)   <-- THE BAIL
+
+o0h == 0x1b12cc0 == h0, so the object and the handle table agree; part 61b's
+"different bug" branch is ruled out.
+
+THE PART THAT MATTERS. [0x45F69C] HAS NO WRITER IN THE STATIC IMAGE.
+Four independent scans, all negative:
+
+  1. eeref refs 0x45f69c            -> call=0 ptr=0 imm=0 gp=0.
+  2. eeref refs 0x45f678            -> exactly ONE materialization of the base,
+                                       the lui+addiu inside get_data_ptr itself.
+  3. Full-image effective-address scan (lui + addiu chains + register-to-register
+     move propagation, every load and store in every PT_LOAD segment) over the
+     window 0x45F670..0x45F6B0 -> 8 hits, ALL of them 0x45F670 or 0x45F674.
+     Zero touches of 0x45F69C.
+  4. All 31 `jal 0x14e4d0` callers disassembled: exactly one touches offset 36,
+     and it is `lw` (the reader f_1555e8). No `sw` at +36 anywhere in
+     0x14C000..0x170000 at all -- of 713 stores at offset 36 image-wide, none
+     is in the CRI region. And there are ZERO `j 0x14e4d0` tail jumps, so
+     [A Tail Jump Hides The Caller] is closed out too.
+
+Readers: eeref refs 0x1555e8 -> exactly two, noop_sub_5210+0xdc (the pump) and
+sub_155320+0x7c (the servicer gate). Both treat it as a suppress flag.
+
+RESIDUAL COVERAGE GAP, stated so it is not mistaken for an absolute: a store
+through a base pointer that arrived in a register FROM MEMORY (the struct
+address saved into some other object and reloaded) is invisible to all four
+scans. That is the one way guest code could still be the writer.
+
+HYPOTHESIS (labelled, not verified): if no guest code writes 0x45F69C, our
+0 -> 1 is a stray host-side store -- memory corruption landing on this word,
+the same failure class as the part-51 IRQ-handler stack overlap. A corrupted
+suppress flag would silently disable the whole SofDec service path, which is
+exactly the symptom.
+
+TWO CHECKS OUTSTANDING, in order:
+
+  A. ORACLE. PCSX2 was not running this session (DebugServer + Pine both
+     disconnected), so [Reproduce On The Oracle Before Naming A Root Cause] is
+     NOT yet satisfied. Read [0x45F69C] on hardware during movie playback. If
+     hardware also sets it to 1, g36 is normal behaviour and this whole thread
+     retracts, exactly as part 58 did.
+
+  B. WHO WROTE IT. The HWWATCH machinery already in game_overrides.cpp answers
+     this with no code change -- it is fully env-driven:
+
+       PS2X_HWWATCH=1  PS2X_HWWATCH_ADDR=0x0045F69C  PS2X_HWWATCH_VAL=0xFFFFFFFF
+
+     Arms an x64 DR0 write breakpoint on the host address of guest 0x45F69C and
+     dumps symbolized backtraces to <PS2X_PROBE_FILE>.hwwatch.txt.
+
+     TRAP: the arm site guaranteed to run is sdbzFrameTraceWrapper, so this run
+     MUST leave PS2X_FRAMETRACE at its default of 1. The part-61b run set it to
+     0; repeating that would arm nothing and report a confident false negative.
+
+     Reading it: hits>0 -> the backtrace names the writer, done. hits=0 with
+     armed>0 in HWSTAT -> nothing ever writes that word and g36=1 arrives some
+     other way (aliasing, a wide store, a memcpy) -- widen the watch. hits=0
+     with armed=0 -> the probe never armed; frametrace was off.
+
+No code changed in this part. The [sofdec] sampler from part 61b stays in place
+so the two instruments can be read against each other.
+
+## HANDOFF 2026-09-04 part 61b -- MEASURED: the servicer is never called
+
+> The `[sofdec]` probe from part 61 ran. It answered its question on the first try.
+
+### The measurement
+
+```
+t=1..125    done=0x0 cur=0x0                                    live=0 busy=0
+t=126..296  done=0x0 cur=0x1b12cc0 h0=0x1b12cc0 st0=1 pd0=1*    live=1 busy=1
+```
+
+Frozen from t=126s to the end of the 296s run. Corroborating, from the same log:
+
+* `[pump] s: 1 0 0 0 0 0 0 0` from t=126s -- inline object 0 is in state 1.
+* `[pump] en` flips 0 -> 1 at t=126s, exactly when the handle appears.
+* `[sofdec:stat] loadscreen_tick.3e0e60` climbs to **1090** and then never moves
+  again from t=143s -- the render wall, 17s after the handle goes busy.
+* `crisrv.11d510` fires 24+ times (capped) at t=125-126s, i.e. right at the open.
+
+The handle address is **`0x1b12cc0`, identical to PCSX2's**. Allocation matches;
+only the state differs -- hardware idle showed `st=4 pd=0`, we show `st=1 pd=1`.
+
+### Why it is stuck
+
+`sub_165300` (`0x165300`) is the **only** clear of `[h+68]` -- the
+`sw $zero, 68($s1)` at `0x165338`. Its own two guards are:
+
+```
+st = [h+72];  if ((st - 1) unsigned >= 4) return;   // st=1 -> PASSES
+              if ([h+68] == 0)           return;   // pd=1 -> PASSES
+              [h+68] = 0;                          // never reached
+```
+
+**Both guards pass for `st=1 pd=1`.** So this is not a predicate that rejects our
+state -- the function is simply never entered.
+
+### The only path in
+
+`eeref` gives `sub_165300` two callers, and `sub_1652A8` -- the other sweep over
+`0x461164` -- is **UNREACHABLE in the static image** (`call=0 ptr=0 imm=0 gp=0`).
+So exactly one live chain exists, and it runs through the pump itself:
+
+```
+sub_155210  reset loop, 8x per iteration
+  -> sub_155320(obj)                      obj = 0x45F678 + 0x6C + i*0x304
+       -> wrap_sif_is_bound_h (0x165250)  a0 = [obj+60]  <- the handle
+            -> sub_165300                 clears [h+68]
+```
+
+`sub_155320` gates on three things before it reaches `0x1553d8` and the servicer:
+
+| guard | expression | status |
+|---|---|---|
+| object state | `[obj+0] == 1` | **known GOOD** -- `[pump] s:` prints `1` |
+| per-object lock | `f_155520` = `[obj+96]` must `!= 1` | unmeasured |
+| global | `f_1555e8` = `[0x45F69C]` must `!= 1` | unmeasured |
+
+`f_155520` (`0x155520`) is two instructions: `jr $ra; lw $v0, 96($a0)`.
+`f_1555e8` (`0x1555e8`) is `get_data_ptr() + 36` = **`0x45F69C`**.
+
+Note the pump reaches its own `f_1555e8` check only when `s1 == 0`; ours has
+`s1 == 1` and returns first, so that call site tells us **nothing** about
+`[0x45F69C]`. It has to be sampled directly.
+
+### Probe extended (not yet run)
+
+The `[sofdec]` line now also prints `o0st`, `o0lock` (`[obj+96]`), `o0flag`
+(`[obj+100]`), `o0h` (`[obj+60]`) and `g36` (`[0x45F69C]`).
+
+* `o0lock=1` -- the per-object lock is stuck; find who sets `[obj+96]` and never clears it.
+* `g36=1` -- a global suppresses the whole service path.
+* `o0h != 0x1b12cc0` -- the object and the handle table disagree; different bug.
+* neither is 1 -- the chain should be running, so the bail is upstream of these
+  three and this instrument is wrong.
+
+### Naming collision, harmless
+
+A `[sofdec]` tag family **already existed** in `game_overrides.cpp` (`[sofdec:stat]`,
+`[sofdec] fn=...`, `PS2X_SOFDEC=0` disables). The new sampler reuses the tag. They
+coexist and `--tag sofdec` returns both; the new lines are the ones with `t=`.
+
+### Status
+
+Open, but the search space is now two words wide.
+
+## HANDOFF 2026-09-04 part 61 -- the movie pump's return value, decoded end to end
+
+> Static + PCSX2. No build, no recomp run. Part 60 left the question as "what does
+> the stream loop in `0x155210` wait on?". It is now fully decoded, and the answer
+> is **a stream-handle pending count**, not the scheduler.
+
+### The return path
+
+`sub_155210` (`0x155210`, funcmap `noop_sub_5210`, 0x110 bytes) reduces to:
+
+```
+en = [0x45F674];                 if (en != 1)                 return 0;
+s1o = f_14e4d0();                                  // get_data_ptr == const 0x45F678
+if (f_1548a0(s1o + 0x58) != 1)                                return 0;   // 0x45F6D0
+f_155148();
+if (f_1556f8() != 1) { ...reset 8 inline objects at 0x45F6E4 stride 0x304... }
+
+s1 = 0;
+f_1554d0(a0);
+if (f_1556f8() != 1)             // [0x460F04], the top-level done flag
+    s1 = (f_1651d8() != 1);      // f_1651d8 returns 0 when a handle is still busy
+f_155178();
+if (s1) return 1;                // <-- BUSY. our runtime, 49,400,607 times running
+if (f_1555e8() == 1) return 0;
+f_1551e0();                      return 0;
+```
+
+So the pump reports "busy" from **exactly one place**, and it needs **both**:
+
+* `[0x460F04] != 1` -- the done flag, and
+* `f_1651d8() == 0` -- at least one stream handle still busy.
+
+### The two deciders, by address
+
+`get_data_ptr` (`0x14e4d0`) is a 3-instruction constant: `lui $v0,0x46; jr $ra;
+addiu $v0,$v0,-2440` => **`0x45F678`**. Therefore:
+
+| symbol | address | meaning |
+|---|---|---|
+| `f_1556f8` | reads `[base+6284]` = **`0x460F04`** | top-level done flag |
+| handle table | **`0x461164`** | 8 x `uint32_t` handle pointers |
+| `[0x460F58]` | written by `sif_is_bound` `0x15b560` | last handle examined |
+| `[h+72]` | per handle | state; 1..4 == active |
+| `[h+68]` | per handle | pending count |
+
+`f_1651d8` (`0x1651d8`) walks the 8 pointers. `f_15b560` skips null / `[h+72]==0`
+entries; `f_1651b0` (`0x1651b0`) is:
+
+```
+st = [h+72];  if ((st - 1) unsigned < 4) return ([h+68] == 0);  else return 1;
+```
+
+**A handle is busy iff state in 1..4 AND `[h+68] != 0`.** One busy handle makes
+`f_1651d8` return 0, which keeps the pump returning 1 forever.
+
+> NOTE: this table at `0x461164` is **not** the inline stream objects at
+> `base+0x6C` that the existing `[pump]` line already prints. Different array,
+> different stride, different meaning. `[pump] s:` never showed this.
+
+### Measured on hardware (PCSX2, stream idle)
+
+`0x461164` held exactly one live handle, `0x01B12CC0`, with:
+
+```
+[h+0x44] pending = 0        [h+0x48] state = 4 (active)
+```
+
+=> `f_1651b0` returns 1 => `f_1651d8` returns 1 => `s1 = 0` => **pump returns 0**.
+That is the state we never reach. `[0x460F04]` was 0 and `en`=1, `skip`=0 --
+i.e. hardware exits through the *handle* path, not the done flag.
+
+A conditional breakpoint at `0x1651cc` on `v0 == 0` (f_1651b0 returns BUSY) did
+**not** fire while the stream was idle, which is consistent and not evidence of
+anything more; catching the busy state needs a movie actually playing.
+
+### The done flag is the stop/EOF path, not the streaming path
+
+`eeref field 6284` finds **one** writer in the SofDec range: `0x1556e4`, inside
+`wrap_get_data_ptr_r` (`0x1556d0`), which is nothing but `[0x460F04] = a0`. Its 8
+callers are all in the play/stop API (`sub_14C8C8`, `sub_14F140`, `sub_14F278`,
+`obj_set_fields_k_2`). So during normal playback the loop is expected to exit via
+the handle drain, exactly as hardware showed.
+
+### Probe added (not yet run)
+
+`ps2_runtime.cpp`, a new `[sofdec]` line beside the existing 1 Hz `[pump]` line.
+Prints `done=`, `cur=`, and per non-null handle `h<i>/st<i>/pd<i>` with a `*` on
+any handle matching `f_1651b0`'s busy predicate, plus `live=` and `busy=`.
+
+Reading it on the next run:
+
+* `busy>=1` -- expected. The starred handle names the stream that never drains,
+  and `pd` is how much it still thinks is outstanding. That is an I/O / decoder
+  completion bug, and the next question is who decrements `[h+68]`.
+* `live=0` with `done!=1` -- different failure: the handle table was never
+  populated at all. Do not conflate the two.
+* `busy=0` with `done!=1` -- the pump should already be returning 0, so the gate
+  is not here and this instrument is the wrong one.
+
+### Status
+
+Open. The mechanism is decoded and instrumented; nothing is fixed. Still no
+runtime measurement of the handle table -- that needs the user's next run.
+
+## HANDOFF 2026-09-04 part 60 -- PCSX2 ORACLE: part 58's root cause is RETRACTED
+
+> Ran the hardware oracle (PCSX2 DebugServer, SLUS-21442, live game, 7 EE threads).
+> Two of part 58's headline claims are now **disproved by measurement**, and the
+> blocking question from part 59 ("who runs the spinner?") is **answered**.
+> No build and no recomp run was needed for any of this.
+
+### ANSWERED: the spinner's host thread is **thread 1**
+
+Breakpoint at `0x11e690`, hit immediately on live hardware:
+
+```
+TID 1: status=1 (RUN)   <- the only running thread == the spinner's host
+TID 6: status=12 (WAIT|SUSPEND), waitType=1 (sleep)   <- the target
+a0 = 0x6        target tid          (= [0x44198C], read back as 6)
+a1 = 0x19 = 25  restore priority    (= [0x441908])
+ra = 0x0013C478 <- EXACTLY the ra part 58 recorded
+gp = 0x00503070 <- matches the static decode of the creation site
+```
+
+Backtrace confirms the part-59 plumbing and its tail-jump shape:
+
+```
+#0 entry=0x0011e690 pc=0x0011e690        the spinner
+#1 entry=0x0013c448 pc=0x0013c478        callback dispatcher
+#2 ????? (walk dies -- 0x154950 reaches the dispatcher by `j`, leaving no frame)
+```
+
+So: **not thread 3** (part 59's retracted draft), **not thread 6** (it is the target).
+**Thread 1.** See [[feedback_tail_jump_hides_the_caller]] -- frame #2 is exactly the
+blind spot that made this undecidable statically.
+
+### RETRACTED: "the poisoned save" is normal hardware behaviour
+
+Part 58 headlined: *`enter_critsec` saves the already-boosted **1** into `[0x449210]`,
+so `leave_critsec` restores 1 and pins thread 6 at the ceiling.* That sequence is
+real -- **and real hardware does exactly the same thing.**
+
+Breakpoint at `0x11e5e4` (immediately after the save), on hardware:
+
+```
+v0 = 0x00000001   <- ChangeThreadPriority(6, 1) returned OLD priority 1
+s1 = 0x00000006   <- the calling thread IS thread 6
+ra = 0x0011E5DC   <- EXACTLY the ra part 58 called the poison site
+[0x449210] = 1    <- hardware stores the boosted 1, same as ours
+[0x441920] = 0    <- nest was 0, so the save path was taken, same as ours
+[0x441924] = 1    <- park request in flight
+```
+
+Every field matches our runtime. **The save of `1` is not a divergence and not a bug.**
+Any fix aimed at the priority save/restore logic is aimed at correct code.
+
+Why it is harmless on hardware: the spinner's **tail restore** unwinds it. Breakpoint
+at `0x11e744` was reached normally, with `a0=6, a1=0x19` (25), `[0x441920]=0` (nest
+balanced), `[0x441924]=0` (acknowledged).
+
+### The real divergence is the CYCLE COMPLETING, not its contents
+
+Hardware, one full park cycle, measured by EE cycle counter:
+
+| event | EE cycle | delta |
+|---|---|---|
+| spinner entry `0x11e690` | 4,152,277,507 | -- |
+| thread 6 enters critsec `0x11e598` | 4,152,279,524 | +2,017 |
+| save of prio 1 completes `0x11e5e4` | 4,152,280,180 | +656 |
+| spinner tail restore `0x11e744` | 4,152,283,760 | +3,580 |
+
+**6,253 EE cycles end to end.** Ours: 54,756,293 enter/leave pairs and only **3**
+restores to 25 in an entire run. Hardware closes the loop in microseconds; we
+essentially never close it.
+
+The mechanism is visible in the thread states. On hardware thread 6 is
+`status=12` (WAIT|SUSPEND, waitType=1 **sleep**) and is *woken* by the spinner's
+`0x11ed28`/`0x11ed90` nudge, runs a few thousand cycles, clears `[0x441924]`, and
+sleeps again. Threads 1/4/5/6 are all `waitType=1` sleepers. In our runtime thread 6
+is runnable and busy-waits -- which is where the 54.7M pairs come from.
+
+> **Next question, and it is a different question than part 58 asked:** why does our
+> thread 6 fail to reach `0x11eb5c` (`sw $zero, [0x441924]`) and acknowledge? Look at
+> the wait/wake path (`0x11ed28`, `0x11ed90` = `thread_resume_if_suspended`, `0x11ed78`),
+> NOT at `ChangeThreadPriority`.
+
+### Verified hardware constants (all match the static decode)
+
+```
+[0x4418F0] = 1     ceiling
+[0x441908] = 25    restore priority
+[0x441920] = 0/1   critsec nest counter
+[0x441924] = 0/1   park request flag
+[0x44198C] = 6     park target tid (thread 6)
+[0x441990] = 0     second park target, unused at this point
+[0x449210] = 1     saved priority (24 when thread 1 owns it)
+[0x449214] = 1     owner tid -- WRITTEN BUT NEVER READ (see below)
+```
+
+### Correction: enter_critsec's entry address
+
+Memory records `enter_critsec = 0x11e5a0`. The true entry is **`0x11e598`**
+(funcmap `sub_11E598,[0x11e598,0x11e61c)`); `0x11e5a0` is +8 into the prologue.
+`leave_critsec` is `sub_11E620,[0x11e620,0x11e690)` as recorded.
+
+### Decoded: the critsec is a priority-ceiling mutex with a thread-affinity hazard
+
+```
+enter_critsec 0x11e598:
+  if ([0x441920] != 0) goto skip          ; only the FIRST entry saves
+    v0 = ChangeThreadPriority(GetThreadId(), [0x4418F0]=1)
+    0x11e5dc: sw v0, [0x449210]           ; save OLD priority
+              sw s1, [0x449214]           ; owner = me
+              jal 0x11ed90                ; resume_if_suspended([0x441978])
+  skip: [0x441920]++
+
+leave_critsec 0x11e620:
+  if (--[0x441920] != 0) goto skip
+    jal 0x11edf8([0x441978])
+    v0 = GetThreadId()
+    ChangeThreadPriority(v0, [0x449210])  ; <-- restores to the CALLER, not to [0x449214]
+  skip: if ([0x441920] < 0) [0x441920] = 0
+```
+
+`[0x449214]` (owner) is stored and **never read**. `leave_critsec` restores whatever is
+in `[0x449210]` to whichever thread happens to call it. Enter and leave must therefore
+be paired on the same thread; the game relies on that, and on hardware it holds.
+This is worth remembering if the acknowledge-path investigation leads back here --
+but it is NOT the current bug, since hardware runs the identical code.
+
+### The SofDec pump on hardware -- the divergence is DURATION, not shape
+
+Part 55's model was: `MWSFSVR_IdleThrdProc` returns 0 -> thread 6 sleeps (healthy);
+returns non-zero -> thread 6 skips `SleepThread` and loops (stuck). That model is
+correct. What is new is the hardware baseline for it.
+
+Hardware gate state, read at the moment the spinner was live:
+
+```
+[0x45F674] "en"   = 1     pump ENABLED
+[0x45F688] "skip" = 0     not skipping
+[0x45F67C]        = 0x426FC28F  (float 59.94 -- a frame rate)
+```
+
+That is the **same configuration our stuck run has.** `en=1` is therefore *not* the
+trigger, and neither is `skip`.
+
+Breakpoint at `0x11eb44` (the return of `run_callbacks(6)` in thread 6's loop):
+
+- first hit: **`v0 = 0`** -> falls through to `SleepThread()`, thread 6 parks.
+- conditional breakpoint `v0 != 0`: **it does fire.** Second hit: **`v0 = 1`**.
+
+So hardware returns *both* values. It returns non-zero sometimes -- that is designed --
+and 0 in between, which is what lets everyone else run. Our runtime returns non-zero
+for **49,400,607 consecutive iterations** and never comes back to 0.
+
+> ⚠️ Do not restate this as "hardware always returns 0." It does not. One sample
+> would have supported that and it would have been wrong -- the conditional
+> breakpoint is what caught it. [[feedback_absolute_quantifiers_are_audit_targets]]
+
+**The question to answer next is therefore: what does the stream loop inside
+`0x155210` wait on, such that on hardware it finishes and on ours it never does?**
+That is an I/O / decoder-completion question, not a scheduler question.
+
+### Incidental: the thread group is torn down and rebuilt
+
+Across ~1.5s of hardware run time the EE thread ids changed
+`{3,4,5,6}` -> `{7,8,9,10}`, with identical PCs and roles (`0x11e808` watchdog
+suspended, three `0x174bc8` sleepers). `[0x44198C]` tracked it, reading back
+**`0x0a` = 10**. So `[0x44198C]` is confirmed dynamically as "current park target
+tid", not a constant, and **thread ids are not stable across a scene change** --
+any probe keyed on "thread 6" must key on `[0x44198C]` instead.
+
+### Status of the part-59 CHGPRI `cur` probe
+
+Still in the tree, still worth having -- its purpose has changed. It no longer needs to
+*discover* the host (hardware just named it: thread 1). It now **cross-checks** whether
+our runtime reproduces the hardware shape:
+
+- `ra == 0x11e6e8` -> `cur` should be **1**. If it is not, our callback dispatch runs on
+  the wrong thread and that alone would explain the stall.
+- `ra == 0x11e5dc` -> `cur` should be **6** with `old == 1`, matching hardware exactly.
+
+**The run of 2026-09-04 03:27 does NOT answer this -- it is a false negative.**
+`runSeconds=300` but the log ends at **t=71s**; `PS2X_FRAMETRACE=1`, `hostProfile=True`
+and `PS2X_HWWATCH=1` were all armed, and the guest reached only 7.8M ticks with
+`nTh=2` for the whole run -- threads 3-6 were never created, so the spinner phase was
+never entered. CHGPRI fired twice, both `ra=0x175b48` startup calls.
+See [[feedback_run_window_false_negative]] and [[feedback_capped_probes_false_negatives]].
+Re-run **without** frametrace/hostprofile/hwwatch and long enough to pass the
+thread-6 creation point before reading `cur`.
+
+---
+
+## HANDOFF 2026-09-04 part 59 -- static graph closed as far as it goes; probe armed
+
+> Attacks part 58's blocking question ("who runs the spinner `sub_11E690`?").
+> The registry plumbing is now fully decoded, but the answer is **NOT statically
+> decidable** -- see "Why static cannot finish this" below. A one-field probe is
+> in the tree awaiting a build.
+>
+> ⚠️ An earlier draft of this part claimed "the spinner runs on thread 3."
+> **That was wrong and is retracted** -- it mis-attributed `0x11eb3c` to the
+> function at `0x11e7e0`. The func map settles it: `wrap_syscall_stub_t` is
+> `[0x11e7e0, 0x11e838)`, only 0x58 bytes; `0x11eb3c` lives in
+> `sub_11EAC8 [0x11eac8, 0x11ec00)`. See [[feedback_no_guessing]].
+
+### Verified: how the spinner is reached (registry plumbing)
+
+```
+cblist_run(class 6) = 0x13c6e8            (siblings 0x13c6a0/6b8/6d0 = classes 3/4/5)
+  class-6 list holds exactly one fn: 0x154fa8   MWSFSVR_IdleThrdProc
+    0x154fcc jal 0x155210 -> 0x155320 -> 0x154e60 -> 0x154a60
+      -> 0x154ae0 -> 0x14f580 -> 0x155630 -> 0x154950
+         0x154954  addiu $a0, $zero, 0x6      <- SLOT 6
+         0x154960  j     0x13c448             callback dispatcher (tail jump)
+           0x13c470  jalr $ra, $v0            fn = [0x554EBA0 + 6*8]
+             -> 0x11e778                      spinner wrapper
+                0x11e78c  lw $a1, [0x441908]  = 25   (restore priority)
+                0x11e790  lw $a0, [0x44198C]  = thread 6's tid
+                0x11e798  j  0x11e690         THE SPINNER (tail jump)
+```
+
+The `jalr` at `0x13c470` returns to **`0x13c478`** -- exactly the `ra` part 58
+observed on the successful restore to 25. Rescue path and poison path share code.
+
+Established this session, each by disassembly or `eeref`:
+
+- `eeref refs 0x11e690` -> **two** callers, both `j` (tail jumps), from thin wrappers
+  `0x11e778` and `0x11e7a0`. Neither wrapper is ever `jal`-ed.
+- Both wrappers are address-taken and handed to the registrar `0x13c3f0(slot, fn, arg)`:
+  at `ADX_Init+0x158` with `a0=6, a1=0x11e778, a2=0`, and twice inside `sub_11FE90`.
+  `0x13c3f0` stores fn at `0x554EBA0 + slot*8`, arg at `+4`; `0x13c448(slot)` reads
+  them back and `jalr`s.
+- `eeref refs 0x13c448` -> only `0x154950` (passes **6**) and `0x120180` (passes 7,
+  statically unreachable).
+- `0x154fa8` is registered into **class 6** of the second registry via
+  `0x13c068(6, 0x154fa8, 0, 0x4bd7d0)` (helper `0x154688`, called from `0x14e6fc`).
+  `0x13c068` -> `0x13c0d0` writes `0x55E960 + class*72`, six 12-byte slots.
+
+### Verified: thread 6's identity and its role as the spinner's TARGET
+
+Creation site `sub_11F0C8` (`0x11f0e0`-`0x11f138`), `ee_thread_t` on the stack:
+
+```
+sp+4  func  = 0x11eac8      <- thread 6's entry
+sp+8  stack = 0x...5210
+sp+12 size  = 0x2000
+sp+16 gp    = 0x503070
+sp+20 prio  = 1             (matches THCREATE prio=0x1)
+0x11f114 jal 0x174aa0       CreateThread
+0x11f11c sw  $v0, [0x44198C]   <- tid stored to the SAME global wrapper 0x11e778 reads
+0x11f128 jal 0x175de0       StartThread
+0x11f138 jal 0x174b30       ChangeThreadPriority(tid, [0x441908] = 25)  creator demote
+```
+
+The spinner is a **cross-thread park**, not a self-boost:
+
+```
+sub_11E690(a0 = tid, a1 = restorePrio)
+  a1 = [0x4418F0] = 1        ceiling
+  [0x441924] = 1             REQUEST flag
+  jal 0x174b30               boost TARGET to the ceiling
+  loop: 0x11ed28(tid); 0x11ed90(tid)   ; nudge/resume the target
+        if [0x441924] == 0 -> break    ; target ACKNOWLEDGED
+        if ++n > 0xBEBC1FF -> 0x13bde8 ; timeout panic
+  0x11e744  j 0x174b30       restore(tid, a1)
+```
+
+and thread 6's own loop clears that flag -- `0x11eb4c-0x11eb5c`:
+`lw [0x441924]; bne !=1 skip; jal 0x11ed78; sw $zero, [0x441924]`.
+So thread 6 is the acknowledger, i.e. the **target**. The spinner therefore cannot be
+running on thread 6, and `[0x44198C]` (thread 6) vs `[0x441990]` (a second tid thread 6
+itself manages, via `0x11eb74`-`0x11eb94`) are the two park targets, one per wrapper.
+
+### Why static cannot finish this
+
+`cblist_run(6)` (`0x13c6e8`) has **four** call sites, and they are not one thread:
+
+| site | in |
+|---|---|
+| `0x11e390` | `sub_11E320+0x70` |
+| `0x11e480` | seq wrapper (runs classes 3,4,5,6 back to back) |
+| `0x11e53c` | `sub_11E530+0xc` (thin, tail-`j`) |
+| `0x11eb3c` | `sub_11EAC8+0x74` -- **thread 6's own loop** |
+
+The `0x11eb3c` site cannot be the live path to the spinner (thread 6 would be waiting
+on its own acknowledgement), so the host is reached via one of the other three -- and
+which one runs, on which thread, depends on runtime conditionals six frames deep.
+No amount of disassembly decides it. Stop reading; measure.
+
+### Armed and awaiting a build -- `cur` on CHGPRI
+
+`Thread.cpp` ~line 405: the CHGPRI probe now emits a **10th** key, `cur` =
+`ps2x_guest_current_thread_id()` -- the thread that ISSUED the call, as opposed to the
+existing `rid` (the thread being changed). Same TU, no header touched, no new probe
+family, budgets unchanged.
+
+**Build, run, then `analyze_run.py --probe CHGPRI`** (`--probe`, never `--tag` --
+[[feedback_probe_sink_vs_log_tag]]). Two readings settle it:
+
+- `ra == 0x11e6e8` (the spinner's external boost) -> **`cur` names the spinner's host
+  thread.** That is the whole open question.
+- `ra == 0x11e5dc` (enter_critsec's poisoned save) -> `cur` should be **6**, confirming
+  thread 6 saves its own already-boosted priority.
+
+Only after `cur` is known: the PCSX2 oracle on `0x174b30` to ask whether hardware ever
+records `ra=0x11e5dc` with `v0 == 1`. If hardware poisons too, the divergence is
+thread 6's blocking point (our wait path), not the scheduler.
+
+**Still in force:** do NOT patch the guest priority logic until `cur` is read.
+
+---
+
+## HANDOFF 2026-09-03 part 58 -- ★★★ ROOT CAUSE FOUND, MEASURED AND DECODED
+
+> Supersedes parts 56 and 57 for the t≈143s wall. (Part 57 was never written into
+> this file; its two headline claims are corrected below.)
+> Full detail lives in memory `project_sofdec_idle_loop_wall.md` → "Part 58".
+
+### The bug, in one sentence
+
+`enter_critsec` saves the **return value** of `ChangeThreadPriority` into `[0x449210]`.
+That is correct — unless someone already boosted you from outside. The spinner
+`sub_11E690` does exactly that, so the "saved" priority is the boosted ceiling `1`,
+and `leave_critsec` restores `1`. Thread 6 pins at the ceiling forever.
+
+### Evidence — run of 09-03 02:19 (300s), freshness chain verified
+
+Thread.cpp 01:16 → exe 01:50 → run 02:19. The hardened `rid` probe (budgets on the
+*resolved* thread id, emits key `rid`, plus a dedicated `t6Budget` giving thread 6's
+TRUE call count as `n6`) is live and the run post-dates it.
+
+Probe counts: CHGPRI **9597**, THLIFE 5460, VSYNCREG 756, PSEUDOTID 514, SLOTENTRY 400,
+GSENTRY 128, RASLOT 46, STACKOOB 16, DISPATCH 8, THCREATE 5, CRITSEC 4. Total 16,934.
+
+`CHGPRI rid==6` = 7864 records. `ra` histogram:
+`0x11e5dc` 3930 (enter_critsec) · `0x11e670` 3930 (leave_critsec) · `0x11e6e8` **2**
+(spinner external boost) · `0x11f140` 1 (creator demote) · `0x13c478` 1 (callback
+dispatcher — the spinner's TAIL restore, see below).
+
+Thread 6's complete life, keyed on `n6` (its own counter, so nothing here is a
+sampling artefact):
+
+| n6 | prog | ra | prio | old | meaning |
+|---|---|---|---|---|---|
+| — | — | — | — | — | created at prio **0x1**, func `0x11eac8`, ra `0x11f11c` |
+| 1 | 15,120,075 | 0x11f140 | 0x19 | 0x1 | creator demotes to 25 (`a1=[0x441908]`) |
+| 2 | 15,120,310 | 0x11e5dc | 0x1 | 0x19 | enter_critsec saves **25** ✓ |
+| 3 | 15,120,310 | 0x11e670 | 0x19 | 0x1 | leave_critsec restores 25 ✓ balanced |
+| 4 | 15,121,344 | 0x11e6e8 | 0x1 | 0x19 | **spinner boosts th6 from outside** |
+| 5 | 15,121,344 | 0x11e5dc | 0x1 | **0x1** | ← **POISON**: saves the already-boosted 1 |
+| 6 | 15,121,344 | 0x11e670 | 0x1 | 0x1 | restore is a no-op |
+| 7 | 15,121,344 | 0x13c478 | 0x19 | 0x1 | spinner tail-restore RESCUES it |
+| 8 | 15,129,291 | 0x11e6e8 | 0x1 | 0x19 | **spinner boosts again** |
+| 9 | 15,129,291 | 0x11e5dc | 0x1 | **0x1** | poisoned again |
+| 10 | 15,129,291 | 0x11e670 | 0x1 | 0x1 | no-op restore |
+| 11 … **54,756,293** | → 27,749,070 | 11e5dc / 11e670 | 0x1 | 0x1 | infinite ping-pong, never rescued |
+
+Only **3** records in the whole run set prio back to `0x19`, and **none after n6=7**.
+
+### Why it never recovers — the cycle closes on itself
+
+spinner boosts th6 to ceiling 1 → th6 preempts and runs its work loop → the work calls
+`enter_critsec`, which saves the boosted **1** → `leave_critsec` restores **1** → th6
+stays at the ceiling → the spinner's own thread (pri 8/16/18/24) is **starved and never
+runs its tail restore** → th6 stays at the ceiling.
+
+### The three guest functions, disassembled from `ELF/SLUS_214.42`
+
+`build_scripts/mips_r5900_disassembler.py <elf> <addr> [count|--func]`
+(NOT recorded in command_log.md — it is.)
+
+`enter_critsec` @ **0x11e5a0** — nest `[0x441920]`, ceiling `[0x4418F0]`=1,
+save slot `[0x449210]`, owner `[0x449214]`:
+```
+0x0011e5b4  bne   $v0, $zero, 0x11e5fc   ; nested -> skip save/boost
+0x0011e5cc  lw    $a1, 6384($v0)         ; ceiling = 1
+0x0011e5d4  jal   0x174b30               ; ChangeThreadPriority(me, 1)
+0x0011e5dc  lui   $v1, 0x45              ; <- probe ra
+0x0011e5e0  sw    $v0, -28144($v1)       ; [0x449210] = RETURNED old priority  ← THE BUG
+```
+`leave_critsec` @ **0x11e620**:
+```
+0x0011e640  bne   $v0, $zero, 0x11e670   ; still nested -> skip restore
+0x0011e664  lw    $a1, -28144($v1)       ; $a1 = [0x449210]
+0x0011e668  jal   0x174b30
+0x0011e670  lw    $v0, 0($s1)            ; <- probe ra
+```
+`sub_11E690(a0=tid, a1=restorePrio)` @ **0x11e690** — the spinner:
+```
+0x0011e6d4  sw    $v0, 0($s0)            ; [0x441924] = 1  (req flag)
+0x0011e6e0  jal   0x174b30               ; BOOST TARGET FROM OUTSIDE
+0x0011e6e8  daddu $s0, $zero, $zero      ; <- probe ra of the boost
+0x0011e6f0  jal   0x11ed28               ; spin body …
+0x0011e708  beq   $v0, $zero, 0x11e720   ; [0x441924] cleared -> exit
+0x0011e728  daddu $a1, $s5, $zero        ; a1 = the ARGUMENT prio
+0x0011e744  j     0x174b30               ; ★ TAIL JUMP, not jal
+```
+
+★ **The tail jump is why the restore looked absent.** `j` leaves `$ra` holding the
+*caller's* return address, so the restore emits under `0x13c478` / `0x11f140`, not
+under any address inside the spinner. New rule memory:
+`feedback_tail_jump_hides_the_caller.md`.
+
+The two "unknown" ra sites, also disassembled:
+- `0x11f140` — the creator of thread 6 (`jal 0x174aa0` CreateThread → `jal 0x175de0`
+  → `jal 0x174b30` demote with `a1=[0x441908]`=25).
+- `0x13c448` — a **callback dispatcher**: table `0x554eba0 + tid*8`, `jalr $ra,$v0`,
+  returns land at `0x13c478`.
+
+### Corroborated by `run_log.txt` (UTF-16LE, 297 `[thsync]` lines)
+
+th6 pri transitions, ever: t=132 `st=4 pri=25` · t=133 `st=12 pri=25` ·
+**t=143 `st=1 pri=1` req=0 inWork=1 dTick=140082**, then constant to t=296.
+`gif/s`: t=142 25→18 · t=143 18→3 · t=144 3→0 · dead through t=296.
+Last sample — th6 parked INSIDE `leave_critsec`:
+```
+[6:st=1,wt=0,wid=0,pri=1,pc=0x11e670]
+```
+`DISPATCH` last emit at prog 15,129,184, fatal poison at 15,129,291; `d6`=0 throughout
+⇒ th6 is not being *dispatched*, it never yields.
+
+### Corrections to the record
+
+1. **Thread 6 is created at priority `0x1`, NOT 25.** `THCREATE res=0x6 prio=0x1
+   func=0x11eac8 stksz=0x2000 ra=0x11f11c`. The `pri=25` at t=132/133 is the creator's
+   demote (n6=1). Part 57's "created at pri 25" is wrong.
+2. **Our `changePriority` is CORRECT.** `ret == old` in all 9597 records — the part-52
+   return-value fix works. This is a guest race we LOSE, not a runtime defect.
+   **Do not patch the scheduler.**
+3. Part 56's poisoned-save hypothesis is **CONFIRMED** — by `old=0x1` at `ra=0x11e5dc`,
+   not by the retracted register snapshot of part 57.
+
+### Open — gates any fix
+
+Why do we lose a race real hardware wins? Unverified candidates, in order:
+- **Thread 2 sits `st=4 wt=2 wid=3 pri=0` for the entire 296s run** — blocked on
+  semaphore 3 at the highest priority in the system. If the spinner runs on thread 2,
+  it would outrank th6@1 and always complete its tail restore. HYPOTHESIS.
+  Who is supposed to signal semaphore 3?
+- Th6's work loop never blocks (`inWork=1`, `dTick` 140k-185k/s). On hardware it
+  presumably blocks on movie data. `gate=[0x4419D8]=0` so `sub_11EAC8` never early-outs.
+
+**Do NOT patch the guest priority logic until the spinner's caller thread is identified.**
+
+Next diagnostic, in "static → PCSX2 → probe" order:
+1. `eeref refs 0x11e690` — enumerate callers of the spinner (static, free).
+2. PCSX2 oracle: break `0x174b30`, watch whether hardware enters the same boost/poison
+   sequence at all.
+3. Only if both inconclusive: add key `cur = ps2x_guest_current_thread_id()` to the
+   existing CHGPRI emit in `Thread.cpp` (same TU, no header touched).
+
+### Learned patterns from this session
+
+1. **A tail `j <target>` makes an `ra`-keyed probe lie.** Only `jal` leaves your own
+   return address in `$ra`; a tail jump leaves the *caller's*. So a call reached that
+   way is attributed to the caller-of-the-caller, and the absence of an expected `ra`
+   in a histogram is **not** the absence of the call. Disassemble the epilogue (`--func`)
+   before concluding "it never ran". Cost a wrong "the spinner never restored" reading,
+   caught before it reached the user. → `[[feedback_tail_jump_hides_the_caller]]`
+2. **Budget a per-thread probe on the RESOLVED id, and emit a dedicated counter for the
+   thread under investigation.** `n6` is the only reason the 11-row life table is
+   trustworthy: without it, a missing restore record is indistinguishable from a
+   rate-limiter artefact. Rate-limit shape decides what your data can prove.
+3. **`ret == old` across every record closes the "is our runtime wrong?" question
+   cheaply.** 9597/9597 turned a standing suspicion about `changePriority` into a
+   settled negative, and redirected the whole investigation at the guest.
+4. **A creation-time record beats any later sample of the same field.** `THCREATE
+   prio=0x1` overturned part 57's "thread 6 is created at pri 25", which came from a
+   `[thsync]` sample taken 132 s after creation. Prefer the record written *at* the
+   event.
+5. **Static disassembly corrected two conclusions that runtime probes had produced** —
+   in seconds, for free, from a file already on disk. "Ask the binary before the
+   runtime" paid out again; the disassembler invocation is now in
+   `[[command_log]]` so the next session does not have to rediscover it.
+
+---
+
+## HANDOFF 2026-09-03 part 56 -- the priority save is poisoned
+
+**Run 09-03 00:44 (400s, exe 00:44, det=1). Wall at t=146s / progress 15.25M.**
+
+- Reproducible: 200s run t=181s/17.8M, 400s(a) t=136s/14.9M, 400s(b) t=146s/15.25M.
+  The *second* moves because the mechanism is a race; the end state is identical.
+- `stuckSecs` RESETS -- do not read a late value as the onset. Use last `gif/s>0`.
+- Guest `progress` rate goes UP ~100x at the wall (800/s -> 85,000/s).
+
+### Mechanism (static decode + one agreeing live sample)
+
+Corrected addresses: saved priority = **`0x449210`**, owner tid = `0x449214`
+(prior state file said `0x44FF50`/`0x44FF54` -- wrong).
+
+- `enter_critsec` `0x11e5a0` is **nest-guarded** (`if [0x441920] != 0` skip boost
+  AND skip save), so plain reentrancy is NOT the bug.
+- `leave_critsec` `0x11e620` restores `ChangeThreadPriority(GetThreadId(), [0x449210])`
+  at `jal 0x11e668`, `ra = 0x11e670`.
+- `f_11E690(tid, restorePrio)` boosts `tid` to the ceiling `[0x4418F0]=1` from
+  *outside*, spins on `req [0x441924]`, then tail-restores from its ARGUMENT.
+
+HYPOTHESIS: thread 6 reaches `enter_critsec` at nest==0 while `f_11E690` has it
+boosted, so the save captures **1**; `leave_critsec` later pins it at 1 forever.
+
+MEASURED: watchdog t=394 `sysPc=0x174b30 sysA0=0x6 sysA1=0x1 sysRa=0x11e670`
+-> `[0x449210] == 1`. How it got there is NOT yet measured.
+
+### Two probe bugs found and fixed (both mine)
+
+1. `DISPATCH` emitted ZERO records in 394s -- the 4096-event gate needed 8192
+   events before the first emit. Now 64, first batch seeds the clock instead of
+   being discarded. `EeScheduler.cpp` 149055 -> 149653.
+2. `CHGPRI`/`THLIFE` 6000-caps saturated at progress 15,206,291 = **t=141s, five
+   seconds before the wall**. Replaced with `ProbeBudget(warm, perSec)`
+   (unconditional warm-up, then rate-limited forever) + separate thread-6
+   budget + true-call-count `n`/`n6` fields. `Thread.cpp` 39426 -> 42155.
+
+Both files: pure CRLF, ASCII, brace depth 0/0 verified.
+
+### EXIT TEST -- next run, `--probe CHGPRI` during the stall
+
+- `thid=0x6 prio=0x1 old=0x1 ra=0x11e5dc` then `thid=0x6 prio=0x1 ra=0x11e670`
+  => CONFIRMED, fix goes runtime-side.
+- every `thid=0x6` enter shows `old != 0x1` => DEAD; arm a hardware data
+  breakpoint on `0x449210` to find the real writer.
+- `--probe DISPATCH`: `d1` flat while `d6` climbs = genuine starvation.
+
+Also unresolved and visible all run: thread 2 sits `st=4 wt=2 wid=3 pri=0` --
+blocked on semaphore 3 at the highest priority in the system, forever.
+
+---
+
+# Part 55 handoff — 2026-09-03
+
+## Terminal, confirmed by the 400s run
+
+`pc=0x11eb44`, `gif/s=0` from t=136s to t=394s — **258 seconds, no recovery**.
+⚠️ the transition time is NOT reproducible under `-Determinism 1`:
+t≈181s / progress 17.8M (200s run) vs t≈136s / progress 14.9M (400s run).
+
+The game renders normally at **25 fps** (`gif/s=25 vbl/s=25 dma/s=150`) right up
+to the second it dies.
+
+## `[thsync]` — the whole story in one probe
+
+Healthy (t=130/134): threads 4/5/6 blocked just past `SleepThread`
+(`pc=0x174bc8`), main RUNNING at 24.
+
+Stuck (t=138 → 390s, **every** sample):
+`[1:st=2,pri=24] [4:st=2,pri=16] [5:st=2,pri=18] [6:st=1,pri=1]`
+
+**Thread 6 RUNS at priority 1 and never yields it.** 1, 4, 5 are READY and never
+scheduled — main never runs, so nothing renders. `[cblist]` agrees exactly:
+group 6's counter goes 2 → **49,400,607** while groups 2/4/5 freeze at
+258/258/257.
+
+## Why
+
+`sub_11E690` (main) boosts the worker — `ChangeThreadPriority(tid, [0x4418F0])`
+— then spins for the ACK. The boost IS the mutual exclusion, and it assumes the
+worker's work is short. Main boosted thread 6 and then could not run to
+un-boost it.
+
+Thread 6 skips its own yield: `SleepThread` at `0x11ebb4` is reached **only when
+`run_callbacks(6)` returns 0** — `bne $s0, $zero, 0x11ebbc` jumps over it
+whenever the callback claims work.
+
+The gate (already decoded at `ps2_runtime.cpp:5353`, sampled as `[pump]`):
+
+```
+0x154fa8 MWSFSVR_IdleThrdProc:
+   if ([0x45F688] == 1) return 0;          // "skip"  — 0 all run
+   return f_155210();
+0x155210:
+   if ([0x45F674] != 1) return 0;          // "en"    — 0→1 at t=125
+   if (f_1548a0(0x45F6D0) != 1) return 0;  // "obj"   ← THE TRIGGER
+   ...stream loop over 8 objects...
+```
+
+`[pump] obj` is 0 in **every** sample before t=137 and first goes 1 at t=137 —
+the transition second.
+
+## Everything else is unchanged
+
+`[sfdcp]`, `[sfdst]`, `[sfdbuf]` are byte-identical at t=132 and t=390. The only
+other differing field anywhere is `[movie] stat` 1→0. The decoder is frozen
+because nothing services it — it is not the cause.
+
+## ⚠️ The open gap
+
+`obj` **oscillates** (120 of 394 samples), it is not latched. So the pump does
+sometimes return 0 and thread 6 should sometimes sleep — at which point main
+(prio 24, READY) is the highest runnable thread and should recover the run. It
+never does. `[thsync]` samples at 1 Hz and cannot separate:
+
+  (a) thread 6 never actually yields → zero context switches, or
+  (b) it yields but is re-dispatched before anyone else runs.
+
+## Changes made — need a build
+
+- `EeScheduler.cpp` — new **`DISPATCH`** probe. `makeRunning` is the single
+  point a thread becomes Running, so per-id counts there are exact.
+  `sleepCurrent` is counted too, splitting `blocked` (actually parks) from
+  `fast` (the `wakeupCount>0` path that parks nothing). Emitted on a 1s wall
+  clock from both sites, so a run with zero switches still yields records.
+  **Read it as:** `d1` (main) staying 0 while `d6` climbs proves genuine
+  starvation → scheduler-fairness bug. `d1` non-zero kills that. `blocked==0`
+  with `fast` climbing identifies the `wakeupCount` fast path as the reason
+  thread 6 never parks.
+- `Thread.cpp` — `THLIFE` 600→6000, `CHGPRI` 400→6000.
+
+Brace-depth verified 0/0 on both files.
+
+## Retracted
+
+`PSEUDOTID` is **not** a `GetThreadId` failure reaching the guest. `GetThreadId`
+returns `guestVisibleThreadId()` (=6); `raw=-1` is only recorded. Its 514 firings
+are the mitigation working. Do not chase it as the cause of a failed priority
+restore.
+
+# Part 54 handoff — 2026-09-03
+
+## The previous wall is CLOSED, and it was not a bug
+
+`THLIFE` (10 keys) predicted exactly right: all 283 thid-3 resumes show
+`tpri=8`, `mypri=1`, so `requestPreemptionIfHigher` bails on `8 >= 1`.
+Disassembling the caller showed **the bail is correct**.
+
+`0x11e5a0 enter_critsec` / `0x11e620 leave_critsec` are a priority-ceiling
+mutex: nest counter `[0x441920]`, self boosted to prio 1, old prio saved at
+`[0x44FF50]`, and thread 3 (`[0x441978]`, prio 8) **resumed only while the lock
+is held**, suspended before the priority is restored. Thread 3 is a deadlock
+watchdog — it gets CPU only if the holder blocks inside the critsec. Never
+running is the design. A prio-8 thread cannot preempt a prio-1 holder on real
+hardware either.
+
+`resumeThread`, `requestPreemptionIfHigher`, `transferIfRequested` are all
+correct. Do not change them.
+
+## The real wall — the game runs and renders for 180 seconds
+
+| t | pc | gif/s | progress Δ/10s | stuckSecs |
+|---|---|---|---|---|
+| 1–170s | 0x421ee4 / 0x422660 / 0x104c74 | 3–8 | ~1,000,000 | 0–2 |
+| 171→181s | 0x104c74 | 7→23 | **7,529** | 12 |
+| 191–198s | **0x11eb44** | **0** | ~800,000 | 15 |
+
+GIF traffic flows the whole first 180s. Then a ~10s near-freeze, and the guest
+emerges in SofDec's idle loop with rendering dead. `gstate@0x5e6b3c` = `0,0,0,1`
+from t=31s onward.
+
+The 283 critsec ping-pongs map to progress 16.98M = **t=171–181s**, i.e. they
+happen *during* the freeze. They are a symptom of main hammering the SofDec
+lock, not a steady state.
+
+**UNPROVEN: whether this is terminal.** The run hit its 200s limit and only 17
+seconds of the new state exist. A 400s run answers it and needs no rebuild.
+
+## SofDec server callback machinery — fully mapped
+
+Table `0x54E960`: 8 groups × 6 slots × 12 bytes {fn, arg, flags}.
+Counters `0x45EFC8 + group*4`. In-callback flags `0x45EFE8 + group*4`.
+
+- `0x13c4f8 run_callbacks(group)` — ORs all 6 slot returns, bumps the counter
+- `0x13c5c0 call_one_slot(group, slot)`
+- `0x13c0d0 register_callback` (first free slot) ← only caller `0x13c068`
+- `0x13c068 register_callback_locked` (lock `0x13bc10` / unlock `0x13bc28`)
+- `0x154688` — the ONLY group-6 registrar; handle → `0x55A408`
+- `0x14e6b0` — registers groups 2, 5, 6 in a straight line
+
+| group | fn | name string |
+|---|---|---|
+| 2 | 0x154f40 | MWSFSVR_VsyncThrdProc |
+| 5 | 0x154f58 | MWSFSVR_MainThrdProc |
+| 6 | 0x154fa8 | **MWSFSVR_IdleThrdProc** |
+
+Other registrations: `0x11d824`→4, `0x11d848`→5, `0x1545ac`→0, `0x154604`→2.
+
+Thread 6 (prio 25) loops at `0x11eb30` on `run_callbacks(6)`, exiting only when
+a callback returns non-zero. `MWSFSVR_IdleThrdProc` (`0x154fa8`) returns 0
+whenever `[0x14e4d0() + 16] == 1`, else returns `0x155210()`. `[0x441960]` is a
+free 64-bit iteration counter — a ready-made liveness probe.
+
+This is CRI SofDec — the Stage 5.17 subsystem. `0x45EFC0` (the "SVM nest counter
+= −2") sits just below the `0x45EFC8` counter table.
+
+## Verified this cycle, do not re-derive
+
+- syscall **0x32 = SleepThread** (`0x11ed78` = `j 0x174bc0`), **0x2F =
+  GetThreadId** — read from our own `Syscalls/Dispatcher.cpp`, not assumed.
+- `EeScheduler::wakeupThread` is **correct** (`makeReady` on a Sleep-blocked
+  target, `++wakeupCount` otherwise). The adjacent block at ~line 2032 is
+  `cancelWakeup` and is easy to misread as `wakeupThread`.
+
+## Open
+
+- **PSEUDOTID: GetThreadId returned −1, 514×** (`raw=0xffffffff given=0x6
+  pc=0x175b7c ra=0x11ed18`), and the runtime substituted tid 6. A never-varying
+  value is an error code. Unexplained; deserves its own pass.
+- Semaphore 3 never signalled. STACKOOB total=512 (cap 16 → absence proves
+  nothing).
+- `eeref refs 0x55a408` reported UNREACHABLE = a **false negative**; a `lui` +
+  negative-offset store is invisible to its IMM scan.
+
+## Change made — needs a build
+
+`Kernel/Syscalls/Thread.cpp`: THLIFE cap 600→6000, CHGPRI cap 400→6000. Both
+saturated at t≈171s, right as the transition began. One TU.
+
+# Part 53 handoff -- 2026-09-02 (probe written, needs a build)
+
+## Part 52 result: thread 3 is resumed correctly and still never runs
+
+`THLIFE` fired 600 records in the 23:39 run. Decoded (`op` 0x53=Start, 0x55=Suspend,
+0x52=Resume; status 0x10=DORMANT 0x02=READY 0x08=SUSPEND 0x04=WAIT 0x0c=WAITSUSPEND):
+
+- All five threads (2,3,4,5,6) `Start` with `res=0`, DORMANT -> READY.
+- Thread 3: **284x Suspend READY->SUSPEND** (`ra=0x11ee3c`), **283x Resume SUSPEND->READY**
+  (`ra=0x11edd8`). Guest `progress` does not advance between a resume and the
+  following suspend.
+- Thread 6 reaches WAIT (0x4) -- it runs and blocks. Thread 3 never does.
+
+**Our `resumeThread` is not the bug** -- `st1` is READY on every resume.
+
+## The two guest helpers (disassembled)
+
+- `0x11ed90` = `resume_if_suspended(thid)`: ReferThreadStatus, status 8/0xc -> ResumeThread (0x174c30), ra 0x11edd8.
+- `0x11edf8` = `suspend_if_running(thid)`: ReferThreadStatus, status not 8/0xc -> SuspendThread (0x174c10), ra 0x11ee3c.
+
+A pause/resume-a-worker pair. On hardware, resuming a higher-priority thread
+switches immediately, so thread 3 would run before the suspend lands.
+
+## Where the switch is lost
+
+`EeScheduler::resumeThread` -> `requestPreemptionIfHigher` (EeScheduler.cpp:3192):
+
+    if (!running || readyThread.currentPriority >= running->currentPriority) { return; }
+
+`transferIfRequested` is correct (requeues self, throws EeDispatcherTransfer).
+The running thread's priority at that instant is **not yet measured** -- do not
+assume it. `thread_resume_if_suspended` has 11 static callers, so the caller
+cannot be attributed by counting.
+
+## Priorities actually in play (measured, corrects an older note)
+
+| thid | created prio | repriorized to | entry |
+|---|---|---|---|
+| 2 | **0x0** | never | `0x1759a0` (SDK-side) |
+| 3 | 0x1 | **0x08** | `0x11e7e0` |
+| 4 | 0x1 | 0x10 | `0x11e8d0` |
+| 5 | 0x1 | 0x12 | `0x11e9d8` |
+| 6 | 0x1 | 0x19 | `0x11eac8` |
+| 1 (main) | 0x0 | 0x18 | -- |
+
+Lower = higher priority. Thread 3 is the highest-priority *game* thread; thread 2
+outranks everything and is never repriorized. Only thread 2's call actually needs
+the `PS2X_EE_PRIO0` gate, so the gate stays in but its scope is narrower than the
+part-49 note implied. The PCSX2 oracle check is still outstanding.
+
+There is also a critical-section idiom: boost self to prio 0x1 at `ra=0x11e5dc`,
+restore the old value at `ra=0x11e670`. CHGPRI saturated at 400, so its counts are
+lower bounds only.
+
+## Change made this part
+
+`Kernel/Syscalls/Thread.cpp` -- `THLIFE` extended from 7 to 10 keys, adding
+`me` (issuing thread), `mypri`, `tpri`. Brace depth verified 0, CRLF preserved,
+all three call sites rewired. One TU.
+
+**Read it as:** `tpri >= mypri` on the thid-3 resumes confirms the bail and makes
+this a preemption-semantics fix. `tpri < mypri` kills the hypothesis and the bail
+is elsewhere.
+
+## Still open
+
+- Semaphore 3 never signalled.
+- `STACKOOB` total=512 (capped at 16, so per-site absence proves nothing).
+- `[present] has=1 nonblack=229376` appears in this run -- the framebuffer is no
+  longer uniformly black; recheck the black-framebuffer thread when the scheduler
+  work lands.
+
+---
+## HANDOFF 2026-09-02 (session 5, part 52) - **The pump gate never flips. New sharpest lead: thread 3 has never run.**
+
+Run 2026-09-02 06:04 (200s, `-Determinism 1`). Adds the `pmpEn`/`pmpIdle`
+watchdog words to the 1 Hz `[pump]` line.
+
+### Measured
+
+| field | address | result |
+|---|---|---|
+| `pmpIdle` | `0x45F688` | **`0x0` in all 197 samples** |
+| `pmpEn` | `0x45F674` | `0` for 136 samples, then `1` for 60 |
+
+So `sub_154FA8` never takes its return-0 branch (`beq $v0,$v1` needs
+`[0x45F688]==1`), always falls through to `sub_155210`, which always reports
+work -> the acker `sub_11EAC8` never reaches `SleepThread`. It spins 183k/s by
+design, not by accident. `eeref refs 0x45F688` is UNREACHABLE (struct field
+only, reached via `get_data_ptr 0x14e4d0` + 16, and that has 28+ callers), so
+the writer is not statically nameable.
+
+### The lead that replaced it
+
+The run ends with the acker polling **thread 3**:
+`sysPc=0x174ba0 sysA0=0x3 sysA1=0x4470c0 sysRa=0x11edb4` - i.e. inside
+`thread_resume_if_suspended` (`0x11ed90`).
+
+**Thread 3 is SUSPEND at `0x11e7e0`, its own entry.** Across all three runs it
+has never executed one instruction of its body.
+
+Three explanations are indistinguishable at 1 Hz:
+1. the guest suspends it,
+2. our `resumeThread` fails to clear the flag,
+3. a resume succeeds and is immediately undone.
+
+### Probe written this part (needs a build)
+
+`THLIFE` in [Thread.cpp](ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp:559) -
+records `op` ('S'/'U'/'R' as a byte), `thid`, `st0` (status before), `st1`
+(status after), `res`, `ra`, `cap`. Capped at 600.
+
+Coverage checked, not assumed: `EeThreadStatus::Suspended` is only ever set by
+`EeScheduler::suspendThread` (or by `makeReady` seeing the `suspendCount` it
+raised), `suspendThread`/`resumeThread` have **no other callers** in the
+runtime, and `Dispatcher.cpp:149-156` routes both the `i`- and non-`i`
+syscall numbers (0x37/-0x38, 0x39/-0x3A) through these same two wrappers. Every
+path into SUSPEND is therefore visible to this probe.
+
+`CHGPRI` trimmed 4000 -> 400: it saturated inside a 4,400-tick window in the
+06:04 run (`cap=0x1`, all records within progress 15.000M-15.005M) and its
+question is already answered.
+
+### Not explained yet
+
+The 06:04 run was much slower than 05:33: `dTick` 15,432/s vs 183,000/s,
+`busy%=15`, `vbl/s=0`, `stuckSecs=47`, tick 7.6M vs 11.2M. Noted, not diagnosed.
+
+### Side issues still open
+
+- semaphore 3 never signalled (tid 2 waiting since eeCycle 2,649,968; 13,668 signal records, none `id=3`) - pre-existing
+- `STACKOOB` x16 on tid 4 (`sp=0xf7ff0` outside `0x443210-0x444210`, `pc=0x178068`)
+- `PSEUDOTID` 2 -> 514 (all `raw=0xffffffff given=0x1 pc=0x175b7c ra=0x11ed18`)
+- `[present] has=0 nonblack=0`
+
+---
+
+## HANDOFF 2026-09-02 (session 5, part 51) - **CHGPRI FIX VERIFIED. The worker runs. New wall: the SofDec pump never reports idle.**
+
+Run 2026-09-02 05:33 (200s, `-Determinism 1`), exe 05:13.
+
+### The `ChangeThreadPriority` return fix landed
+
+`CHGPRI` (200 records, saturated) shows the critsec save/restore now balanced:
+
+| pattern | count |
+|---|---|
+| `thid=1 prio=0x18 old=0x1 ret=0x1` (leave, `ra=0x11e670`) | 46 |
+| `thid=1 prio=0x1 old=0x18 ret=0x18` (enter, `ra=0x11e5dc`) | 45 |
+| `thid=5 prio=0x12 old=0x1` / `prio=0x1 old=0x12` | 38 / 37 |
+| `thid=4 prio=0x10 old=0x1` / `prio=0x1 old=0x10` | 12 / 11 |
+
+It also answered the open question: at `seq=1307` the guest issues
+`ChangeThreadPriority(1, 0x18)` from `ra=0x11f3bc`. **Main really does run at
+priority 24**, so the old KE_OK return was pinning it 24 levels too high.
+
+### The handshake now completes
+
+`VERDICT=WORKER-NOT-RUNNING` is GONE. From t=128s the acker ticks:
+`tick` 0 -> 11,218,533, `dTick` ~183,000/s, `req=0 inWork=1`.
+
+| tid | status | pri | pc |
+|---|---|---|---|
+| 1 main | READY | 24 | `0x174bd0` |
+| 2 | WAIT sema **3** | 0 | `0x174ce0` |
+| 3 | READY/SUSPEND | 8 | `0x11e7e0` (never left its entry) |
+| 4 | READY | 16 | `0x174bc8` |
+| 5 | READY | 18 | `0x174bc8` |
+| 6 acker | **RUN** | 1 | inside `sub_11EAC8` |
+
+### The new wall, read statically
+
+The acker only sleeps when its callback reports no work:
+
+```
+0x11eb3c  jal 0x13c6e8   ; cblist_run(6); L6 has one entry, 0x154fa8
+0x11eb60  bne $s0, $zero, 0x11ebbc   ; nonzero => skip the sleep, loop again
+0x11ebb4  jal 0x11ed78   ; else -> j 0x174bc0 = SleepThread
+```
+
+`[cblist] L6=11,218,532` equals `tick` exactly, so the return is never 0.
+Two gates decide it, both fixed globals:
+
+- `get_data_ptr` (`0x14e4d0`) is the constant **`0x45F678`**; `sub_154FA8`
+  returns 0 iff `[0x45F688] == 1`.
+- `sub_155210` short-circuits to 0 iff `[0x45F674] != 1`.
+
+This is the Stage 5.17 SofDec path: `[sofdec:stat] loadscreen_tick.3e0e60=1085`,
+`[mvgate] en=1 nLive=1 live=0`, `[adx:stream] act=1 st=1` on streams 0 and 1.
+The difference from every earlier session is that the pump is now **running**.
+
+### Added this part (Thread.cpp + ps2_runtime.cpp, UNBUILT)
+
+1. `CHGPRI` cap 200 -> **4000**. It saturated at progress 14.8M of 20M, so
+   late-run priority changes were unmeasured and no absence claim was valid.
+2. `[pump]` gains **`pmpEn=[0x45F674]`** and **`pmpIdle=[0x45F688]`** - says
+   which of the two gates holds the acker open, sampled 1 Hz.
+
+### Also new this run, not yet chased
+
+- **`STACKOOB` x16** (was 0): tid 4, `sp=0xf7ff0` outside its stack
+  `0x443210-0x444210`, `pc=0x178068` (`sub_178068`), alternating `site=0/1`.
+  Appeared only because the threads now actually run.
+- **`PSEUDOTID` 2 -> 514**, all `raw=0xffffffff given=0x1 pc=0x175b7c
+  ra=0x11ed18` (`sub_175B68`, called from `sub_11ECD8`).
+- **Semaphore 3 is never signalled.** tid 2 has waited on it since
+  eeCycle 2,649,968; `[semwatch:wait] id=3` appears once, id 3 never appears
+  in `[semwatch:signal]` (which is 13,668 records, almost all id=1). This was
+  also true in the 04:24 run - pre-existing, not a regression.
+- `[present] has=0 nonblack=0` this run (04:24 had `nonblack=229376`). The
+   boot path diverged at t=128s, so treat as changed-not-worse until measured.
+
+### Gates now in the tree
+
+| env | default | effect |
+|---|---|---|
+| `PS2X_EE_PRIO0` | unset = fix on | accept `initial_priority == 0` |
+| `PS2X_CHGPRI_RET` | unset = fix on | return old priority, not `KE_OK` |
+| `PS2X_REFSTAT_YIELD` | unset = off | make syscall 0x30 yield (no longer needed) |
+
+Both fixes stay gated until the PCSX2 oracle check is done.
+
+## HANDOFF 2026-09-02 (session 5, part 50) - **PRIO0 FIX VERIFIED; the next wall is `ChangeThreadPriority` returning the wrong value.**
+
+Run 2026-09-02 04:24 (200s, `-Determinism 1`), exe 04:00. The `PS2X_EE_PRIO0` fix landed:
+
+| probe | before (03:44) | after (04:24) |
+|---|---|---|
+| `THCREATE` res | all `0xfffffe6d` (-403) | `0x2 0x3 0x4 0x5 0x6` |
+| `PSEUDOREFER` | 653 | **0** |
+| `PRIOREJECT` | 15 | **0** |
+| `nTh` | 1 | **6** |
+
+The guest now has six real EE threads. `[thsync]` thread table at t=198s:
+
+| tid | status | pri | pc |
+|---|---|---|---|
+| 1 (main) | RUN | **0** | `0x11edb4` (`thread_resume_if_suspended`) |
+| 2 | WAIT sema 3 | 0 | `0x174ce0` (WaitSema) |
+| 3 | SUSPEND | 8 | `0x11e7e0` |
+| 4 | READY | 16 | `0x174bd0` (WakeupThread) |
+| 5 | READY | 18 | `0x174bc8` (SleepThread ret) |
+| 6 | READY | **1** | `0x174bc8` |
+
+`[thsync]` names the actors itself: `spinner=sub_11E690 acker=sub_11EAC8` (= tid 6),
+`VERDICT=WORKER-NOT-RUNNING`, `dTick=0` for the whole run.
+
+### Root cause (verified against ps2tek, not inferred)
+
+ps2tek 29h/2Ah: `ChangeThreadPriority` / `iChangeThreadPriority` return **the
+thread's old priority** on success. `Thread.cpp:changePriorityImpl` computed
+`oldPriority` and then did `setReturnS32(ctx, result)` - `KE_OK` = **0**.
+
+The guest saves and restores its own priority around a critical section:
+
+```
+enter  0x11e5d4  jal 0x174b30          ; ChangeThreadPriority(self, boost=[0x4418F0]=1)
+       0x11e5e0  sw  $v0, -28144($v1)  ; saved = $v0   <-- got 0, not the old priority
+leave  0x11e668  jal 0x174b30          ; ChangeThreadPriority(self, saved=0)
+```
+
+So every critical-section exit pins main at priority 0 - the top of the ready
+queue. `sub_11E690` boosts the acker to priority 1 and then busy-polls; at pri 1
+the acker can never preempt a pri-0 spinner, so the handshake never completes.
+It also explains the old run's 15 `PRIOREJECT`s: all `ra=0x11e670`, the leave
+routine restoring the bogus saved 0.
+
+### Syscall trampolines resolved this part
+
+| addr | `$v1` | syscall |
+|---|---|---|
+| `0x174b90` | `0x2f` | `GetThreadId` |
+| `0x174bc0` | `0x32` | `SleepThread` |
+| `0x174bd0` | `0x33` | `WakeupThread` |
+| `0x174c30` | `0x39` | `ResumeThread` |
+| `0x174ce0` | `0x44` | `WaitSema` |
+
+### Fix applied, NOT yet built
+
+`ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp` only - one TU, relink:
+
+1. `changePriorityImpl` now returns `oldPriority` on success, gated
+   `PS2X_CHGPRI_RET` (unset = ps2tek-conformant; `=0` restores the old
+   status-code return for A/B). Failure codes untouched - `PRIOREJECT` keys
+   off `KE_ILLEGAL_PRIORITY`.
+2. New `CHGPRI` probe on **every** call (`thid prio old ret isafe ra cap`,
+   cap 200). Open question it answers: does the guest ever raise main above
+   the boost level, or is main pri 0 from `ExecPS2` onward (ps2tek 07h creates
+   the main thread at priority 0)? A reject-only probe cannot tell.
+
+### Fallback already in the tree if the fix is not sufficient
+
+`PS2X_REFSTAT_YIELD=1` (Thread.cpp, pre-existing) makes syscall 0x30 yield.
+Its own comment documents this exact handshake starving. Use it as arm B only
+if `CHGPRI` shows main legitimately sitting at priority 0.
+
+### Still open, unchanged
+
+- `PSEUDOTID` fired twice this run (was 0): `raw=0xffffffff given=0x6`,
+  `pc=0x175b7c ra=0x11ed18`. A negative internal id reached `GetThreadId`.
+- Framebuffer still black at `[present]` despite real `[gs:image]` uploads.
+- Before deleting either gate: cross-check against PCSX2 as the oracle.
+
+## HANDOFF 2026-09-02 (session 5, part 49) — **THE t~140s WALL IS ROOT-CAUSED: our own `createThread` refuses `initial_priority == 0`.** THCREATE answered it on the first armed run. Fix applied to `EeScheduler.cpp`, gated `PS2X_EE_PRIO0`. **BUILT 2026-09-02 04:00** (exe newer than the 03:48 source); awaiting the verification run.
+
+### The measurement
+
+Run 2026-09-02 03:44 (200s, Determinism 1, HostProfile). Wall reproduces exactly:
+`sysPc=0x174bb0 sysA0=0xfffffe6d sysRa=0x11ecf4 stuckSecs=58`, `nTh=1`, `busy%=0`.
+
+| probe | hits | what it says |
+|---|---|---|
+| `THCREATE` | **5** | every `CreateThread` returns `-403`; **`prio=0x0` on all five** |
+| `PRIOREJECT` | **15** | `ChangeThreadPriority(thid=1, prio=0)`, all from `ra=0x11e670` |
+| `ROTREJECT` | 0 | `rotateReadyQueue` not involved |
+| `PSEUDOREFER` | 653 | `thid=0xfffffe6d found=0` — the forever-poll |
+| `PSEUDOTID` | 0 | pseudo-thread leak stays dead (part 47) |
+
+The five refused threads:
+
+```
+seq=2     func=0x1759a0 prio=0 stksz=0x400  ra=0x175b00   (early boot)
+seq=1303  func=0x11e7e0 prio=0 stksz=0x800  ra=0x11eea4   <-- the four
+seq=1306  func=0x11e8d0 prio=0 stksz=0x1000 ra=0x11f00c       at the wall
+seq=1308  func=0x11e9d8 prio=0 stksz=0x1000 ra=0x11f094
+seq=1310  func=0x11eac8 prio=0 stksz=0x2000 ra=0x11f11c
+```
+
+`attr`, `stksz` and `stk` all decode sanely, so this is not a `ee_thread_t` offset error — the guest really does pass priority 0.
+
+### The defect
+
+`EeScheduler::createThread` and `changePriority` both gate on `priority < 1 || priority >= kPriorityCount`. The lower bound was never validated against real EE, and `rotateReadyQueue` 40 lines below uses `priority < 0` for the same range — the two already disagreed with each other. ps2tek documents no lower bound for `CreateThread` (only "returns -1 if the function fails"), and the game shipped on real hardware making exactly these calls.
+
+Priority 0 is structurally safe: `m_readyQueues` is indexed `0..127` and the ready-queue invariant assert is already `>= 0`.
+
+**Fix:** both gates now use `eeMinGuestPriority()`, which returns 0 unless `PS2X_EE_PRIO0=0`. One TU, relink.
+
+### ⚠️ A false negative I generated and then caught
+
+`analyze_run.py --tag NAME` reads **`run_log.txt`**; `ps2x_probe_kv` writes to **`run_probe.jsonl`**, which is `--probe NAME`. Querying `--tag THCREATE` returned `records=0` **plus the line "no [cap] for this tag: absence IS evidence"** — a confident, wrong "never fired" for all five probes. Caught only because `PSEUDOREFER` was known to have fired 663 times the run before and also read 0. **Use `--probe` for anything written by `ps2x_probe_kv`.** See [[feedback_probe_sink_vs_log_tag]].
+
+### Resume here
+
+1. User builds: `cd "F:\SDBZ Recomp"; .\build.ps1 RelWithDebInfo`
+2. User runs the standard 200s command (see § Active Runner Command).
+3. Read `analyze_run.py --probe THCREATE` — expect `res` = small positive thread ids, not `0xfffffe6d`. Then `--probe PSEUDOREFER` should collapse toward 0.
+4. If the four threads now start, the next wall is whatever they were waiting to do; the black framebuffer (`nonblack=229376` in VRAM but `[present]` still reports the same value every frame) is the standing downstream question.
+5. **Before deleting the `PS2X_EE_PRIO0` gate**, cross-check priority 0 against PCSX2 as the oracle — do not promote our own table to ground truth ([[feedback_validate_tables_against_an_oracle]]).
+
+### Still open, unchanged
+
+- Framebuffer black; four legacy per-address guards still ON; pseudo-thread id churn; fixing `Interrupt.cpp:146` at source.
+
+---
+
+## HANDOFF 2026-09-01 (session 5, parts 44-48) — **THE SESSION-5 FREEZE IS FIXED AND VERIFIED.** Root cause was an IRQ-handler stack overlap, not any of the four addresses we hand-guarded for six sessions. `[ee:zero-pc-dormant] SUSPECT` went **234 -> 0** and stayed there across two 200s runs. Boot now reaches a **new, later wall at t~140s** with a completely different signature. Probes for that one are written, not built.
+
+### Part 46 — root cause, verified from the armed run
+
+`Syscalls/Interrupt.cpp:146` `addHandler()` passed `getRegU32(ctx, 29)` — the **registering function's `$sp`** — into `EeScheduler::addIrqHandler()`, which stored it in `EeIrqHandler::sp`. `dispatchIrq()` then seeded *every later invocation* with that same `$sp`. Real hardware has no such parameter: `AddIntcHandler` takes only (cause, handler, next, arg) and the kernel runs handlers on its own interrupt stack.
+
+The arithmetic, off the `[ee:zero-pc-dormant]` dump:
+- thread 1 running `0x178a08` (`mem_fill_z_18`), `$sp=0x1fef9c0`, frame `0x70`; its saved `$ra` lives at `0x1fefa20` (`sd $ra,0x60($sp)` / `ld $ra,0x60($sp)` / `jr $ra`)
+- IRQ handler `0x178068` dispatched with `$sp=0x1fefa40`, prologue `addiu $sp,$sp,-0xA0` -> writes `0x1fef9a0..0x1fefa40`
+- that range **covers `0x1fefa20`**. Stack hexdump confirms `[sp+0x60] == 0`.
+
+So the epilogue reloads `$ra = 0`, `jr $ra` sets `ctx->pc = 0`, the scheduler sees `pc==0` with no invocation to pop, and `makeDormant()` silently hangs the run.
+
+`0x178aec`, `0x17cfa4`, `0x174cb8`, `0x178068` were **four victims of one bug**. That is why every rebuild in parts 37-42 surfaced the next one. See [[feedback_remeasure_the_premise]].
+
+**Fix:** `Interrupt` / `Alarm` / `GsCallback` invocations now always take `invocationStackTop()` (a reserved 0x4000 callback stack) instead of the guest-supplied `$sp`, at all four push sites. Gated `PS2X_IRQ_OWN_STACK=0` for A/B. Fired **2,235 times** in run 1.
+
+**Verdict:** `SUSPECT = 0` (was 234) on two consecutive runs; all remaining dormant events are `EXPECTED` pseudo-thread recycle at `tid=-1`. Cold resumes stable at 312 with **0** witness-table insert failures, so that number is bounded and real, not saturated ([[feedback_capped_probes_false_negatives]]).
+
+Also fixed here: 379 EXPECTED dumps x ~368 ring lines was 139,596 lines = **87% of a 39 MB run_log**. Now collapsed to one line each after the first three, with SUSPECT never suppressed. Log 39 MB -> **6.3 MB**.
+
+### Part 47 — a hypothesis that was measured and died
+
+The new wall's watchdog named `sysPc=0x174bb0 sysA0=0xfffffe6d`. `0xfffffe6d` = **-403**, a negative "thread id". Since `EeScheduler::acquireInvocationThread()` mints pseudo-threads with negative ids and `GetThreadId` returned `currentThreadId()` raw, the theory was that a pseudo-thread id had leaked to the guest.
+
+Rather than assert it, it was probed: `guestVisibleThreadId()` (returns the last *real* current thread id, gated `PS2X_PSEUDO_TID_HIDE`) plus an uncapped `PSEUDOTID` probe on the producer side and `PSEUDOREFER` on the consumer side.
+
+**`PSEUDOTID` fired 0 times in a full 200s run.** `GetThreadId` never returned a negative value. Hypothesis dead. The `guestVisibleThreadId()` hardening is a harmless gated no-op and was left in.
+
+### Part 48 — what -403 actually is
+
+`PSEUDOREFER` fired **663 times**, and `thid` was `0xfffffe6d` on **every single one**, with `found=0` every time. Zero variance across 663 samples is not how allocated ids behave — see [[feedback_constant_id_is_an_error_code]].
+
+`grep -rn '\-403' src/lib` -> `constexpr int KE_ILLEGAL_PRIORITY = -403;` (`Syscalls/Helpers/State.h:27`, `EeScheduler.cpp:19`).
+
+**-403 is an error code the guest stored as a thread id and now polls forever.**
+
+Syscall trampolines, read off the generated stubs (`addiu $v1,$zero,N`):
+
+| addr | `$v1` | syscall |
+|---|---|---|
+| `0x174aa0` | `0x20` | `CreateThread` |
+| `0x174ac0` | `0x22` | `StartThread` |
+| `0x174ba0` | `0x30` | `ReferThreadStatus` |
+| `0x174bb0` | `-0x31` | `iReferThreadStatus` |
+| `0x174bc0` | `0x32` | **`SleepThread`** |
+
+Thread census at the wall: `[thsync] nTh=1 [1:st=4,wt=1,wid=0,pri=1,pc=0x174bc8]` — one thread, blocked at the instruction *after* `SleepThread`. The loop is `ReferThreadStatus(-403)` -> not found -> `SleepThread()` -> wait for a wakeup from a thread that was never created.
+
+Exactly three sites return `KE_ILLEGAL_PRIORITY`, all guarding `priority < 1 || priority >= kPriorityCount` (=128, which matches real EE): `createThread` (`EeScheduler.cpp:1732`), `changePriority` (`:2010`), `rotateReadyQueue` (`:2058`). `ee_thread_t` matches ps2sdk and its `static_assert(sizeof == 0x24)` holds, so a mis-decoded `initial_priority` is **not** explained by struct layout.
+
+Only a `createThread` return is plausibly stored by a game as a thread id — but that is inference ([[feedback_no_guessing]]), so all three are probed rather than assumed:
+- **`THCREATE`** — logs *every* `CreateThread` (low volume): result, priority, entry func, attr, stack, stack size, `$ra`. Successes logged too; which thread was refused matters as much as that one was.
+- **`PRIOREJECT`** / **`ROTREJECT`** — fire only on a -403 from the other two.
+
+All three live in `Syscalls/Thread.cpp` — one TU, relink.
+
+### Resume here
+
+1. User builds: `cd "F:\SDBZ Recomp"; .\build.ps1 RelWithDebInfo`
+2. User runs (never launch it myself — [[feedback_delegated_x64dbg_recomp_control]]):
+   `$env:PS2X_FATAL_ON_ZERO_PC='1'; & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"`
+3. Read `THCREATE` for `res=0xfffffe6d` and its `prio`. If the game genuinely passes a priority outside 1..127, the next question is whether real EE accepts it — validate against PCSX2 as oracle, not against our own table ([[feedback_validate_tables_against_an_oracle]]).
+4. If none of the three probes fire, -403 came from somewhere else entirely and the framing needs re-measuring.
+
+### Still open, deliberately not chased yet
+
+- **Framebuffer is black.** 2,112 real `[gs:image]` uploads, 742 `[gs:frame-change]`, fbp alternating 0x0/0x70 (double buffering), `[present] has=1 w=512 h=448` — but `nonblack=0` everywhere. Downstream of the stall.
+- The four legacy per-address guards are still ON. Flipping them off is a relink; confirm no regression, then delete them.
+- Pseudo-thread ids descend past -1000 because `EeScheduler.cpp:1804` erases the record on exit, defeating the recycle predicate at `:2931`. Cosmetic churn, not a bug we have evidence for.
+- Fixing the original defect at source in `Interrupt.cpp:146` rather than compensating in the scheduler.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 43) — **STOPPED the whack-a-mole. The premise was wrong: `output/` was six generator vintages stacked, and 34% of it emitted a code shape the generator no longer produces. Pruned to a single current generation, removed 7 stale registrations (2 were actively clobbering current bodies), deleted 125 shadowed duplicates, and replaced the per-address guard approach with a general dispatch diagnostic. Awaiting the one long rebuild.**
+
+Triggered by the user calling out that we were spinning in place — parts 37-42 each added a hand-written guard for one freeze address, and every rebuild surfaced the next one. Re-measured the top-level premise per [[feedback_remeasure_the_premise]]. It did not survive.
+
+**What was actually wrong (all verified, not inferred):**
+- `output/` held **36,311 `.cpp` across six generator vintages** (2026-05-17, 05-23, 06-14, 07-02, 07-23, 07-24, 08-07, 08-29). Only 12% was current-generation. `ps2xRuntime/src/runner/` mirrored it exactly.
+- Those 36,311 files covered only **17,145 distinct guest addresses** — ~19,000 were duplicate bodies for the same address under stale symbol names from older func-map revisions.
+- **12,457 files (34%)** still emitted `__entryPc` (the old inline-call-plus-return-guard). `grep -rn "__entryPc" ps2xRecomp` → **zero hits**; that emitter no longer exists. 4,600 files called the `shouldPreemptGuestExecution` compat shim whose own comment (`ps2_runtime.h:582-587`) says to delete it once the regen lands.
+- **Nothing in the pipeline ever prunes.** `build.ps1:106-120` copies newer files into `src/runner/`, never deletes; the generator has a content-compare guard (`ps2_recompiler.cpp:2327-2350`) that skips identical writes but never removes files it no longer emits. CMake then globbed all 36,311.
+- ⇒ Every diagnosis for the past several sessions was made against a tree that was partly two months stale. That is the "spinning in place".
+
+**What was already sitting on disk unused:** `output_scratch_210regen_v2/` (2026-08-29) — 17,083 `.cpp`, zero `__entryPc`, zero `shouldPreemptGuestExecution`. Its `register_functions.cpp` is **byte-identical** to live (md5 `C915C8F23A01CCA81EB6506A72B46FE5`), as are all three headers. Address-set comparison ([[feedback_diff_by_address_not_filename]]): 17,082 regen vs 17,145 live, **0 regen-only**. So adopting it was a pure deletion, not a merge. Generator unchanged since 2026-08-27 and the regen exe postdates it, so re-running would reproduce it bit-for-bit — skipped.
+
+**Actions taken:**
+1. Backed up `recovered/` (untracked *and* unignored — git could not restore it) to `_backup_recovered_2026-08-31/`.
+2. Quarantined **19,225 orphan `.cpp` from each of `output/` and `src/runner/`** (+ the 22 MB `register_functions.cpp.legacy-bak`) into `_quarantine_stale_output_2026-08-31/`. Both trees now hold **17,086** files. Gate was an exact balance identity (`17,086 + 19,225 = 36,311`), not a hardcoded expectation — the planning agent's predicted 19,226 was an arithmetic slip and was rejected rather than followed.
+3. Removed **7 stale `registerFunction` calls** in `game_overrides.cpp`. All seven addresses now have real table slots post-func-map-rebuild, and because `registerFunction()` is an unconditional overwrite (`ps2_runtime.cpp:1699-1702`) they were **clobbering current generated bodies with stale July ones** — `fn_1137B0_0x1137b0.cpp` alone carried 8 `__entryPc` sites. ⚠️ `0x1137b0` and `0x1c9980` now route to interior aliases (`sub_1137A4_0x1137a4` +0xC, `sub_1C997C_0x1c997c` +4): a real behaviour change, watch it.
+4. Kept the 3 genuinely slot-less registrations (`0x1a4500`, `0x1bf2e0`, `0x22c8f0`) and the hand-written `fn_17EE80_0x17ee80` (defined in `game_overrides.cpp:240`, not a generated file — the agent's list had missed it).
+5. Deleted the **125 `recovered/` files byte-identical to their `src/runner/` twin**; kept the 10 that differ.
+
+**The find that reframes the hunt:** `ps2xRuntime/src/lib/Kernel/recovered/sub_001750C0_0x1750c0.cpp` is a **hand-fix for exactly our bug class** — no resume-label `switch`, no `ctx->pc` pre-advanced before `handleSyscall`. Its generated twin has both. Under `/FORCE:MULTIPLE` (`ps2xRuntime/CMakeLists.txt:716`) the runner object wins the link, so **that fix has been dead code**. 135 of 136 `recovered/` files were shadowed the same way. HYPOTHESIS (link order), settled by grepping the next build log for `LNK4006`.
+
+**Codegen root cause of the family (verified in the generator, still UNFIXED):** `control_flow_analyzer.cpp:141-144` emits a resume entry at `syscall+4` for every syscall, and `ps2xRecomp` has **no leaf/frameless detection anywhere** (grep `leaf|frameless|savesRa|touchesSp|frameSize` → zero hits). So a 4-instruction frameless trampoline gets a mid-body entry point whose `jr $ra` reads whatever is live in GPR31. ⚠️ **Do NOT simply delete that resume label** — `control_flow_analyzer.cpp:138-140` documents that it exists because a guest-installed handler runs as a separate invocation and the thread must resume at syscall+4. That is why the recovered file's hand-fix was never generalized. The codegen cure is deliberately deferred until there is evidence.
+
+**Replaced the guard approach with a general diagnostic** (`EeScheduler.cpp`, all in the `ps2_runtime` static lib so future iterations are one TU + relink):
+- `eeResolveOwnerEntry(pc)` derives, at runtime, whether a dispatch is a **mid-function resume** — by walking back through the dense function table while the slot holds the same function pointer. This is the exact fact each of the four bespoke guards was hardcoding by hand.
+- A 16-entry dispatch ring (`pc, ra, sp, ownerEntry, tid, invocationDepth, midFunctionResume, eeCycle`) written unconditionally at the loop's single dispatch site. No I/O, no allocation.
+- At the `pc==0` / no-invocation path — previously a **silent** `makeDormant()` that also erased the evidence — an `[ee:zero-pc-dormant]` dump of the ring plus an explicit verdict naming the offending label, its owner, and the `$ra` it was entered with.
+- ⚠️ **Corrected a bug in my own first draft:** `startThread` seeds the base context with `$ra=0` (`EeScheduler.cpp` ~:1089), so a *normal thread exit* also lands on this path. The dump now classifies `EXPECTED` (last dispatch's owner == `running->entry`) vs `SUSPECT`, and only escalates on `SUSPECT`. Without this it would have fired on every clean thread exit and mislabelled it a hang.
+- `PS2X_FATAL_ON_ZERO_PC=1` (env var, not a CMake flag — deliberate deviation from the plan so toggling needs no rebuild) aborts on the SUSPECT case so the freeze becomes an attachable stack.
+
+**Deliberately NOT done:** the `PS2X_LEGACY_RESUME_GUARDS` toggle for the four existing bespoke guards. They stay ON for this run by design (if they were removed and it still froze, we could not tell a failed diagnostic from a reopened hole). Wrapping ~250 lines of hand-written guards carried more risk than value; flipping them later is a one-TU rebuild.
+
+**Pre-build verification done:** all 30 `register/replaceFunction` symbols resolve; zero references anywhere in hand-written lib code to quarantined files; brace depth balanced; both CMake globs use `CONFIGURE_DEPENDS` so the reduced file set re-globs automatically.
+
+**NEXT:** user runs `.\build.ps1 RelWithDebInfo` (expect a full runner recompile — the glob drops 36,311 → 17,089 so unity batches re-partition; payoff is ~4,539 → ~2,137 TUs permanently). Then grep the build log for `LNK4006`, then run with `PS2X_FATAL_ON_ZERO_PC=1`.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 42) — **Ran the corrected watchpoint (`entrySp-0x10`). It never fired because the bug it was aimed at never recurred this run: no `[semwatch:cf50resume]`, `[workaround:cf50resume]`, or `[frametrace:cf50wrap]` lines at all, and `HWSTAT` shows a clean `armed=1/hits=0/seen=0` for the whole run. Progress went further than ever (eeCyc ~45.95 BILLION, vs the prior 32.19B ceiling) but froze again on a DIFFERENT, new-looking instance of the same general bug class, at a syscall stub (`0x174cb0` = `syscall_stub_z_7`) instead of `sub_17CF50`. Decision point raised to the user rather than picked unilaterally — see below.**
+
+**What the data actually shows (facts, not inference):**
+- `analyze_run.py --probe HWSTAT`: `armed=0x1` from `seq=21` (progress=8897) straight through to the last record before the freeze (`seq=627`, progress=11220402 — same progress value as the freeze point, confirming the armer thread kept running through the stall). `hits=0x0 seen=0x0 skipped=0x0 outwin=0x0 drop=0x0` throughout. The watched `guest=` address moved several times (0x1ffbf00 -> 0x1fd6000 -> 0x1fd1300), consistent with `isCf50TrueEntry` re-arming on every true entry as designed.
+- Console log (grepped in full, case-insensitive): zero occurrences of `cf50` anywhere — `[semwatch:cf50resume]`, `[workaround:cf50resume]` (EeScheduler.cpp:631, part 38/39's proven patch site) and `[frametrace:cf50wrap]` (game_overrides.cpp:3624, part 41c's own unconditional diagnostic) all stayed silent all run. That patch site's own guard is `context.pc==0x17cfa4u` at the scheduler's top-level dispatch loop — the same condition part 39 caught real corruption on in an earlier run. It simply never got hit this run.
+- **Conclusion: the specific `sub_17CF50` corruption this hunt targeted did not occur in this run at all**, so the watchpoint got no opportunity to fire. This is a non-result for the original question (who writes to the slot), not a "confirmed clean" negative — the mechanism was proven armed and idle, not proven never-hit-under-corruption.
+- The run froze again anyway, 185+s stuck, with a **new signature**: `pc=0x0 ra=0x0 lastCall=0x174cb0 sysPc=0x174cb0 sysNum=0xffffffff` at `progress=11220402 eeCyc=45951316184`. `0x174cb0` is `syscall_stub_z_7` per `sdbz_func_map_merged.csv:3423` (`0x174ca0`/`syscall_stub_z_6` next to it is the already-known CreateSema stub). `pc=0x0 ra=0x0` matches the same "zeroed $ra slot" shape as parts 37-40's bug class, just at a different, previously-unseen call site.
+
+**Why this matters for the part-40 decision point:** part 40 already flagged that this bug class recurs at call sites with many static callers (`0x177eb0`, `0x178be8`) where no single safe fallback value exists, and asked whether to keep patching one address at a time or attempt a general dispatch fix. This run adds a THIRD flavor: the same shape appearing at a generic syscall stub, reached from many possible callers by construction (every guest `syscall` instruction routes through the syscall stub table). This is consistent with — not proof of — the class being systemic across all preemption-unwind-then-redispatch paths, not specific to `sub_17CF50`/`mem_fill_z_18`. Not stating that as confirmed; it is the same open question part 40 raised, now with one more data point.
+
+**Options for the user (not decided unilaterally):**
+1. Keep the current watchpoint armed on `sub_17CF50` and re-run, hoping to catch that specific corruption on a future run where it does recur (cheap, but non-deterministic — this run shows the target bug is not guaranteed to appear every run even at fixed `PS2X_DETERMINISM=1`, which is itself worth noting since determinism was assumed to make behavior repeatable).
+2. Point the SAME watchpoint infrastructure at the new syscall-stub freeze (`0x174cb0`) instead, since it just froze further than ever before and is the CURRENT blocker.
+3. Revisit part 40's original fork: general dispatch-level fix in `EeScheduler.cpp` for the whole bug class, now with a third recurrence site as added justification.
+
+**User chose option 3.** Implemented in `EeScheduler.cpp` (~line 670, right after the existing part-38/39 `0x17cfa4u` block): a small reusable table (`kZeroRaGuards[]`, `struct ZeroRaGuard{resumeLabel, kind (Slot|Live), slotOffset}`) plus a per-label `s_lastGoodRa` cache that AUTO-LEARNS the last observed nonzero value at each guarded resume label from healthy dispatches, and patches (RDRAM slot, or the live `$ra` register for stub-style resume labels with no stack frame) whenever a later dispatch at that same label reads exactly 0. This generalizes the mechanism (add a table row for a new site, no new bespoke if-block/log-formatting/static-single-caller-proof needed) without touching the two ALREADY-PROVEN hardcoded blocks (`0x178aecu`, `0x17cfa4u`), which are left exactly as-is to avoid any regression risk.
+
+First table entry: `{0x174cb8u, Live, 0}` — the new syscall_stub_z_7 resume label found this run (`output/syscall_stub_z_7_0x174cb0.cpp`: no stack frame at all, `ctx->pc = GPR_U32(ctx,31); return;` directly off the live register at its own `case 0x174cb8u:` resume label). `syscall_stub_z_7` has 20 static callers (`grep -rl 0x174cb0 output/` — no `eeref.py up` single-caller shortcut available here, unlike sub_17CF50), so there is no literal to derive up front; the auto-learn cache is required for this site specifically, and it CANNOT heal the very first occurrence before a healthy sample is observed (logs `[semwatch:genericzeroguard]` unconditionally either way; only patches + logs `[workaround:genericzeroguard]` once a learned value exists).
+
+**Root cause of the underlying bug class is still NOT confirmed** — this is a generalized workaround (per the user's original session-5 directive, "not something that needs to be fixed just worked around"), not a fix. Ruled out one candidate mechanism while investigating: `GuestInvocation` gives every interrupt/RPC-callback invocation its OWN isolated `R5900Context` (`ee_scheduler.h:126-133`, `activeContext()` returns `invocations.back().context`), so a shared-mutable-context clobber across nested invocations is NOT the mechanism. Also confirmed (via a pre-existing 2026-07-25 comment in `Dispatcher.cpp:7-15`) that `handleSyscall` itself does not alter `$ra` as a side effect. The actual stomping mechanism for why these specific resume-label reloads read 0 remains open.
+
+**Needs a rebuild + run** to confirm the new syscall_stub_z_7 guard actually fires/heals and to see how much further eeCyc gets past `45951316184`.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 41) — **user chose to root-cause via a live data watchpoint rather than patch further or redesign the scheduler. First implementation attempt was placed at the wrong hook point (zero data); corrected by reusing the `kSdbzFrameTraceSlots` replaceFunction mechanism from the 2026-07-20/22 rpc_call hunt, which is proven to work for exactly this class of dispatch. Needs a rebuild + run.**
+
+**Why not "skip prologue" after all:** reading `output/fn_17CF50_0x17cf50.cpp` line-by-line shows the real prologue (0x17cf50-0x17cf58) DOES run and DOES correctly write `$ra` to `sp+0x20` in RDRAM on every true entry -- that memory write is real and persists. GPRs (including the live `$ra` register used for the `jal`'s own bookkeeping) are also correctly preserved across every preempt/resume cycle. So "the scheduler skips a prologue on resume" was the wrong mental model from parts 38-40 -- the corrupted slot means something ELSE overwrites that exact RDRAM address later, or `$sp` has drifted from its value at the original prologue write.
+
+**First attempt failed silently (informative failure, not wasted):** hooked `EeScheduler::run()`'s top-level dispatch loop on `ctx->pc==0x17cf50u`, expecting it to fire at every true entry. The run came back with ZERO `[HWSTAT]`/`[HWWATCH]` records -- the armer thread never even started. Root cause: `sub_17CF50` is normally entered via a NESTED INLINE C++ call from its caller (`sub_10C480`'s own generated code does `auto targetFn = runtime->lookupFunction(...); targetFn(...)` directly), never touching the scheduler's own dispatch loop at all -- that loop only ever sees `sub_17CF50` on the RESUME labels (0x17cf68/0x17cf70/0x17cfa4), which is exactly the case my hook excluded. Reverted both edits (EeScheduler.cpp hook + the extern "C" wrapper in game_overrides.cpp).
+
+**Found existing, proven-correct infrastructure for this exact problem while investigating the failure:** `game_overrides.cpp`'s `kSdbzFrameTraceSlots[]` / `sdbzFrameTraceWrapper<I>` / `installSdbzFrameTraceWrappers` (2026-07-20/22, built for the rpc_call/0x178be8 hunt) works by calling `PS2Runtime::replaceFunction()` on EVERY registered slot address (true entry AND every resume label) -- since `replaceFunction` swaps what `lookupFunction()` returns, this fires for BOTH nested inline calls and top-level scheduler dispatches, unlike my dispatch-loop hook. Its own comment names the mechanism directly: "the recompiler registers interior 'resume' addresses of a function as their own dispatch-table slots aliasing back to the same function... a dispatch that reaches one of those slots outside a legitimate resume executes `ld $ra, N($sp)` against the CALLER's frame" -- i.e. this is the SAME bug class already partially characterized for rpc_call, not a new discovery.
+
+**Part 41 fix, corrected (game_overrides.cpp only, no EeScheduler.cpp changes needed):**
+- Added 4 entries to `kSdbzFrameTraceSlots[]` (~line 2102): `{0x0017CF50u,...}` (true entry), plus its 3 resume labels, all with `funcStart=0x0017CF50u`. `kSdbzFrameTraceSlotCount`/`installSdbzFrameTraceWrappers` pick these up automatically via the existing `index_sequence` mechanism -- no other registration code needed.
+- Inside `sdbzFrameTraceWrapper<I>` (~line 3605), added an `isCf50TrueEntry` block mirroring the existing `isRpcTrueEntry` one, arming `hwWatchArm(rdram, entrySp + 0x20u)` (sub_17CF50's own `$ra` offset, vs rpc_call's `-0x10`) whenever the TRUE entry slot fires. Deliberately unconditional on `PS2X_HWWATCH_CLIENT` -- that var only silences the *competing* rpc_call arm, not this one.
+
+**Next run needs (same as before, `-HwWatch` plus):**
+- `$env:PS2X_HWWATCH_VAL = '0xFFFFFFFF'` -- record EVERY store, not just value==1 (tuned for rpc_call's old "flips to 0x1" symptom; ours zeroes instead).
+- `$env:PS2X_HWWATCH_CLIENT = '1'` -- disarms the competing rpc_call arm site so it doesn't steal the single DR0 slot mid-run.
+- Do NOT set `PS2X_HWWATCH_ADDR`.
+
+**After the run:** check `run_hwwatch.txt` and `analyze_run.py --tag HWSTAT`/`--tag HWWATCH`. `HWSTAT armed=1` with `hits>0` names the actual writer's RIP + backtrace directly.
+
+**Result (2nd run): looked like still-zero HWSTAT/HWWATCH, but that was a TOOLING error, not a code problem.** `analyze_run.py --tag "HWSTAT" --log run_log.txt` returned 0 records both times -- wrong flag. `HWSTAT`/`HWWATCH` are `ps2x_probe_kv` families and live in `run_probe.jsonl`, queried via `--probe NAME`, not `--tag` (which is for `[bracketed]` console lines like `semwatch:*`). See [[project_diagnostic_tooling]] for the now-documented distinction. The `[frametrace:cf50wrap]` diagnostic (added to settle whether the wrapper even fires) confirmed `isCf50TrueEntry` DOES evaluate true (16 hits, `I=75`, correct slot/entryPc/entrySp).
+
+**`--probe HWSTAT` showed the REAL result: `armed=1 selfarm=0x987 hits=0 seen=0 skipped=0 outwin=0 drop=0`** -- DR0 genuinely was armed and self-armed 2439 times, and genuinely never saw a single store to the watched address (not even a filtered-out one) -- a trustworthy "never written" negative, but on the WRONG address. Root cause (a real bug in my own code, found by cross-referencing `entrySp` from `[frametrace:cf50wrap]` against the resume-time `sp` from `[semwatch:cf50resume]` in the SAME run -- 0x1ffbee0 vs 0x1ffbeb0, exactly `0x30` apart): `entrySp` is captured at the wrapper's start, BEFORE the real prologue's `addiu $sp,$sp,-0x30` runs, so `0x20($sp)` in the prologue's OWN frame of reference is `entrySp-0x30+0x20 = entrySp-0x10`, not `entrySp+0x20` as originally armed. **Fixed** (`game_overrides.cpp` ~line 3609): now arms `entrySp - 0x10u`. Needs one more rebuild+run (same env vars: `-HwWatch`, `PS2X_HWWATCH_VAL=0xFFFFFFFF`, `PS2X_HWWATCH_CLIENT=1`) -- and query with `--probe HWSTAT`/`--probe HWWATCH` this time, not `--tag`.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 40) — **part 39's patch CONFIRMED working (eeCyc 36.3M -> 32.19 BILLION, ~900x further). Hit the third-recurrence trigger from part 39's own plan: same bug class at multiple new call sites, at least one with MANY static callers -- no safe single-value fallback exists. Escalating to the user rather than deciding unilaterally, per the boundary set in part 38/39.**
+
+**Part 39 result:** rebuilt + run. `[workaround:cf50resume]` and `[workaround:fillz18aec]` both fired repeatedly and in lockstep (32 logged hits each, capped -- the underlying patch itself is uncapped and kept firing every loop iteration) as `eeCyc` climbed from 2.8M past 1 BILLION in the logged window, and `[watchdog] eeCyc=` shows it reaching **32,190,266,168** before the run's 200s window ran out and it froze again. This is ~900x further guest progress than the part-37/38 freeze point (36.3M) and by far the largest advance of the session.
+
+**New freeze, third distinct call site of the SAME bug class:** watchdog's final state: `pc=0x0 ra=0x0 lastCall=0x177fc4`, `stuckSecs` climbing to 187 by t=198s. The generated-code trace at the moment of freeze shows `callee=0x177eb0 entryPc=0x177fc4 ... exitPc=0x0 exitRa=0x0` -- the exact same signature as parts 37-39 (a resume-label entry immediately producing a zeroed pc/ra). A second, independently pre-existing diagnostic (`[frametrace:RASLOT]`, dated 2026-07-26, originally written for an unrelated IRQ-worker/critical-section race that was already marked RESOLVED at the time) is ALSO firing repeatedly this run at `slot=0x178be8`/`0x178dac` with `saved=0x0` -- the same zeroed-slot signature, not the old race's specific corrupted-value signature, suggesting this may be the same generic class hitting a third (or fourth) function, not a revival of the old race.
+
+**Why this is the point to stop patching addresses one at a time:** part 39's fix was only safe because `eeref.py up 0x17cf50` proved `sub_17CF50` has exactly ONE static caller -- no ambiguity about the correct fallback value. Checking the same way for the two new sites:
+- `eeref.py up 0x177eb0` -- `sub_177EB0` is called via `0x177fe8` (itself called from **10** different sites), fanning out to dozens of distinct call chains.
+- `eeref.py up 0x178be8` -- `rpc_call` is called from at least 3 distinct top-level chains with more branching underneath.
+
+Neither has a single unambiguous return address. A healthy-sibling probe hit here would only tell us what ONE particular call site's return address looks like, not all of them -- picking a fallback would be a guess, which breaks the evidentiary bar parts 37 and 39 both met. This matches exactly the condition flagged in part 39's "Next step" as the trigger to raise the tradeoff with the user rather than deciding it myself: continue finding + verifying a safe fallback per address (safe, incremental, but has just proven to have no natural end and no longer has a "one caller" shortcut to lean on) vs. a general dispatch-level fix in `EeScheduler.cpp` (would close the whole bug class at once, but changes core dispatch semantics -- a bigger, riskier change than any of the three patches applied so far).
+
+**Next step:** this needs the user's call, not mine -- raised in chat rather than decided unilaterally.
+
+**Data gathered from the part-38 diagnostic run:** `analyze_run.py --tag "semwatch:cf50resume"` returned 3 records: `#1 sp=0x1ffbeb0 raOnEntry=0x17cfa4 raAtSpPlus32=0x10c4b4 eeCycle=2813992` (a HEALTHY hit, before either dormant event), `#2 sp=0x1ffbe30 raOnEntry=0x17cfa4 raAtSpPlus32=0x0 eeCycle=2814288` (the original part-36 freeze point), `#3 sp=0x1ffbe30 raOnEntry=0x17cfa4 raAtSpPlus32=0x0 eeCycle=36369000` (the post-part-37 freeze point, 32 cycles after the part-37 patch fired).
+
+**Fallback established without guessing:** `eeref.py up 0x17cf50` shows `sub_17CF50` has exactly ONE static caller in the entire binary — `sub_10C480`, via a `jal` at `0x10c4ac`. With a single caller there is no call-site ambiguity: every legitimate invocation must return to `0x10c4ac+8 = 0x10c4b4`. Hit `#1` recorded exactly that value live, confirming the static prediction. This meets the same evidentiary bar part 37 used (a healthy-sibling observation in the same run), just combined with a static single-caller proof this time.
+
+**Part 39 fix (workaround, in [EeScheduler.cpp:601-660](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:601), same file/shape as part 37):** when `ctx->pc==0x17cfa4` and `raAtSpPlus32==0`, patch that RDRAM slot to `0x10c4b4` before `sub_17CF50`'s own epilogue reads it. Logs `[workaround:cf50resume]`. The diagnostic `[semwatch:cf50resume]` logging stays in place alongside it.
+
+**Next step:** user rebuilds RelWithDebInfo, runs again (same `launch_recomp.ps1 -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -HwWatch` invocation). Query `analyze_run.py --tag "workaround:cf50resume"` to confirm it fires, then `--tag watchdog` / `--tag "semwatch:zeropc"` to see how far `eeCyc` advances past `36369000` and whether a third recurrence of the same bug class (inline-call-with-return-guard losing a caller's saved `$ra` across callee preemption) shows up yet another frame up. If it does, this is the point to raise with the user whether a general dispatch-level fix is warranted instead of continued per-address patching — that would touch `EeScheduler.cpp`'s core dispatch semantics, not just a local memory patch, and is not a call to make unilaterally.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 38) — **part 37's workaround CONFIRMED working (eeCyc jumped from 2.8M to 36.3M), but exposed a recursive sibling bug at the next call-frame up. Diagnostic-only probe added; needs another rebuild+run before a fallback can be chosen.**
+
+**Part 36 status: CONFIRMED PARTIAL.** User built+ran RelWithDebInfo. `vbl/s` is nonzero (3-4/s) for the whole 200s run — the IRQ worker thread fix works, VBlank delivery is alive. But a SECOND, distinct bug then surfaced: the guest's sole thread (tid=1, nTh=1) went permanently `Dormant` at `eeCycle=2814288` — same freeze point as before part 36, different mechanism. Per explicit user directive ("its not something that needs to be fixed just worked around") this was worked around, not root-caused, and the user delegated the specific mechanism to my judgment.
+
+**Part 37 mechanism (confirmed via `eeref.py` + live log, not guessed):** the dormant transition happens at `0x178aec`, an ordinary in-body instruction inside `mem_fill_z_18` (0x178a08-0x178b54), reached via the recompiler's generic "preempt mid-function, unwind to scheduler, re-dispatch via `lookupFunction(ctx->pc)`" mechanism (confirmed unreachable via any static `jal`/`j` — `eeref.py refs 0x178aec` — consistent with a resume-only label, not a branch target). On this resume, the generated stub does `ld $ra,96($sp); jr $ra` — a real MIPS reload from the function's own stack slot. `[semwatch:fillz18mid]` showed one healthy sibling in the same run (`sp=0x1ffbe40, raAtSpPlus96=0x17cfa4`, a legitimate resume back into `sub_17CF50` right after its `jal mem_fill_z_18`) and one broken one (`sp=0x1ffbdc0, raAtSpPlus96=0`) — the latter's `jr $ra` would send `ctx->pc` to 0 with the invocation stack empty, permanently dormanting the guest's only thread.
+
+**Part 37 fix (workaround, in [EeScheduler.cpp:542-599](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:542)):** when `ctx->pc==0x178aec` and `raAtSpPlus96==0`, patch that one RDRAM slot to `0x17cfa4` (the value proven correct for this exact call site earlier in the same run) before the stub's epilogue reads it. Logs `[workaround:fillz18aec]`.
+
+**Result: it fired twice (`eeCycle=2814272`, then again at `eeCycle=36368984`) and eeCyc advanced ~33.5M cycles it never reached before — real forward progress, not a crash.** But `[semwatch:zeropc] #10` then caught a NEW dormant event 32 cycles later: `lastDispatchPc=0x17cfa4, invocationsEmpty=1` — this time for real, no invocation left to bounce to.
+
+**Part 38 — same corruption class, one frame up, confirmed by reading generated code (not guessed).** [output/fn_17CF50_0x17cf50.cpp:105-126](output/fn_17CF50_0x17cf50.cpp:105): `sub_17CF50` calls `mem_fill_z_18` via an *inline C++ call* and guards its own continuation with `if (ctx->pc != 0x17CFA4u) { return; }`. When `mem_fill_z_18` preempts mid-body, that bail-out unwinds `sub_17CF50`'s own C++ frame too — so the eventual re-dispatch at `0x17cfa4` (via part 37's patched fallback) goes through the scheduler's fresh `lookupFunction(0x17cfa4)`, entering `fn_17CF50_0x17cf50` at `label_17cfa4` directly and **skipping `sub_17CF50`'s own real prologue at `0x17cf50`** — which is what writes a valid `$ra` to `sp+0x20` (32). The skipped invocation's own epilogue (`0x17cfc4: ld $ra,0x20($sp)`) then reads whatever stale value sits there. Unlike part 37, this run has no healthy-sibling observation of what `sp+0x20` should legitimately hold at this specific resume, so a blind patch risks sending the guest somewhere worse than a detectable dormant state.
+
+**Fix applied (diagnostic only, NOT yet a workaround — [EeScheduler.cpp:601-635](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:601)):** logs `[semwatch:cf50resume]` with `sp`, `raOnEntry`, `raAtSpPlus32` whenever `ctx->pc==0x17cfa4`, unconditionally, no memory write. Needs a rebuild + run to gather data — if a healthy sibling shows up in that log (a case where `raAtSpPlus32` is nonzero/valid), that's the fallback value for a part-39 patch mirroring part 37's shape.
+
+**Next step:** user rebuilds RelWithDebInfo, runs again (same launch_recomp.ps1 invocation is fine — `-Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -HwWatch`). Query `analyze_run.py --tag "semwatch:cf50resume"` for the new data. If it recurs at yet another frame up, the pattern is now well-enough understood (recompiler's inline-call-with-return-guard idiom loses its caller's own stack-saved `$ra` across any preemption inside a callee) that a general fix at the dispatch level may be more appropriate than continuing to patch one address at a time — flag that trade-off to the user rather than deciding it unilaterally, since it touches `EeScheduler.cpp`'s core dispatch semantics, not just a local memory patch.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 36) — **ROOT CAUSE FOUND AND FIXED (not yet built/tested): `EnsureVSyncWorkerRunning()` had zero production call sites.** The VBlank-delivering IRQ worker thread never started outside unit tests. Fix applied to [ps2_runtime.cpp](ps2xRuntime/src/lib/ps2_runtime.cpp) — awaiting user build+run.
+
+**How this was found:** continuing from part 35's live x64dbg attach (same process, still paused, PID unchanged). Re-examined `run_probe.jsonl`'s HWWATCH data (18 hardware-watchpoint hits on guest `0x1ffbe20`, the address from the original "checkpointDue bounce" ★★★ item): every hit is a different value/RIP from `GameThread` itself, several repeating `0x0` writes from the same 2 RIPs (ordinary epilogue cleanup). **Nothing here looks like a corruption — it's normal stack-slot reuse across shallow sequential calls, and it just stops.** This retires the "stack clobber" framing; it's consistent with, not contradictory to, part 35.
+
+Per part 35, [EeScheduler.cpp:2307-2319](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:2307) self-perpetuates VBlank deadlines (`scheduleEvent()` for the next VBlankEnd+VBlankStart, called *before* `processEvent()`) — so once VBlank ticking starts, `m_deadlines` should never actually go empty. But [EeScheduler.cpp:289-295](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:289) has an explicit comment: SDBZ deliberately does **not** self-seed VBlank in the scheduler; "SDBZ's IRQ worker thread is the sole source of `EeEventType::VBlankStart` via `postEvent()` instead." `postEvent()` pushes into `m_events` (checked by the wait predicate), not `m_deadlines` — so the scheduler's own self-rearm loop is essentially dead weight for this build; the *only* thing that can ever wake `waitForEvent()`'s unconditional wait is that external IRQ worker thread.
+
+**Checked whether that thread is alive, live, via x64dbg (`GetThreadList` + per-thread `switchthread`/`GetCallStack` on all 19 threads):** identified every thread definitively — `sofdecStatLine` probe, CPU `samplerMain`, `hwWatchArmerMain`, two miniaudio threads (WASAPI command + audio callback, both healthy, proving audio is a fully separate subsystem from the frozen EE side), `GameThread` (still parked exactly as in part 35), `PcWatchdog`, plus NVIDIA driver / InputHost / COM threadpool threads unrelated to the runtime. **`g_irq_worker_thread`/`interruptWorkerMain` is not in the list at all.**
+
+**Static confirmation:** grepped the whole repo for `EnsureVSyncWorkerRunning` (the only wrapper that calls the file-local `ensureInterruptWorkerRunning()`, which itself is called from nowhere else). Every call site is inside `ps2xTest/` (`ps2_scheduler_workload_regression_tests.cpp:822`, `ps2_runtime_expansion_tests.cpp:682,4744`). **Zero call sites in `ps2_runtime.cpp`, `game_overrides.cpp`, or any generated runner code.** `stopInterruptWorker()`/`signalInterruptWorkerStop()` are equally uncalled — the whole subsystem was orphaned, not just the start path. Confirmed `interruptWorkerMain()` (Interrupt.cpp:344) handles both wall-clock and `PS2X_DETERMINISM` (quantum + 50ms-stall-fallback) vblank pacing in one function — there is no alternate driver elsewhere.
+
+**Why boot got ~1s / eeCycle=2814288 in before freezing, instead of hanging immediately:** the guest runs plenty of instructions/syscalls before it ever needs a real vsync (hence all the ordinary `0x1ffbe20` stack traffic in HWWATCH). The freeze is the *first* genuine "wait for vblank" the guest performs — at that point `m_events`/`m_deadlines` are both empty and nothing exists to ever call `postEvent()`, so `EeScheduler::waitForEvent()`'s unconditional wait (EeScheduler.cpp:2487) blocks forever. This lines up exactly with the `[semwatch:waitforever] #1 entering eeCycle=2814288` log line from part 35.
+
+**Fix applied** (not built/tested yet — per house rule, user runs builds):
+- Added `#include "Kernel/Syscalls/Interrupt.h"` to `ps2_runtime.cpp`.
+- In `PS2Runtime::run()`, immediately before `std::thread gameThread(...)` is constructed: `ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);` — starts the worker before the guest can possibly reach its first vsync-wait.
+- In the shutdown sequence, right after `requestStop();`: `ps2_syscalls::stopInterruptWorker();` — joins the now-live worker cleanly on exit (previously dead code, so this was never needed before).
+
+**Next step:** user builds (RelWithDebInfo, per [[project_framerate_instrumentation]] — Debug is not a valid perf/correctness gate) and runs. Expect either: (a) boot proceeds past the freeze point, or (b) if it doesn't, some other blocker was hiding behind this one and the same live-x64dbg-attach technique from part 35/36 applies again immediately. If (a), re-verify against [[project_pcsx2_title_screen_trace]]'s "only four holes to the title screen" baseline.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 35) — **SETTLED, live, via x64dbg: the freeze is a clean, legitimate condition-variable wait that nothing ever wakes.** Part 34's `std::cerr`-pipe-backpressure hypothesis is RULED OUT.
+
+**Setup:** user started a fresh run with no `-RunSeconds` limit ("recomp running tno time limit"), so the frozen process stays alive indefinitely instead of getting killed at 200s. Used the newly-verified x64dbg MCP to attach live: `attach 0x46C8` (hex — x64dbg's command parser defaults numeric args to hex; decimal `18120` silently failed, `0x46C8` worked; `IsDebugging` confirmed the attach). `GetThreadList` found the guest-dispatch thread by name: **`GameThread`** (tid 26572), separate from `PcWatchdog` (tid 18732, the diagnostic sampler thread analyzed in part 34). Paused, switched focus to `GameThread` (`switchthread 0x67CC`), and pulled its live native call stack:
+
+```
+ps2entryrunner.EeScheduler::waitForEvent+11C
+  -> msvcp140._Cnd_wait+2A
+  -> kernelbase.SleepConditionVariableSRW+38
+  -> ntdll.RtlSleepConditionVariableSRW+1DE
+  -> ntdll.ZwWaitForAlertByThreadId+14
+ps2entryrunner.EeScheduler::run+E2
+ps2entryrunner.`PS2Runtime::run'::`2'::<lambda_1>::operator()+84
+... (normal thread-entry trampoline down to RtlUserThreadStart)
+```
+
+**This directly rules out part 34's hypothesis.** The thread is not blocked inside a `std::cerr`/pipe write, not spinning, not crashed. It is cleanly parked in a real, well-formed `std::condition_variable::wait()` inside `EeScheduler::waitForEvent()` — exactly the code path at [EeScheduler.cpp:2465-2495](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:2465), specifically the unconditional no-timeout branch at line 2487 (`m_eventCv.wait(lock, ...)`), which is only reached when **both `m_events` and `m_deadlines` are empty**.
+
+**Confirmed against the log, not just the live stack:** that exact branch already has a probe from a prior session (`[semwatch:waitforever]`, comment dated 2026-08-30 — a pre-existing part-34-numbered probe from BEFORE this session, unrelated to today's part 34 entry above; the numbering collision is in the code comment, not a state-file duplicate). `analyze_run.py --tag "semwatch:waitforever"` on the live run's log shows exactly one record and no wake:
+```
+[semwatch:waitforever] #1 entering eeCycle=2814288
+```
+`eeCycle=2814288` matches part 33's frozen `eeCyc=2814288` watchdog value exactly — this is the same freeze event, now root-caused at the mechanism level. No `#1 woke` line has ever followed (confirmed still true live, hours into this run).
+
+**What this means:** `EeScheduler::run()` correctly ran out of work — `m_deadlines` (the timer/event queue) drained to empty, and nothing has called `scheduleEvent()` or `postEvent()`/notified `m_eventCv` since. This is a real "no more scheduled wakeups" state, not a corrupted jump or an I/O hang. It is **consistent with, and likely downstream of,** the stack-clobber found in part 33: whatever normally re-arms the next deadline (per [EeScheduler.cpp:2311,2314](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:2311), VBlank re-arming happens INSIDE the same event-processing path that fires when a scheduled event's deadline hits) never got to run its own re-arm call. The watchdog's `nextDl=0` reading from t=1s onward (checked in part 33/34's own watchdog line) is consistent with `m_deadlines` having been empty essentially from the start of the freeze, not draining gradually.
+
+**Not yet checked — the real remaining question:** WHY did the last-processed event (whatever it was — possibly not a VBlank at all this early, `eeCycle=2814288` is very early boot) fail to re-arm a successor? Two candidate framings, not yet distinguished:
+1. The stack-clobber (part 33, hit #17, `sub_178068`'s `$s1`-into-`$ra`-slot write) corrupted state that the event handler needed to decide what to re-schedule, so it silently took a no-op/early-return path instead of calling `scheduleEvent()` again.
+2. This is actually normal, momentary idle behavior on real hardware too (a legitimate brief gap with no armed timer), and the real bug is upstream — something that's SUPPOSED to arm the first VBlank/timer deadline during boot never got the chance to run, independent of the stack-clobber.
+
+**Next step:** with the process still live and paused-on-demand via x64dbg, read `m_deadlines`/`m_events`/`m_eventCv` state and the guest's own interrupt-enable bits (INTC_MASK et al.) directly rather than guessing — or bracket it in source by finding every caller that could have been the "last" event processed before eeCycle 2814288 and checking whether ITS branch has a missing `scheduleEvent()` call on some path. This is now a scheduler-logic question, not a stack-corruption-mechanism question — the two may still be connected via part 33's clobber, but they are now separable and this one is directly inspectable live.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 34) — SUPERSEDED by part 35 (live x64dbg attach ruled out the `std::cerr`-pipe hypothesis below; kept for the dispatch-ring/`m_debugPc` evidence, which is still valid and load-bearing). the same run's OWN data (no rebuild, no re-run) narrows the freeze to a single blocking call, and rules out one candidate. **New leading hypothesis: the guest-dispatch thread hangs inside a `std::cerr` write, not inside guest MIPS logic at all.**
+
+**What was re-examined:** the part-33 run's `run_log.txt`/`run_probe.jsonl` are still on disk. Instead of proposing a new run, I pulled three things straight out of the existing data via `analyze_run.py`:
+
+1. **`[runmeta]` confirms `noDebugger=True`** and every env var actually exported (`PS2X_FRAMETRACE=1` WAS already set this run — correcting part 33's "currently only armed, not recording" note, which was written before checking runmeta). This lets me rule something out cleanly (below).
+
+2. **The global dispatch ring (`trace=` field of every `[watchdog]` line, fed unconditionally by `pushDispatchPc()` inside `lookupFunction()` — [ps2_runtime.cpp:1730](ps2xRuntime/src/lib/ps2_runtime.cpp:1730), no gate, no `PS2X_FRAMETRACE` dependency) is frozen identically from t=1s onward:**
+   ```
+   trace=0x178610 -> 0x178068 -> 0x174ce0 -> 0x178aec -> 0x174cb0 -> 0x17cfa4 -> 0x10c4b4 ->
+   0x186ec8 -> 0x186c50 -> 0x178de8 -> 0x178260 -> 0x17ed60 -> 0x178a08 -> 0x178428 -> 0x17ed60 ->
+   0x17edb0 -> 0x174ca0 -> 0x177fe8 -> 0x177eb0 -> 0x1781b0 -> 0x175060 -> 0x178068 -> 0x175090 ->
+   0x178560 -> 0x174cd0 -> 0x178608 -> 0x1784d0 -> 0x178610 -> 0x178068 -> 0x174ce0 -> 0x178aec -> 0x174cb0
+   ```
+   Oldest-first, 32 entries (ring size). The chain `178610→178068→174ce0→178aec→174cb0` appears TWICE (start and end) — this is two legitimate laps through the same real boot-sequence pattern, not garbage. **The very last dispatch ever recorded is `0x174cb0`** — i.e. after hit #17's `sub_178068` clobber, execution continued CORRECTLY through `174ce0`→`178aec`(resume)→`174cb0`, and only stopped after that. `lastCall=0x174cb0` and `sysPc=0x174cb0` in the same watchdog line corroborate this independently. So the clobber at hit #17 did **not** immediately derail control flow — whatever finally hangs happens one call layer past `174cb0`.
+
+3. **`m_debugPc`/`m_debugRa` (`EeScheduler.cpp:371-372`, stored unconditionally at the top of every scheduler-loop iteration, BEFORE the `context.pc==0u` check at line 415) read `pc=0x0 ra=0x0`, frozen, in every `[watchdog]` line from t=1s on.** This means `context.pc` genuinely reached literal `0` at least once — directly contradicting the part-33 note that treated `[semwatch:zeropc]`'s zero hit-count as meaning "pc never reaches 0 this run." It reaches 0. It just never gets past logging it.
+
+**New, load-bearing question this raises, answered in part:** why would `context.pc==0u` be true, `m_debugPc` capture it, and the `[semwatch:zeropc]` cerr line at `EeScheduler.cpp:434` (guarded only by a trivial atomic counter, `n<=32`) never print even once? Between the successful `m_debugPc.store(0)` (line 371) and that first possible print (line 434), the only code is: 4 trivial atomic stores, the `RecompDbg::Update`/`CheckBreakpoint` IPC block (376-398), and the `if(context.pc==0u)` branch itself.
+
+**Ruled out, by direct evidence (not guessed):** `RecompDbg::Update`/`CheckBreakpoint` cannot be the hang. Both start with `if (!s_shm) return;` ([recomp_debug_writer.cpp:136](ps2xRuntime/src/lib/recomp_debug_writer.cpp:136), [:200](ps2xRuntime/src/lib/recomp_debug_writer.cpp:200)), and `RecompDbg::Init()` (which allocates `s_shm`) only runs when `PS2X_DEBUGSHM` is set ([ps2_runtime.cpp:3212](ps2xRuntime/src/lib/ps2_runtime.cpp:3212)). `launch_recomp.ps1` explicitly `Remove-Item Env:PS2X_DEBUGSHM` under `-NoDebugger` (line ~220), and this run's own `[runmeta]` line confirms `noDebugger=True`. `s_shm` was null all run; both calls are single-pointer-check no-ops. (This also retroactively rules out the `while(s_shm->bp_hit){...Sleep(1);}` spin-wait in `CheckBreakpoint` — a real blocking primitive that exists in this code, but is provably unreachable this run.)
+
+**What's left, once RecompDbg is eliminated:** the only remaining statement in that window capable of *blocking* (not just costing time) is the `std::cerr <<` call itself at line 434 (or one of the several other `std::cerr` writes on the hot path — `[watchdog]`, `[frametrace:*]`, `[pump]`, hwwatch dumps — all sharing the same OS pipe back to `launch_recomp.ps1`'s `Tee-Object`). This run stacked FOUR simultaneously-verbose probes (`HWWATCH` + `FRAMETRACE` + `HostProfile` + the standing `[watchdog]`/`[cblist]`/`[pump]` lines) — enough console volume that a full OS pipe buffer with a slow/stalled reader on the PowerShell side is a real, mechanical way for a single `std::cerr` write to block forever. This would explain every symptom without requiring any new MIPS-level corruption theory: `context.pc` reaching 0 could itself be perfectly ordinary (e.g. a clean thread-dormant transition), and the "freeze" is actually the diagnostic harness deadlocking on its own output, not a recompiler bug at all.
+
+**Also checked this session:** the `PS2X_FRAMETRACE` ring (`dumpFrameTrace()`) is confirmed dead weight for this bug specifically — it only ever prints from inside `PS2Runtime::reportMissingFunction()` ([ps2_runtime.cpp:2093](ps2xRuntime/src/lib/ps2_runtime.cpp:2093)), a one-shot "missing dispatch target" report that never fires here (every target this run resolves to a real function). The per-slot `[frametrace:IMBAL]`/`[frametrace:LEAFEXIT]` immediate-print records DID fire (8 and 10 hits) but all belong to a different thread (`tid=0xe196`, `entrySp≈0x1ff3xxx`) — an earlier, unrelated `0x178068` invocation at a completely different stack depth than the fatal one (`tid=0x4d90`, `entrySp=0x1ffbda0`, per part 33's hwwatch backtrace). Confirms `0x178068` is legitimately called from multiple concurrent contexts at very different `$sp` ranges by design — consistent with part 32/33's existing comment on this — but this particular probe path never captured the actual fatal call. Correct part 33's "Next step (b)" accordingly: turning `PS2X_FRAMETRACE=1` back on (already done, in fact) buys nothing further here without also wiring a new emit site.
+
+**Next step — no rebuild, needs a live attach, not a new probe:** re-run the identical command (already have it; nothing needs to change), and while the process is hung (any time after ~t=5s, it stays hung for the full ~190s remainder of the window), use the just-verified **x64dbg MCP** ([reference_x64dbg_mcp_setup.md]) to attach to the live `ps2EntryRunner.exe` and pull `GetCallStack`/`GetThreadList` for the EE-scheduler thread specifically (name it via `GetThreadList`, or match the tid printed in `[watchdog]`/hwwatch output). If that thread's native stack shows it inside a CRT/Win32 I/O call (`WriteFile`, `ucrt` stdio internals, console-handle write) — the pipe-backpressure hypothesis is confirmed, and the fix is nothing to do with `dispatchGuestBranch`/stack-clobber at all: it's throttling/buffering the diagnostic output. If instead it shows a normal MIPS-interpretation call chain still inside `dispatchGuestBranch`/`EeScheduler::run`/`makeDormant` — the original part-33 stack-clobber theory stands and this was a dead end. Either way this settles it directly, live, with zero code changes.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 33) — THE CLOBBERING WRITE IS IDENTIFIED, with a backtrace. Part 32's race fix worked; the re-run produced 18 real hits on `0x1ffbe20`. The last one, immediately before the permanent freeze, is `sub_178068`'s own prologue register-save executing as a **fresh top-level scheduler dispatch that shares an overlapping, stale `$sp` with the still-parked `mem_fill_z_18` call chain.**
+
+**Setup:** user re-ran with env vars correctly set this time (`PS2X_HWWATCH_ADDR=0x1ffbe20`, `PS2X_HWWATCH_VAL=0xFFFFFFFF`, both re-exported in the same shell before invoking `launch_recomp.ps1` — the prior attempt lost them across a shell restart and watched the wrong, already-closed address `0x464dc0` instead). `run_probe.jsonl`'s HWSTAT now reads `guest=0x1ffbe20 armed=1 selfarm=1 hits=0x12(18) seen=0x12 thr=0x12` — the part-32 fix confirmed working (`selfarm>0` on the first heartbeat) AND, this time, a real non-degenerate result. Backtraces are in `run_probe.jsonl.hwwatch.txt` (repo root — note the actual filename is `<probe-sink-name>.hwwatch.txt`, i.e. keyed off `PS2X_PROBE_FILE`/the probe sink's name, not a fixed `run_hwwatch.txt` unless no sink name is set).
+
+**Read all 18 hits directly (not sampled).** Hits #9, #11, #12, #16 are legitimate: real return-address-shaped values (`0x178018`, `0x186f9c`, etc.) written from deep inside the still-live, nested C++ call `EeScheduler::run → sub_0010C480 → dispatchGuestBranch → sub_186EC8 → dispatchGuestBranch → mem_fill_z_18_0x178a08` — each is `mem_fill_z_18` (or a callee in its chain) saving its own `$ra` at `sp+0x60` where `sp=0x1ffbdc0`, exactly the address and mechanism part 31 predicted from static analysis.
+
+**Hit #17 (the LAST hit, immediately before the freeze) breaks the pattern:**
+```
+=== HWWATCH hit #17  guest=0x01ffbe20  newval=0x00000000  tid=0x4d90 ===
+  store site: sub_00178068_0x178068 + 0x1f7   [sub_00178068_0x178068.cpp:120]
+  host stack: hwWatchVeh -> ... -> sub_00178068_0x178068 -> sdbzFrameTraceWrapper<52> -> EeScheduler::run+0x12a0 -> PS2Runtime::run lambda -> thread entry
+```
+`sub_00178068_0x178068.cpp:120` is `WRITE64(ADD32(GPR_U32(ctx,29),128), GPR_U64(ctx,17))` — the guest instruction `sd $s1, 0x80($sp)`, a completely ordinary MIPS callee-save in `sub_178068`'s own prologue (`addiu $sp,$sp,-0xA0` executed first). The value it wrote, `0`, is simply whatever `$s1` held in that context — not a hardcoded zero, just an unlucky register value.
+
+**The call stack for this write has ZERO `dispatchGuestBranch` frames and ZERO `mem_fill_z_18`/`sub_186EC8`/`sub_0010C480` ancestry** — it goes directly `EeScheduler::run → sdbzFrameTraceWrapper<52> → sub_178068`. This is a **fresh top-level scheduler dispatch**, completely unrelated to the parked `mem_fill_z_18` chain, executing while that chain is still logically mid-call (never having reached its own epilogue). For `sub_178068`'s write to land on `0x1ffbe20`, its own `$sp` at entry must be `0x1ffbda0` — 0x20 **deeper** than `mem_fill_z_18`'s frame base (`0x1ffbdc0`), meaning `sub_178068`'s frame `[0x1ffbda0, 0x1ffbe40)` fully overlaps `mem_fill_z_18`'s still-needed frame `[0x1ffbdc0, 0x1ffbe30)`, including its `$ra`-save slot at `+0x60`.
+
+**Ruled out, by direct code read (not guessed):** this is NOT an invocation-pool/async-callback-stack collision. `PS2Runtime::reserveAsyncCallbackStack` ([ps2_runtime.cpp:2836](ps2xRuntime/src/lib/ps2_runtime.cpp:2836)) carves downward from `kAsyncCallbackStackTop=0x00100000` (~1MB mark) — nowhere near `0x1ffbe20` (top-of-RAM main stack, ~32MB mark). `invocationStackTop()`'s memoized per-`(threadId,depth)` addresses come from that same pool. So `sub_178068` is not running on a scheduler-managed invocation stack; it's using the single shared `ctx->sp` register directly, same as `mem_fill_z_18`.
+
+**Mechanism, confirmed by reading the actual generated call sites** ([mem_fill_z_18_0x178a08.cpp:322](ps2xRuntime/src/runner/mem_fill_z_18_0x178a08.cpp:322)): every `dispatchGuestBranch` call in this function follows the pattern `if (!runtime->dispatchGuestBranch(...)) { return; }`. When `checkpointDue()` fires, `dispatchGuestBranch` returns `false` and `mem_fill_z_18` does a bare C++ `return;` — abandoning its own C++ activation record entirely, **without touching `ctx->sp`**. This bubbles up through every intervening caller's identical `if (!dispatchGuestBranch(...)) return;` pattern, all the way to the scheduler's top-level loop, which just re-reads `context.pc` (parked at the bounce target) next iteration. `ctx->sp` is never saved, restored, or "reserved" anywhere in this path — it is bare shared mutable state with no concept of "a parked call chain still owns this range."
+
+**Leading hypothesis (well-evidenced, not yet 100% proven):** the checkpoint-bounce mechanism has no notion that an abandoned/parked call chain still logically owns its stack frame. Something in the scheduler's redispatch path between the bounce and the eventual correct resume of `0x178aec` legitimately advances `ctx->sp` further (to `0x1ffbda0`) before dispatching `sub_178068` — i.e. `sub_178068` is real, correct guest control flow, just executing at a moment when `ctx->sp` is wrong (stale-deep) for what SHOULD be a much shallower point in the game's actual call graph. On real PS2 hardware this never happens because a blocking syscall doesn't hand control to unrelated top-level code at a different logical stack depth; here, the checkpoint-bounce+redispatch trick effectively does exactly that, with no stack-region protection.
+
+**Not yet checked:** the exact sequence of `ctx->pc` values between the `0x174CE0` bounce and `sub_178068`'s dispatch (does `0x174CE0` correctly `jr $ra` back to `0x178AEC` first, and does mem_fill_z_18 actually get one more correct resume before `sub_178068` runs — or does something upstream of `sub_178068` itself already have a corrupted `$ra` that redirects here instead of back into `mem_fill_z_18`?). The existing `s_dispatchHist[4]` ring buffer in `EeScheduler.cpp` (~line 413) already logs the last 4 dispatched PCs on every `context.pc==0u` hit — cross-referencing that against this run's hwwatch hit sequence (both keyed on the same freeze) would show whether `sub_178068` is an expected/normal-looking neighbor call or an already-corrupted jump target itself.
+
+**Checked, this session:** `[semwatch:zeropc]` fired ZERO times in this run (`grep -c` on both `run_log.txt` and the raw log = 0) — unlike part 30's run, `ctx->pc` never actually reaches the literal `0u` dormant-handler path this time. Combined with the watchdog's frozen call-trace being IDENTICAL from t=1s through t=193s (a real address chain, not a `0`/spin marker), this run's freeze looks like it never gets far enough to reproduce part 30's exact "`jr $ra` with `$ra==0`" ending — it's consistent with the corruption from hit #17 instead redirecting execution into a genuine infinite bounce/dispatch cycle earlier, rather than reaching a clean dormant-pc=0 state. Not yet reconciled with part 30's mechanism; both could be real (different runs, same root corruption, different downstream symptom depending on exact timing).
+
+**Next step (no build needed — pure analysis):** the `s_dispatchHist[4]` ring buffer in `EeScheduler.cpp` (~line 413) only prints via the `[semwatch:zeropc]` path, which didn't fire — so it's not available for this run. To get real cross-referencing data, either (a) add an unconditional low-rate dump of `s_dispatchHist`/`context.pc` independent of the `pc==0` gate, or (b) just re-run with `PS2X_FRAMETRACE=1` (already wired, currently only "armed" not recording per this run's `[frametrace] armed` line) to get a full call/return trace across the freeze window, which would show directly whether `sub_178068` is a normal neighbor in the boot sequence or a divergence. Either way, the fix is almost certainly in `dispatchGuestBranch`/`EeScheduler`: the checkpoint-bounce path needs to snapshot-and-restore `ctx->sp` (or otherwise reserve the parked chain's stack range) so an unrelated top-level dispatch can't reuse it before the parked chain resumes.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 32) — part 31's hwwatch run came back inconclusive for a NEW, confirmed reason (not "address never written"): the DR0 watchpoint armed too late to see the fatal window. Fix applied to `game_overrides.cpp` (closes the race); rebuild + re-run needed.
+
+**part 31's run analyzed.** User ran the corrected hwwatch command. `run_hwwatch.txt` was never created and `run_log.txt` has zero `[HWSTAT]` lines — but that's because HWSTAT goes to `run_probe.jsonl` (JSON sink), not the human-readable log; checked there instead and it's full of records:
+```
+{"seq":"0x3", ..., "probe":"HWSTAT","guest":"0x1ffbe20","armed":"0x1","skipped":"0x0","outwin":"0x0","hits":"0x0","seen":"0x0","drop":"0x0", ...}
+```
+`armed=1` (target correctly set), but `hits=0/seen=0/skipped=0/outwin=0` for the entire 200s run — per the code's own documented interpretation table this is the "all four zero → address genuinely never written" branch. **That reading is wrong for this run, proven by the probe's own sequence numbers, not guessed:**
+- `run_probe.jsonl`'s global `seq` counter shows 3 `[CRITSEC]` records (unrelated probe, same file) BEFORE the first-ever `[HWSTAT]` record. Those three show guest progress climbing `0x287 → 0x2b4 → 0x2c1` (647 → 692 → 705) — and `0x2c1`/705 is the exact frozen `progress=` value from every `[watchdog]` line in every prior part (26-31). I.e. **guest progress had already reached its final, permanently-stuck value by the time the FIRST `[HWSTAT]` heartbeat printed.**
+- `[HWSTAT]` only prints from inside `hwWatchArmerMain`'s loop, on tick 0, which only runs after `SymInitialize()` + `AddVectoredExceptionHandler()` complete AND the loop's first `hwWatchSweep()` call returns ([game_overrides.cpp:2416-2513](ps2xRuntime/src/lib/game_overrides.cpp:2416), pre-fix line numbers). `hwWatchArm()` itself only *publishes* the target address ([game_overrides.cpp:3394](ps2xRuntime/src/lib/game_overrides.cpp:3394), pre-fix) — the actual DR0 register write happens exclusively inside that background thread's first sweep.
+- Conclusion, directly evidenced: **DR0 was never actually set on the guest thread until after the guest had already frozen.** The whole 200s of `hits=0/seen=0` describes a watchpoint that came up AFTER the suspension window part 31 wanted to observe had already closed — the classic shape of [[feedback_run_window_false_negative]] / [[feedback_degenerate_result_convicts_the_probe]]. Part 31's stack-slot-clobber hypothesis is neither confirmed nor refuted by this run; the probe just never watched the right moment.
+
+**Fix applied (`game_overrides.cpp`, no header touched):** split the two setup costs. `AddVectoredExceptionHandler` is a cheap synchronous call; `SymInitialize` (symbol/module enumeration, only needed later for the eventual `.hwwatch.txt` backtrace dump) is the slow one that was gating everything else behind it on the background thread. Added:
+- `hwWatchEnsureVeh()` — registers the VEH once, guarded by a new `g_hwWatchVehUp` atomic, callable from any thread.
+- `hwWatchArmSelf(uint64_t host)` — sets DR0 on the CALLING thread directly via `SetThreadContext(GetCurrentThread(), ...)` (no suspend needed/possible for self), thread_local-deduped so it's a no-op once already armed for the current target.
+- `hwWatchArm()` now calls `hwWatchEnsureVeh(); hwWatchArmSelf(host);` synchronously, inline, immediately after publishing `g_hwWatchHost` — BEFORE spinning up the background thread. The background thread (`hwWatchArmerMain`) is unchanged otherwise (still owns `SymInitialize`, periodic re-sweep for any other/future thread, the HWWATCH dump, and the HWSTAT heartbeat) and now calls the same guarded `hwWatchEnsureVeh()` instead of registering the VEH a second time.
+- Added a `selfarm` field to the `[HWSTAT]` heartbeat (now 12 keys) — `g_hwWatchSelfArmed`, incremented on every successful inline self-arm. **This is the direct confirmation signal for the next run:** `selfarm>0` on the very first HWSTAT record proves DR0 was live before the background thread even finished its own setup, closing the specific gap this run exposed.
+
+**Next step:** user rebuilds (`build.ps1 RelWithDebInfo`) and re-runs the same hwwatch command from part 31 (env vars `PS2X_HWWATCH=1`/`PS2X_HWWATCH_ADDR=0x1ffbe20`/`PS2X_HWWATCH_VAL=0xFFFFFFFF` already in shell, `-HwWatch` switch already in the command):
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -HwWatch -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+Read `run_probe.jsonl` for `HWSTAT`, not `run_log.txt` (confirmed this session: HWSTAT is JSONL-only, never printed to the console/text log). Branches:
+- `selfarm=0` on every record → the fix didn't actually close the gap (e.g. `hwWatchArm` still isn't reached before the freeze at all, or `hwWatchStaticAddr()` check is failing) — re-check whether `sdbzFrameTraceWrapper` runs before progress reaches 705 in this build.
+- `selfarm>0`, still `hits=0/seen=0/skipped=0/outwin=0` → NOW a real "never written" result — the address is genuinely never touched during the suspension window, which reopens part 31's stack-slot-clobber hypothesis (something else entirely must be zeroing $ra, e.g. a stale-read rather than a stale-write, or the corruption is at a different address than `entrySp-...=0x1ffbe20` assumed).
+- `hits>0` → `run_hwwatch.txt` names the actual writer via its backtrace — read that first, this closes part 31 directly.
+
+---
+
+## HANDOFF 2026-08-31 (session 5, part 31) — root MECHANISM found for the $ra=0 freeze: `PS2Runtime::dispatchGuestBranch`'s `checkpointDue()` early-return (before `targetFn(...)` runs) bounces a mid-call-chain guest function back to the scheduler with `ctx->pc` parked at the callee address. Refined bug: NOT prologue-skip (disproven), likely a stack-slot clobber during the bounce window. Hardware watchpoint queued, blocked on a launcher command typo (fixed, not yet re-run). Session closed here — resume with the corrected hwwatch command below.
+
+**Ring-buffer contradiction from part 30 resolved:** `[semwatch:fillz18mid]` (0 hits one run, 2 hits the next, under identical code) was plain run-to-run scheduling variance, not a probe bug — confirmed via `[semwatch:zeropc] #9`'s own `hist=0x10c4b4,0x178068,0x174ce0,0x178aec` ring-buffer field, whose values arithmetic-match the fillz18mid hits' `sp`.
+
+**Mechanism, read directly from [ps2_runtime.cpp:2120-2222](ps2xRuntime/src/lib/ps2_runtime.cpp:2120) (`PS2Runtime::dispatchGuestBranch`):**
+- Line ~2128: `ctx->pc = targetPc;` happens FIRST, unconditionally.
+- Immediately after: `if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles)) { return false; }` — this can fire *before* `targetFn(rdram, ctx, this)` is ever called.
+- When this fires during `mem_fill_z_18_0x178a08`'s `jal 0x174ce0` (a real, correctly-generated syscall stub — [syscall_stub_z_10_0x174ce0.cpp](ps2xRuntime/src/runner/syscall_stub_z_10_0x174ce0.cpp), syscall `0x44`, verified not buggy), the caller unwinds to the scheduler with `ctx->pc=0x174CE0`. Scheduler redispatches it fresh (runs correctly), its own `jr $ra` sets `ctx->pc=0x178AECu` (the real caller's saved $ra), scheduler redispatches THAT fresh via `lookupFunction`, which resolves back into `mem_fill_z_18_0x178a08`'s own internal resume table (`switch(ctx->pc){case 0x178aecu: goto label_178aec;}`) — by luck/design this lands on the correct function, but as a brand-new top-level invocation with no relation to the original call chain's C++ stack.
+- Two distinct `checkpointDue()` call sites exist (both `kGuestDispatchCycles=8`, [ee_scheduler.h:268](ps2xRuntime/include/runtime/ee_scheduler.h:268)): the outer one in `EeScheduler::run()` ([EeScheduler.cpp:595](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:595), ruled out — `[schedwatch:skip]` = 0 hits) and the inner one inside `dispatchGuestBranch` (the actual culprit, per its own comment: "bounds straight-line call chains that have no local loop").
+
+**Refined bug statement — prologue-skip hypothesis DISPROVEN:** Using the pre-existing `[semwatch:fillz18dispatch]` probe (2 real top-level entries this run) and arithmetic on the prologue's `addiu $sp,$sp,-0x70`, both the benign AND fatal `0x178aec` resumes correspond to invocations whose real prologue at `0x178a08` fully executed, including the unconditional `sd $ra,0x60($sp)` store. So the RDRAM slot (fatal case: `sp=0x1ffbdc0` → addr `0x1ffbe20`) WAS correctly written with a nonzero $ra at entry, and read back as 0 later. **Current hypothesis (unconfirmed): something else writes 0 to that exact RDRAM stack address during the checkpoint-bounce suspension window** — most likely another interleaved invocation/thread whose own stack usage collides with the same guest address while `mem_fill_z_18`'s call chain is parked.
+
+**Side finding, not yet acted on:** duplicate function generation for `0x178a08`-`0x178b54` — both `fn_178A08_0x178a08.cpp` (older, raw `hasFunction`/`lookupFunction` pattern) and `mem_fill_z_18_0x178a08.cpp` (newer, Ghidra-named, `dispatchGuestBranch` pattern) exist in `src/runner/`; only the latter is wired in `register_functions.cpp`. Structurally equivalent internal re-entry tables, so not implicated as the direct cause — likely a leftover from the func-map-gap-holes regen ([[project_ghidra_func_map_rebuilt]]). Worth a cleanup pass once the freeze is closed, not urgent.
+
+**BLOCKED, then fixed, not yet re-run:** hardware watchpoint on the fatal RDRAM address to catch the clobbering writer. First attempt failed — `launch_recomp.ps1` throws when `PS2X_HWWATCH_*` env vars are set without the `-HwWatch` switch (deliberate guard against a silent false-negative). Fix confirmed via grep of the script; **next command to run** (env vars `PS2X_HWWATCH=1`, `PS2X_HWWATCH_ADDR=0x1ffbe20`, `PS2X_HWWATCH_VAL=0xFFFFFFFF` should still be set in the user's shell):
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -HwWatch -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+No rebuild needed (env/switch-gated existing instrumentation). After running: check `run_hwwatch.txt` (repo root) for the backtrace of whoever wrote to `0x1ffbe20`, and console/`run_log.txt` `[HWSTAT]` line to confirm the watchpoint actually armed (`hits>0` names the writer; `hits=0,skipped>0` unexpected since VAL=0xFFFFFFFF matches everything; `hits=0,skipped=0` means either the address is genuinely never written post-prologue — contradicts current hypothesis — or the watch never armed on the right thread).
+
+---
+
+## HANDOFF 2026-08-30 (session 5, part 30) — [semwatch:zeropc] fired. The freeze is `mem_fill_z_18_0x178a08` returning via `jr $ra` with $ra==0. Traced to source: confirmed via static read of the generated `.cpp`, not inference. New probe added to catch $ra at call entry; awaiting next build+run.
+
+Fresh run (`PS2X_DETERMINISM=1`, 200s) hit the part-29 probe:
+```
+[semwatch:zeropc] #1-8  invocationsEmpty=0  (various pc, e.g. 0x17ee80, 0x17f4b0, 0x17e5d8, 0x178068 — legitimate nested pops)
+[semwatch:zeropc] #9    tid=1 invocationsEmpty=1 lastDispatchPc=0x178aec eeCycle=2814288   <- the freeze
+```
+`eeCycle=2814288` matches the frozen `eeCyc` in every `[watchdog]` line from t=1s through t=197s — the freeze happens inside the first second, not gradually.
+
+**Static trace (read directly, not guessed):** `lastDispatchPc=0x178aec` is `label_178aec` inside `mem_fill_z_18_0x178a08` ([output_scratch_210regen_v2/mem_fill_z_18_0x178a08.cpp](output_scratch_210regen_v2/mem_fill_z_18_0x178a08.cpp) — this is a scratch regen dir, not necessarily byte-identical to the live `output/`, but addresses/logic should match). The function:
+- Uses `a0 = 0x563100` (built from `lui 0x56; addiu 0x3100` at 0x178a1c/0x178a34) — matches the `cid=0x80000009` SIF service from the part-28 fix.
+- Is a **polling loop**: repeatedly calls `func_174CB0`/`func_174CE0` (status checks) via `dispatchGuestBranch(..., DirectCall, "JAL")`, each of which unwinds back to the scheduler and resumes via the `invocations` stack (this is why hits #1-8 are healthy nested pops with non-empty invocations — normal poll iterations).
+- On this run, the poll condition was finally satisfied, the function fell through to its epilogue at `label_178b38` (restore saved regs, `jr $ra` at 0x178b4c), and **`ctx->pc = GPR_U32(ctx,31)` — the literal value of $ra — was 0**. [mem_fill_z_18_0x178a08.cpp:450-465](output_scratch_210regen_v2/mem_fill_z_18_0x178a08.cpp:450) confirms this is a direct register read, not a hardcoded sentinel: the scheduler's `context.pc==0u` handler only fires because $ra itself was 0.
+- $ra is saved/restored from this function's OWN stack frame (`sd $ra,0x60($sp)` at entry, `ld $ra,0x60($sp)` before the jr) — so nothing *inside* this function zeroed it. Whoever called into `0x178a08` (or the `dispatchGuestBranch` DirectCall path standing in for a `jal 0x178a08`) must have already had $ra=0 in GPR31.
+- **Ruled out** the "this is a thread-entry trampoline, $ra=0 by SDK convention" hypothesis: `eeref.py up 0x178a08 --depth 4` shows this is a widely-shared helper (`mem_fill_z_18`) reached from 19+ static call sites (via `sub_179B28`, `sub_17CF50`→`MemSysInit`→`GameInit`, `sub_1866A0`, etc.) — it is not a dedicated thread entry point.
+
+**Next probe (already added, [EeScheduler.cpp:501-516](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:501)):** `[semwatch:fillz18entry]` logs `$ra`/`$sp`/`$a0` every time `ctx->pc==0x178a08` exactly (a fresh call, not a mid-function label resume), capped at 32 hits. Check on next run: do earlier calls into this function show a real (nonzero) $ra, and only the fatal one shows 0? If so, that pins the bug on whoever made THAT specific call — cross-reference against `eeref.py up 0x178a08` callers and the SIF cid=0x80000009 bind chain from part 28/29, since `a0=0x563100` on the fatal call would confirm it's the same SIF-bind path. Also worth cross-checking `soHandler=0x17ee80` in the `[watchdog]` output — 0x17EE80 was one of the 12 real gaps in the func-map (see [[project_ghidra_func_map_rebuilt]]), fixed and validated but **not yet baked into the live `output/`** per that memory; `[semwatch:zeropc] #1/#2` both dispatched through 0x17ee80 successfully, but if the live build still has stale/gap behavior there it remains a plausible register-corruption source upstream of the fatal call — not yet confirmed either way.
+
+Not yet known — not guessed, not yet measured: whether $ra=0 at the call site is itself the SDK's own convention for *this particular caller* (in which case the real bug is elsewhere — e.g. why nothing else exists to resume once this returns, i.e. why `[thsync] nTh=1` never becomes 2), or a genuine corruption bug in the call/dispatch chain leading up to it.
+
+Build: `& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo`
+Run: `& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"`
+
+---
+
+## HANDOFF 2026-08-30 (session 5, part 29) — part 28's fix CONFIRMED: WaitSema(4)/(5) deadlock is gone. New blocker found one step downstream: the guest's only thread (nTh=1) returns to pc=0 with no invocations pending and goes dormant — total EE freeze, no crash. Probe added, awaiting next build+run.
+
+**Confirmation of part 28's fix**, fresh `run_log.txt` from the user's own build+run:
+```
+[semwatch:reqendgate] #1 cid=0x80000009 ranToOwnReturn=1 clientPtr=0x564980 gateValue=0x4
+[semwatch:reqendgate] #2 cid=0x80000009 ranToOwnReturn=1 clientPtr=0x5688a8 gateValue=0x5
+[semwatch:signal] id=4 interruptSafe=1 found=1 waiters=0 count=0   (line 228)
+[semwatch:wait]   id=4 found=1 count=1                              (line 236, succeeds immediately)
+[semwatch:signal] id=5 interruptSafe=1 found=1 waiters=0 count=0   (line 269)
+[semwatch:wait]   id=5 found=1 count=1                              (line 277, succeeds immediately)
+```
+`ranToOwnReturn=1` on both hits (was `0` before the fix) — the dispatcher now genuinely completes and runs `fn_175090` → `fn_178560` → `SignalSema`, exactly as diagnosed. Both semaphore binds (id=4, id=5) now signal-then-wait cleanly instead of deadlocking. **Part 27 and part 28's root-cause chain is closed.**
+
+**New blocker, found immediately downstream, same run:**
+- `[semwatch:dispexit] #15 exitPc=0x0` (line 276) — the *first* `exitPc=0x0` in the whole run (hits #1-#14 all landed on real addresses), firing right after `reqendgate #2` and right before `wait id=5` succeeds. Its `exitSp=0x1ffbe40` doesn't match the nested SIF-reply frames (`~0x1ff3c50-0x1ff3d30` throughout the rest of the trace) — it matches the *outer* stack range seen at the very top of the log (`entrySp=0x1ffbee0`/`0x1ffbfb0`), meaning this fired from the top-level `EeScheduler` dispatch loop, not from inside `deliverSifRpcReply`.
+- Immediately after this, the entire EE thread goes silent: `eeCyc` frozen at `2814288` for the rest of the 199s run (identical at t=1s/193s/197s/198s/199s), `busy%=0` throughout, `stuckSecs` climbing to 198 — not a single-thread block this time, a total halt. `[thsync]` confirms only one guest thread the whole run (`nTh=1`, thread id 1 — same thread the original WaitSema(4) block was on).
+- `EeScheduler.cpp`'s dispatch loop (`ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:402`, `if (context.pc == 0u)`) is the exact handler for this: if the thread's `invocations` stack is non-empty, it pops one and resumes the parent (legitimate nested-call return); if empty, it calls `makeDormant()` and clears `m_currentThreadId` — i.e. **the thread parks itself with nothing left to wake it**. Whether this is (a) a legitimate invocation-pop that should have found a parent invocation but didn't, or (b) the guest's actual main-loop function genuinely returning (a real bug — the game's thread function should never return during normal play) is not yet known — **not guessed, not yet measured.**
+
+**Probe added (`EeScheduler.cpp` ~line 400-429, `[semwatch:zeropc]`, capped at 32 hits):** two file-scope statics (`s_semwatchLastDispatchPc`/`s_semwatchLastDispatchTid`, declared line 400-401) are updated every time the loop successfully resolves a non-zero `context.pc` via `lookupFunction()` (line ~484, right after the existing `[schedwatch]` instrumentation's insertion point). When `context.pc == 0u` is hit, the probe logs `tid`, `running->invocations.empty()`, and those last-dispatch statics — settling directly whether the zero-pc event follows a genuine invocation-stack pop or the thread's own top-level return, and naming exactly which guest function dispatched last before pc went to 0.
+
+**Next build+run should show:** `[semwatch:zeropc] #1 tid=<n> invocationsEmpty=<0|1> lastDispatchPc=0x<addr> lastDispatchTid=<n> eeCycle=<n>`. Read `lastDispatchPc` first — that names the guest function whose return (or trampoline hop) produced pc=0, the same way `[semwatch:dispexit]`/`[frametrace:LEAFEXIT]` named `fn_175090` last time. If `invocationsEmpty=1`, the thread genuinely went dormant with no way back — the next question is why nothing else (VBlank interrupt, a second thread, a queued invocation) was set up to revive it, which likely means checking `[thsync] nTh=1` never becoming `2` and whatever guest code is supposed to spawn the game's real main-loop thread.
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 28) — ROOT CAUSE FOUND: `deliverSifRpcReply`'s mini dispatch-loop exits on the FIRST trampoline hop, silently dropping the rest of the dispatcher body. Fix applied to `SIF.cpp`; awaiting a build+run to confirm.
+
+**The part-27 probe answered its own question, and it was branch 3 ("ranToOwnReturn=0"), but the correct diagnosis is not what that branch guessed.** Fresh run (`run_log.txt`):
+```
+[semwatch:reqendgate] #1 cid=0x80000009 ranToOwnReturn=0 clientPtr=0x564980 gateRead=1 gateValue=0x4 gateNegative=0
+```
+`gateNegative=0` — the `client_obj+8` SignalSema gate from part 27 was a red herring; it would have passed fine. The real break is upstream of it entirely.
+
+**Root cause, confirmed by cross-referencing the probe against the log's own frametrace lines, not inferred:**
+- `[semwatch:dispexit] #5 exitPc=0x175090` (line 219) — right after `[frametrace:LEAFEXIT] callee=0x178068 entryRa=0x175068 exitRa=0x1780e4` (line 220, tracks the SAME call) — shows the dispatcher's translated code executed the `jal` at `0x1780dc` into `func_175090` (`sceSifSetDChain`, confirmed by the `fn_175090_0x175090.cpp` filename) and set `ctx->pc=0x175090`.
+- `0x175090` is **not** a genuine return — it's `fn_175090`'s own entry address. A direct `jal` to a statically-known callee compiles to a **trampoline**: set `ctx->pc` to the callee's entry and return as a plain C++ call, relying on the *real* dispatch loop to look the callee up, invoke it, and resume the caller via `$ra`. `deliverSifRpcReply` is standing in for that dispatch loop but wasn't doing this hop.
+- The old loop (`SIF.cpp` ~line 1085) only checked `ctx->pc < kSifDispatcherFn || ctx->pc >= kSifDispatcherEnd` (i.e. outside `[0x178068,0x1781b0)`) and treated that as "genuinely returned, done." `0x175090` satisfies that check too, purely because it's a *different* function's address — not because the dispatcher finished. So the loop broke immediately, **`fn_175090` never ran**, and everything after it in the dispatcher body — the `jalr $a2` into `fn_178560` and its `SignalSema` call — never executed. `[semwatch:reqendgate]`'s `ranToOwnReturn = (ctx->pc == savedPc)` correctly reported `0`, proving this directly: `0x175090 != savedPc`.
+- Worse: line ~1165 (`ctx->pc = savedPc;`) unconditionally snapped execution back to the caller regardless of whether the dispatcher truly finished — silently papering over the dropped continuation. No crash, no error, just a quietly incomplete dispatch. That's why the whole system goes idle at t≈1s instead of erroring: `WaitSema(4)` really is never signaled, because the guest code path that would call `SignalSema(4)` (`fn_178560` → `func_174CD0`) is never reached in the first place.
+
+**Fix applied (`SIF.cpp`, `deliverSifRpcReply`'s mini dispatch-loop, ~line 1078-1132):** replaced the narrow range-check exit condition with: (1) break only when `ctx->pc == savedPc` (the actual injected sentinel — genuine top-level return); (2) if `ctx->pc` is still inside `[kSifDispatcherFn, kSifDispatcherEnd)`, resume `dispatcher` directly (unchanged — this is the existing resumable-coroutine/preemption-yield case); (3) otherwise, resolve `ctx->pc` via `runtime->lookupFunction()` and call *that* function next, looping again — following the trampoline chain instead of stopping at the first hop. If resolution fails, still break (preserves the existing derail-detector behavior for genuine derails). The `[semwatch:reqendgate]` probe (part 27) was left in place unchanged — after this fix, `ranToOwnReturn` should read `1` on the next run, which is the direct confirmation signal.
+
+**Next step:** user builds and runs. Read `[semwatch:reqendgate]` in the fresh log:
+- `ranToOwnReturn=1` → fix confirmed; check `[semwatch:signal] id=4` next (previously always absent) — if it now appears, cross-check the watchdog fields for whether the guest thread actually progresses past t≈1s.
+- `ranToOwnReturn=0` still → the trampoline-follow fix didn't fully close the gap (e.g. another hop type not covered, or `lookupFunction` failing on `0x175090` for an unrelated reason) — check for a fresh `[SifRpcReply] dispatcher resume cap hit` or a `[SIF_DIAG:DERAIL]` line to see where the new loop actually stops.
+- The EeScheduler.cpp Phase 3 rewrite (part 27's regression lead) is very likely **not** the cause after all — this bug is fully explained by `SIF.cpp`'s own loop logic, which predates that rewrite. Keep it as a secondary lead only if the fix above doesn't resolve the stall.
+
+## HANDOFF 2026-08-29 (session 5, part 27) — Part-26's "0x178560 never invoked" RETRACTED (wrapper-bypass false negative, same shape as feedback_registerfunction_bypass). Traced the actual runner .cpp for fn_178068 and fn_178560 byte-for-byte; found the real SignalSema gate (`client_block[8] < 0` skip) and a strong regression lead (EeScheduler.cpp Phase 3 rewrite, 08-26/27, landed AFTER the 08-11 run that passed this exact BIND). Added `[semwatch:reqendgate]` probe to SIF.cpp; awaiting a build+run.
+
+**Part-26 correction.** The grep-based "`0x178560` appears once, only at registration" conclusion was a false negative, not evidence of non-invocation. Read `fn_178068_0x178068.cpp` and `fn_178560_0x178560.cpp` (the actual recompiled runner files, ground truth per [[feedback_imbal_exitpc_can_be_preemption]]) in full and statically traced them against the exact packet `deliverSifRpcReply` synthesizes for this BIND:
+- `fn_178068`'s dispatcher body, after its copy loop, calls `func_175090` (the sceSifSetDChain syscall stub) as a plain subroutine, then continues to `0x1780e4` and eventually reaches `jalr $a2` at `0x178180`, which is a table-driven indirect call. Traced the table walk: cid `0x80000008` (our packet's word[2]) → slot 8 → `fn=0x178560`, matching the `[SIF_DIAG] sys[8] fn=0x178560` registration dump exactly.
+- The `jalr $a2` call is `runtime->lookupFunction(jumpTarget); targetFn(...)` — a **direct inline C++ call from inside `fn_178068`'s own translated body**, the identical shape [[feedback_registerfunction_bypass]] already documented for the `0x175090` call. That means the existing `[semwatch:reqend]` entry probe (game_overrides.cpp:3620, wraps `funcStart==0x00178560` at the top-level dispatch wrapper) **cannot see this invocation either way** — its silence in the fresh run's log is expected, not proof `0x178560` never ran.
+- Strong (but not yet proven) evidence `0x178560` DOES run: `deliverSifRpcReply` injects a sentinel `$ra` (`savedPc`, the caller's own pc) before the first call into the dispatcher specifically so a genuine `jr $ra` return is distinguishable from a mid-body preemption. The fresh run's `[semwatch:dispexit] #5` shows `exitPc=0x175090` — matching that sentinel — meaning the dispatcher's body ran all the way to its own `jr $ra`, which is only reachable by falling through the `jalr $a2` call and the rest of the function tail.
+- Read `fn_178560_0x178560.cpp` in full and traced it against our packet: `$a0` at entry is the **address of the packet's own local stack copy** (not a persistent object), so `client_block[8]` in the source comments = our packet's word[8] = `0x80000009` (`kSifCmdRpcBind`, set deliberately by `SIF.cpp:929`). That correctly hits the "register" branch (`0x1785e4`), which writes our packet's word[9]/word[10] into the REAL persistent client object (`pkt[7]` = `0x564980`, matching `[SIF:BIND] client=0x564980`) — matching the source comments exactly. **New finding: right after that write, there's a previously-unnoticed gate** — it loads `*(client_obj + 0x8)` and only calls `SignalSema` (`func_174CD0` at `0x178600`) if that value is **non-negative**; otherwise it skips straight past to `0x178608`. That field is guest-owned state the game itself set before ever sending the BIND — not something our synthesized reply touches.
+
+**Regression lead (user-directed: "check the old build first," before reaching for PCSX2).** [PS2_PROJECT_STATE.md:7178] (RUN 47/48, **2026-08-11**) already has PCSX2-cross-checked ground truth for this **exact** client/sid: `sceSifCallRpc(cd=0x564980 /*sid 0x80000003*/, ...)` completed successfully back then, and the game proceeded all the way to the SJX_Init/title-screen stage — meaning the `client_block[8]` gate cleared fine at that time. Today's freeze is on the very *first* occurrence of this same BIND, at t≈1s. Checked git history for what changed since: `SIF.cpp` hasn't been touched since `330acc38` (2026-08-25, PR #179 merge). **`EeScheduler.cpp` is a brand-new 2038-line file, landed 2026-08-26/27** (`a45fe142`/`657e1f08`, "Phase 3: EE scheduler... replacing dispatchLoop/ps2sched" — part of the 8-phase upstream catch-up, [[project_upstream_full_catchup_plan]]), i.e. it did not exist at the time of the successful 08-11 run. `657e1f08`'s own message ("restore 4 incomplete-migration symbols") signals the migration left gaps that had to be patched just to build — plausible more remain that don't block compilation but do change behavior. **Not yet proven** which specific behavior changed; this is the strongest lead, not a confirmed cause.
+
+**Action taken:** added `[semwatch:reqendgate]` to `SIF.cpp` (right after `deliverSifRpcReply`'s mini dispatch-loop breaks, ~line 1104), unconditional, bounded to 64 lines, read-only. Logs per delivery: whether the dispatcher ran all the way to its own `jr $ra` (`ranToOwnReturn`, comparing `ctx->pc` to the injected `savedPc` sentinel), and the actual live value at `client_obj+8` (`gateValue`/`gateNegative`) at that moment. This directly answers, without needing PCSX2: (1) did the dispatcher's body really reach the `jalr` call, and (2) is the SignalSema gate actually the blocker, or does it clear fine and the real bug is elsewhere (e.g. in the new EeScheduler's `signalSemaphore`/wake path, which `[semwatch:signal]` already shows is never even called for id=4 — so if the gate turns out to clear, the next thread to pull is why `func_174CD0`'s own guest body never reaches the `SignalSema` syscall).
+
+**Next step:** user builds and runs; read the new `[semwatch:reqendgate]` lines from the fresh `run_log.txt`. If `ranToOwnReturn=1` and `gateNegative=1` → confirmed, the gate is the blocker, next question is what should have set `client_obj+8` non-negative before the BIND (trace forward from the game's own BIND-issuing code, not backward from here). If `ranToOwnReturn=1` and `gateNegative=0` → the gate clears fine, so `SignalSema` executes on the guest side but its own syscall never reaches `EeScheduler`'s `signalSemaphore` for id=4 — pivot to tracing `func_174CD0`'s runner file next. If `ranToOwnReturn=0` → the dispatcher itself is stalling somewhere between `0x1780e4` and its own return, contradicting the static trace — re-examine `shouldPreemptGuestExecution()`'s interaction with the new `EeScheduler` (the regression lead above) directly.
+
+## HANDOFF 2026-08-29 (session 5, part 26) — `m_checkpointPending` hypothesis DISCONFIRMED by the new watchdog fields; pivot back to WaitSema(4) with a concrete new lead: `fn=0x178560` is registered as a SIF callback but never invoked.
+
+**The part-25 hypothesis is ruled out.** Grepped every `eeCyc=... nextDl=...` pair across the full `run_log.txt` of the fresh 200s run (all ~200 `[watchdog]` records, not just the console-visible ones): **`eeCyc=2813952 nextDl=0` is identical on every single sample from t=1s through t=197s**, no exceptions. This is branch (c) from the part-25 handoff, not branch (a): `m_eeCycle` itself never advances even once after the first second, so `checkpointDue()`'s cycle-deadline comparison (the branch the whole `m_checkpointPending`-stuck theory turned on) never gets re-evaluated at all after the freeze. There's nothing to get "stuck" on if that code path isn't being reached — the scheduler's cycle-accounting loop is not the bottleneck. Do not pursue the `m_checkpointPending` angle further without new evidence.
+
+**This pushes the investigation back to the original, more direct finding:** the guest thread is genuinely parked inside `WaitSema(4)` on the host side and nothing ever resumes it, so nothing downstream (including scheduler cycle accounting) ever runs again. Confirmed via `Sync.cpp`'s `waitSemaphore()` ([EeScheduler.cpp:1173-1200](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:1173)): when `object->count == 0`, it pushes the thread onto the semaphore's waiter list and calls `blockCurrent(...)` — a correct cooperative block, not a host spin. So the freeze is expected/correct *given* sema 4 is never signaled; the real question is why nothing ever calls `iSignalSema(4)`/`SignalSema(4)` for it.
+
+**New concrete lead from this run's raw log** (lines 206, 223-224 of `run_log.txt`):
+```
+[SIF_DIAG] sys[8] fn=0x178560 arg=0x563100 gp=0x503070
+...
+[semwatch:wait] id=4 found=1 count=0
+[semwatch:block] id=4 threadId=1
+```
+`0x178560` — already identified in this session's earlier `game_overrides.cpp` investigation trail as the SIF `_request_end` completion-callback handler and the only known candidate signaler of sema 4 — gets **registered** as SIF callback slot `sys[8]` shortly before the thread blocks. Grepped the entire 200s log for every occurrence of `178560`: **it appears exactly once, at that registration line, and is never referenced again** — no `[frametrace:*]` record, no dispatch-table hit, nothing shows it ever being *called*. So the candidate signaler is wired up but never invoked; sema 4 is therefore never signaled and the thread waits forever.
+
+**Not yet known (do not guess):** what should trigger the SIF layer to invoke `0x178560` — an IOP-side RPC/DMA completion event routed back to the EE — and whether that delivery mechanism is implemented, stubbed, or itself gated behind guest progress that can't happen because the thread is already blocked (a potential chicken-and-egg deadlock, unconfirmed). Next step: read the SIF completion-delivery path (`RPC.cpp` / wherever `sys[8]`-style callback slots get invoked) to find what's supposed to call entry `sys[8]` and check whether that call site is ever reached in this run.
+
+**Two independently-confirmed syscall identities, still valid:** syscall `0x44` = `WaitSema` ([Dispatcher.cpp:181-182](ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp:181)); syscall `-0x78` (issued by `syscall_stub_z_24`/`0x175090`) = `sceSifSetDChain` ([Dispatcher.cpp:350-352](ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp:350)), NOT WaitSema — these are two separate call chains, not one.
+
+## HANDOFF 2026-08-29 (session 5, part 25) — leading root-cause candidate found: `m_checkpointPending` may never clear. Re-read the pasted run's raw `run_log.txt` directly with `analyze_run.py` (not just the filtered console paste) and found the `[schedwatch]` probes' zero result was **misleading**: the console filter hides most tags. The full log shows the sibling probes in `game_overrides.cpp` (uncommitted, already written by an earlier pass this session) DID fire:
+- `[semwatch:dispidx]` (gated on the wrapped/`lookupFunction` path for `funcStart==0x175090`): **0 records**, confirming `runtime->hasFunction(0x175090u)` is FALSE this run — [fn_178068_0x178068.cpp:277-288](ps2xRuntime/src/runner/fn_178068_0x178068.cpp:277) always takes the **direct-call `else` branch**, never the wrapped one. This is `[[feedback_registerfunction_bypass]]` confirmed at the source level, not inferred.
+- `[semwatch:dispexit]` (gated on `funcStart==0x178068`, the wrapper `sub_178068` itself IS reached through): **6 records total** in 200s. #2/#3/#4 are byte-identical (`exitPc=0x1780c0`, the copy-loop preemption checkpoint) — three separate top-level invocations of `sub_178068`, each one yielding at the exact same first-iteration checkpoint with zero forward progress between them. Only 6 invocations of `sub_178068` in 200 real seconds is itself strong evidence of near-total starvation.
+
+**New static finding, not yet in prior handoffs — this is now the lead hypothesis:** `shouldPreemptGuestExecution()` ([ps2_runtime.h:587](ps2xRuntime/include/ps2_runtime.h:587)) is a direct alias for `EeScheduler::checkpointDue()`. Reading `checkpointDue()` ([EeScheduler.cpp:608-654](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:608)) and grepping every writer of `m_checkpointPending`:
+- It is set `true` from **at least six** call sites (`postEeEvent` L603, the cycle-deadline branch L640, `queueInvocation` L1372, L1997, `requestStop` L588, `processDueDeadlines` L2304).
+- It is read (and returns `true` immediately, short-circuiting everything else) at L617-621 — **this branch never clears it**.
+- It is cleared to `false` in exactly **two** places in the entire file: the scheduler's initial `reset()` (L260, run once at startup) and `processPendingEvents()` (L2039-2040), which recomputes it as `!m_events.empty() || cycleEventDue || m_stopRequested` — where `cycleEventDue = (nextEventCycle != 0 && m_eeCycle >= nextEventCycle)`.
+
+**The hypothesis:** if `m_nextDeadlineCycle` is set once (`processDueDeadlines`, L2336) and never advanced to a cycle beyond the current `m_eeCycle` after that deadline is "consumed", then `cycleEventDue` is true forever once `m_eeCycle` first crosses it — and since `m_eeCycle` is monotonic (only increases via `accountCycles()`), `m_checkpointPending` becomes permanently stuck `true` from that point on. Every subsequent call to `checkpointDue()` anywhere in the recompiled guest code — not just `sub_178068`'s copy loop, literally every cooperative-preemption checkpoint system-wide — would then return `true` immediately, forever. This matches the global symptom exactly: `busy%=0`, `res/s=0`, `vbl/s=0` for the entire 196s tail of every run, and would explain why `sub_178068` (and by extension everything downstream of it, including whatever is supposed to reach `iSignalSema(4)`) can never make progress, independent of the WaitSema/SIF-dispatch investigation thread.
+
+**Why this wasn't caught by `[schedwatch:skip]` (0 records) despite being gated on the exact same `checkpointDue()` call:** unresolved — plausibly `[schedwatch:skip]` (in `EeScheduler.cpp`, edited in an earlier part of this session) was not yet compiled into the binary used for the pasted run, since `game_overrides.cpp`'s independently-added `dispidx`/`dispexit` probes (which DID fire) live in a different translation unit. Needs a fresh build to resolve — do not draw conclusions from the mismatch yet.
+
+**Action taken this part:** added two fields to the existing 1Hz `[watchdog]` line ([ps2_runtime.cpp:5425-5443](ps2xRuntime/src/lib/ps2_runtime.cpp:5425), right before `trace=`) — `eeCyc=` and `nextDl=`, read via the **already-public** `EeScheduler::snapshot()` accessor (`EeKernelSnapshot::eeCycle` / `::nextEventCycle`, [ee_scheduler.h:214](ps2xRuntime/include/runtime/ee_scheduler.h:214)). **No header file was modified** — `snapshot()` and both fields already existed publicly; this avoids the full-rebuild risk of touching `ee_scheduler.h`. The watchdog fires every second regardless of guest progress (confirmed: it never missed a beat across the whole 200s stall), so this gives a continuous, non-gated trace of the exact two values the hypothesis turns on.
+
+**Interpretation branches for the next run:**
+- (a) `nextDl` stays fixed at some nonzero value while `eeCyc` keeps climbing past it every second → **hypothesis confirmed**: the deadline is never being rescheduled after being consumed. Next step: find where `processDueDeadlines()` (L2045+) is supposed to push a fresh deadline back onto `m_deadlines` / advance `m_nextDeadlineCycle`, and why that isn't happening for whatever event this is (likely VBlank, given `vbl/s=0` all run).
+- (b) `nextDl` is `0` the whole time → the cycle-deadline branch isn't the culprit; `m_checkpointPending` must be getting latched true by one of the OTHER five writers (`postEeEvent`/`queueInvocation`/etc.) and never cleared because `processPendingEvents()` itself isn't running, or `m_events` never empties. Next step: instrument `m_events.size()` in the same watchdog line.
+- (c) `eeCyc` itself stops climbing entirely (frozen, not just `nextDl` behind it) → `accountCycles()` is never being called at all after t=1s, meaning `checkpointDue()` itself is never being reached anywhere — a different, more fundamental dispatch problem than a stuck deadline.
+- (d) Both fields look healthy/moving normally → the `m_checkpointPending` theory is wrong; fall back to the still-open WaitSema(4)/SIF-dispatch thread (parts 21-24) using a fresh `[semwatch:dispidx]`/`[semwatch:dispexit]` run once schedwatch is confirmed actually compiled in.
+
+Also confirmed independently via the already-committed syscall-in-flight watchdog (`sysNum=0x44 sysA0=0x4 sysA1=0x4 sysPc=0x174ce0 sysRa=0x178aec`, frozen from t=1s onward every sample): syscall `0x44` = `WaitSema` (Dispatcher.cpp:181-182), called with sema id 4 — this is a second, fully independent confirmation of the `WaitSema(4)` stall (matches `[semwatch:block] id=4 threadId=1`), triangulated from a completely different probe than `semwatch`. Also confirmed syscall `-0x78` (the one `syscall_stub_z_24`/`0x175090` actually issues) is `sceSifSetDChain` (Dispatcher.cpp:350-351), a SIF DMA-chain setup call — NOT WaitSema itself, just an upstream step in the same dispatch chain believed to lead to the completion callback that would eventually signal sema 4.
+
+## HANDOFF 2026-08-29 (session 5, part 24) — `[schedwatch]` results are in: **zero records, both probes.** Neither `[schedwatch:skip]` nor `[schedwatch:dispatch175090]` fired once in the full 200s run (`analyze_run.py --tag schedwatch` → `records=0`, no `[cap]`, absence is valid). This falsifies part-23's two lead hypotheses: (a) NOT a tight skip-loop at the outer `checkpointDue()` gate (would have saturated the 40-cap fast; instead `cputime` shows real Wait states and `hostprof` shows 89.6% in `ntdll!ZwDelayExecution` — genuinely idle, not spinning); (c) NOT a "dispidx has a gating bug while dispatch actually happens" case either — the outer loop never dispatches `function()` with `context.pc==0x175090` at all.
+
+**Root mechanism found by reading `fn_178068_0x178068.cpp` directly:** `sub_178068` calls `syscall_stub_z_24` via a **direct in-body C++ call** (`fn_175090_0x175090(rdram, ctx, runtime);` at [fn_178068_0x178068.cpp:285](ps2xRuntime/src/runner/fn_178068_0x178068.cpp:285)) — NOT through the scheduler's outer dispatch loop. This confirms `[[feedback_registerfunction_bypass]]`'s prior prediction empirically instead of by assumption: `context.pc==0x175090` is a value that only ever exists transiently inside `sub_178068`'s own stack frame before the inline call, so the outer loop's dispatch-side check can never see it.
+
+**New, more concrete (still not fully confirmed) candidate: an orphaned-thread bug in the reschedule guard.** Read `checkpointDue()` in full ([EeScheduler.cpp:567-616](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:567)): it has **three** `return true` branches, but only **one** sets `m_rescheduleRequested`:
+- L576 `m_checkpointPending || m_stopRequested` → `return true`, `m_rescheduleRequested` **untouched**.
+- L596 cycle-deadline-due → latches `m_checkpointPending=true`, `return true`, `m_rescheduleRequested` **untouched**.
+- L608 same/higher-priority thread ready → sets `m_rescheduleRequested=true; m_timeSliceExpired=true;`, `return true`. **Only this branch sets it.**
+
+The post-`function()` guard ([EeScheduler.cpp:527](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:527)) only calls `enqueueReady()` and resets `m_currentThreadId=0` **if `m_rescheduleRequested` is true**. If `sub_178068`'s call-site preemption check (a plain cooperative `if (shouldPreempt()) return;`, not a `blockCurrent()`/semaphore path — confirmed `blockCurrent()` at [EeScheduler.cpp:1920-1929](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:1920) self-resets `m_currentThreadId=0` and throws, entirely bypassing this guard) hit one of the first two branches instead of the priority branch, the thread would never be re-enqueued — but `m_currentThreadId` staying pinned to it should have caused the outer loop to immediately retry the SAME thread next iteration, which contradicts zero `[schedwatch:skip]` records. This inconsistency is unresolved.
+
+**Also unresolved and arguably more important:** whether `sub_178068`'s thread (frametrace `tid=0x58dc`, a host thread id) is even the SAME guest thread as the one already confirmed legitimately blocked (`[semwatch:block] id=4 threadId=1` — `threadId` there is `GuestThread::id`, a small guest-side integer, a completely different id space). It's possible this entire `sub_178068`→`syscall_stub_z_24` excursion is tracing a benign, unrelated cooperative-preemption event on a thread that has nothing to do with the actual `WaitSema(4)` stall.
+
+**Fix added (probe, no functional change):** `[schedwatch:funcret175090]` at [EeScheduler.cpp:510-544](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:510) (approx, right after `function()` returns) — fires when `context.pc==0x175090` on return from `function()`, logging `running->id` (guest thread id — directly comparable to `[semwatch:block]`'s `threadId`), `m_eeCycle`, `m_rescheduleRequested` (pre-decision), `m_currentThreadId` (pre-decision). Capped at 20. This directly answers: (1) does `sub_178068` belong to guest thread 1 (the one already known blocked on `WaitSema(4)`)? (2) was reschedule requested at this exact preemption? Old `[schedwatch:skip]`/`[schedwatch:dispatch175090]` probes left in place (harmless, already proven silent).
+
+**Next steps (user runs build+run+analyze — 4 tags now: `semwatch`, `schedwatch`):**
+- If `tid` in `[schedwatch:funcret175090]` == `1` → `sub_178068` IS the already-blocked thread; the `WaitSema(4)` call must happen somewhere downstream of this call chain (possibly inside `sceSifSetDChain` indirectly, or in whatever `sub_178068` calls after — re-trace forward from here, not backward).
+- If `tid` != `1` → this whole `sub_178068` thread is a red herring for the WaitSema(4) stall specifically; drop this thread and instead trace directly from `[semwatch:wait] id=4`/`[semwatch:block] threadId=1` forward — find what code guest thread 1 was running right before it called `WaitSema(4)`, and what's supposed to call `SignalSema(4)`.
+- If `reschedReq(pre)=0` when `pc==0x175090` → confirms the orphaned-thread guard gap is real for this event; next check would be why `[schedwatch:skip]` still didn't fire (possibly `m_currentThreadId` gets cleared by a DIFFERENT path not yet found — grep all `m_currentThreadId = 0` assignments).
+- If `[schedwatch:funcret175090]` ALSO never fires (zero records again) → `sub_178068`'s call-site preemption isn't reaching this exact point either, meaning the earlier `[semwatch:dispexit]` `exitPc=0x175090` observation needs re-examination — check whether `dispexit`'s probe itself fires from INSIDE `sub_178068`'s body (a different vantage point than this scheduler-level probe) and reconcile the two.
+
+## HANDOFF 2026-08-29 (session 5, part 23) — `[semwatch:dispexit]` results are in. The copy loop DOES finish: by call #5 `exitPc` progresses from `0x1780c0` past the loop to `0x175090` (the entry of `syscall_stub_z_24`, the dispatch callee) — but that's as far as it gets. `sub_178068`'s wrapper (`funcStart==0x178068`) is never invoked again for the rest of the 200s run (no dispexit #7), and `syscall_stub_z_24`'s own funcStart (`0x175090`, watched by `[semwatch:dispidx]`) never fires either. Read `syscall_stub_z_24_0x175090.cpp` (ground truth, not decompile): it's a **trivial 3-instruction syscall trampoline** (`$v1=-0x78; syscall 0; jr $ra`), NOT an RPC handler — syscall 0x78 resolves (`Dispatcher.cpp:349-352`) to `sceSifSetDChain`, a SIF DMA-chain setup call, not a semaphore wait. So the callee itself has no preemption checks; `exitPc` staying exactly at `0x175090` (the callee's raw entry address, not `0x175094`/`0x175098` which the callee's own code would set) means **the callee was never actually entered** — `sub_178068` preempted at its own call-setup site, right before invoking `lookupFunction(0x175090)`/calling it.
+
+**New hypothesis, not yet confirmed:** total system idle afterward (`busy%=0`, `res/s=0`, `pc` frozen, for the remaining ~196s) is consistent with a genuine EE-scheduler starvation bug, not just this one thread failing to get rescheduled. Read `EeScheduler.cpp`'s main dispatch loop ([EeScheduler.cpp:300-460](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:300)): `checkpointDue()` ([EeScheduler.cpp:541](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:541)) can latch `m_checkpointPending=true` on a deadline hit ([EeScheduler.cpp:564](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:564)), and it's only cleared by `processPendingEvents()` recomputing `cycleEventDue` from `m_eeCycle` vs `m_nextDeadlineCycle` ([EeScheduler.cpp:1959-1964](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:1959)) — but `m_eeCycle` only advances via `accountCycles()`, which (static reading suggests, not yet proven) is only reachable from inside a completed guest `function()` call. If the dispatch loop's `if (checkpointDue(...)) { continue; }` ([EeScheduler.cpp:456-459](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:456)) keeps returning true, `function()` never runs, `m_eeCycle` freezes, and the deadline can look "due" forever — a self-sustaining skip loop that would produce exactly the observed frozen state. **Not yet verified — this is a hypothesis to test, not a conclusion**, per [[feedback_no_guessing]].
+
+**Fix added (probe, no functional change):** two new probes in `EeScheduler.cpp`:
+- `[schedwatch:skip]` at [EeScheduler.cpp:456](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:456) — fires every time `checkpointDue()` returns true and the loop skips calling `function()`, logging `pc`, `tid`, `m_eeCycle`, `m_nextDeadlineCycle`, `m_sliceEndCycle`, `m_checkpointPending`, `m_rescheduleRequested`. Capped at 40 (`s_schedSkipDumps`). If this hits the cap, that alone is strong evidence of a tight skip loop (host CPU would spin, not idle) — check `[cap]` in the run validity banner.
+- `[schedwatch:dispatch175090]` at [EeScheduler.cpp:470](ps2xRuntime/src/lib/Kernel/EeScheduler.cpp:470) — fires only if the scheduler ever actually calls `function()` with `context.pc==0x175090`. If this NEVER appears, it's direct proof the scheduler never re-dispatches that address (confirms starvation over "dispidx has some unrelated gating gap").
+
+**Next steps (user runs build+run+analyze, same 3 commands as before, tag now includes `schedwatch` too — use `--tag semwatch` and separately `--tag schedwatch`):**
+- If `[schedwatch:skip]` saturates the 40-cap with `pc` frozen at the same value and `nextDeadline <= eeCycle` never changing → starvation confirmed, root cause is in `processDueDeadlines()`/`accountCycles()` interaction, investigate next.
+- If `[schedwatch:skip]` does NOT saturate (fires occasionally, `eeCycle`/`nextDeadline` do advance) → the scheduler is fine; the thread with `pc=0x175090` specifically must be stuck elsewhere (not selected, not re-enqueued) — check `selectReady()`/ready-queue contents instead.
+- If `[schedwatch:dispatch175090]` fires at all → the dispatch DID happen; re-examine why `[semwatch:dispidx]` (gated on the SAME funcStart) didn't catch it — likely a dispidx gating-condition bug, not a scheduler bug. Re-read the exact dispidx gate in `game_overrides.cpp` (~line 3894-3925) to check for an extra condition beyond `funcStart==0x175090u`.
+
+## HANDOFF 2026-08-29 (session 5, part 22) — Part-21's "gate always reads 0, dispatch never reached" is WRONG — corrected. `sub_178068` DOES reach the dispatch; the gate byte CAN be nonzero; `exitPc=0x1780c0` is a mid-loop cooperative-preemption point, not a return. `[semwatch:dispidx]` silence is an instrumentation gap (`registerFunction` bypass), not evidence of anything. Added `[semwatch:dispexit]`.
+
+**Build+run done by user.** `[semwatch:gatebyte]` (part 21's new probe) fired 6 times, and **one of them is nonzero**: `#2 ptr=0x20561600 gate=0x40 entrySp=0x1ff3db0`. This immediately falsifies part 21's "gate always 0" claim. Per [[feedback_absolute_quantifiers_are_audit_targets]] and [[feedback_reverify_inherited_conclusions]] — re-verified from source rather than trusting the prior handoff.
+
+**What `exitPc=0x1780c0` actually is, read from the real runner file (not the IDA decompile):** [fn_178068_0x178068.cpp](ps2xRuntime/src/runner/fn_178068_0x178068.cpp) is the literal MIPS→C++ translation, instruction by instruction. `0x1780c0` is `label_1780c0: lq $v0, 0x0($a2)` — the **body of the 16-byte packet copy loop**, not a return statement:
+```cpp
+// fn_178068_0x178068.cpp:256-264 — the loop's only backward-branch exit
+if (branch_taken_0x1780d4) {
+    ctx->pc = 0x1780C0u;
+    if (runtime->shouldPreemptGuestExecution()) {   // eeCheckpointDue()
+        return;
+    }
+    goto label_1780c0;
+}
+```
+The gate check at `0x17808c` (`beqz $a1, ...`) branches to `0x17819c` (the real epilogue, skipping `sync`/`ei`) when the byte is 0 — **not** to `0x1780c0`. So a call that exits at `0x1780c0` necessarily took the **true** branch (gate nonzero), cleared the byte, and started the copy loop, then got cooperatively yielded out by `shouldPreemptGuestExecution()` mid-loop. Matching entrySp confirms it: gatebyte `#2` (`entrySp=0x1ff3db0`, `gate=0x40`) is the exact same call as the `[frametrace:IMBAL]` line (`entryPc=0x178068 entrySp=0x1ff3db0 exitPc=0x1780c0 exitSp=0x1ff3d10 ... a0=0x3`), and gatebyte `#3/#4/#5` (`entrySp=0x1ff3d10`, `gate=0x0` — already cleared, resumption skips the gate check entirely) are 3 further re-entries of the SAME preempted call, at the stack depth it was left at. `a0=0x3` at the logged exit is the loop's remaining-iteration counter (MIPS `addiu $a0,$a0,-1` each pass) — consistent with 3 more preemption/resume cycles being exactly what's needed to finish.
+
+**Why `[semwatch:dispidx]` never fires even though the dispatch is real:** per [[feedback_registerfunction_bypass]] (already in memory, directly applicable) — `sub_178068` calls `syscall_stub_z_24` via `runtime->lookupFunction(0x175090u)` **directly from inside its own translated body** ([fn_178068_0x178068.cpp:277-288](ps2xRuntime/src/runner/fn_178068_0x178068.cpp:277)), not through the top-level dispatch loop. `dispidx` is wrapped on `funcStart==0x00175090u`, which only fires for dispatch-loop-mediated calls — a direct in-body `lookupFunction()` call bypasses it entirely. Its silence was never evidence the dispatch doesn't happen; it's a blind spot in the probe's placement. **Retracting** part 21's claim that this proves "dispatch never runs."
+
+**Fix applied:** new `[semwatch:dispexit]` probe at [game_overrides.cpp:3928](ps2xRuntime/src/lib/game_overrides.cpp:3928) (in the shared post-`original()` block, gated on `funcStart==0x00178068u`, capped at 64). Logs `ctx->pc` after `original()` returns (`0x1780c0` again = preempted again; anything past `0x1780e4` = the internal call to `syscall_stub_z_24` actually happened and returned) plus `[sp+8]` (the real dispatch index the decompile calls `v12`, reloaded into `$v1` at `0x1780e4`) and the two table bases/bounds.
+
+**Next step (needs a build+run from the user):**
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+then the Active Runner Command, then:
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag semwatch --log "F:\SDBZ Recomp\run_log.txt"
+```
+Read `[semwatch:dispexit]` lines. If `exitPc` is consistently `0x1780c0` (never progresses past it) across a full run → the copy loop never finishes even after repeated preemption/resume — a real EeScheduler starvation bug worth checking (does this specific thread ever get its timeslice back?). If `exitPc` lands past `0x1780e4` → the dispatch call completed; read `v1@sp8` against `negTbl/negBound/posTbl/posBound` to see whether it's an out-of-range index, a null handler slot, or a real successful dispatch (in which case the WaitSema(4) stall is downstream of here, not at this dispatcher at all — go looking at whatever the handler `v9()` was supposed to do next).
+
+## HANDOFF 2026-08-29 (session 5, part 21) — `[semwatch:dispidx]` never fired: `sub_178068`'s dispatch table is never reached at all. Part-20's "byte at `[0x5616D8]` is the ready-gate" was WRONG — corrected, and traced to the real gate byte. Added `[semwatch:gatebyte]`.
+
+**Build+run done by user** (same Active Runner Command, 200s, auto-stopped cleanly). `analyze_run.py --tag semwatch`: **still only the same 10 records as parts 19/20** (`id=1` x4 clean, `id=4` wait/block once) — **`[semwatch:dispidx]` never appears, not even once, and it's absent from the full 76-tag census too** (not just filtered out by the `semwatch` grep). The probe's gate (`funcStart==0x00175090u`, i.e. `syscall_stub_z_24`) never matched.
+
+**Why, confirmed from this run's own data, not guesswork:** the `[frametrace:IMBAL]` line for this run's *only* two entries to `sub_178068` reads `entryPc=0x178068 ... exitPc=0x1780c0`. Re-reading the decompile (`ida_scripts/decompiles_SLUS_214_42.txt:94822-94874`) line by line:
+```c
+v0 = *(unsigned __int8 *)dword_5616D8;
+result = 0;
+if ( *(_BYTE *)dword_5616D8 )      // <-- gate
+{
+    ... copy packet, call syscall_stub_z_24(), table lookup ...
+}
+return result;                      // <-- exitPc=0x1780c0 lands HERE
+```
+`0x1780c0` is the early-return line — the copy loop, the `syscall_stub_z_24` call, and the whole table-lookup block never execute. Both entries this run took the "gate is 0" branch. That's not a table/index bug (part 20's "out-of-range or null slot" branches are moot) — the dispatcher never even starts routing.
+
+**Correction to part 20 (do not carry the old wording forward):** `[0x5616D8]` is **not itself** the gate byte. `dword_5616D8` is a pointer *variable* living at address `0x5616D8`; `sub_177B00` (the one-shot RPC-table init, gated by `dword_461B78`, `decompiles_SLUS_214_42.txt:94602-94647`) sets it to the **constant** `0x20561600` exactly once and it is never reassigned anywhere else. The gate/size byte `sub_178068` actually tests is `*(BYTE*)dword_5616D8`, i.e. the byte **at `0x20561600`** — a completely different address, ~0xD8 bytes before the `dword_5616D8..dword_5616F4` block. This lines up with the frametrace log's own `[0x5616d8]=0x20561600` field (that field was always printing the *pointer value*, not gate content) — a self-consistent, verified read, not an inference. Also confirmed from the same init: `dword_5616EC`/`dword_5616F0` (the "non-negative" table base/bound) start at **0/0** — an empty table until something else populates it — while `dword_5616E4`/`dword_5616E8` (the "negative" table) start populated at init (`&dword_561700`, bound 32, slot 0 = `noop_wrapper`).
+
+**Fix applied:** new `[semwatch:gatebyte]` probe in `game_overrides.cpp` at [game_overrides.cpp:3507](ps2xRuntime/src/lib/game_overrides.cpp:3507), right in the existing pre-call `is178068` block (before `original(...)` runs, so it reads state as the guest actually saw it at entry — not part 20's post-call placement). Fires unconditionally on every entry to `sub_178068` (`funcStart==0x00178068u`), capped at 64, logs the pointer (`READ32(0x5616D8)`, should always read back `0x20561600` — a sanity check that the pointer itself is never corrupted) and the real gate byte (`READ8(0x20561600)`).
+
+**Next step (needs a build+run from the user):**
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+then the Active Runner Command, then:
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag semwatch --log "F:\SDBZ Recomp\run_log.txt"
+```
+Read the `[semwatch:gatebyte]` lines. If `gate` is **always 0** across every entry in a full run → nothing ever arms this dispatcher; the next question is who is *supposed* to write that byte (grep the decompile / IDA xrefs for writers to `0x561600`/`0x20561600` — none found yet in this session, only the one read site in `sub_178068` and the one pointer-init site in `sub_177B00`). If `gate` is ever nonzero on some entry but `sub_178068` still doesn't reach `syscall_stub_z_24` per a later `[frametrace:IMBAL]` line, that's a race (dispatcher polls before/after the write, not "never written") — re-arm `[semwatch:dispidx]` at that point since the table-index question becomes live again. If `ptr` is ever anything other than `0x20561600`, that's a *different* bug entirely (the pointer itself got clobbered) and takes priority over all of the above.
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 20) — `[semwatch:reqend]` CONFIRMED ABSENT (interpretation branch 1 from part 19): `sub_178560` is never entered. Read the real decompile of `sub_178068` instead of reusing the old (unrelated) RA-corruption probe framework — found the actual dispatch-index source and added `[semwatch:dispidx]`.
+
+**Build done by user** (`build.ps1 RelWithDebInfo`, clean, `game_overrides.cpp` recompiled, `+03:57`). **Run done by user** (Active Runner Command, `-Determinism 1 -RunSeconds 200 -HostProfile`, auto-stopped at 200s). `analyze_run.py --tag semwatch` (the part-19-fixed tool): **10 records, no `[cap]` — absence IS evidence.** Same 10 as part 19: `id=1` cycles clean x4, `id=4` waits/blocks once, **zero `[semwatch:reqend]` lines.** `sub_178560` was never entered this run — branch 1 confirmed, not branch 2.
+
+**Do not reuse the `kSdbzFrameTraceSlots` RA-corruption instrumentation (the `RAFORK`/`TABLE`/`SLOTWATCH*` blocks, 07-20 through 07-25) for this thread.** That machinery targets a *different, older, already-diagnosed* bug (a mid-body `$ra` clobber at the `jalr $a2` in `0x178180`) and its `[frametrace:TABLE]` probe is gated on that bug's corruption signature (`ctx->pc==0x20561900`), so it would silently never fire for a normal dispatch and look like more false-negative "absence." Per [[feedback_probe_gate_on_shape_not_address]], an address-gated leftover probe reports confidently on the wrong thing.
+
+**Read the actual current decompile instead** (`ida_scripts/decompiles_SLUS_214_42.txt:94808`, `sub_178068`). Corrected understanding — the earlier "word[2] of the packet" routing guess (part 19 line 23) is **not** what the code does:
+- Byte at `[0x5616D8]` is a single-shot ready-gate: nonzero → proceed AND immediately clear it (classic [[feedback_gated_write_decouples_count]] shape), then copy 16-byte-aligned data starting at that same address to a stack buffer.
+- Calls `syscall_stub_z_24` (`0x175090` — already an entry-only wrapped slot in `kSdbzFrameTraceSlots`). Its return value (`$v0`, decompile's local `v12`) is the **real** dispatch index.
+- `v12 >= 0` → index into table at `[0x5616EC]`, bound `[0x5616F0]`, stride 12. `v12 < 0` → `v12 & 0x7FFFFFFF` indexes table at `[0x5616E4]`, bound `[0x5616E8]`, stride 12.
+- Either an out-of-bound index or a null function pointer at the resolved slot → falls straight to `LABEL_15` (`_sync(); _ei(); return`) — **no handler ever called.** That is exactly the shape that would run `sub_178068` once (matches the frozen watchdog `trace=` showing it entered) while never reaching `sub_178560`.
+
+**Fix applied:** added `[semwatch:dispidx]` in `game_overrides.cpp`, right after `original(rdram, ctx, runtime);` (the post-call point, so `ctx` holds `syscall_stub_z_24`'s real return registers), gated on `funcStart == 0x00175090u`. Logs `$v0`/`$v1` (the dispatch index) plus all four live table-base/bound words (`[0x5616E4]`, `[0x5616E8]`, `[0x5616EC]`, `[0x5616F0]`) on every actual call, unconditional, capped at 64. This settles directly whether the index is in-bounds and whether the resolved slot is null, instead of inferring it.
+
+**Next step (needs a build+run from the user):**
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+then the Active Runner Command, then:
+```powershell
+python "F:\SDBZ Recomp\build_scripts\analyze_run.py" --tag semwatch --log "F:\SDBZ Recomp\run_log.txt"
+```
+Read the `[semwatch:dispidx]` line(s). If `v0` is negative and `(v0 & 0x7FFFFFFF) >= negBound`, or non-negative and `v0 >= posBound` → the index itself is out of range; find who's supposed to grow that bound (a missing registration, same shape as the closed `h2`/`h2a` ADX thread). If in-bounds but the resolved slot is null (would need a follow-up read of `table[stride*index]` — not yet in this probe), the registration exists but that particular slot was never filled. If `v0` looks like a sane, in-bounds, non-null-implying value, the bug is elsewhere (re-open branch 2's "internal register branch" question) and this hypothesis is wrong — say so plainly rather than stretching the data.
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 19) — `semwatch` re-run CONFIRMED: `iSignalSema(4)` never fires. Added a second, unconditional probe on `sub_178560` (`_request_end`) entry to settle whether the dispatcher ever reaches it.
+
+**Re-run done by user** (`-Determinism 1 -RunSeconds 200 -HostProfile`, completed cleanly — process exited at t=198s, log confirmed complete via `Get-Process` returning nothing). Grepped fresh `run_log.txt` for `semwatch`: **10 total hits, verified non-truncated count via `(Select-String ...).Count`.**
+
+Result: `id=1` (an unrelated, healthy semaphore) cycles wait→signal cleanly 4 times. `id=4`: `[semwatch:wait] id=4 found=1 count=0` → `[semwatch:block] id=4 threadId=1`, then **nothing** — no `[semwatch:signal] id=4` anywhere in the rest of the complete log, through `stuckSecs=197`. This is now **CONFIRMED, not inferred**: whatever should call `iSignalSema(4)` never executes this run. Lands on interpretation branch 1 from part 18's guide: dispatcher never reaches `_request_end`'s register branch.
+
+**Supporting (not yet conclusive) static context, checked before acting on it rather than assumed:**
+- `game_overrides.cpp` already documents `sub_178560` as the SIF dispatcher's `_request_end` completion-callback handler (comment block near `kSdbzFrameTraceSlots`, 2026-07-25g), and it's already wrapped (entry-only) in that same table.
+- `sub_178560` appears exactly once in the fresh log: `[SIF_DIAG] sys[8] fn=0x178560 arg=0x563100 gp=0x503070` — this is a **registration/bind** line (the callback being recorded as the handler for `sys[8]`), not an execution trace. No frametrace `LEAFEXIT`/`IMBAL`/`VECCTOR` line names `0x178560` anywhere in the log.
+- The watchdog's `trace=` field is frozen identical across t=196/197/198s and does not include `0x178560` in its window — consistent with (but, per the file's own earlier caveat at line ~1885-1889, not proof of) the dispatcher never reaching it, since `trace=` is a global, thread-interleaved, ring-limited history.
+- Checked why the existing entry-only wrap on `0x178560` produced no log line: the frametrace wrapper (`sdbzFrameTraceWrapper`) only emits `VECCTOR`/`LEAFEXIT`/`IMBAL`/etc. lines on specific anomaly conditions, not on plain entry — so "never logged" and "entered cleanly" are indistinguishable in that mechanism. This is a probe-design gap, not evidence either way (same class as the already-documented 07-25j GSENTRY false-negative one section above it).
+
+**Fix applied:** added a third, unconditional entry probe (same pattern as the existing `GSENTRY` probe) gated on `funcStart == 0x00178560u`, logging `[semwatch:reqend] #n entryPc=... entrySp=... entryRa=...` on every actual entry to `_request_end`, capped at 64. This directly answers "was `sub_178560` ever entered" independent of the ring/anomaly mechanism. Added in `game_overrides.cpp` (not `runner/`, not a header — safe, only that TU + link needs rebuilding).
+
+**Next step (needs a build+run from the user):**
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+then the Active Runner Command, then:
+```powershell
+Select-String -Path "F:\SDBZ Recomp\run_log.txt" -Encoding unicode -Pattern "semwatch" | ForEach-Object { $_.Line }
+```
+If `[semwatch:reqend]` never appears → `sub_178560` is genuinely never entered → the bug is in `sub_178068`'s dispatch-table routing (investigate its jump-table selector, likely `word[2]` of the RPC packet) upstream of `_request_end` entirely. If `[semwatch:reqend]` DOES appear → `_request_end` runs but its internal register branch (`word[8]==0x80000009` check, per part 18 line 8) doesn't take the signal path — next probe would need to be inside that branch logic, which is guest code (no direct print point without a narrower wrapper or a hardware watch on the sema-id load at `s1+8`).
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 18) — WaitSema(4) stall fully traced statically (disasm + decompile + `run_log.txt` cross-check); the completion mechanism SHOULD fire but no log proves it does. Added `[semwatch:signal]`/`[semwatch:wait]`/`[semwatch:block]` probes to `EeScheduler.cpp`; next run's log will say definitively whether `iSignalSema(4)` ever executes.
+
+Verified `sysNum=0x44`=WaitSema against live source (was memory-only in part 17): `Dispatcher.cpp:181-182` `case 0x44: WaitSema(...)`. Also verified via raw syscall-stub disasm that `0x174ca0`=syscall 0x40 (CreateSema), `0x174cb0`=0x41 (DeleteSema), `0x174ce0`=0x44 (WaitSema), `0x174cd0`=syscall_stub_z_9=syscall 0xffffffbd (=-0x43, the interrupt-safe encoding of 0x43=**iSignalSema**).
+
+**Full call chain, traced instruction-by-instruction** (`mips_r5900_disassembler.py --func` on the ELF, cross-checked against `decompiles_SLUS_214_42.txt` line 95301 and `run_log.txt`):
+`mem_fill_z_18` (0x178a08, param `a1`=our struct=`0x564980` this run) → `CreateSema(init=1)` (delay-slot `sw $v0,8($s1)` unconditionally stores the new sema id — confirmed id=4 — into `*(0x564980+8)`, i.e. `s1` IS the struct later reused as the SIF-RPC "client control block") → builds a SIF DMA descriptor at `s0=0x20561900` (`sceSifSetDma` thunk chain `0x177fe8`→`0x177eb0`) whose payload word[7]=`0x564980` (=`s1`, confirmed in `run_log.txt`: `[SifRpcPkt] ... w[7]=0x564980` and `[SIF:BIND] client=0x564980`) → `jal 0x174ce0` **WaitSema(4)**, currently blocked here since `t=1s` (confirmed via `[thsync] t=1s ... [1:st=4,wt=2,wid=4,pri=0,pc=0x174ce0]` — independently corroborates sema id 4).
+
+**Expected wake path** (already implemented in `SIF.cpp`, per its own extensive prior-session comments): `sceSifSetDma`'s `rpcReply.valid` branch calls `deliverSifRpcReply` inline, which synthesizes a BIND-completion packet (`pkt[8]=0x80000009`) and re-invokes the guest dispatcher (`sub_178068`) — confirmed in `run_log.txt` (`[SifRpcReply] deliver cid=0x80000009 -> run dispatcher 0x178068`, `[SIF_DIAG]` dump matches the synthesized packet exactly: `pkt[8]=0x80000009 pkt[9]=0x5 pkt[10]=0xffffffff`). Per the decompile of `_request_end`/`sub_178560` (line 95074): `word[8]==0x80000009` takes the register branch (`v3[9]=word[9]; v3[5]=word[10]`, where `v3=(int*)word[7]=s1=0x564980` — same struct as above), falls through to `v4=v3[2]` i.e. `*(0x564980+8)` = **the sema id itself (4, positive)** → `if (v4>=0) syscall_stub_z_9()` = **iSignalSema(4)**. Every field lines up: this SHOULD wake the WaitSema on the very first inline delivery, at ~t=1s.
+
+**But it doesn't** — the run stays parked through t=197s+ with zero retry (`[SIF:BIND]` logs exactly once, never again). One suspicious clue: `[frametrace:IMBAL] #1 func=0x178068 entryPc=0x178068 ... exitPc=0x1780c0 exitSp=0x1ff3d10 delta=-0xa0` fires right where the inline dispatcher call happens — `exitPc=0x1780c0` is still inside `sub_178068` (0x178068-0x1781b0 per func-map), not yet at `_request_end` (0x178560). Could be a real derail, or could be the frame-tracer's heuristic misfiring on the dispatcher's own internal `jal`s (dispatcher functions with jump tables commonly trip naive SP-balance probes) — **not conclusively diagnosed**, flagging per [[feedback_absolute_quantifiers_are_audit_targets]] rather than asserting either way.
+
+Grepped `run_log.txt` for any direct evidence of `SignalSema`/`iSignalSema` actually executing (as opposed to being expected to) — **zero hits**. No existing instrumentation logs the syscall firing, only the packet-building side. This is a real gap, not proof of absence (per [[feedback_capped_probes_false_negatives]] discipline — absence of a log line is not evidence without a probe that would have produced one).
+
+**Fix applied:** added unconditional `std::cerr` probes to `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp`: `signalSemaphore()` now logs `[semwatch:signal] id=... interruptSafe=... found=... waiters=... count=...` on every call (both `SignalSema`/`iSignalSema` route through this), and `waitSemaphore()` logs `[semwatch:wait] id=... found=... count=...` on entry plus `[semwatch:block] id=... threadId=...` if it actually parks. `#include <iostream>` added. This is a runtime `.cpp` file (not `runner/`, not a header) — safe per project rules, only forces a rebuild of `EeScheduler.cpp`'s TU.
+
+**`[frametrace:IMBAL]` anomaly RESOLVED (retroactively, from an earlier 2026-07-22 entry in this same file, line ~12082): already characterized as a false positive.** `IMBAL delta=-0xa0` at this exact function boundary (`0x178068` entry / `0x1780c0` exit) is the recompiler's normal `jal`-boundary function split — the dispatcher's own internal `jal`s trip the frame-tracer's naive SP-balance heuristic, net stack is balanced, not a real derail. So the "one suspicious clue" flagged above is a known non-issue; the dispatcher call itself is not in question.
+
+**Next step, UPDATED — build already done, just needs a re-run:** checked mtimes directly rather than assuming. `run_log.txt` (the one just grepped for `semwatch`, zero hits) was written **15:58:10**, but the `[semwatch:*]` probes weren't saved into `EeScheduler.cpp` until **16:16:52** — that log predates the fix, the zero-hit result is a stale-log false negative, not a real finding (same trap as [[feedback_backup_suffix_and_mtime_traps]]). Good news: `build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe` mtime is **16:23:51** — a rebuild already happened AFTER the probes were added. No rebuild needed, just re-run:
+```powershell
+& "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+```
+then:
+```powershell
+Select-String -Path "F:\SDBZ Recomp\run_log.txt" -Encoding unicode -Pattern "semwatch" | ForEach-Object { $_.Line }
+```
+If `[semwatch:signal] id=4` never appears → the dispatcher genuinely never reaches `_request_end`'s register branch → investigate `sub_178068`'s dispatch-table routing on `word[2]` (NOT the IMBAL clue — that's resolved/false, see above). If it appears but `found=false` → semaphore 4 doesn't exist anymore by then (deleted/wrong id). If it appears with `found=true waiters=1` and the thread still doesn't wake → bug is in `makeReady`/thread-resume plumbing, not the syscall layer.
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 17) — `soCalls` CONFIRMED advancing past 1 (now 2): the #210 syscall-resume-dispatch fix + func-map gap patch is baked into the live build and WORKS. Original boot-stall bug at `0x17eec4`/`sub_17EF08` is CLOSED. Boot still doesn't complete — new, later stall found: thread parked in `WaitSema(4)`, never signaled.
+
+User ran `build.ps1 RelWithDebInfo` (51:45, not the estimated 30h+ — 1,944/4,541 obj files recompiled, exe relinked fresh; `/FORCE:MULTIPLE` linker warnings in the output are pre-existing/expected, traced to `ps2xRuntime/CMakeLists.txt:716`, not a new failure). Then ran the Active Runner Command. Watchdog `t=193s`/`t=197s`: `soCalls=2 soHandler=0x17ee80 soBranch=4` (was stuck at `soCalls=1` every prior run) — **confirms the fix took effect**, `soHandler` resolves exactly to the func-map-patched `sub_17EE80`.
+
+**But progress is re-stuck**, one level further: `t=193s` and `t=197s` samples are byte-identical (`progress=704`, same 32-hop trace, `pc=0x174ce0`, `stuckSecs` 192→196 with zero advance). `pc=0x174ce0` is `syscall_stub_z_10` — decoded via func-map lookup, confirmed inside range `0x174ce0-0x174cf0`. `sysNum=0x44` = **WaitSema** (`reference_ee_syscalls.md`: "count>0 → decrement. count==0 → set WAIT, reschedule"). `sysA0=0x4` (likely sema id 4). `ra=0x178aec` is inside `mem_fill_z_18` (`0x178a08-0x178b54`) — the caller.
+
+**Not yet investigated:** what's supposed to signal sema 4, and why it isn't. This is a fresh diagnostic thread, separate from the now-closed #210 issue. Next step: find who calls `SignalSema`/`iSignalSema` (0x42/0x43) on sema id 4 — likely another thread or IOP-side RPC completion that isn't running/completing. Static-first per [[feedback_static_before_probe]]: grep recompiled `game_overrides.cpp`/runner for `SignalSema` call sites and cross-reference sema creation (`CreateSema`, 0x40) to find sema 4's owner before adding new probes.
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 16) — part 15's "19,234 missing functions" claim RETRACTED (methodology flaw), replaced with the real, now-FIXED finding: 12 genuine func-map gaps found and patched, #210 regen is now technically clean. Live regen NOT yet run — needs user go-ahead (30h+ rebuild).
+
+**User asked to continue integrating not-yet-added upstream PRs.** `git fetch upstream` shows tip unchanged at `14b1e5cb` (#214, 2026-08-18) — same commit the 8-phase catchup plan (all phases CLOSED 2026-08-27) already triaged through. No new upstream PRs exist. The one concretely unfinished piece is Phase 5's own exit condition: bake #210 into `runner/`/`output/` via a regen — i.e. exactly the thread session 5 has been chasing all along. Picked that back up.
+
+**Part 15's file-count diff methodology was wrong.** Comparing `output/` vs a scratch regen by raw *filename* found "19,234 live-only files, all `fn_XXXXXX`" and concluded the func-map CSV was missing that many functions. Re-checked by *address coverage* instead (does each live-only address fall inside some `[start,end)` range in `sdbz_func_map_merged.csv`, regardless of filename): **19,215 of the 19,233 are not missing at all** — same address, same function, just carrying a real `sub_`/named CSV entry now instead of the old generic `fn_` fallback name the live tree used (confirmed directly: address `0x100220` is `fn_100220_0x100220.cpp` live, `sub_100220_0x100220.cpp` in scratch — identical function, renamed). Root cause of the earlier miscount: comparing filenames instead of addresses. **The "malformed CSV rows skipped silently" hypothesis from part 15 is also retracted** — not what happened here; that failure mode was for an unrelated earlier incident (`project_ghidra_func_map_rebuilt.md`), not this one.
+
+**What was actually true: only 12 addresses were genuine gaps**, all real executable MIPS code (confirmed via `build_scripts/mips_r5900_disassembler.py`), none of them data/padding. One of the 12 is **`0x0017EE80`** — the exact syscall-0x83 handler this session's `registerFunction` fix in `game_overrides.cpp` depends on. A regen off the un-patched map would have silently dropped its dispatch entry again, reintroducing the very bug this session confirmed fixed.
+
+**Fixed.** Walked each gap's enclosing range (prev CSV entry's end → next CSV entry's start) instruction-by-instruction, splitting on `jr $ra` + delay slot (the map's existing terminator convention, same one `patch_func_map.py`'s 4 thunks used). All 11 gaps (2 of the 12 addresses share one gap: `0x17EE48`/`0x17EE80`) resolved cleanly — every walk landed exactly on the next known boundary, with only small trailing-nop-padding remainders (same pattern as the existing 4 patched thunks). 13 new function rows added via new script `build_scripts/funcmap/patch_func_map_gap_holes.py` (mirrors `patch_func_map.py`'s idempotent/overlap-checked pattern). Map: 17,069 → **17,082 functions**.
+
+**Re-ran the scratch regen against the patched map** (`output_scratch_210regen_v2/`, config `config.scratch_210regen_v2.toml`) — `Recompilation completed successfully`, 0 errors. Confirmed `sub_0017EE80_0x17ee80.cpp` now exists. Re-ran the address-coverage check against all 19,233 originally-flagged live-only addresses: **0 uncovered** (was 12). The func-map is now a verified superset of everything the live `output/` tree's addresses need.
+
+**Live regen DONE, user-approved.** User confirmed via AskUserQuestion ("Yes, run it now"). Ran `build\ps2xRecomp\RelWithDebInfo\ps2_recomp.exe config.toml` against the real `config.toml` (live `output/`) — `Recompilation completed successfully`, 0 errors. Confirmed: `output/` file count 36,153 → **36,311** (+158, consistent with the 13 patched functions plus naming/coverage growth from the newer func-map), `sub_0017EE80_0x17ee80.cpp` now exists in the live tree, dir mtime updated to 2026-08-29 12:46 (was 07-24, over a month stale).
+
+**Next step (user-run, per standing rule): `build.ps1`.** This syncs `output/` into `src/runner/`, regenerates `fn_forward_decls.h`, and — because that header is included by all ~4,520 runner TUs — forces the full 30+ hour rebuild, not the usual ~48 min incremental. Command (from `command_log.md`):
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+After it completes: re-run the Active Runner Command and check `soCalls` — expect it to advance past 1 now that the syscall-resume dispatch entry exists at `0x17eec4`, unblocking `sub_17EF08`'s loop.
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 15) — `registerFunction(0x17ee80)` fix CONFIRMED WORKING (`soBranch=4`, not 3). Boot still fully stalled, but root cause traced to the ALREADY-KNOWN #210 recompiler-regen gap (part 3, 2026-08-27) — not a new bug. New blocker found: `config.toml` needed to run the regen does not currently exist anywhere in the repo.
+
+Ran the Active Runner Command from part 14 against the freshly-built exe (4:13:07 AM). Watchdog: `soCalls=1 soHandler=0x17ee80 soBranch=4` for the entire 200s run (never re-fired), `progress=639` unchanged the whole time, `stuckSecs=192`, `pc=0x17eec4` frozen from t=1s onward. `[hostprof]` shows 91% `ntdll!ZwDelayExecution` — the process is idle/sleeping, not spinning.
+
+**Branch 4 confirms the dispatch-hole fix works** — `dispatchSyscallOverride()` took the real-invoke path, not `KE_ERROR`. But the boot didn't advance, so investigated further rather than declaring victory:
+
+- Decompiled the caller, `sub_17EF08` (`ida_scripts/decompiles_SLUS_214_42.txt:99477`): it calls `syscall_stub_z_35` (=`sub_17EEC0`@0x17EEC0, the syscall-0x83 issue site) **at least twice unconditionally** before it even checks its loop condition, then potentially loops more. `soCalls=1` for the whole run means execution never reached the 2nd call — it's stuck immediately after the 1st.
+- Read `EeScheduler::invokeCurrent()` (`EeScheduler.cpp:1291`, `[[noreturn]]`): it pushes the `GuestInvocation` onto the owning thread's queue and does `throw EeDispatcherTransfer{};` — an exception-based control transfer, NOT a normal call/return. This unwinds the entire C++ call stack of the recompiled caller (`sub_17EEC0`/`sub_17EF08`), which is ordinary linear compiled C++ with no mid-function checkpointing. For the scheduler to resume `sub_17EF08` afterward, the recompiler must have registered a dispatch entry at `syscall+4` (`0x17eec4`) — a "resume entry point."
+- This is **exactly** what part 3's #210 entry (line ~710 below) already documented as APPLIED-to-source-but-not-regenerated: `control_flow_analyzer.cpp` (commit `d877ef8f`, 2026-08-27 03:01) now queues resume-entry-points for `syscall` (previously only JAL/JALR), with the comment "scheduler resumes this thread at syscall+4... `+4`, not `+8`: syscall has no delay slot" — matching `pc=0x17eec4` (0x17eec0+4) exactly. That entry's own predicted symptom — "thread went dormant instead of resuming — silent, no error, looks like clean shutdown" — is precisely what today's run shows.
+- Confirmed the regen still hasn't happened: `output/`'s own directory mtime is **2026-07-24 08:54**, over a month before the #210 commit (2026-08-27 03:01) — the runner output on disk predates the fix by more than the fix's own age.
+
+**New blocker, not previously flagged this explicitly: `config.toml` does not exist anywhere in the repo right now.** Checked `F:\SDBZ Recomp\config.toml` (path the "Active Runner Command" section below cites as the config) — does not exist. `Glob **/config.toml` across the whole tree finds nothing except unrelated third-party `config.toml`s (toml11 docs, ruflo). `ps2_recomp.exe` takes only a positional TOML path (confirmed via `--help`, no output-dir flag), so without this file the regen can't be run at all, scratch-dir or otherwise. This needs to be located or reconstructed before #210 can take effect — did not attempt to fabricate one blind.
+
+**Conclusion: two fixes are now stacked and both required.** (1) `registerFunction(0x17ee80)` — DONE, confirmed via `soBranch=4`. (2) Recompiler regen to bake in #210's syscall-resume-entry-points — source-side done since 2026-08-27, blocked on a missing `config.toml`. Neither alone unblocks the boot.
+
+**Next step: locate or reconstruct `config.toml`**, then hand the user the scratch-dir regen procedure (`ps2_recomp.exe <scratch-config>` writing to a throwaway output dir first, diff against live `output/`, per the hard rule at line ~6476: never point it at the live config/output directly — that triggers an unreviewed ~4,520-TU recompile via `build.ps1`'s sync step). Do not run `ps2_recomp.exe` without the user's go-ahead — full regen is the same class of cost as the 30h+ full rebuild this project treats as irreversible-without-warning.
+
+**Update, same part:** user pointed at a backup at `F:\sdbz_recomp_test\config.toml` — found, and its referenced paths (`ELF/SLUS_214.42`, `build_scripts/funcmap/sdbz_func_map_merged.csv`) still exist and are current, so it's not stale. Restored to `F:\SDBZ Recomp\config.toml` (its `output` field points at the **live** `F:/SDBZ Recomp/output` — do not run the recompiler against this copy directly). Created `F:\SDBZ Recomp\config.scratch_210regen.toml`, identical except `output = "F:/SDBZ Recomp/output_scratch_210regen"`, per the scratch-dir-first hazard rule. Confirmed the scratch dir doesn't already exist (clean).
+
+**Third finding, after the tool rebuild and scratch regen ran: the drift is far bigger than #210 alone — NOT safe to sync.** Ran the rebuilt `ps2_recomp.exe` (RelWithDebInfo, picks up #210) against the scratch config. It completed cleanly — `Recompilation completed successfully`, 0 errors, same 17069 functions from the same func-map CSV as always (`Loaded 17069 functions from Ghidra map`) — but reported **364,134 resumable entry point(s) across 11,060 owner function(s)**, and wrote only **17,070 output files** vs live `output/`'s 36,153. `git diff --stat` between the two trees: 23,726 files changed, 27,144 insertions, **6,743,006 deletions**.
+
+This is not a broken run — it's a code-generation **architecture** change. What used to be separate output files per clone (`mem_fill_z_31_clone_01.cpp`, `vtable_dispatch_o_0_clone_47.cpp`, etc.) now fold into a single owner function with internal resumable-entry-point dispatch. Live `output/` was generated by a tool build from 2026-07-24 — whatever landed in `ps2xRecomp` between then and now goes well beyond the #210 patch (`+8 lines` per the state-file's own part-3 description) to produce a swing this large. **Did not sync this into the live `output/` or `src/runner/`** — doing so would replace the runtime's entire code-gen shape on unvalidated ground, not just add syscall resume points. Left both `output_scratch_210regen/` and the live `output/` untouched relative to each other; no `src/runner/` sync attempted.
+
+**Investigated per user's "investigate the gap first" choice — root cause found, and it is NOT a recompiler architecture change.** `git log --since=2026-07-24 -- ps2xRecomp/src/lib/` found only 4 commits touching the recompiler (`d877ef8f` #210 itself, `6a0f8361`, `2ed84d64`, `08491440`), totaling ~240 lines of diff across `control_flow_analyzer.cpp`/`control_flow_emitter.cpp`/`function_emitter.cpp`/`ps2_recompiler.cpp`/`recompiler_reporter.cpp`/`vu_translation_helpers.cpp`/`vu_translator.cpp`/`mmi_translation_helpers.cpp` — none of it is file-count/architecture-shaped (verified by reading the actual diffs of the two most emitter-relevant commits: comment rewording + a stub-epilogue simplification, nothing that would touch how many output files get written).
+
+Diffed the actual file **listings** (not content) between `output/` (36,157 entries) and `output_scratch_210regen/` (17,073 entries) with `comm`: **19,234 files exist in live `output/` that don't exist in the scratch regen at all — every one of them a generic `fn_XXXXXX_0xXXXXXX.cpp`** (auto-addressed, no Ghidra-assigned name). Only 150 files exist in scratch but not live (net-new from the #210/#214-era func-map growth, expected). Spot-checked `mem_fill_z_31_clone_*` — all 25 present in BOTH trees identically, ruling out the "clones got folded into resumable entries" theory from the same-day earlier entry above (that theory is WRONG, superseded by this one).
+
+**Actual root cause: the checked-in func-map CSV is missing ~19,234 generic function entries relative to whatever function list generated the live `output/` tree.** `build_scripts/funcmap/sdbz_func_map_merged.csv` (17,069 functions, tracked in git) is what both the live output and today's scratch regen were built from (`Loaded 17069 functions from Ghidra map` in both console logs) — same CSV, same count, same tool now that it's rebuilt. The 19,234 missing `fn_XXXXXX` functions were never in this CSV to begin with; live `output/`'s extra 19,234 files must predate this CSV's current (2026-08-25, `08491440`) merged state entirely — i.e. `output/` on disk is stale relative to the CSV that's actually checked into git, not the other way around. Matches the already-known risk in [[project_ghidra_func_map_rebuilt]]: "malformed CSV rows skipped silently, exit 0" — this looks like exactly that failure class, though NOT independently re-verified this session (no direct proof the merge step silently dropped rows vs. the CSV simply never including generic fallback entries by design — flagging as a hypothesis, not confirmed).
+
+**This means the #210 regen was never actually blocked by architecture drift — it's blocked by the func-map CSV itself being incomplete**, and regenerating from it (even a perfectly clean, up-to-date recompiler) would silently drop 19,234 real functions from the runtime, independent of #210 entirely. This is a bigger, more foundational problem than tonight's original syscall-dispatch investigation. Handing this to the user rather than proceeding further — next step would be figuring out where a complete (36k-function-equivalent) func-map came from originally and whether it can be recovered/reconstructed, before any recompiler regen (#210 or otherwise) can safely touch the live `output/` tree.
+
+**Second blocker found before handoff: every existing `ps2_recomp.exe` predates the #210 fix.** Checked all 3 copies on disk — `Binaries\ps2_recomp.exe` (2026-04-27), `build\ps2xRecomp\Debug\ps2_recomp.exe` (2026-08-07), `build\ps2xRecomp\RelWithDebInfo\ps2_recomp.exe` (2026-08-07) — all older than the #210 commit (`d877ef8f`, 2026-08-27 03:01). Running any of them against even the scratch config would silently reproduce the exact same pre-fix output and waste the exercise. **The `ps2xRecomp` target (project file confirmed at `build\ps2xRecomp\ps2_recomp.vcxproj`) must be rebuilt first** — this is the standalone recompiler tool, not the 4,520-TU `ps2EntryRunner` runtime, so should be a much smaller/faster build. Not yet done — handing the full 3-step sequence (rebuild tool → scratch regen → diff) to the user next, per standing "user runs builds" rule.
+
+---
+
+## HANDOFF 2026-08-29 (session 5, part 14) — LNK1136 blocker CLEARED, `ps2EntryRunner.exe` built and links clean (RelWithDebInfo, Aug 28 22:05). `registerFunction(0x0017EE80u,...)` fix at `game_overrides.cpp:1808` is now compiled into the exe but **STILL UNVERIFIED end-to-end** — the diagnostic run has not yet been executed.
+
+What cleared LNK1136 this time: after part 13's "bare retry" pattern failed 3x more, a targeted non-destructive fix worked — deleted only `build\ps2xRuntime\ps2EntryRunner.dir\RelWithDebInfo\unity_4186_cxx.obj` (not a clean build) and re-ran `build.ps1 RelWithDebInfo`; that one `.obj` recompiled fresh and the subsequent link succeeded first try. **True root cause of the repeated LNK1136 was never conclusively identified** — `dumpbin /headers` on the previously-failing `.obj` showed a structurally valid COFF (machine `8664`, 781 sections, max 12 relocations/section, nowhere near the 65,535 `/bigobj` threshold), ruling out relocation overflow. `Get-MpThreatDetection` showed no Defender hit on the build tree either, though that's inconclusive for a silent scan-lock race. Treat "delete the one bad unity `.obj`, let it recompile, relink" as the known-working recovery move if LNK1136 recurs — cheaper than the Defender-exclusion route (which additionally requires admin rights the user's shell didn't have) and doesn't require a 30h clean rebuild.
+
+Build warnings present in the successful link, not yet investigated: `LNK4075` (`/INCREMENTAL` ignored due to `/FORCE`) and `LNK4088` (image generated via `/FORCE`, "may not run or generate correct results"). `/FORCE` linking can mask unresolved-symbol problems — low-priority follow-up if the exe misbehaves in a way that looks like a missing symbol rather than the known stall.
+
+**Next step, unchanged from part 13's goal:** run the Active Runner Command against this exe and check via `analyze_run.py` whether `soHandler=0x17ee80 soBranch=3`/`soCalls` still climbs forever (fix had no effect, same as part 13) or moves past branch 3 (fix worked). Nothing about the fix itself changed this session — only the build blocker was cleared.
+
+## HANDOFF 2026-08-28 (session 5, part 13) — registerFunction(0x0017EE80u,...) fix confirmed present at game_overrides.cpp:1808. Build to test it has hit LNK1136 on unity_4186_cxx.obj three times running (compile succeeded ~07:31, link failed each time). Checked the .obj directly: 656952 bytes, size in line with sibling unity_*.obj files, not zero/truncated — this is NOT file corruption. Matches the known MSVC+Defender real-time-scan race (link reads a just-compiled .obj while Defender's scanner still holds a read lock on it). As of this handoff the .obj has sat untouched for 12+ hours (last write 07:31, now 19:54) — well past any scan window — so a bare relink retry should now succeed without needing a full recompile. STILL UNBUILT / registerFunction fix still unverified.
+
+Recommended (not yet run, needs admin + user approval — Defender config is a system-security setting): add a Defender exclusion for `F:\SDBZ Recomp\build` to eliminate this recurring race permanently, e.g. `Add-MpPreference -ExclusionPath "F:\SDBZ Recomp\build"` from an elevated PowerShell.
+
+The build eventually succeeded (link tlogs show a clean RelWithDebInfo link at
+07:50, after the LNK1136 failure shown at the end of part 11 -- consistent
+with the established pattern that a bare retry clears it, [[feedback_no_guessing]]
+still satisfied: verified via tlog timestamps, not assumed). Ran the same 200s
+determinism probe. Result: **`soHandler=0x17ee80 soBranch=3` for every single
+sample again**, `soCalls` climbing 9.9M -> 1.78B over the run -- byte-identical
+symptom to part 11, fix apparently had zero effect.
+
+Root cause of THAT: `hasFunction(addr)` (`ps2_runtime.cpp`) checks a dense
+`g_ps2RecompiledFunctionTable[]` slot, populated only by an explicit
+`runtime.registerFunction(addr, fn)`/`replaceFunction` call at startup — NOT
+by merely defining the function or by its forward declaration existing in
+`fn_forward_decls.h`. That header is auto-generated from a regex scan of
+`game_overrides.cpp` and only emits `void fn_X(...);` prototypes — it has
+nothing to do with table registration. Confirmed by grep: `fn_17EE80_0x17ee80`
+had a forward decl (`include/fn_forward_decls.h:16366`, auto-generated
+06:09:20, after the game_overrides.cpp edit) but **zero** `registerFunction`
+call anywhere in the tree. Every other missing-body override in this file --
+all ~30 of them, `0x180d30`/`0x1a4500`/`0x2ff580`/`0x12f708`/etc. -- has an
+explicit `runtime.registerFunction(0xADDR, &fn)` line inside
+`applySdbzKernelThunkFixes()` (`game_overrides.cpp:1643`). Part 11's write-up
+claimed "no header edit, no register_functions.cpp edit... no runner-file
+edit" needed and treated that as sufficient — true but incomplete: it
+described what ISN'T needed without checking what IS. Confirmed via
+`strings` on the RelWithDebInfo exe: `fn_170268_0x170268` (an existing,
+registered override, called indirectly by name from a runner call site) is
+present as a linked string; `fn_17EE80_0x17ee80` was completely absent —
+direct evidence the symbol built but was never wired to anything reachable.
+
+**Fix:** added `runtime.registerFunction(0x0017EE80u, &fn_17EE80_0x17ee80);`
+at the end of `applySdbzKernelThunkFixes()`
+([game_overrides.cpp](ps2xRuntime/src/lib/game_overrides.cpp)), following the
+exact pattern every sibling override in that function already uses. The
+function body itself (word-scan loop, disassembly, semantics) is unchanged
+from part 11 and was never in question.
+
+**Not yet done:** build. Same verification plan as part 11 once it lands:
+(a) `soBranch=3`/`soCalls` should stop climbing, (b) `sub_17EF08`'s hostprof
+share should drop from 19.4%, (c) dispatch trace should move off `0x17eec0`.
+If `soBranch` moves to 4 but the stall still doesn't clear, the next target
+is the caller (`sub_17EF08+0x58` onward) as already flagged in part 11.
+
+
+
+Part-10's probe (`soCalls=`/`soHandler=`/`soBranch=`) ran a fresh 200s
+determinism run (`run_log.txt`, converted from UTF-16LE). Result is
+unambiguous: **every single sample from `t=1s` to `t=199s` reads
+`soBranch=3 soHandler=0x17ee80`**, with `soCalls` climbing from ~10M to
+~1.79B over the run (~9M calls/sec) — this IS the stall. `hostprof` for the
+same run shows `sub_0017EF08` burning 19.4% CPU / 19.97s of a 194s window
+and the dispatch trace pinned on `0x17eec0` — both are this same hot spin,
+now explained.
+
+`soBranch=3` is the `!runtime->hasFunction(handler)` → `KE_ERROR` branch in
+`dispatchSyscallOverride()` (`System.cpp`). The guest registered `0x17ee80`
+as its own handler for syscall 0x83 via `SetSyscall`, but the runtime has no
+function there, so every call returns an error and the guest (whatever calls
+this via `sub_17EF08`) just retries forever — a classic silent dispatch hole,
+same class as Stage 5.13's 207 (`[[project_stage513_missing_body_12f708]]`),
+except this one is invisible to `find_dispatch_holes.py` because that tool
+only decodes static `j`/`jal` targets, and 0x17ee80 is reached exclusively
+through the `SetSyscall`-registered handler table, never through a direct
+branch. Found instead via `eeref.py refs 0x17ee80`: `NOT IN FUNC MAP
+slot=NO`, materialized by `lui+lo` in `sub_17EF08+0x58`.
+
+**Confirmed real code, not a boundary-scan artifact.** `sdbz_func_map_merged.csv`
+has `syscall_stub_z_34` ending at `0x17ee48` and `syscall_stub_z_35` starting
+at `0x17eec0` — a 0x78-byte gap. Disassembled by hand
+(`mips_r5900_disassembler.py "ELF/SLUS_214.42" 0x17ee38 40`, IDA MCP not
+connected this session): `0x17ee80-0x17eebc` is a complete, self-contained
+16-instruction leaf function (no calls, clean `jr $ra` at 0x17eeb8, ends
+exactly at the next function's start — a clean boundary, not a false split).
+It is a compiler-unrolled word-scan loop: `a0`=start, `a1`=end (exclusive),
+`a2`=target word; returns the matching address in `v0`, or `0`. This is
+**exactly the 3-register signature the part-9 investigation was chasing** —
+but it was never the repo's `FindAddress()` (System.cpp) being called with
+the wrong signature; it's the *game's own* local reimplementation, reached
+only via the override table. The `db-syscalls.md` single-arg-signature
+question from part 9 is confirmed moot: that entry describes the *kernel's*
+default 0x83, which this game never calls.
+
+Traced the two `movz $a0,$zero,$v0` merge points by hand before writing the
+fix (worth noting since they look asymmetric in the raw disasm): both only
+fire when the immediately-preceding `sltu` found the scan already
+out-of-range, so a match is never clobbered — a plain
+`for(;addr<end;addr+=4) if(*addr==target) return addr; return 0;` is a
+faithful translation, not an approximation.
+
+**Fix written:** `fn_17EE80_0x17ee80(rdram, ctx, runtime)` in
+[game_overrides.cpp](ps2xRuntime/src/lib/game_overrides.cpp) — real body
+(loop above), not a stub, placed right after the existing missing-body
+stub trio (`fn_151830`/`fn_170268`/`fn_11ABA0`) whose comment already
+documents this exact hole class and the `fn_<ADDR>_0x<addr>` naming
+convention that gets auto-picked-up by the build's regex-scan
+([[project_fn_forward_decls_autogen]]) — no header edit, no
+`register_functions.cpp` edit, no runner-file edit.
+
+**Not yet done:** build. Once built, rerun the same Active Runner Command
+and confirm (a) `soBranch=3` stops recurring / `soCalls` stops climbing,
+(b) `sub_17EF08`'s hostprof share drops, (c) whatever `sub_17EF08` was
+gating (dispatch trace should move off `0x17eec0`) actually progresses.
+If it still stalls afterward, the *caller* of this handler
+(`sub_17EF08+0x58` onward) is the next place to look — this fix only
+guarantees the FindAddress-shaped call itself now returns a real answer
+instead of `KE_ERROR`, not that the answer is the one the guest wants.
+
+
+
+Session opened with `build finished` from the user, but the shown build
+output was `LNK1136: invalid or corrupt file` on `unity_4186_cxx.obj`
+(`ps2EntryRunner.dir`, unrelated to any file touched this session). Fixed by
+having the user delete only that one `.obj` (never a clean build — 30+
+hours) and retry; it failed the SAME way once more on the SAME file even
+though `dumpbin /headers` read the freshly-recompiled replacement's COFF
+header fine (structurally valid, symbol-table math checked out, disk not
+full at 82GB free) — most likely a transient Windows Defender real-time-scan
+lock on the freshly-written object, not real corruption (Defender exclusion
+would need admin rights the agent doesn't have; flagged to the user as an
+optional follow-up, not done). A bare retry of `build.ps1 RelWithDebInfo`
+(no second delete) succeeded.
+
+**Ran the part-9 probe. Verdict: FindAddress() itself is never called, for the
+entire run.** `faCalls=0`, `faScan=0`, `faResult=0x0`, `faAborted=0` at every
+single 1 Hz sample from `t=1s` to `t=199s` — never once increments, despite
+`sysNum=0x83` recurring throughout and `progress` climbing past 30M. Stronger
+than the atomics alone: `logFindAddressDiagnostics()` (which prints
+`[FindAddress:hit]` or `[FindAddress:miss]` unconditionally on **every**
+entry to `FindAddress()`, both exit paths) never appears **anywhere** in the
+run's 56-tag census — not even in the "rare (≤2 hits)" bucket.
+
+Before trusting that, ruled out the obvious build-chain alternative given
+this session's LNK1136 saga: checked mtimes end to end.
+`System.cpp` edited 01:48:08 → `System.cpp.obj` recompiled 01:53:06 →
+`ps2_runtime.obj` recompiled 01:53:01 → both rolled into
+`RelWithDebInfo\ps2_runtime.lib` at 01:53:06.768 → `ps2EntryRunner.exe`
+linked 04:01:33 (after the unrelated LNK1136 fix). Chain is clean — this is
+not a stale-object bug like the earlier LNK1136s. [[feedback_no_guessing]]
+satisfied by evidence, not assumption.
+
+**Root cause traced by reading code, not inferring from behavior.**
+`ps2_syscalls::dispatchNumericSyscall()` (`Dispatcher.cpp:19`) calls
+`dispatchSyscallOverride(syscallNumber, ...)` **before** its `switch`, and
+returns immediately if that returns `true` — `case 0x83: FindAddress(...)`
+(line ~389) is only reached if it returns `false`.
+`dispatchSyscallOverride()` (`System.cpp:498`) looks up
+`runtime->findEeSyscallOverride(0x83, handler)` — non-zero only if the guest
+called `SetSyscall` (0x83, 0x74) at some point to install its **own** handler
+for this syscall number, which is exactly what SDBZ appears to have done.
+From there it has 3 live exit branches (a 4th, the kernel-query HLE path,
+also never logged `[SyscallOverride:kernel-query]` this run, so it's ruled
+out too):
+1. **Reentrancy decline** (`scheduler.hasInvocation(...)` true) → returns
+   `false`, which WOULD fall through to the real `FindAddress()` — but that
+   never happened this run either (faCalls=0), so this isn't it.
+2. **`!runtime->hasFunction(handler)`** → silently sets `$v0 = KE_ERROR` and
+   returns `true`. This is the leading suspect: if the guest's registered
+   0x83 handler address has no corresponding recompiled function (a
+   dispatch hole), every call silently fails with no diagnostic output,
+   which is exactly what would drive `sub_17EF08`'s call sites into an
+   unbounded retry loop against `0x17eec0` — matching the dispatch trace
+   exactly (`0x17eec0 -> 0x17eec0 -> ...` x191+ per sample).
+3. **Real invoke** via `scheduler.invokeCurrent(...)` — jumps into the
+   guest's own recompiled override function. If this is what's firing, the
+   investigation target moves entirely away from `FindAddress`/`db-syscalls.md`
+   and into whatever guest function the handler address names.
+
+**New probe (unbuilt) to tell 1 vs 2 vs 3 apart, plus the handler address
+itself:**
+- `System.cpp` (before `dispatchSyscallOverride`, ~line 498): 3 new
+  externally-linked atomics — `g_syscallOverrideCallCount`,
+  `g_syscallOverrideLastHandler`, `g_syscallOverrideLastBranch` — populated
+  only when `syscallNumber == 0x83`, at entry (count + handler) and at each
+  of the 4 exit points (branch = 1 kernel-query-hle / 2 reentrancy-decline /
+  3 no-function-KE_ERROR / 4 real-invoke).
+- `ps2_runtime.cpp`: `extern`-declared in the **same** true-global-scope
+  block (before the anonymous namespace opens — see the linkage-trap
+  comment already there) as the part-9 `g_findAddress*` externs, and printed
+  as `soCalls=`/`soHandler=0x`/`soBranch=` appended to the existing
+  `[watchdog]` line, right after `faAborted=`.
+
+**Next step (not started this session):** rebuild
+(`build.ps1 RelWithDebInfo`), re-run the unchanged Active Runner Command
+below, read `soCalls=`/`soHandler=`/`soBranch=` from the fresh (UTF-16LE)
+`run_log.txt`. `soBranch=3` (KE_ERROR, dispatch hole) closes this
+sub-investigation and redirects to finding/porting the missing guest
+function at `soHandler`'s address; `soBranch=4` means pivot entirely to
+tracing that guest override function instead — `db-syscalls.md`'s
+single-vs-3-arg question from part 9 becomes moot either way, since the
+built-in `FindAddress()` is confirmed dead code for this game.
+
+---
+
+## HANDOFF 2026-08-28 (session 5) — part 9's probe IS built and HAS run (found by mtime, not told); sysNum caught 0x83 (FindAddress) firing; FindAddress's own 3-arg semantics look WRONG against our own syscall reference. New probe written, UNBUILT.
+
+Picked up on "prioritize and execute" with no further steer. Checked file
+state before assuming part 9 below was still open: `ps2EntryRunner.exe`
+(RelWithDebInfo) mtime is **2026-08-28 01:19:09**, after `ps2_runtime.cpp`'s
+own mtime (01:14:49) and well after `fe190f2a` (08-27 04:22:51) — the
+`build.ps1 RelWithDebInfo` part 9 asked for has already been run, and
+`run_log.txt` (01:24:38) postdates the exe. Part 9's "still UNBUILT" status
+is stale; this session's data is from that already-completed run.
+
+**Read the result the session-3 probe was built to get.** `sysNum=` is
+`0xffffffff` (sentinel, no syscall in flight) on all but one of the last five
+1 Hz watchdog samples; at `t=197s` it shows `sysNum=0x83 sysPc=0x17eec4
+sysA0=0x3 sysA1=0x80080000 sysA2=0x17ee80 sysRa=0x17efa4`, back to sentinel
+at `t=198s`. So this is **not** a syscall that blocks forever — it dispatches
+and returns within about a second, and it is `syscall_stub_z_35` (0x83 =
+**FindAddress**, confirmed via `eeref.py refs 0x17eec0`), called from 4 sites
+inside `sub_17EF08` (`eeref.py refs 0x17ee80` / owning-function lookup against
+`sdbz_func_map_merged.csv`; `sysRa=0x17efa4` = the 3rd call site, at
+`0x17ef9c`). `progress` climbs steadily through the whole window
+(28.97M→29.46M) while `bssnz`/`gstate@0x5e6b3c`/`pc`/`ra`/`lastCall` stay
+dead at their boot values for the full 200 s — i.e. the interpreter is doing
+real work, but nothing at the game-state level the watchdog can see is
+advancing. Per [[feedback_measure_dont_infer_rates]] / the `stuckSecs`
+false-positive pattern already in this file (2026-07-29 entry), climbing
+`progress` alone does not prove liveness that matters; `gstate` staying at
+`0,0,0,0` for 200 s straight is the stronger signal here, and it says stuck.
+
+**★★ Our own FindAddress(0x83) implementation may be using an invented
+calling convention.** `Kernel/Syscalls/System.cpp` (comment above `FindAddress`,
+pre-existing, no citation) treats it as `a0=table start, a1=table end,
+a2=target`, doing a linear word-scan `[start,end)` for a match. But this
+project's OWN sourced syscall table, `resources/db-syscalls.md:159`
+(ps2-recomp skill), documents it as `a0=id -> $v0=addr` — a single-argument
+lookup, nothing like a scan. The live register capture fits the single-arg
+reading far better than the 3-arg one: `a0=0x3` is id-shaped (tiny, not a
+plausible RAM pointer), while `a1=0x80080000`/`a2=0x17ee80` look exactly like
+leftover register content from whatever `sub_17EF08` last did with $a1/$a2,
+not deliberately-passed arguments. WebSearch/WebFetch for the real signature
+(`israpps.github.io/ps2tek`, `psdevwiki.com` (403'd), raw `ps2sdk` kernel.h)
+found only the bare name "FindAddress" — the parameter semantics are not
+public anywhere I could reach, so **this is HYPOTHESIS, not confirmed**: I
+have not proven our 3-arg scan is wrong, only that it contradicts our own
+prior sourced reference and that the live args fit the 1-arg reading better.
+
+**If the hypothesis is right, the mechanism is:** `start=(3+3)&~3=4`,
+`end=0x80080000&~3=0x80080000`, so the scan runs `addr` from `4` to
+`0x80080000` in word steps — up to ~536M iterations of `getConstMemPtr` +
+memcpy — per call, 4 call sites in `sub_17EF08`, and since the real
+single-arg FindAddress(3) would return some fixed kernel-resident address
+that our scan will essentially never stumble onto (target=0x17ee80 is a code
+address, vanishingly unlikely to appear as a literal data word in a ~2GB
+sweep), our implementation returns 0 (not-found) essentially every time where
+real hardware would return a valid nonzero address — and `sub_17EF08`'s
+retry-on-zero loop (unconfirmed, not yet read) would be the actual stall.
+
+**Probe written (UNBUILT), two files, no header touched:**
+- `ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp` — 4 new externally-linked
+  atomics (`g_findAddressCallCount/LastScannedWords/LastResult/LastAborted`)
+  in `namespace ps2_syscalls`, populated at both `FindAddress` return points.
+- `ps2xRuntime/src/lib/ps2_runtime.cpp` — `extern` forward-declares of the
+  same 4 atomics **outside** the file's anonymous namespace (placed
+  deliberately before `namespace { ... }` opens at line ~370+14 — inside it,
+  `namespace ps2_syscalls { extern ... }` would bind to a distinct
+  `(anonymous)::ps2_syscalls` and silently read garbage); watchdog print line
+  gets 4 new fields, `faResult=0x... faScan=... faCalls=... faAborted=...`,
+  appended right after the existing `sysRa=`.
+- **Next run's watchdog line answers the hypothesis directly:** `faScan` in
+  the hundreds-of-millions with `faResult=0x0`/`faAborted=0` on most calls
+  confirms the mega-scan-that-never-matches theory; `faScan` small or
+  `faAborted=1` (i.e. `getConstMemPtr` rejecting the out-of-range address
+  before it gets far) kills it and the search moves to `sub_17EF08`'s
+  broader retry logic instead.
+
+**Status: UNBUILT.** Per [[feedback_user_runs_builds]], needs the same
+incremental-rebuild pattern part 8 used (`build.ps1` targeting
+`ps2EntryRunner`, RelWithDebInfo — 2 changed `.cpp`, no header, so this
+should be a small incremental link, not the 48-minute full build part 9 just
+paid for). Then re-run and read `faScan`/`faResult`/`faCalls`/`faAborted` off
+the tail of `run_log.txt` (UTF-16LE) the same way `sysNum` was just read.
+
+**Also still not done, not started this session:** actually reading
+`sub_17EF08` to find what it does with FindAddress's return value and
+whether it retries on 0 — the natural next step once the scan-magnitude
+question above is settled, not before (no point reading a caller's retry
+logic against a callee whose own behavior is still unverified).
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 9) — probe still UNCONFIRMED live: user's rebuild targeted the wrong target+config
+
+Session picked up mid-verification of part 8's probe (`sysNum=`/`sysPc=` watchdog
+fields added to `ps2_runtime.cpp`, commit `fe190f2a`). Two things happened,
+both process/build-hygiene findings, zero new code:
+
+**1. First re-check confirmed the exe was still stale.** `ls -la` on
+`build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe` showed mtime unchanged
+at 01:59, predating `fe190f2a` (04:22:51) — the probe was not in the tested
+binary. Gave the user `cmake --build "F:/SDBZ Recomp/build" --target ps2_runtime`.
+
+**2. That command was insufficient — user ran it, but it built the wrong
+thing.** The pasted build log's final line: `ps2_runtime.vcxproj ->
+F:\SDBZ Recomp\build\ps2xRuntime\Debug\ps2_runtime.lib`. Two problems with
+the command I gave, both now corrected:
+- **Wrong target.** `--target ps2_runtime` only rebuilds the static library,
+  not `ps2EntryRunner.exe` (the actual diagnostic binary) — needed
+  `--target ps2EntryRunner` to relink the exe.
+- **Wrong config.** No `--config` flag on this multi-config (VS/MSBuild)
+  generator defaulted to **Debug**, not the **RelWithDebInfo** every prior
+  run in this investigation depends on (109× guest work/sec, per
+  [[project_framerate_instrumentation]]). `ps2_runtime.cpp` *was* recompiled
+  (confirmed in the file list) but only into the Debug-config lib — the
+  RelWithDebInfo `ps2EntryRunner.exe` was not touched by this build at all.
+
+**Correction (same turn) — the raw-cmake command above was itself wrong.**
+`command_log.md` (this project's canonical command reference, per
+[[feedback_use_command_log_for_dirs]]) explicitly says "Never raw
+cmake/MSBuild" for building — the one documented exception is a single
+user-run `cmake -S ... -B ... -DPS2X_ENABLE_RUNTIME_LOGS=ON` configure step,
+already done, not a build. I reconstructed a `cmake --build` invocation
+instead of reading that file first, which is exactly the failure mode
+[[feedback_use_command_log_for_dirs]] exists to prevent. The actual
+corrected command, now handed to the user, not yet run/confirmed:
+```powershell
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
+```
+(full runner build, ~48 min; per `command_log.md` the config argument is
+mandatory — a bare `build.ps1` silently builds only Debug and leaves
+RelWithDebInfo untouched, the same trap as the target/config mistake above.)
+
+**Status: still UNBUILT in the config that matters.** Next session/turn:
+confirm the user ran `build.ps1 RelWithDebInfo`, check the RelWithDebInfo
+exe's mtime is now > `fe190f2a` (04:22:51) — or better, diff the run log's
+own `[runmeta] exeWritten=` line against `ps2_runtime.cpp`'s mtime per
+`command_log.md`'s own advice — then re-run the Active Runner Command above
+and read `sysNum=`/`sysPc=` from `run_log.txt` (UTF-16LE — convert before
+grepping). This closes the "which syscall" question part 8 left open.
+
+**Learned pattern for the index:** before handing the user ANY build
+command in this project, read `command_log.md`'s `## Build` section first —
+raw `cmake --build` (even with correct `--target`/`--config`) is banned here
+in favor of `build.ps1 <Config>`, and guessing cmake flags instead of
+checking the log produces a wrong command that still "succeeds" and wastes
+a full round trip. This is the same class of mistake
+[[feedback_use_command_log_for_dirs]] already names — this entry is a fresh,
+concrete instance of it, not a new rule.
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 8) — session-3 stall probe WRITTEN (unbuilt): syscall-in-flight watchdog field, per [[feedback_write_probes_dont_ask]]
+
+The 8-phase catchup plan (below) is closed; this returns to the one item still
+flagged urgent, the session-3 finding that a post-Phase-3-build-gate run of
+`ps2EntryRunner.exe` never leaves early init (`g_lastDispatchPc`/"lastCall"
+frozen at the `syscall_stub_z_35` trampoline `0x17eec0` for all 198s, `bssnz=0`
+the whole run, `.SFD` never opened). That handoff's own "next diagnostic step"
+was pre-written but not yet built: log the syscall number ($v1) + calling PC
+whenever a dispatched syscall doesn't return. Written now, not asked, per the
+standing rule that an obvious next probe gets written on sight.
+
+**What was added — `ps2xRuntime/src/lib/ps2_runtime.cpp` only, 3 sites:**
+1. Two new file-scope atomics next to `g_lastDispatchPc` (~line 451):
+   `g_syscallInFlightNumber` (sentinel `kNoSyscallInFlight = 0xFFFFFFFFu`) and
+   `g_syscallInFlightPc`.
+2. `PS2Runtime::handleSyscall` (~line 2176): stores `syscallId` + `ctx->pc`
+   into those atomics *before* calling `dispatchNumericSyscall`, and clears
+   the number back to the sentinel on every return path (both the
+   `dispatchNumericSyscall` success return and the `TODO` fallthrough).
+3. The `[watchdog]` print line (~line 5363): two new fields, `sysNum=0x...`
+   and `sysPc=0x...`, read right after the existing `cb=0x...` (0x13c4f8
+   callback-in-flight) field — same pattern, same author intent.
+
+**Why this, not a game_overrides.cpp hook.** The prior handoff's phrasing
+("a game_overrides.cpp probe") named the *style* (a lightweight in-flight
+flag set/cleared around a call, mirroring `g_sdbzCb13C4F8InFlight`), not the
+file — `handleSyscall` already lives in `ps2_runtime.cpp`, which is runtime
+code, not a generated `runner/*.cpp`, so instrumenting it directly is in
+scope per [[feedback_no_runner_file_patches]] and needs no indirection.
+
+**Why this survives where `lastCall` doesn't.** `g_lastDispatchPc` only
+advances on the *next* table-dispatched call — a syscall that blocks forever
+(the suspected EeScheduler `blockCurrent` mis-bind under an exception-unwind
+model, still unconfirmed) never produces a "next" call, so it freezes at the
+syscall's own *trampoline*, not the syscall. `sysNum=`/`sysPc=` are written
+synchronously inside `handleSyscall` itself, so if the run stalls with
+`sysNum=` still != `0xffffffff`, the next run names the exact EE syscall
+number (decode via the `Dispatcher.cpp` switch — negative "i" variants are
+`static_cast<uint32_t>(-N)`) and the guest PC that issued it, closing the
+"which syscall number" question the session-3 handoff left explicitly open.
+If dispatch instead unwinds via a C++ exception rather than returning, the
+flag *also* stays set — that's the correct diagnostic outcome, not a bug in
+the probe.
+
+**Status: UNBUILT.** Per [[feedback_user_runs_builds]] this needs a
+user-triggered incremental rebuild of `ps2EntryRunner` (touches one runtime
+`.cpp`, no header changed, so no 30h rebuild) before the next
+`launch_recomp.ps1 -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile`
+run can show `sysNum=`/`sysPc=` in the watchdog line. Read those two fields
+first in the next run's tail — they should name the blocking syscall
+directly, no further probe needed to get that far.
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 7) — Phase 8 (ps2xTest reconciliation) CLOSED. All 6 previously-uncharacterized files now read. 8-phase catchup plan is DONE.
+
+Read every file left uncharacterized in part 6. Same "SDBZ ahead" pattern held
+for 5 of 6; one genuine production-code gap found and deliberately deferred
+per user decision; one real test file ported.
+
+**`ps2_memory_tests.cpp` — SDBZ ahead, no action.** Upstream *removed* its
+deterministic per-cycle EE timer tests (independent per-timer COUNT/MODE/COMP,
+Timer2 compare/overflow raising INTC_TIM2, EQUF/OVFF latch-and-clear-on-write,
+ZRET) in favor of a simpler host-time `sleep_for`-based single test. SDBZ kept
+the hardware-accurate deterministic tests. The `GSPSMCT32::addrPSMCT32` vs
+`GSMem::LookupPixelAddressCT32` diff is just Phase 4's deferred GS-split
+naming, expected.
+
+**`ps2_sif_dma_tests.cpp` — mostly SDBZ ahead, but surfaced one real,
+verified production-code gap:** SDBZ's `sceSifAllocIopHeap`
+(`kIopHeapBase`/`kIopHeapLimit` in
+[Support.h:39-40](ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h:39))
+still hands out addresses at `0x01A00000`-`0x01F00000` — **inside real EE
+RDRAM** — and `allocateSifHeapBlock` is bookkeeping-only, so any DMA/guest
+read-write to that range passes straight through to live `rdram[address]`.
+Upstream (`14b1e5cb`) fixed this: moved the range to `0x04000000`-`0x04500000`
+(outside `PS2_RAM_SIZE`) backed by a dedicated `g_sifHeapStorage` array,
+intercepted via `isSifIopHeapAddress`/`readSifIopHeap`/`writeSifIopHeap` in
+the DMA path. SDBZ's own upstream-inherited test even names the failure mode:
+"IOP DMA must not overwrite the old 0x01A00000 EE alias range." **User
+decision: defer, don't port** — real risk only if the game actually touches
+that EE RAM range for something else, which isn't yet confirmed; revisit if a
+memory-corruption symptom ever points there. The scheduler-based DMAC-handler
+test upstream has was correctly simplified in SDBZ (now uses direct syscalls
+instead of a full `eeScheduler().run()` loop) because SDBZ has a *dedicated*
+`register_scheduler_dmac_guest_dispatch_tests()` suite covering that ground
+separately (see expansion-tests finding below).
+
+**`ps2_sif_rpc_tests.cpp` — SDBZ ahead, no action.** Missing tests
+(MCSERV/DBCMAN/LIBSD-via-bridge, DTX-dispatcher) are all Phase-7
+bridge-dependent, already decided. The one non-bridge-looking miss ("RECVX
+sound callbacks complete in HLE...") is superseded by SDBZ's own two new
+tests ("snddrv HLE dispatches all configured subcommand semantics" /
+"...unconfigured layout is inert") — a generalized, table-driven
+`handleSoundDriverRpcService`/`PS2SoundDriverCompatLayout` mechanism that
+replaces upstream's per-game hardcoded SID/callback constants. Confirmed by
+reading both: SDBZ's "stop" subcommand test covers the same busy-flag-clear
+behavior upstream's RECVX-specific test checked, just generically.
+
+**`ps2_runtime_interrupt_tests.cpp` — SDBZ ahead, one narrow test-only gap
+noted.** SDBZ (1055 lines vs upstream's 616) replaced old
+`ps2_scheduler`/fiber-era tests (VBlank deadline/IRQ invocation,
+"scheduler stop wakes an idle VSync wait") with new `EeScheduler`-era
+equivalents (`WaitVSyncTick returns when runtime stop is requested`, INTC
+pending-cause age-window tests, MMIO DMAC-dispatch-from-CHCR tests) — expected
+given Phase 3 fully retired the old scheduler. One real gap: upstream has
+IRQ-ordering unit tests for `iSignalSema`/`DelayThread`-via-Timer2
+("defers selection until IRQ return", "wakes a DelayThread-style semaphore
+wait") with no SDBZ equivalent anywhere in the test tree (grepped all of
+`ps2xTest/src/`). Both syscalls exist and are implemented in production code
+(`Kernel/Syscalls/Sync.cpp`) — this is a test-coverage gap only, not a known
+behavior bug. Not ported (would need behavior verification against SDBZ's
+actual EeScheduler IRQ-return ordering, which needs a build to check).
+
+**`ps2_recompiler_tests.cpp` — clean SDBZ ahead, confirmed by diff, no
+action.** 38 SDBZ tests vs 17 upstream; the full sorted-name diff has **zero
+`<` lines** (zero upstream tests missing from SDBZ) — pure superset. The 21
+extras cover external-call-target collection, data-embedded thread-entry
+decoding, oversized-TU manifests, and the giant-function O1 pipeline.
+
+**`ps2_runtime_kernel_tests.cpp` — clean SDBZ ahead, confirmed, no
+action. Also closes out the previously-open question about
+`ps2_runtime_expansion_tests.cpp`.** The 15 tests only upstream has are all
+old `ps2_scheduler`/`ps2_fiber`-API tests (`RotateThreadReadyQueue`,
+"EE scheduler selects absolute priority then FIFO", "SetSyscall override runs
+as a scheduler invocation," etc.) — verified every one has a direct, often
+more rigorous, equivalent already in
+`ps2_runtime_expansion_tests.cpp`'s ~29 dedicated scheduler suites (e.g.
+`ChangeThreadPriority raises X above Y causing X to preempt Y`,
+`RotateThreadReadyQueue reorders equal-priority ready fibers`, `DeleteSema
+wakes all N waiters with KE_WAIT_DELETE via pair-based drain`). SDBZ's 12
+additions (thread/semaphore EE-layout-decode tests, syscall-override
+fallback tests) are real additive coverage. **This confirms the part-6 "5.4x
+bigger, SDBZ ahead" read on `ps2_runtime_expansion_tests.cpp` was correct —
+no further action needed there.**
+
+**`ps2_gs_tests.cpp` — blocked on Phase 4, not reconcilable without undoing
+that decision.** Confirmed via include-list diff: upstream's version is
+built entirely against the split `runtime/gs/gs_frontend.h` +
+`ps2_gs_memory.h`/`ps2_gs_psmct32.h`/`ps2_gs_psmt4.h`/`ps2_gs_psmt8.h`
+headers from the deferred GS refactor. SDBZ's version uses the monolithic
+`runtime/ps2_gs_gpu.h`. No separate action possible here; tied 1:1 to the
+already-made Phase 4 deferral.
+
+**Ported: `ps2_vu_tests.cpp` (upstream-only, 1045 lines, VU0 macro-mode
+coverage).** Every function name the test calls (`sceVu0MulMatrix`,
+`sceVu0RotMatrixX`, `sceVu0ecossin`, etc. — 63 distinct calls) already
+exists with an identical signature in SDBZ's own independent VU0 stub
+(`Kernel/Stubs/VU.h`, introduced in old commit `0a619813` "Feature/runtime
+ecosystem refactor (#107)" — predates and is unrelated to upstream's own
+VU0 PR #183). Cross-checked every call resolves in SDBZ's headers/test
+tree before copying. Zero production-code changes; pure additive test
+coverage for a subsystem that had none. Wired into `main.cpp` and
+`ps2xTest/CMakeLists.txt`. Committed `a0d26d73`. **Not yet build-verified**
+(user runs builds).
+
+**Phase 8 is now CLOSED — this closes the whole 8-phase catchup plan.**
+Two things still need a user-run build to actually take effect:
+1. Phase 5's `#210` fix in `control_flow_analyzer.cpp` needs a recompiler
+   regen (regenerates every `fn_*.cpp` in `runner/`) before it does anything.
+2. This session's `register_ps2_iop_tests()` fix and the new
+   `ps2_vu_tests.cpp` need `ps2x_tests.exe` rebuilt to confirm they actually
+   compile/link/pass.
+
+**Known deferred items, not bugs, intentionally left open:**
+- IOP heap aliasing gap above (production code, user said defer).
+- `iSignalSema`/`DelayThread` IRQ-ordering test gap (test-only).
+- Phase 4's GS frontend/backend split (whole subsystem, user said defer).
+- Phase 7's ADX audio IOP-bridge gap (whole subsystem, narrow, already
+  reasoned through in Stage 5.16/5.17).
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 6) — Phase 8 (ps2xTest reconciliation) STARTED, one real fix landed, large reconciliation work characterized but NOT done. Checkpoint, not closed.
+
+Compared SDBZ's `ps2xTest/src/*.cpp` file list against upstream tip
+(`14b1e5cb`) file-by-file, then sized every file's diff (CRLF-normalized).
+
+**One concrete fix applied:** `register_ps2_iop_tests()` was DEAD CODE —
+defined in `ps2_iop_tests.cpp` (added back in Phase 2's `2ed84d64` VU1-refactor
+merge, commit message literally says "wasn't present locally") but never
+called from `main.cpp`, so it's been compiling and linking into
+`ps2x_tests.exe` this whole time without ever running. It unit-tests
+`ps2x::iop::IopSubsystem` in isolation — no `PS2Runtime`/bridge dependency, so
+this is safe regardless of Phase 7's bridge-deferral decision, and `ps2_iop`
+(the `ps2xIOP` static lib) is already linked into `ps2_test_lib` via
+`CMakeLists.txt`. Added the declaration + call. Restores real coverage, zero
+new test-writing. **Not yet build-verified.**
+
+**File-by-file characterization (CRLF-normalized diff size against upstream tip):**
+
+| File | Upstream lines | SDBZ lines | Diff size | Read? | Verdict |
+|---|---|---|---|---|---|
+| `ps2_vu1_tests.cpp` | — | — | 12 | ✅ full | Trivial — pure GS-refactor include-path/API rename (upstream's split GS API SDBZ doesn't have, per Phase 4 deferral). No action. |
+| `ps2_runtime_io_tests.cpp` | — | — | 39 | ✅ full | Trivial — cosmetic ABI-arg-passing helper refactor (stack args vs `$t0`/`$t1`), same behavior either way. No action needed, low priority to even adopt. |
+| `main.cpp` | — | — | 97→~10 after fix | ✅ full | Was missing only the one dead-code wiring gap above; otherwise SDBZ already calls MORE registration functions than upstream (all the `register_scheduler_*` suites, `register_ps2_gsdump_replay_tests`) — SDBZ ahead here too. |
+| `code_generator_tests.cpp` | — | — | 200 | partial | Diff is mostly Phase 5's own `#210` test addition (this session) plus pre-existing SDBZ-only test cases upstream lacks. Not further reconciled. |
+| `ps2_memory_tests.cpp` | 1965 | 1873 | 149 | ❌ not read | Comparable size both sides — genuine reconciliation candidate, NOT characterized yet. |
+| `ps2_sif_dma_tests.cpp` | 1138 | 1133 | 312 | ❌ not read | Nearly identical size — genuine reconciliation candidate, NOT characterized yet. |
+| `ps2_sif_rpc_tests.cpp` | 1299 | 1136 | 851 | ❌ not read | Comparable size, upstream somewhat bigger — NOT characterized yet. |
+| `ps2_runtime_interrupt_tests.cpp` | 616 | 1055 | 1200 | ❌ not read | SDBZ ~1.7x bigger — NOT characterized yet, could be ahead or genuinely divergent. |
+| `ps2_recompiler_tests.cpp` | 1089 | 2276 | 1203 | ❌ not read | SDBZ ~2x bigger — likely ahead pattern (per #210 precedent, SDBZ's recompiler is more test-covered), NOT confirmed. |
+| `ps2_gs_tests.cpp` | 4536 | 4399 | 1816 | ❌ not read | Comparable size, but upstream's version almost certainly tests the NEW GS frontend/backend split API — since Phase 4 deferred that split, this is likely NOT reconcilable without undoing that decision. Needs a read to confirm before touching. |
+| `ps2_runtime_kernel_tests.cpp` | 1537 | 1606 | 1927 | ❌ not read | Comparable size, biggest diff-to-size ratio of the "comparable size" group — genuine reconciliation candidate, NOT characterized yet. |
+| `ps2_runtime_expansion_tests.cpp` | 1491 | 8084 | 7361 | ❌ not read (structure only) | SDBZ is **5.4x bigger** — contains 21 of upstream's ~29 `register_scheduler_*`/EE-scheduler test suites already, hand-written directly in this file. Almost certainly the "SDBZ ahead" pattern like Audio.cpp/main.cpp, not a gap. |
+
+**Files that exist on only one side:**
+- Upstream-only: `ps2_vu_tests.cpp` (1045 lines, VU0-specific coverage via
+  `Kernel/Stubs/VU.h` — SDBZ has no VU0 test file at all; this is a genuine,
+  low-risk, additive porting candidate since it's pure new test coverage with
+  no production-code dependency change). `fake_iop_bad_abi.c`/
+  `fake_iop_missing_symbol.cpp`/`fake_iop_plugin.cpp` — all test the
+  `ps2xIOP` plugin-loading path, irrelevant per the Phase 7 bridge-deferral
+  decision, skip.
+- SDBZ-only: `ps2_gsdump_replay_tests.cpp`, `ps2_observability_tests.cpp`,
+  `ps2_scheduler_workload_regression_tests.cpp` (defines the other 9 of the
+  ~29 scheduler suites — combined with `ps2_runtime_expansion_tests.cpp`'s
+  21, this accounts for ALL of upstream's scheduler-test surface plus 2 SDBZ
+  extras), `recomp_override_stubs.cpp` — keep all, nothing to reconcile.
+
+**Established pattern this phase (matches Phase 6/7): SDBZ is very often AHEAD
+of upstream's test coverage, not behind.** A blind line-level "reconcile
+toward upstream" on the still-uncharacterized files risks the same mistake
+Phase 6 almost made on `Audio.cpp` — replacing SDBZ's more complete tests
+with upstream's simpler ones. Each remaining file needs an actual read before
+touching, same discipline as Phases 4/6/7, not a mechanical merge.
+
+**Phase 8 is a checkpoint, not closed.** Remaining work: read and
+characterize the 6 "not yet read" files above (`ps2_memory_tests.cpp`
+through `ps2_runtime_kernel_tests.cpp`), decide on `ps2_vu_tests.cpp`
+porting, and confirm `ps2_runtime_expansion_tests.cpp`'s 5.4x-bigger read is
+really all "SDBZ ahead" and not hiding a real gap in the parts upstream still
+differs on. This is genuinely the largest remaining piece of the whole
+8-phase plan by file count.
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 5) — Phase 7 (ps2xIOP bridge): plan doc's premise was STALE. CLOSED, zero code changes — nothing upstream has here that SDBZ lacks.
+
+Read the plan doc's Phase 7 section fresh, then read the actual new upstream
+files it calls for (`ps2_iop_host.h`/`.cpp`, `ps2_iop_transport.h`, 669 lines
+total, saved to scratchpad and read in full) before writing anything.
+
+**First finding, before even getting to CRI_ADXI:** the plan's premise that
+this is "build 3 new files + wire in `ps2xIOP`" undersells what's already
+here. SDBZ has its own hand-built, validated, closed-stage IOP module
+implementations living directly in `ps2xRuntime/src/lib/`:
+`ps2_iop_mcman.cpp` (612 lines, closed Stage 5.12), `ps2_iop_cl.cpp` (514),
+`ps2_iop_sdrdrv.cpp` (325), `ps2_iop_dbcman.cpp` (89), `ps2_iop_audio.cpp`
+(37, dispatches `IOP_SID_LIBSD` through the real `audioBackend()`). The
+separate `ps2xIOP` static lib (extracted, unwired, from Phase 1's #170) has
+its own independent, never-tested reimplementation of the exact same
+services (`mcserv.cpp`, `clfile.cpp`, `sdrdrv.cpp`, `dbcman.cpp`,
+`libsd.cpp`). Wiring the full bridge in would mean running two competing
+implementations of already-validated subsystems side by side — same
+regression shape as Phase 4's GS split. **Put this to the user; chose to
+scope down to just the plan's named "genuinely open gap" (CRI_ADXI.IRX)
+instead of the full bridge.**
+
+**Then checked that gap itself, and it dissolved too.** The plan doc says
+CRI_ADXI's import fids `[4,5,6,11,17,18,19,20,26,28]` "still need real
+IOP-side stubs" — but `ps2_iop.cpp` lines 131-156 already contain a fully
+reasoned, deliberate design decision, NOT a TODO:
+- The sid `0x90000200` SJX/DTX handshake is answered locally rather than by
+  loading real `CRI_ADXI.IRX`, with an explicit comment addressing
+  `[[feedback_no_iop_faking]]` head-on: the DTX handle that crosses back to
+  the EE is proven (via a real-PCSX2 comparison at `0x44DAF0`) to be an
+  opaque IOP-address token the EE never dereferences, just stores and
+  echoes — so minting one loses no information, unlike ARKD_DVD's payload
+  bytes (the case that rule was written for).
+- `Kernel/Stubs/SIF.cpp` lines 1665-1688 (part of the already-CLOSED
+  Stage 5.16, `project_stage516_srd_completion.md`) hand-derives the ADX
+  stream ring's ack-advance mechanism from the guest ELF's own disassembly
+  and synthesizes the ack **count** (not fabricated stream data) to match
+  real transfers, precisely because the real IOP-side consumer inside
+  `CRI_ADXI.IRX` is never loaded.
+- Both together mean the real, current cost of not loading `CRI_ADXI.IRX` is
+  narrow and already understood: **no actual ADX audio output** (no sound
+  from movie/music streams), not a stall, crash, or faked-data violation.
+  Fixing that for real needs a whole new subsystem (a second real IOP module
+  load alongside `ARKD_DVD.IRX` + a from-scratch libsd/SPU2 backend) — this
+  is a **feature build**, not "finish an unfinished stub," and it's not
+  something upstream's own PR #170 provides either (the plan doc's own
+  caveat: "`ps2xIOP`'s `libsd.cpp` is EE-side only").
+
+**Phase 7 CLOSED with zero code changes.** There is nothing in upstream's
+`ps2xIOP` bridge that SDBZ is missing and that upstream itself actually
+solves — the bridge would only introduce redundant, unvalidated
+reimplementations of subsystems SDBZ already has working. Real ADX audio
+output remains a known, bounded, separately-scoped feature gap (not a
+catch-up item) if the user wants to pursue it later.
+
+**Next: Phase 8** (`ps2xTest` reconciliation) — the last phase in the plan.
+Folds in sub-phase 3e's already-known remaining test debt (3 test files still
+broken against `EeScheduler`, from Phase 3) alongside whatever else `+7,195/
+−13,943` of upstream test diff turns out to still be relevant after Phases
+1-7 landed in this (hand-reconciled, not merged) form.
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 4) — Phase 6 (MPEG.cpp/Audio.cpp): MPEG got a real 1-line leak fix + ffmpeg-guard widening. Audio.cpp left UNTOUCHED — SDBZ is ahead of upstream, not behind. Phase 6 CLOSED.
+
+The plan doc sized this at "~50 hunks both directions, needs judgment merge,"
+based on the assumption Phases 2-4 would land via real `git merge` and sweep
+these files up as a byproduct. Since Phases 1-4 were hand-reconciled instead
+(and Phase 4 deferred entirely), neither file had actually moved — checked by
+diffing straight against upstream tip (`14b1e5cb`), CRLF-normalized, same
+trap as Phase 4 (`feedback_line_ending_false_diffs`).
+
+**`MPEG.cpp` — diff was only 14 lines, not ~50 hunks. Two real changes applied:**
+1. **Leak fix (the only actual bug):** `dispatchGuestStreamCallback`'s
+   `writeMpegCallbackData` failure path returned without calling
+   `runtime->guestFree(cbDataAddr)` — the buffer is only freed via the
+   `GuestInvocation`'s `onComplete` lambda, which never runs if the invocation
+   is never queued. `git blame` traced the missing free back to the original
+   `11f47e23` (Feature/mpeg decoder #120, 2026-06-26) and confirmed via
+   `git log -p` that it was never explicitly removed by SDBZ — upstream fixed
+   this independently sometime after the two diverged. Applied verbatim.
+2. **`PS2X_HAS_FFMPEG` guard widened** to also cover the ffmpeg includes and
+   `ffmpegErrorString`/`configureFfmpegLogLevel` (previously only guarded
+   `MpegFfmpegDecoder`), matching upstream — lets a no-ffmpeg build skip the
+   headers entirely. Zero risk: `ps2xRuntime/CMakeLists.txt:503` already
+   defines `PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>` unconditionally via
+   generator expression, so the macro is always defined and SDBZ's build
+   (ffmpeg always enabled) behaves identically either way. Left SDBZ's removal
+   of upstream's redundant `#if !defined(PS2X_HAS_FFMPEG) #define ... 1
+   #endif` header fallback alone — genuinely dead code once CMake always
+   defines it, no reason to re-add.
+
+**`Audio.cpp` — deliberately left untouched.** The diff shows SDBZ is
+strictly ahead here, not behind:
+- SDBZ tracks per-core (`kLibSdCoreCount=2`) transfer state
+  (`VoiceTransferState`/`BlockTransferState` arrays); upstream has one global
+  non-per-core state.
+- SDBZ distinguishes real SDK commands `sceSdVoiceTrans` (0x80D0) from
+  `sceSdBlockTrans` (0x80E0) as genuinely different operations; upstream
+  conflates both under one "BlockTrans" handler and has no voice-transfer
+  support at all.
+- SDBZ handles the transfer-stop direction (`kLibSdTransStop`) and loop/bank
+  reporting (bit 24 of the status word, `kLibSdTransLoop`) for real
+  interleaved-loop playback position; upstream's simplified model has neither.
+- SDBZ has `kLibSdCmdVoiceTransStatus` handling; upstream doesn't.
+
+Nothing in upstream's version does anything SDBZ's doesn't already do more
+completely — merging upstream's shape in would be a functional regression
+(losing voice-transfer support, per-core isolation, and loop/stop semantics),
+not a fix. **Left alone on purpose, not a gap to revisit** unless a future
+upstream PR specifically improves on one of these areas.
+
+**Phase 6 CLOSED.** Not yet build-verified (no build run this session, per
+standing rule). **Next: Phase 7** (`ps2xIOP` bridge — build
+`ps2_iop_host.cpp/.h` + `ps2_iop_transport.h` implementing
+`ps2x::iop::IopHost`, per the plan doc's Phase 7 section) — not yet started.
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 3) — Phase 5 (#210, #214): #210 applied, #214 already independently fixed. Both isolated, low-risk. ⚠️ Needs user-run recompiler regen.
+
+Moved to Phase 5 per the plan doc (`C:\Users\mwlab\.claude\plans\warm-painting-kahn.md`)
+after closing Phase 4 (see part-2 entry below). Phase 5 is just two small,
+isolated upstream fixes (`git show` read in full for each, not assumed):
+
+- **#210 (`d9ea4fb6`, syscall resume-entry-point) — APPLIED, not yet built.**
+  `ps2xRecomp/src/lib/control_flow_analyzer.cpp`: the analyzer only queued
+  scheduler resume-entry-points for JAL/JALR, not `syscall`. A guest thread
+  that installs its own syscall handler via `SetSyscall` gets suspended and
+  resumed at syscall+4 by `EeScheduler`, but with no entry point registered
+  there `hasFunction()` failed and the thread went dormant instead of
+  resuming — silent, no error, looks like clean shutdown. Confirmed via grep
+  that SDBZ's `control_flow_analyzer.cpp` has the exact same pre-fix shape
+  upstream patched (same `queueResumeEntryTarget` lambda, same loop
+  structure) — applied verbatim, +8 lines. Test ported to
+  `ps2xTest/src/code_generator_tests.cpp` too (+40 lines, exact diff-stat
+  match against upstream) — `makeSyscall()` helper + one new test case,
+  inserted at the same spot upstream did (right before "resume entry targets
+  emit a top-level pc switch").
+  ⚠️ **This changes `control_flow_analyzer.cpp`, which means every `fn_*.cpp`
+  in `runner/` needs the recompiler re-run to regenerate — per the standing
+  rule, only the user runs that (30h+ full rebuild potential). Not yet done.**
+  Until that regen happens this fix has zero runtime effect (existing
+  `runner/` output was generated before this change).
+
+- **#214 (`14b1e5cb`, COP0 Status.IE) — ALREADY FIXED independently, no-op.**
+  Checked `ps2_runtime.cpp` (`PS2Runtime::PS2Runtime()`, ~line 1093) before
+  touching anything: SDBZ already sets
+  `m_cpuContext.cop0_status = COP0_STATUS_IE | COP0_STATUS_EIE` right after
+  the `memset`, with its own detailed comment tracing the exact same
+  `StartThread`/`DIntr` guard-clause bug upstream's #214 describes (both cite
+  a thread-can't-start symptom from Status defaulting to zero). This was
+  fixed here independently, at some earlier point before this catch-up effort
+  — nothing to do. Matches the Phase 1 precedent of convergent fixes
+  ("expect no-op/trivial conflict").
+
+**Phase 5 status: functionally done except the recompiler regen.** Nothing
+else in Phase 5 remains — the plan doc's expectation that "most of what
+shrank `ps2_runtime.cpp` should already be resolved as a byproduct of Phases
+2-4" doesn't apply here since Phases 2-4 were hand-reconciled, not
+`git merge`d, but there's no leftover `ps2_runtime.cpp` diff to chase because
+Phase 4 was deferred rather than merged (no upstream restructuring of
+`ps2_runtime.cpp` was ever pulled in to begin with).
+
+**Next: hand off the recompiler regen command to the user for #210 to take
+effect, then move to Phase 6** (MPEG.cpp/Audio.cpp manual merge) once that's
+done, or proceed to Phase 6 investigation in parallel since it doesn't depend
+on the regen.
+
+---
+
+## HANDOFF 2026-08-27 (session 4, part 2) — Phase 4 (#204 GS refactor): SPLIT DEFERRED by user decision. Phase 4 CLOSED at type-layer-only scope.
+
+Continued from the part-1 entry directly below. Started sub-phase 4b (the actual
+content port) by reading `ps2_gs_gpu.h` in full and tracing real call sites in
+`ps2_gs_gpu.cpp` for the CLUT/texture-page-cache methods, to build an exact
+member-by-member frontend/backend split map before writing any new code.
+
+**What that tracing found:**
+- `ReloadClutCache`/`InvalidateTexturePageCache` etc. are called as immediate
+  side effects of register writes (`GS_REG_TEX0_1/2` → `ReloadClutCache`,
+  `GS_REG_TEXFLUSH` → `InvalidateTexturePageCache`, in `writeRegisterPacked`),
+  not lazily during rasterization. Confirmed via direct grep + read of
+  `ps2_gs_gpu.cpp` lines 4930-4990 and 5171-5177. This means the frontend needs
+  a way to command these on the backend — upstream's own `GSRasterBackend`
+  interface has no such methods (upstream has no CLUT cache at all), so I
+  extended `gs_backend.h` with 6 SDBZ-only methods (`ReadTexturePageCache`,
+  `ReloadTexturePageCache`, `InvalidateTexturePageCache`, `ReadClutCache`,
+  `ReloadClutCacheCSM1`, `ReloadClutCacheCSM2`, `ReloadClutCache`) mirroring
+  `GS`'s existing public API 1:1. **This edit is committed and kept** — it's a
+  correct, low-risk addition regardless of the split decision below.
+- Also found a `PresentProbe` local-struct diagnostic (destructor spans
+  roughly `ps2_gs_gpu.cpp` lines 1833-2900+, feeds the `[vramcen]`/`[clutlive]`
+  probes used in stages 5.14-5.17) whose destructor reads fields that would
+  land on **both** sides of a real split in the same block: frontend-owned
+  `m_hostPresentationFrame`/`m_hostPresentationWidth` alongside backend-owned
+  `m_vram`/`m_clut_cache`. Not an isolated case — `ps2_gs_gpu.cpp` is full of
+  this kind of diagnostic scaffolding built up across stages 5.8-5.17, layered
+  directly on top of the rendering internals, not cleanly separable from them.
+
+**Decision point raised with user:** full hand-port of all 6527+3085 lines into
+a real `GSCpuBackend` (matching upstream's architecture exactly, multi-session
+effort, real risk of silent rendering regressions with no build/run available
+to verify against) vs. deferring the split (keep `ps2_gs_gpu.cpp/.h` completely
+untouched and working, keep the new `gs_types.h`/`gs_backend.h` headers
+unused as scaffolding for whenever a future PR actually needs to call through
+`GSRasterBackend`).
+
+**User chose: defer the split.** Nothing in SDBZ today requires the
+frontend/backend interface to exist in order to function — it's pure
+architectural alignment with upstream, not a functional gap, and the
+regression surface (silent visual corruption in code that took multiple
+stages — 5.8/5.11/5.14-5.17 — to get render/movie-correct) isn't worth taking
+on for zero current benefit.
+
+**Phase 4 is CLOSED at this scope:**
+- ✅ 4a — type/interface layer (`gs_types.h`, `gs_backend.h`, now with the 6
+  CLUT/texture-cache methods added) — committed, unused, safe.
+- ❌ 4b/4c (frontend/backend content port) — explicitly NOT done, NOT planned.
+  `ps2_gs_gpu.cpp`/`.h` and `ps2_gs_rasterizer.cpp/.h` remain exactly as they
+  were before Phase 4 started — this is a deliberate no-op, not a gap to fill
+  later, unless a future upstream PR actually forces the issue.
+- ❌ 4d/4e/4f — moot; nothing to reconcile since nothing moved.
+
+If a future upstream PR depends on `GSRasterBackend` existing as a real
+implementation (not just a header), that PR's own catch-up phase is where this
+gets revisited — don't reopen this deferral speculatively.
+
+**Next: Phase 5** (`ps2_runtime` core + `#210`/`#214`) — not yet started. Note
+Phase 5 per the original 8-phase plan requires a user-run recompiler
+regeneration (30h+) at some point; confirm scope before diving in.
+
+---
+
+## HANDOFF 2026-08-27 (session 4) — Phase 4 (#204 GS refactor) started; scope confirmed LARGER than Phase 3
+
+User said "continue integration, we'll worry about troubleshooting later" — proceeding
+through the 8-phase plan's Phase 4. Committed sub-phase 3e's fixture fix +
+session-3 handoff first (`2dfab050`), then began Phase 4.
+
+**Scope reality check (verified via direct file/line comparison, not assumed):**
+upstream #204 (`d74a3ce1`) deletes `ps2_gs_gpu.cpp`(2961 lines)/`ps2_gs_rasterizer.cpp`
+(1102 lines) wholesale and replaces them with a `GSRasterBackend` interface +
+`gs_frontend.cpp`(1733)/`gs_cpu_backend.cpp`(1894). SDBZ's actual current files are
+**`ps2_gs_gpu.cpp`=6527 lines, `ps2_gs_rasterizer.cpp`=3085 lines** — more than
+double/triple upstream's pre-refactor size, from PR #144's CLUT cache, extra
+texture formats, zbuf, and the box-tex/texfetch/glyphfate/shadow/fbsplit/fbaddr/
+uvspan diagnostics seen in every run log's tag census. None of the "renamed" files
+in upstream's diff (`ps2_gif_arbiter`, `ps2_gs_common`, `ps2_gs_memory`, the new
+`ps2_gs_gpr.h`-equivalent) are clean moves for us — confirmed via CRLF-normalized
+diff (see [[feedback_line_ending_false_diffs]], caught the false whole-file-diff
+trap again before concluding anything) that every GS file has heavy SDBZ-only
+content layered on the old architecture. **This makes Phase 4 bigger in raw
+hand-port volume than Phase 3.**
+
+**Good news found while sizing this up:** SDBZ's `ps2_gs_gpr.h` (737 lines) already
+has a MORE evolved register model than upstream's new `gs_types.h` (315 lines) —
+SDBZ uses `Bitfield<u64,...>`-based unions for every GS register (`GSAlphaReg`,
+`GSPrimReg`, `GSTex0Reg`, etc., richer than upstream's plain-struct fields), and
+`ps2_gs_gpu.h` already has its own `GSContext`/`GSGpr` split. Upstream's
+`gs_types.h` mostly duplicates registers SDBZ already models better — its only
+genuinely NEW content is the batch/transfer/presentation orchestration types the
+`GSRasterBackend` interface needs: `GSVertex`, `GSDrawState`, `GSPrimitiveBatch`,
+`GSTransferCommand`, `GSTransferSnapshot`, `GSPresentationRequest`,
+`PresentationFrame`, `GSSyncReason`.
+
+**Revised Phase 4 sub-phase plan:**
+- **4a (IN PROGRESS)** — type/interface layer. Added `ps2xRuntime/include/runtime/gs_types.h`
+  (new orchestration types only, built on SDBZ's existing `GSContext`/`GSPrimReg`/
+  `GSTexaReg`/`GSTexClutReg`/`GSBitBltBufReg`/`GSTrxPosReg`/`GSTrxReg`/`GSFrameReg`
+  rather than redefining them) and `ps2xRuntime/include/runtime/gs_backend.h`
+  (the `GSRasterBackend` pure-virtual interface, verbatim from upstream since it's
+  wholly new). Both are flat in `runtime/` for now (NOT yet in a `gs/` subdirectory
+  like upstream) — kept minimal-diff on purpose; the directory move is deferred to
+  4e so it doesn't tangle with the content port. ⚠️ Not yet compiled — nothing
+  includes these two files yet, so they can't break the build, but also haven't
+  been build-verified. Next in 4a: nothing else needed here; move to 4b.
+- **4b (not started)** — `gs_frontend.cpp`/`.h`: port SDBZ's GIF-packet-parsing/
+  register-dispatch logic (currently in `ps2_gs_gpu.h/.cpp`) into the new frontend
+  shape, replacing direct rasterizer calls with calls through `GSRasterBackend`.
+- **4c (not started)** — `gs_cpu_backend.cpp`/`.h`: port SDBZ's rasterizer core
+  (`ps2_gs_rasterizer.cpp`) + PR #144's CLUT cache + texture-format handling into
+  a `GSCpuBackend : GSRasterBackend` implementation.
+- **4d (not started)** — mechanical relocation: `ps2_gs_memory.h/.cpp`,
+  `ps2_gif_arbiter.h/.cpp`, `ps2_gs_common.h` — SDBZ content preserved, just
+  reconciled against upstream's minor changes to each.
+- **4e (not started)** — cross-cutting fixups: `CMakeLists.txt`, `Kernel/Stubs/GS.cpp`,
+  `ps2_runtime.h/.cpp`, VU1 core/lower call sites (the `GetCurrentVSyncTick()` arity
+  bug already flagged in Phase 3d as "same class, deliberately left for Phase 4"
+  lives in `ps2_gs_gpu.cpp` — fix it here), delete old `ps2_gs_gpu.cpp`/
+  `ps2_gs_rasterizer.cpp/.h`, do the `gs/` subdirectory move to match upstream.
+- **4f (not started)** — `ps2xTest` reconciliation (`ps2_gs_tests.cpp`,
+  `ps2_memory_tests.cpp`, `ps2_vu1_tests.cpp`, `ps2_runtime_expansion_tests.cpp`) —
+  likely folds into Phase 8 alongside 3e's remaining test debt.
+
+**Not yet re-validated:** Stages 5.8-5.17 will need re-validation after Phase 4
+closes too, same as Phase 3 — GS is directly load-bearing for the movie/render
+milestones those stages depend on, and this run is already stalled short of that
+milestone under the new EeScheduler (see session-3 entry below) before Phase 4
+even touches it.
+
+---
+
+## HANDOFF 2026-08-27 (session 3) — 🔴 LIKELY REGRESSION: post-Phase-3-build-gate run never leaves early init; two golden runs from 1-2 days ago reach `ATARI.SFD` in the same wall-clock budget
+
+**What was run.** Step 2 of "1 to 3": sanity-check the Phase 3 build-gate fixes
+(commits `657e1f08`/`0667f348`) by running the exe.
+`launch_recomp.ps1 -Determinism 1 -RunSeconds 200 -NoDebugger -HostProfile`
+against `ps2EntryRunner.exe` (RelWithDebInfo). Full console tail + `run_log.txt`
+pasted/read back.
+
+**Comparison baseline (verified, not assumed).** Read the two most recently
+archived logs, `logs/archive/run_log.20260826-141501.txt` and
+`.../run_log.20260825-195843.txt` — both det=1, both ~197-198s watchdog
+duration (i.e. directly comparable to this run, not cherry-picked for length).
+Both:
+- `busy%=84-90` from `t=1s`, `vbl/s=6`, real `res/s`
+- `bssnz` climbing 11,326 → 41,746 over the run (BSS actually getting written)
+- `gstate@0x5e6b3c` transitions `0,0,0,0` → `0,0,0,1` (`gchg=1`) partway through
+- both open `\MOVIE\ATARI.SFD;1` (`.SFD` appears 22× in each log)
+
+**This run, same duration, same det=1:**
+- `busy%=0` for the entire 197s (one anomalous `busy%=19930` at the final
+  t=199 sample — almost certainly a counter artifact at auto-stop, not real)
+- `bssnz=0` for every single second — BSS never gets touched at all
+- `gstate@0x5e6b3c=0,0,0,0` never changes, `gchg=0` for the whole run
+- `vbl/s=0` constant
+- `.SFD`/`ATARI.SFD` never appears anywhere in `run_log.txt` — the movie path
+  is never reached
+- `pc=0x100008` (ELF entry) for every sample — expected on its own (documented
+  at `ps2_runtime.cpp:445-450`: the outer snapshot freezes at a function's
+  entry while its whole call tree runs), **but** `lastCall=0x17eec0` is ALSO
+  frozen for all 198 samples. `g_lastDispatchPc` (`lastCall`) is specifically
+  the counter meant to catch what the outer snapshot can't — it's documented
+  to advance on every table-dispatched call, globally, across all threads
+  (`ps2_runtime.cpp:445-451`). Frozen for 198s straight means zero new
+  top-level guest-function dispatches the entire run.
+- `0x17eec0` decompiles to `syscall_stub_z_35` (`ida_scripts/decompiles_SLUS_214_42.txt:99459`)
+  — a raw MIPS `syscall` trampoline, not game logic. So the last thing the
+  guest dispatched through the table was a syscall, and nothing has been
+  table-dispatched since.
+- Meanwhile `progress` climbs to ~30.8M and `[hostprof]` shows
+  `EeScheduler::checkpointDue` alone burning 11.8% (22.53s / 194s window) of
+  a CPU pinned at 122% of one core the whole run. `ps2x_guest_progress()`
+  increments once per 128 **intra-function back-edges**
+  (`EeScheduler.cpp:74-83`), i.e. loop iterations *inside* an
+  already-dispatched function's call tree — not at dispatch boundaries. So
+  "huge progress + frozen lastCall" is not a contradiction: the guest is
+  spinning at a very high rate inside whatever function was reached from the
+  0x17eec0 syscall call, without that spin ever bottoming out in a new table
+  dispatch, syscall return, or state change.
+
+**Verified vs hypothesis.** Verified: the regression itself (no BSS writes,
+no state change, no SFD open, frozen lastCall, all in stark contrast to two
+comparable recent golden runs). NOT yet verified: *why*. Candidates, not yet
+checked — do not act on these as fact:
+- Which syscall number 0x17eec0's trampoline carried (the trampoline is
+  generic; the number lives in `$v1` at call time, not in the trampoline
+  address) — needs a register-dump probe at that call site, not yet written.
+- Whether this is caused by the Phase 3d `EeScheduler` migration itself
+  (e.g. a blocking syscall that used to suspend-and-resume the old fiber
+  cleanly now mis-binds under `bindMainContextForSyscall`/`blockCurrent`'s
+  exception-unwind model) vs. an unrelated effect of this session's 4
+  build-gate fixes (`GetCurrentVSyncTick` arity, etc.) vs. something already
+  broken before either change that just hadn't been re-run since.
+- ~~Whether the two comparison logs predate or postdate Phase 3d~~ — CHECKED:
+  `git log` shows Phase 3d landed 08-26 18:10-19:26 (`6aa34593`→`514cb03c`).
+  Both comparison logs (08-25 19:58, 08-26 14:15) are **before** that window —
+  i.e. both golden runs were captured on the OLD `ps2sched` fiber scheduler.
+  There is no post-Phase-3d / pre-build-gate golden run to compare against,
+  because Phase 3d couldn't build+link at all until today's 4 build-gate
+  fixes landed (`657e1f08`, 02:04 today) — **this run is the first time
+  `EeScheduler` has ever driven the real game**, not a regression against an
+  otherwise-identical EeScheduler baseline. So the honest framing is: the new
+  scheduler's first live run stalls well short of where the old one got,
+  not "we broke something that used to work under EeScheduler." Narrows the
+  suspect list to EeScheduler's syscall-blocking path specifically (the
+  frozen-stack-fiber vs exception-unwind-redispatch difference already
+  flagged in this session's sub-phase 3e finding above) rather than the 4
+  build-gate symbol fixes, none of which touch scheduling/blocking semantics.
+
+**Next diagnostic step (not yet taken):** a game_overrides.cpp probe on the
+generic syscall dispatch path logging `$v1` (syscall number) + calling PC
+whenever the dispatched syscall is one the guest hasn't returned from within
+N seconds, so the next run names the actual syscall instead of just the
+trampoline address. Per [[feedback_write_probes_dont_ask]] this is a probe
+worth writing on request — not written yet, this handoff is the finding only.
+
+---
+
+## HANDOFF 2026-08-27 (session 2) — Sub-phase 3e scoped correctly: it's an architecture-level test redesign, not an API port. Fixture fixed; 3 test .cpp files deliberately left broken.
+
+**3e's logged scope was wrong.** The prior handoff named only 2 files
+(`SchedTestSupport.h`, `ps2_scheduler_workload_regression_tests.cpp`). Actual
+scope, confirmed by grep across `ps2xTest/`:
+
+| File | Lines | Retired-API hits |
+|---|---|---|
+| `SchedTestSupport.h` | 233 | shared fixture — fixed this session |
+| `ps2_scheduler_workload_regression_tests.cpp` | 1,501 | 5, but 9 suites/13 cases all built on the retired model |
+| `ps2_runtime_expansion_tests.cpp` | 8,084 | **95** |
+| `ps2_runtime_kernel_tests.cpp` | 1,606 | 8 |
+
+**The real finding: this isn't a rename job.** Confirmed by reading
+`EeScheduler::blockCurrent()` (`EeScheduler.cpp:1877-1885`) and `run()`'s
+dispatch loop (`EeScheduler.cpp:298-481`):
+- Old `ps2sched` model: each guest thread was a real OS-level fiber/coroutine.
+  A blocking call (`WaitSema` etc.) froze the actual C++ call stack via a real
+  context switch and resumed it later, mid-function, exactly where it left
+  off. Host threads could park waiting to win a shared "guest execution
+  token" (`async_guest_begin`/`async_guest_end`).
+- New `EeScheduler` model: a block throws `EeDispatcherTransfer`, unwinding
+  the WHOLE C++ stack. Resuming means re-dispatching `lookupFunction(ctx->pc)`
+  as a fresh call — there is no frozen stack, no token, no per-thread OS
+  fiber. This is correct and sufficient for real recompiled MIPS code (which
+  always keeps `ctx->pc` current before anything that might block), but fatal
+  for hand-written test step functions that do "block mid-loop, then keep
+  going in the same C++ frame after" — e.g. the old
+  `ps2_scheduler_workload_regression_tests.cpp`'s `stepInvokeRecordA`
+  (records a value, signals, waits, sets `ctx->pc` **after** the wait — that
+  last line never runs on the block path under the new model; the function
+  just gets re-entered from the top instead). A few tests happen to be
+  stateless-enough loops that restart-from-top is accidentally equivalent to
+  continue-after-block; most aren't, and mechanically porting them would
+  produce tests that compile and pass while silently not testing what their
+  names claim.
+
+**Given that, user chose (2026-08-27): fix the fixture only, leave the 3 test
+`.cpp` files broken, park the full redesign for a dedicated future session.**
+Do NOT attempt to mechanically port those 3 files without re-deriving,
+per test, whether the bug class it regression-tests can even recur under a
+single-executor exception-unwind scheduler — several structurally cannot
+(the fiber-pool/OS-thread-per-fiber races), and are candidates for deletion
+with a comment, not a port.
+
+**What's actually fixed this session** — `SchedTestSupport.h` compiles clean
+against `EeScheduler` (verify with the next `ps2xTest` build attempt, not
+done yet this session):
+- `SchedFixture`: dropped `ps2sched::scheduler_init()/scheduler_shutdown()`
+  and the retired `ps2_syscalls::notifyRuntimeStop()` call entirely. Each
+  fixture now owns a brand-new `PS2Runtime` (and therefore a brand-new
+  `EeScheduler`), so there's no more global fiber-pool state for a previous
+  test to leave dirty — the old calls existed only to heal/reset shared
+  global state that no longer exists. Destructor still calls
+  `runtime.requestStop()` (production's own `PS2Runtime::requestStop()` now
+  routes straight to `EeScheduler::requestStop()` in place of the retired
+  `notifyRuntimeStop()` — confirmed via `git show de9288f8`).
+- `drainedWithin()`: swapped the retired global `g_activeThreads` for
+  `EeScheduler::isIdle()`, scoped to the fixture's own runtime.
+  **Signature changed** — now takes `PS2Runtime &runtime` as its first
+  param (there's no global left to default to). Every call site in the 2
+  broken `.cpp` files will need updating when 3e resumes.
+- `ParkedHostWorker`: swapped `g_currentThreadId = -1` +
+  `async_guest_begin()/async_guest_end()` for
+  `std::lock_guard<std::mutex>(scheduler.hostInvocationMutex())` — the
+  EeScheduler doc comment's own named successor mechanism, not a guess.
+  **Signature changed** — constructor now takes `EeScheduler &scheduler`.
+  **Flagged, not verified**: the old token had an explicit starvation-avoidance
+  gate (`g_host_token_waiters`) guaranteeing bounded-time acquisition even
+  under fiber contention; a plain mutex has no such gate. The
+  `SchedulerTokenHandoff` suite (H1-H3) that exercises exactly this needs
+  re-verification against the new scheduler, not just a recompile, before
+  anyone trusts a green result from it.
+
+**Next for 3e (whenever picked back up)**: go file by file
+(`ps2_scheduler_workload_regression_tests.cpp` first, smallest and already
+read in full this session — 9 suites: `SchedulerTokenHandoff`,
+`SchedulerRpcLoopPark`, `SchedulerGuestContextStop`, `RuntimeAsyncStackPool`,
+`SchedulerDmacGuestDispatch`, `SchedulerRecoveryIsolation`,
+`SchedulerStackIsolation`, `SchedulerOverrideIsolation`,
+`SchedulerJoinStarvation`), and for each test case decide: still-applicable
+invariant → redesign against exception-unwind-and-redispatch semantics;
+structurally-impossible-now bug class → delete with a comment saying why.
+`ps2_runtime_expansion_tests.cpp` (95 hits) and `ps2_runtime_kernel_tests.cpp`
+(8 hits) not yet read in detail — do that before touching either.
+
+**None of this session's SchedTestSupport.h change is committed yet.**
+
+## HANDOFF 2026-08-27 — Phase 3 BUILD-GATE PASSED: `ps2EntryRunner.exe` links clean, +04:57. Fixes committed.
+
+Four incomplete-migration gaps had to be bridged before the tree would
+compile+link. Three are the 3d-retirement class (a Phase-3d commit ported
+every sibling symbol in a family except one, leaving a still-live caller
+pointed at nothing):
+- `shouldPreemptGuestExecution()` restored as a shim in `ps2_runtime.h`
+  (header touch — full ~30k-TU rebuild cost, already paid).
+- `rpcInvokeFunction()`/`RpcInvokeExitReason` restored in
+  `Kernel/Syscalls/Helpers/Runtime.h` (header touch — same rebuild already
+  paid; `RPC.cpp`'s 4 call sites are the live callers, deferred long-term
+  port to `EeScheduler::queueInvocation()`'s async model noted in-comment).
+- `ps2x_determinism_enabled()` restored in `EeScheduler.cpp` alongside its
+  `ps2x_guest_*` diagnostic siblings (`.cpp`-only, no header — cheap
+  relink, confirmed via `git show de9288f8` diff showing it deleted
+  immediately adjacent to the correctly-ported `ps2x_guest_resumes()`).
+  Also added the now-required `#include <cstdlib>` for `std::getenv`.
+
+The 4th is the arity-mismatch class the 08-26 handoff had explicitly logged
+as "deliberately NOT fixed (Phase 4 territory)" — it turned out to actually
+block the build, so it got fixed after all, superseding that note:
+- `ps2_gs_gpu.cpp`'s `recordDebugEventUnlocked`/
+  `latchHostPresentationFrameUnlocked` called the 0-arg
+  `GetCurrentVSyncTick()` against the already-1-arg header. Fixed by
+  threading a `PS2Runtime*` through: `GS::init()` gained a `runtime`
+  param (`ps2_gs_gpu.h`), `PS2Runtime::syncCoreSubsystems()` now passes
+  `this` (`ps2_runtime.cpp`), both call sites use the stored `m_runtime`
+  (null-guarded — `latchHostPresentationFrameUnlocked` treats null as
+  even field rather than crashing). `Stubs/GS.cpp`'s `resetGsSyncVState`
+  also picked up mutex-guarded field resets as part of the same pass.
+  Left the rest of PR #204's GS refactor territory untouched — this was
+  the minimum to compile, not a GS redesign.
+
+All four found via the same method: grep the symptom file/repo for the
+symbol, `git log --all -S"<symbol>"` pickaxe when local search comes up
+empty, `git show <commit> | grep -B/-A` to pull the exact deleted body
+before restoring it verbatim with a rationale comment.
+
+**Next: sub-phase 3e** — `ps2xTest/*` (`SchedTestSupport.h`,
+`ps2_scheduler_workload_regression_tests.cpp`) still built against the
+retired `ps2sched::` API, expected broken, not yet touched. Then the
+recompiler regen for the `shouldPreemptGuestExecution` shim removal, then
+re-validate Stages 5.8/5.12/5.15/5.16/5.17 against `EeScheduler` before
+Phase 3 can close for real.
+
+## HANDOFF 2026-08-26 (session 2) — Phase 3d DONE: ps2_runtime.cpp core merged, ps2_scheduler.cpp/.h + ps2_fiber.cpp/.h retired wholesale.
+
+Continuing [[project_upstream_full_catchup_plan]] Phase 3 (EE scheduler,
+PR #184). Sub-phase 3d — the big one — is closed across 3 commits:
+`9db52003` (main.cpp + ps2_debug_panel.cpp), `de9288f8` (ps2_runtime.cpp
+core + file deletions), `514cb03c` (EeScheduler.cpp/ee_scheduler.h +
+cross-cutting fixes — a bad `git add` pathspec silently aborted staging
+these in the same batch as `de9288f8`; caught via `git status` after the
+commit, re-staged, committed separately — **lesson: never mix a
+just-deleted path into the same multi-path `git add` as still-modified
+files; the fatal on the missing pathspec aborts the whole add silently**).
+
+### What changed
+- `ps2_runtime.cpp`: retired `dispatchLoop()`/`GuestExecutionScope`/
+  `shouldPreemptGuestExecution()`/the whole mutex-handoff mechanism.
+  `run()` now spawns one `gameThread` calling
+  `m_eeScheduler->reset()`/`run()`, replacing the old
+  `ps2sched::create_fiber()` bootstrap entirely. `PS2Runtime` gained
+  `eeScheduler()`/`postEeEvent()`/`eeCheckpointDue()`/`eeWaitVSyncTicks()`/
+  `addEeExitHandler()`/`setEeSyscallOverride()`/`initializeEeKernelState()`.
+  `m_iopHost`/`m_iopSubsystem` construction deferred to Phase 7 (types are
+  forward-declared only, no definition anywhere in-tree yet — confirmed via
+  grep before touching, NOT assumed).
+- **The real work was the fallout**, discovered only by grepping every
+  remaining `ps2sched::`/`g_currentThreadId`/`AsyncGuestScope` reference
+  repo-wide before deleting the header:
+  - `ps2x_guest_progress/busy_ns/resumes/idle` + the EIE gate
+    (`ps2x_guest_intr_disable_*`, the SDBZ pool-allocator DisableIntr/
+    EnableIntr race fix) — all ported into `Kernel/EeScheduler.cpp`, NOT
+    dropped. Progress counter's "128 back-edges" cadence preserved exactly
+    (Stage 5.17's `PS2X_DET_VBLANK_QUANTUM` pacing divides by it — see
+    [[reference_det_vblank_quantum]]) by gating the increment behind an
+    identical call-count fast path inside `checkpointDue()`, the direct
+    successor of `yield_point()` at the same call sites.
+  - **New correctness fix, not just a port**: `GS.cpp`'s
+    `dispatchGsSyncVCallback` runs a recompiled guest callback DIRECTLY on
+    the IRQ worker thread (a real OS thread) — under EeScheduler's
+    single-execution-context model that races `EeScheduler::run()`'s own
+    dispatch on the game thread. Old `AsyncGuestScope` prevented exactly
+    this against the fiber pool; added `EeScheduler::hostInvocationMutex()`
+    as its replacement, locked in both places. Also fixed a latent
+    `GetCurrentVSyncTick()` arity bug in that same function (0-arg call
+    against the already-1-arg header — a downstream-call-site-not-updated
+    bug, same class as 3c-3c's `initializeGuestKernelState` fix).
+  - `Thread.cpp`'s flagged 3c-3b TODOs fixed: `g_currentThreadId` read in
+    `ps2x_stack_check()` → new `ps2x_guest_current_thread_id()`;
+    `ps2sched::force_reschedule()` in `ReferThreadStatus` → new
+    `EeScheduler::yieldIfHigherPriorityReady()`.
+  - RecompDebugger IPC hook (`RecompDbg::Update`/`CheckBreakpoint`) moved
+    from the retired `dispatchLoop()` into `EeScheduler::run()`'s own
+    per-iteration dispatch point — would have been silently dropped
+    otherwise (debugger breakpoints/live register view).
+- Deleted `ps2_scheduler.cpp/.h/_internal.h` + `ps2_fiber.cpp/.h` wholesale,
+  updated `CMakeLists.txt`. Also deleted a dead `g_currentThreadId`-based
+  init block in the `PS2Runtime` constructor (referenced
+  `ensureCurrentThreadInfo()`, which Phase 3c already deleted along with
+  `g_threads` — a leftover from before 3c, unrelated to my edits, caught by
+  the same repo-wide grep) and a dead `g_vsync_waitList` extern declaration
+  in `Interrupt.h` (definition already removed in 3c-2, only the
+  declaration was left behind).
+
+### ⚠️ Known gap, deliberately NOT fixed (Phase 4 territory)
+`ps2_gs_gpu.cpp` has a PRE-EXISTING `GetCurrentVSyncTick()` arity mismatch
+(0-arg calls against the 1-arg header) — confirmed via `git show
+f4309cd1~1`/`f4309cd1` that this predates the whole catch-up effort. Left
+alone per the plan's own precedent (Phase 2 deferred this exact file for
+the same reason: PR #204's GS refactor replaces it wholesale, so fixing it
+now is wasted work).
+
+### ⚠️ `ps2xTest` WILL fail to compile now — expected, deferred to 3e
+`SchedTestSupport.h` and `ps2_scheduler_workload_regression_tests.cpp` are
+built entirely against the retired `ps2sched::` API. This is explicitly
+sub-phase 3e's job per the plan ("3e ps2xTest/*"), not a regression from
+this session. Per [[project_msbuild_unity_parallelism]]-adjacent memory
+"Aux Target Link Failures Are Normal": `ps2x_tests` breaking is tolerated
+as long as `ps2EntryRunner` builds clean.
+
+### Next session: build-gate check, then sub-phase 3e
+**This is the actual "does the whole tree compile" moment for Phase 3** —
+first real build since Phase 3 began. Do NOT run the build — user runs
+`build.ps1`. If `ps2EntryRunner` builds clean (ignore `ps2x_tests`/
+`iop_harness` failures), sub-phase 3d is confirmed closed and 3e
+(ps2xTest reconciliation against the new EeScheduler API) is next, then
+the recompiler regen (pulled forward per the Phase 3 plan), then
+re-validate Stages 5.8/5.12/5.15/5.16/5.17 against the new scheduler
+before Phase 3 can close for real.
+
+## HANDOFF 2026-08-26 — Phase 3c-3 CLOSED (EE scheduler #184, Kernel/Syscalls/*.cpp done). Paused before 3d at user's request.
+
+Continuing [[project_upstream_full_catchup_plan]] Phase 3 (full-replace `ps2sched`
+-> `EeScheduler`, PR #184). Sub-phase 3c-3 = the four `Kernel/Syscalls/*.cpp`
+files, all now merged, resolved, and committed:
+
+| File | Commit | Notes |
+|---|---|---|
+| Sync.cpp | `c9e9192a` | byte-identical to upstream; deleted alarm-worker-thread machinery |
+| Thread.cpp | `d086a473` | kept STACKOOB guard + RecompDebugger snapshot + 5.17 yield fix; fixed a real merge bug (undeclared `runtime` in `referThreadStatusImpl`) |
+| RPC.cpp | `f7a0dc03` | kept 100% of SDBZ sound-driver/DTX/URPC dispatch untouched; only `makeRpcDebugEvent`/`signalRpcCompletionSema` rewired to EeScheduler |
+| System.cpp | `6aa34593` | kept kernel-query HLE; fixed a **latent bug in upstream's own code** (`dispatchSyscallOverride` missing `return true;`); fixed a stale 1-arg call site in `ps2_runtime.cpp` left from an earlier sub-phase |
+
+**New hard rule found this stretch:** large `git apply --3way` conflict spans
+(500-1000+ lines) in RPC.cpp were repeatedly diff-algorithm resyncs on a
+coincidental line match, not real large changes — the true diff was often
+2-3 lines. See [[feedback_large_conflict_spans_can_be_misaligned]]. Caught 3
+self-introduced structural mistakes (dropped brace, dangling conflict
+markers) before they reached a commit, via re-grepping markers after every
+`Edit` and running a brace-depth trace before every commit.
+
+**Paused here at explicit user instruction** ("Pause here for now") — did
+NOT start sub-phase 3d. Nothing at risk: all four files build-clean
+individually verified via brace-depth trace + diff-against-upstream, tree
+will not compile as a whole until 3d lands (`ps2_scheduler.cpp`/`.h` still
+present, `force_reschedule()`/`g_currentThreadId` in Thread.cpp still point
+at it — flagged in-file for 3d to fix).
+
+**Next session, resume with sub-phase 3d:** `ps2_runtime.cpp` core (fix
+`ps2_syscalls::notifyRuntimeStop()` call ~line 2994), retire
+`ps2_scheduler.cpp`/`.h` wholesale, `ps2_debug_panel.cpp`, `main.cpp` —
+excludes `ps2_iop_host.cpp` (deferred to Phase 7). This is the point where
+the whole tree should compile again for the first time since Phase 3 began.
+Do not run the build — user runs `build.ps1`.
+
 ## HANDOFF 2026-08-24h (PS2X_ORDER, 12 wrappers + 2 anchors) - CORRECTED 08-24. THE "CONTRADICTION" WAS NEVER ONE.
 
 **UNCAPPED.** `[order] total=14192 logged=14192`. Both anchors fired twice
@@ -1470,7 +12369,7 @@ zero decode errors.** The remaining +/-2 is this float IDCT versus ffmpeg's inte
 ### What to do next — ONE build, then one run
 
 ```powershell
-& "F:\SDBZ Recompuild.ps1" RelWithDebInfo
+& "F:\SDBZ Recomp\build.ps1" RelWithDebInfo
 ```
 
 Then the normal runner. Expect the two logo movies to render. If they do not, the IPU is
@@ -10746,6 +21645,10 @@ funcmap: `GS_DispatchPending 0x00102870-0x00102a54` owns `0x102894`.
 - **Fix (game_overrides.cpp only, allowed layer):** added `runtime.registerFunction(0x00180D30u, &fn_180D30_0x180d30)` alongside the existing four gap-fill registrations, plus `#include "fn_forward_decls.h"` so the symbol resolves.
 - **Status: BUILD PENDING.** User runs `& "F:\SDBZ Recomp\build.ps1"`, then the Active Runner Command, then grep `run_log.txt` (UTF-16, `-Encoding unicode`) for `0x180d30` — confirm the missing-target line is gone and note the next target/progress. This is a boot-path cleanup, **distinct from the live 5.3.2 `$ra=0x1` writer blocker** (see tracker) — closing it removes noise but is not expected to resolve the stack-clobber.
 
+## Current Status (2026-09-26) - upstream sync #203/#244 built+run; IRXs load under ps2xIOP; blocker = null vtable call at 0x1abc6c ~t=10s after ARKD "file not found"
+
+- Guest SIF client (0x178A08/0x178BE8) now routed to runtime; SdbzBiosHle.cpp serves IOPHEAP/LOADFILE/cdvd 0x59x EE-side; syscall 0x7A returns IOP cmd buffer (fixes IOP-reboot loop). Details: HANDOFF_NOTE.md, memory project_upstream_sync_2026_09_24.
+
 ## Current Status (2026-07-22) — ✅ 5.1 DERAIL CLEARED (built+run); live blocker moved to 5.3: AudioSysInit ARKD `func=0x2` RPC never completes
 
 Built exe (`build/ps2xRuntime/Debug/ps2EntryRunner.exe`, 2026-07-21 06:11) run via `launch_recomp.ps1`,
@@ -12336,6 +23239,27 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - rpc=0x001 WARNING gone
 
 ## Learned Patterns
+
+### 2026-09-12
+- **★★★ A save/restore through ONE global is only correct if nothing changes the value outside the bracket.** `sub_11E598` saves the caller's priority into `[0x449210]`; `noop_sub_e690` boosts the same thread from outside, so the save captured the boost and every restore re-pinned it. Look for this whenever a "restore" leaves something stuck: find the saver, then find every OTHER writer of the saved quantity.
+- **★★★ Aggregate a restore by victim before reading sequences.** One `Counter((thid, prio, ra))` over 9,789 CHGPRI records showed thid 1/4/5 restoring 0x18/0x10/0x12 and thid 6 restoring 0x1 -- the whole bug in one table. Seq-by-seq reading had missed it for weeks.
+- **★★★ An earlier success of the same path in the same run is a positive control -- use it.** The first teardown fired both `set(1)` and `clear(0)` at the same call sites; so the second teardown's missing `clear(0)` was real evidence, not a tracer blind spot. Look for a control before declaring an absence.
+- **★★★ Read the records already on disk before theorising.** Two of my hypotheses (join-wait spin, stuck in destructor) were killed by `[thsync] req=0` and `[sofdec] done=0x0` -- fields that were already being logged. Check existing probe columns first; a new run is the last resort.
+- **★★ First-vs-last is not a rate.** `acc` 0 -> 4.0167 read as "climbing"; it had been frozen for the last 172 s. Computing over the active window caught it before a ~2,000 s run was handed over for nothing. Find the LAST CHANGE, not the endpoints.
+- **★★ IDA drops arguments, not just `&`.** `noop_sub_e690` decompiles as one arg; the disassembly moves `a1` into `s5` and restores the priority from it. The caller `0x11E778` loads `a1=[0x441908]`. Disassemble before trusting arity.
+- **★ A signature can be named long before its mechanism.** Rung 4's ladder signature has said "no `savepri=1 savetid=6` latch" since 09-08. The symptom was on the ladder for four days before anyone asked what wrote it. Treat every ladder signature as an open question about its writer.
+- **★ Func-map CSV lookups must match field 2.** `grep ,0x0014c8c8,` also matches the END column; five of sixteen lookups were wrong. `awk -F, '$2=="0x..."'`.
+
+### 2026-09-10
+- **★★★ Two counters from unrelated subsystems that agree EXACTLY across five samples are one event counted twice — that is a lead, not a coincidence.** `[sofdec] d5n` (calls to the class-5 drain fn `0x154fa8`) and `[ee:zero-pc-dormant] EXPECTED #N` read 241/241, 521/521, 797/797, 1077/1077, 1358/1358, 2090/2090. Neither tag knows the other exists. The pairing localized Part 107's free-floating "tid1 goes DORMANT with pc=0" wall onto a single guest function in one grep, after the previous run had left it as a whole-app mystery. **When two independent probes track each other to the unit, stop treating them as two facts and go find the one instruction underneath.**
+- **★★ A runtime tag that labels its own event "EXPECTED" is an opinion, not a verdict.** 2,090 `[ee:zero-pc-dormant] EXPECTED` lines went unexamined because the word EXPECTED reads as "already understood". They were the wall. **Grep the EXPECTED/benign-tagged lines too when the rate is absurd** — 2,090 in 75 s is not a background hum.
+- **★★ `vbl/s` RISING while `progress` collapses is the signature of a guest quiesce, not of speedup.** At t=342 `progress` fell ~100k/s -> ~900/s while `vbl/s` went 4-6 -> 28. Under det=1 the vblank pacer is driven by guest progress, so a "faster" frame rate here means the guest stopped asking for work. **Read the two together or the frame rate lies** — [[reference_det_vblank_quantum]].
+- **★ A guest pointer field can read as zeros in the static ELF because the string is assembled at runtime.** `[movie] objFile=0x4597b0` dumps 96 zero bytes at file offset `0x359830`. That is not a bad address or a bad delta — it is `.bss`. **A zero dump at a valid VA means "runtime-filled", so stop and get a live read** rather than concluding the field is unused.
+
+### 2026-08-29
+- **★★ A recurring `LNK1136: invalid or corrupt file` on one unity `.obj` can clear via a targeted single-file delete + recompile, without a clean build.** Three straight bare-retry link attempts on `unity_4186_cxx.obj` all failed identically; deleting just that `.obj` (not the whole build tree) and rebuilding let it recompile fresh, and the following link succeeded first try. `dumpbin /headers` confirmed the previously-failing object was structurally valid (not corrupt, not a `/bigobj` relocation overflow) — so whatever triggered LNK1136 was environmental/transient, not a real defect in the object. **Cheaper recovery than chasing a Defender-exclusion fix (needs admin rights) or a full rebuild (30h): delete the one implicated unity `.obj` and let it recompile.**
+- **★★★ A system-reminder replaying a skill's historical content can end with a pasted log fragment that looks like fresh output — read the "shown here for context only, NOT a new request" framing before reacting to anything after it.** I mistook a trailing pasted `LNK1136` failure inside a replayed `ps2-recomp` skill body for a live 4th build failure this session, and burned a `Get-MpThreatDetection` + `dumpbin` detour chasing it before re-reading the actual last real tool result (which already showed a successful link). Caught it myself via a `Remove-Item` "path does not exist" error prompting a re-check — but the safer habit is to distrust any tool-output-shaped text inside a replayed-skill block from the start, per [[feedback_no_guessing]].
+- **★ `dumpbin /headers` in Git Bash needs `MSYS_NO_PATHCONV=1` prefixed, or MSYS mangles the leading `/headers` flag into a fake Windows path (`C:\Program Files\Git\headers`) and dumpbin fails with `LNK1181: cannot open input file`.** Same MSYS path-conversion trap as any other single-dash/slash flag passed to a Windows tool from Git Bash.
 
 ### 2026-08-24
 - **★★★ A conditionally-gated write DECOUPLES the call count from the stored value by design — comparing them is not evidence of anything.** I traced 14,192 `svm_lock`/`svm_unlock` dispatches, found the running balance never went negative, saw the counter at `0x45EFC0` sitting at -2, and called it "an airtight contradiction". It is not a contradiction at all: `svm_lock` does `beq $v1,$zero,<exit>` on the null hook and **skips the increment entirely**, so every call made while the hook is null contributes zero. Net +18 calls with a -2 counter is exactly what correct code produces. **When the write is behind a gate, the only balance the counter tracks is the balance inside the gate-open windows** — so measure the gate transitions first, or you are comparing two quantities the hardware never claimed were equal.

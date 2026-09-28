@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 8 CACHE STRING "Unity build batch size for ps2EntryRunner")
 set(PS2X_RUNNER_CL_JOBS 6 CACHE STRING "cl.exe /MP worker count for ps2EntryRunner")
+option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 option(PS2X_FIBER_PTHREAD "Build the pthread fiber backend on a non-Vita host (for TSan/ASan testing)" OFF)
 # PS2X_SANITIZE is declared and applied in the top-level CMakeLists.txt so the
@@ -16,8 +17,10 @@ option(PS2X_FIBER_PTHREAD "Build the pthread fiber backend on a non-Vita host (f
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" OFF)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" OFF)
+option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
 option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
 option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
+option(PS2X_ENABLE_DEBUG_UI "Build the desktop runtime debug UI" ON)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -41,6 +44,12 @@ set(PS2X_IS_VITA OFF)
 if((CMAKE_C_COMPILER MATCHES "arm-vita-eabi") OR
     (CMAKE_CXX_COMPILER MATCHES "arm-vita-eabi"))
     set(PS2X_IS_VITA ON)
+endif()
+
+set(PS2X_IS_ANDROID OFF)
+
+if(ANDROID)
+    set(PS2X_IS_ANDROID ON)
 endif()
 
 option(PS2X_VITA_CREATE_PACKAGE "Create Vita eboot/vpk targets" ON)
@@ -67,6 +76,10 @@ else()
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 
+    if(PS2X_IS_ANDROID)
+        set(PLATFORM "Android" CACHE STRING "" FORCE)
+    endif()
+
     FetchContent_Declare(
         raylib
         GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
@@ -75,79 +88,81 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
-    FetchContent_Declare(
-        imgui
-        GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG "docking"
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(imgui)
-
-    if(NOT imgui_POPULATED)
-        FetchContent_Populate(imgui)
-    endif()
-
-    set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
-
-    add_library(imgui STATIC
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
-        "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
-    )
-    target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
-
-    FetchContent_Declare(
-        rlImGui
-        GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
-        GIT_TAG "Raylib_5_5"
-        GIT_SHALLOW TRUE
-    )
-    FetchContent_GetProperties(rlImGui)
-
-    if(NOT rlimgui_POPULATED)
-        FetchContent_Populate(rlImGui)
-    endif()
-
-    set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
-
-    add_library(rlImGui STATIC
-        "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
-    )
-    target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
-    target_link_libraries(rlImGui PUBLIC raylib imgui)
-
-    # --- Standalone RecompDebugger GUI dependencies (SDL2 + ImGui's SDL2/
-    # OpenGL backend + a file dialog widget). Distinct from the imgui/rlImGui
-    # pair above, which backs the in-game raylib overlay panel; the
-    # standalone debugger is a separate windowed app so it can stay open
-    # (and keep breakpoints armed) independently of ps2EntryRunner.
-    # Restored 2026-07-14 for the RecompDebugger revival (dropped when the
-    # repo was flattened; see ps2x_imgui_lib below).
-    if(WIN32)
+    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
-            SDL2
-            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-            GIT_TAG        release-2.32.10
-            GIT_SHALLOW    TRUE
+            imgui
+            GIT_REPOSITORY https://github.com/ocornut/imgui.git
+            GIT_TAG "v1.92.7-docking"
+            GIT_SHALLOW TRUE
         )
-        set(SDL_SHARED ON  CACHE BOOL "" FORCE)
-        set(SDL_STATIC OFF CACHE BOOL "" FORCE)
-        FetchContent_MakeAvailable(SDL2)
+        FetchContent_GetProperties(imgui)
 
-        FetchContent_Declare(
-            imgui_file_dialog
-            GIT_REPOSITORY https://github.com/aiekick/ImGuiFileDialog.git
-            GIT_TAG        d0e97b2adc3d3452d72c750c7305dc0291acd052 # master, pinned to avoid refetch/rebuild on every configure
-            GIT_SHALLOW    TRUE
-        )
-        FetchContent_GetProperties(imgui_file_dialog)
-        if(NOT imgui_file_dialog_POPULATED)
-            FetchContent_Populate(imgui_file_dialog)
+        if(NOT imgui_POPULATED)
+            FetchContent_Populate(imgui)
         endif()
 
-        find_package(OpenGL REQUIRED)
+        set(PS2X_IMGUI_SOURCE_DIR "${imgui_SOURCE_DIR}")
+
+        add_library(imgui STATIC
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_draw.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_tables.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
+            "${PS2X_IMGUI_SOURCE_DIR}/imgui_demo.cpp"
+        )
+        target_include_directories(imgui PUBLIC "${PS2X_IMGUI_SOURCE_DIR}")
+
+        FetchContent_Declare(
+            rlImGui
+            GIT_REPOSITORY https://github.com/raylib-extras/rlImGui.git
+            GIT_TAG "Raylib_5_5"
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(rlImGui)
+
+        if(NOT rlimgui_POPULATED)
+            FetchContent_Populate(rlImGui)
+        endif()
+
+        set(PS2X_RLIMGUI_SOURCE_DIR "${rlimgui_SOURCE_DIR}")
+
+        add_library(rlImGui STATIC
+            "${PS2X_RLIMGUI_SOURCE_DIR}/rlImGui.cpp"
+        )
+        target_include_directories(rlImGui PUBLIC "${PS2X_RLIMGUI_SOURCE_DIR}")
+        target_link_libraries(rlImGui PUBLIC raylib imgui)
+
+        # --- Standalone RecompDebugger GUI dependencies (SDL2 + ImGui's SDL2/
+        # OpenGL backend + a file dialog widget). Distinct from the imgui/rlImGui
+        # pair above, which backs the in-game raylib overlay panel; the
+        # standalone debugger is a separate windowed app so it can stay open
+        # (and keep breakpoints armed) independently of ps2EntryRunner.
+        # Restored 2026-07-14 for the RecompDebugger revival (dropped when the
+        # repo was flattened; see ps2x_imgui_lib below).
+        if(WIN32)
+            FetchContent_Declare(
+                SDL2
+                GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+                GIT_TAG        release-2.32.10
+                GIT_SHALLOW    TRUE
+            )
+            set(SDL_SHARED ON  CACHE BOOL "" FORCE)
+            set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+            FetchContent_MakeAvailable(SDL2)
+
+            FetchContent_Declare(
+                imgui_file_dialog
+                GIT_REPOSITORY https://github.com/aiekick/ImGuiFileDialog.git
+                GIT_TAG        d0e97b2adc3d3452d72c750c7305dc0291acd052 # master, pinned to avoid refetch/rebuild on every configure
+                GIT_SHALLOW    TRUE
+            )
+            FetchContent_GetProperties(imgui_file_dialog)
+            if(NOT imgui_file_dialog_POPULATED)
+                FetchContent_Populate(imgui_file_dialog)
+            endif()
+
+            find_package(OpenGL REQUIRED)
+        endif()
     endif()
 endif()
 
@@ -196,6 +211,8 @@ if(PS2X_IS_VITA)
         libIMGEGL_stub_weak
         libgpu_es4_ext_stub_weak
         libGLESv2_stub_weak
+        libGL_stub_weak
+        libGLESv1_CM_stub_weak
     )
 
     set(PS2X_VITA_INCLUDE_DIRS
@@ -226,19 +243,21 @@ if(PS2X_IS_VITA)
 
     function(ps2x_find_vita_library out_var library_name)
         string(MAKE_C_IDENTIFIER "${library_name}" library_id)
-        find_library(${out_var}
+        set(cache_var "PS2X_VITA_LIB_${library_id}")
+
+        find_library(${cache_var}
             NAMES "${library_name}" "${library_name}.a" "lib${library_name}.a"
             PATHS "${PS2X_VITA_LIBRARY_DIR}"
             NO_DEFAULT_PATH
         )
 
-        if(NOT ${out_var})
+        if(NOT ${cache_var})
             message(FATAL_ERROR
                 "Could not find Vita library '${library_name}' under ${PS2X_VITA_LIBRARY_DIR}. "
                 "Install Quenom/raylib-5.5-vita and its SDL2/PVR dependencies into VitaSDK first.")
         endif()
 
-        set(${out_var} "${${out_var}}" PARENT_SCOPE)
+        set(${out_var} "${${cache_var}}" PARENT_SCOPE)
     endfunction()
 
     set(PS2X_VITA_RESOLVED_LIBRARIES "")
@@ -258,6 +277,10 @@ if(PS2X_IS_VITA)
     )
 else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
+
+    if(PS2X_IS_ANDROID)
+        target_link_libraries(ps2_host_backend INTERFACE log android)
+    endif()
 endif()
 
 # Standalone RecompDebugger GUI's ImGui build: SDL2 + OpenGL3 backends plus
@@ -290,7 +313,18 @@ if(WIN32 AND NOT PS2X_IS_VITA)
     endif()
 endif()
 
-if(WIN32)
+if(PS2X_IS_ANDROID)
+    set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
+else()
+    set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
+endif()
+
+option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
+
+if(NOT PS2X_ENABLE_FFMPEG)
+    message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
+    add_library(ffmpeg INTERFACE)
+elseif(WIN32)
     include(ExternalProject)
 
     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
@@ -420,24 +454,35 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_gs_gpu.cpp
     src/lib/ps2_gs_memory.cpp
     src/lib/ps2_gs_rasterizer.cpp
-    src/lib/ps2_iop.cpp
-    src/lib/ps2_iop_audio.cpp
-    src/lib/ps2_iop_cpu.cpp
-    src/lib/ps2_iop_irx_loader.cpp
-    src/lib/ps2_iop_dbcman.cpp
-    src/lib/ps2_iop_mcman.cpp
-    src/lib/ps2_iop_sdrdrv.cpp
-    src/lib/ps2_iop_cl.cpp
+    src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_rom_device.cpp
+    src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
-    src/lib/ps2_scheduler.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+# The VU interpreter is ~33% of fight CPU. RelWithDebInfo's /Ob1 inlines only
+# functions marked `inline`, so every small helper (normalizeOperand,
+# broadcast, applyDest, ...) became a real call. Allow full inlining for these
+# three TUs and the GS rasterizer path only; ps2_runtime is not a unity
+# target, so nothing else rebuilds.
+if(MSVC)
+    set_source_files_properties(
+        src/lib/vu/ps2_vu1_core.cpp
+        src/lib/vu/ps2_vu1_upper.cpp
+        src/lib/vu/ps2_vu1_lower.cpp
+        src/lib/ps2_gs_rasterizer.cpp
+        src/lib/ps2_gs_gpu.cpp
+        src/lib/ps2_gs_memory.cpp
+        PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:RelWithDebInfo>:/Ob2>"
+    )
+endif()
 
 # RecompDebugger IPC writer -- publishes live CPU/GS/pad/thread state into the
 # Local\RecompDebugState shared-memory segment the standalone RecompDebugger.exe
@@ -454,6 +499,16 @@ if(PS2X_ENABLE_RUNTIME_LOGS)
     )
 endif()
 
+if(PS2X_ENABLE_IOP_RPC_TRACE)
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=1
+    )
+else()
+    target_compile_definitions(ps2_runtime PUBLIC
+        PS2X_ENABLE_IOP_RPC_TRACE=0
+    )
+endif()
+
 if(PS2X_ENABLE_AGRESSIVE_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         AGRESSIVE_LOGS=1
@@ -467,18 +522,16 @@ if(PS2X_STRICT_RETURN_DIAGNOSTICS)
     )
 endif()
 
+target_compile_definitions(ps2_runtime PRIVATE
+    PS2X_HAS_FFMPEG=$<BOOL:${PS2X_ENABLE_FFMPEG}>
+)
+
 file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel/*.cpp"
 )
 
 target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
-)
-
-# Fiber backend (ucontext on POSIX; SceFiber on Vita; Win32 Fibers on Windows;
-# pthread under PS2X_FIBER_PTHREAD for Linux TSan testing)
-target_sources(ps2_runtime PRIVATE
-    src/lib/ps2_fiber.cpp
 )
 
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
@@ -494,9 +547,17 @@ elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
 endif()
 
-add_executable(ps2EntryRunner
-    ${RUNNER_SRC_FILES}
-)
+if(PS2X_IS_ANDROID)
+    add_library(ps2EntryRunner SHARED
+        ${RUNNER_SRC_FILES}
+    )
+
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--undefined=ANativeActivity_onCreate")
+else()
+    add_executable(ps2EntryRunner
+        ${RUNNER_SRC_FILES}
+    )
+endif()
 
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     set_target_properties(ps2EntryRunner PROPERTIES
@@ -527,6 +588,28 @@ foreach(_bomb IN LISTS PS2X_OPT_BOMB_SOURCES)
     endif()
 endforeach()
 
+if(PS2X_ENABLE_RUNNER_PCH)
+    set(PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
+    )
+
+    foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
+            list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
+        endif()
+    endforeach()
+
+    list(APPEND PS2X_RUNNER_PCH_HEADERS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_stubs.h"
+    )
+
+    target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})
+endif()
+
 if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
     target_compile_definitions(ps2EntryRunner PRIVATE
         PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}"
@@ -547,18 +630,18 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
 
-# Private include dir so Kernel/Syscalls/*.cpp can reach ps2_scheduler_internal.h
-# and ps2_fiber.h without relative path hacks.
+# Private include dir so Kernel/Syscalls/*.cpp can reach src/lib headers
+# without relative path hacks.
 target_include_directories(ps2_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 
-# ps2_scheduler.cpp and ps2_fiber.cpp use std::thread/std::mutex/std::atomic
-# which require pthread on Linux. Link explicitly so the dependency is not
-# implicit via raylib (ps2_host_backend). The Vita toolchain provides its own
-# pthread; the ucontext default build on Linux also needs it.
+# EeScheduler.cpp (and the rest of ps2_runtime) uses std::thread/std::mutex/
+# std::atomic, which require pthread on Linux. Link explicitly so the
+# dependency is not implicit via raylib (ps2_host_backend). The Vita
+# toolchain provides its own pthread.
 if(NOT PS2X_IS_VITA)
     find_package(Threads REQUIRED)
     target_link_libraries(ps2_runtime PUBLIC Threads::Threads)
@@ -580,7 +663,7 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
-if(NOT PS2X_IS_VITA)
+if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
     )
@@ -590,25 +673,34 @@ endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
 
-# ---- iop_harness: headless standalone driver for the embedded IOP + real
-# ARKD_DVD.IRX (no EE game boot). Links ps2_runtime (which contains the loader
-# and ps2_iop_runArkdService). Not built for Vita. See src/tools/iop_harness.cpp.
-if(NOT PS2X_IS_VITA)
-    add_executable(iop_harness src/tools/iop_harness.cpp)
-    target_link_libraries(iop_harness PRIVATE ps2_runtime)
-    if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
-        ps2x_stage_ffmpeg_runtime_dlls(iop_harness)
-    endif()
-endif()
-
 if(PS2X_IS_VITA)
-    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1") 
+    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
     if(PS2X_VITA_CREATE_PACKAGE)
+        set(PS2X_VITA_VPK_FILES "")
+
+        foreach(PS2X_VITA_MODULE IN ITEMS
+            libgpu_es4_ext.suprx
+            libIMGEGL.suprx
+            libGLESv2.suprx
+            libpvrPSP2_WSEGL.suprx
+            libGL.suprx)
+            set(PS2X_VITA_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/vita/module/${PS2X_VITA_MODULE}")
+
+            if(EXISTS "${PS2X_VITA_MODULE_PATH}")
+                list(APPEND PS2X_VITA_VPK_FILES FILE "${PS2X_VITA_MODULE_PATH}" "module/${PS2X_VITA_MODULE}")
+            else()
+                message(WARNING
+                    "Missing ${PS2X_VITA_MODULE_PATH}; the vpk will rely on ur0:data/external/ for it")
+            endif()
+        endforeach()
+
         vita_create_self(eboot.bin ps2EntryRunner UNSAFE)
         vita_create_vpk(ps2EntryRunner.vpk ${PS2X_VITA_TITLEID} eboot.bin
             VERSION ${PS2X_VITA_VERSION}
             NAME ${PS2X_VITA_APP_NAME}
+            ${PS2X_VITA_VPK_FILES}
         )
     endif()
 endif()
@@ -760,13 +852,27 @@ if(WIN32 AND NOT PS2X_IS_VITA AND TARGET ps2x_imgui_lib AND DEBUGGER_SRC_FILES)
     )
 endif()
 
+# Vita: Work around for GCC 10's LTO plugin
+if(PS2X_IS_VITA)
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_vita_runtime.cpp)
+    set_source_files_properties(src/lib/ps2_vita_runtime.cpp PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
+        COMPILE_OPTIONS "-fno-lto"
+    )
+endif()
+
+if(PS2X_IS_ANDROID)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
+endif()
+
 install(TARGETS ps2_runtime ps2EntryRunner
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
 
-if(WIN32)
+if(WIN32 AND PS2X_ENABLE_FFMPEG)
     install(DIRECTORY "${FFMPEG_BIN_DIR}/"
         DESTINATION bin
         FILES_MATCHING

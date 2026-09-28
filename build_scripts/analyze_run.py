@@ -29,6 +29,9 @@ USAGE
   analyze_run.py --coverage           # what the EE actually dispatched (PS2_COVERAGE=1)
   analyze_run.py --coverage --band game   # ... game band only (default: both)
   analyze_run.py --coverage --diff b.jsonl  # addresses in one run and not the other
+  analyze_run.py --onset              # when each watched field froze (causality order)
+  analyze_run.py --watch g36          # time series for one watched field
+  analyze_run.py --probe TRACE        # [trace] intercepted guest calls
   analyze_run.py --hwwatch            # watchpoint hits + their call sites
   analyze_run.py --hwwatch --val 8a6440   # ... only hits storing that value
   analyze_run.py --hwwatch --all-runs # ... every run in the dump, not the last
@@ -412,7 +415,16 @@ def cmd_tag(log_path, tag, limit):
         return 2
     text = read_text_any(log_path)
     name = tag.strip("[]")
-    recs = re.findall(r"\[" + re.escape(name) + r"\][^\[]*", text)
+    # Match the bare tag OR a colon-namespaced sub-tag (e.g. "semwatch" also
+    # catches "[semwatch:wait]", "[semwatch:signal]", "[semwatch:block]").
+    # Without this, --tag semwatch silently returned 0 records against a log
+    # that actually had 10 -- an exact-bracket-only match on a family of
+    # sub-tagged probes reads as "never fired" instead of "wrong query", which
+    # is exactly the false-negative-by-omission trap this tool exists to
+    # prevent (2026-08-29). A caller who already passes the full sub-tag
+    # (e.g. "semwatch:wait") is unaffected -- the optional group just doesn't
+    # trigger.
+    recs = re.findall(r"\[" + re.escape(name) + r"(?::[^\[\]]*)?\][^\[]*", text)
     caps = [c.strip() for c in re.findall(r"\[cap\][^\[]*", text)
             if name in c]
 
@@ -914,6 +926,159 @@ def cmd_hwwatch(sink_path, dump_path, value_filter, all_runs, limit):
     return 0
 
 
+WATCH_META = ("seq", "tid", "progress", "probe", "t", "unreadable")
+
+
+def _watch_rows(records):
+    """WATCH samples in time order, plus the field names they carry.
+
+    Field order follows first appearance rather than sorted(), so the table
+    reads in the order the operator wrote PS2X_TRACE_WATCH.
+    """
+    rows = [r for r in records if r.get("probe") == "WATCH"]
+    rows.sort(key=lambda r: r.get("t", 0))
+    fields = []
+    for r in rows:
+        for k in r:
+            if k not in WATCH_META and k not in fields:
+                fields.append(k)
+    return rows, fields
+
+
+def _field_track(rows, field):
+    """(first_t, last_change_t, changes, first_val, last_val) for one field.
+
+    Samples whose 'unreadable' flag is set are skipped outright. A failed
+    read reports 0, and a spurious 0 is indistinguishable from the real
+    transition-to-zero this tool exists to date -- so it must never enter the
+    change history at all.
+    """
+    first_t = last_change_t = None
+    first_val = last_val = None
+    changes = 0
+    for r in rows:
+        if r.get("unreadable", 0):
+            continue
+        if field not in r:
+            continue
+        t = r.get("t", 0)
+        v = r[field]
+        if first_t is None:
+            first_t, first_val, last_val, last_change_t = t, v, v, t
+            continue
+        if v != last_val:
+            changes += 1
+            last_change_t = t
+            last_val = v
+    return first_t, last_change_t, changes, first_val, last_val
+
+
+def cmd_onset(records):
+    """When did each watched field last move, and in what order did they stop?
+
+    This is the query that retracted a root-cause claim on 2026-09-04. A
+    suspect whose value froze at t=143 cannot explain a symptom that was
+    already frozen at t=134 -- the cause has to stop moving no later than the
+    effect. That check is three lines of reasoning and was skipped for weeks
+    because computing the table by hand from a console log was tedious enough
+    to feel optional.
+    """
+    rows, fields = _watch_rows(records)
+    if not rows:
+        print("no WATCH records in the sink.")
+        print("Set PS2X_TRACE_WATCH=\"name=0xADDR,...\" and re-run; the 1 Hz")
+        print("watchdog sampler writes one WATCH record per second.")
+        return
+    if not fields:
+        print("%d WATCH record(s) but no fields -- PS2X_TRACE_WATCH parsed empty."
+              % len(rows))
+        return
+
+    span_lo = rows[0].get("t", 0)
+    span_hi = rows[-1].get("t", 0)
+    bad = sum(1 for r in rows if r.get("unreadable", 0))
+    print("WATCH: %d sample(s), t=%d..%ds, %d field(s)%s"
+          % (len(rows), span_lo, span_hi, len(fields),
+             ", %d with unreadable memory (excluded)" % bad if bad else ""))
+    print("")
+
+    tracks = []
+    for f in fields:
+        first_t, last_change_t, changes, first_val, last_val = _field_track(rows, f)
+        if first_t is None:
+            tracks.append((f, None, None, 0, None, None))
+            continue
+        tracks.append((f, first_t, last_change_t, changes, first_val, last_val))
+
+    # Earliest freeze first: that is the onset order, and the field at the top
+    # is the only one that can be upstream of everything below it.
+    tracks.sort(key=lambda row: (row[2] is None, row[2] if row[2] is not None else 0))
+
+    print("%-16s %8s %12s %8s %12s %12s  %s"
+          % ("field", "first_t", "last_change", "changes", "first", "last", "verdict"))
+    print("-" * 96)
+    for f, first_t, last_change_t, changes, first_val, last_val in tracks:
+        if first_t is None:
+            print("%-16s %8s %12s %8d %12s %12s  %s"
+                  % (f, "-", "-", 0, "-", "-", "NEVER SAMPLED"))
+            continue
+        frozen_for = span_hi - last_change_t
+        if changes == 0:
+            verdict = "CONSTANT for the whole window"
+        elif changes == 1 and first_val == 0 and last_val != 0:
+            # 0 -> value, exactly once. That is an INITIALISATION, not a
+            # freeze: the field held nothing until its writer first ran, and
+            # "frozen since t=N" would invite reading a startup as a stall.
+            # This is not a corner case for the sofdec preset -- the CRI
+            # globals are all zero at the main menu, so most of the field set
+            # looks precisely like this until the movie window opens.
+            verdict = ("first written at t=%d, unchanged since (%ds)"
+                       " -- INIT, not a freeze" % (last_change_t, frozen_for))
+        elif frozen_for >= 5:
+            verdict = "frozen since t=%d (%ds)" % (last_change_t, frozen_for)
+        else:
+            verdict = "still moving"
+        print("%-16s %8d %12d %8d %12s %12s  %s"
+              % (f, first_t, last_change_t, changes,
+                 "0x%x" % first_val, "0x%x" % last_val, verdict))
+
+    print("")
+    print("Read the table top-down: a field cannot be the CAUSE of anything")
+    print("that froze above it. A constant field tested nothing -- it may")
+    print("never have been written, or its writer may never have run.")
+    print("")
+    print("Rows marked INIT are 0 -> value transitions, i.e. the moment that")
+    print("field's writer FIRST ran. A block of them sharing one timestamp")
+    print("dates the start of a phase, not the start of a stall; only the")
+    print("rows above them that genuinely stopped are onset evidence.")
+
+
+def cmd_watch(records, field, limit):
+    """Time series for one watched field. Changes are flagged with '*'."""
+    rows, fields = _watch_rows(records)
+    if not rows:
+        print("no WATCH records in the sink (is PS2X_TRACE_WATCH set?).")
+        return
+    if field not in fields:
+        print("no field %r in the WATCH records. Available: %s"
+              % (field, ", ".join(fields) if fields else "(none)"))
+        return
+
+    prev = None
+    shown = 0
+    for r in rows:
+        if field not in r:
+            continue
+        v = r[field]
+        mark = " " if prev is None or v == prev else "*"
+        flag = "  UNREADABLE" if r.get("unreadable", 0) else ""
+        print("t=%-5d %s %s=0x%x%s" % (r.get("t", 0), mark, field, v, flag))
+        prev = v
+        shown += 1
+        if limit and shown >= limit:
+            break
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -943,6 +1108,11 @@ def main():
                     help="with --hwwatch, only hits whose stored value matches")
     ap.add_argument("--all-runs", action="store_true",
                     help="with --hwwatch, every run in the dump, not just the last")
+    ap.add_argument("--onset", action="store_true",
+                    help="when each PS2X_TRACE_WATCH field last moved, earliest "
+                         "freeze first (the causality-ordering check)")
+    ap.add_argument("--watch", metavar="FIELD",
+                    help="time series for one PS2X_TRACE_WATCH field")
     ap.add_argument("--limit", type=int, default=0, help="cap dumped records")
     ap.add_argument("--tag", metavar="NAME",
                     help="dump [NAME] records from the console log + cap verdict")
@@ -1005,6 +1175,10 @@ def main():
             print("no %s records matched." % args.probe.upper())
         for r in rows:
             print(fmt(r))
+    elif args.onset:
+        cmd_onset(records)
+    elif args.watch:
+        cmd_watch(records, args.watch, args.limit)
     elif args.derail:
         cmd_derail(records)
     elif args.threads:

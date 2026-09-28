@@ -2,6 +2,9 @@
 #include "GS.h"
 #include "ps2_log.h"
 #include "runtime/ps2_gs_common.h"
+#include "runtime/ee_scheduler.h"
+
+void ps2xGsThreadSync(uint32_t reason); // ps2_gif_arbiter.cpp
 
 namespace ps2_stubs
 {
@@ -16,6 +19,7 @@ namespace ps2_stubs
         uint32_t g_gs_sync_v_callback_stack_base = 0u;
         uint32_t g_gs_sync_v_callback_stack_top = 0u;
         uint32_t g_gs_sync_v_callback_bad_pc_logs = 0u;
+
         uint64_t makeClearPrim(bool useContext2)
         {
             return static_cast<uint64_t>(GS_PRIM_SPRITE) |
@@ -121,6 +125,7 @@ namespace ps2_stubs
                 return;
             }
 
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
@@ -597,10 +602,10 @@ namespace ps2_stubs
         setReturnU32(ctx, terminatePacketBuilderState(rdram, ctx, runtime));
     }
 
-    static void resetGsSyncVState()
+    static void resetGsSyncVState(PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_gs_sync_v_mutex);
-        g_gs_sync_v_base_tick = ps2_syscalls::GetCurrentVSyncTick();
+        g_gs_sync_v_base_tick = ps2_syscalls::GetCurrentVSyncTick(runtime);
     }
 
     static int32_t getGsSyncVFieldForTick(uint64_t tick)
@@ -625,7 +630,10 @@ namespace ps2_stubs
             g_gs_sync_v_callback_stack_top = 0u;
             g_gs_sync_v_callback_bad_pc_logs = 0u;
         }
-        resetGsSyncVState();
+        {
+            std::lock_guard<std::mutex> lock(g_gs_sync_v_mutex);
+            g_gs_sync_v_base_tick = 0u;
+        }
     }
 
     void dispatchGsSyncVCallback(uint8_t *rdram, PS2Runtime *runtime, uint64_t tick)
@@ -638,7 +646,7 @@ namespace ps2_stubs
         uint32_t callback = 0u;
         uint32_t gp = 0u;
         uint32_t callbackStackTop = 0u;
-        const uint64_t callbackTick = (tick != 0u) ? tick : ps2_syscalls::GetCurrentVSyncTick();
+        const uint64_t callbackTick = (tick != 0u) ? tick : ps2_syscalls::GetCurrentVSyncTick(runtime);
         {
             std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
             callback = g_gs_sync_v_callback_func;
@@ -684,13 +692,14 @@ namespace ps2_stubs
 
         try
         {
-            // Acquire the guest token before running recompiled PS2 code. This
-            // dispatch runs on the interrupt worker (a host thread); without the
-            // token the callback executes concurrently with whatever fiber the
-            // guest executor is running, violating the N=1 invariant. It also
-            // makes the worker a visible g_host_token_waiters waiter, which the
-            // executor's resume predicate is gated on.
-            AsyncGuestScope guestScope;
+            // Acquire the guest-invocation lock before running recompiled PS2
+            // code. This dispatch runs on the interrupt worker (a host
+            // thread); without it the callback would execute concurrently
+            // with EeScheduler::run()'s own dispatch on the game thread,
+            // violating the single-execution-context invariant. Ported off
+            // ps2sched's AsyncGuestScope (Phase 3d) -- see
+            // EeScheduler::hostInvocationMutex()'s comment.
+            std::lock_guard<std::mutex> guestLock(runtime->eeScheduler().hostInvocationMutex());
             R5900Context callbackCtx{};
             SET_GPR_U32(&callbackCtx, 28, gp);
             SET_GPR_U32(&callbackCtx, 29, (callbackStackTop != 0u) ? callbackStackTop : kAsyncCallbackFallbackSp);
@@ -729,6 +738,19 @@ namespace ps2_stubs
                     break;
                 }
 
+                if (callbackCtx.pc == 0x178a08u)
+                {
+                    static std::atomic<uint32_t> s_fillZ18GsCbLogs{0u};
+                    const uint32_t n = s_fillZ18GsCbLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (n <= 32u)
+                    {
+                        std::cerr << "[semwatch:fillz18-gscb] #" << n
+                                  << " ra=0x" << std::hex << getRegU32(&callbackCtx, 31)
+                                  << " sp=0x" << getRegU32(&callbackCtx, 29)
+                                  << " a0=0x" << getRegU32(&callbackCtx, 4)
+                                  << std::dec << std::endl;
+                    }
+                }
                 auto step = runtime->lookupFunction(callbackCtx.pc);
                 if (!step)
                 {
@@ -915,6 +937,7 @@ namespace ps2_stubs
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
 
+        ps2xGsThreadSync(3u); // GS thread: drain queued packets first
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
         runtime->guestFree(pktAddr);
 
@@ -949,6 +972,7 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
+        ps2xGsThreadSync(4u); // GS thread: drain queued packets first
         applyGsRegPairs(runtime, pairs, 8u);
         setReturnS32(ctx, 0);
     }
@@ -972,7 +996,7 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
-            resetGsSyncVState();
+            resetGsSyncVState(runtime);
 
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
@@ -1338,6 +1362,7 @@ namespace ps2_stubs
         }
         if (which == 0u)
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
             if (hasSeededGsClearPacket(db.clear0))
@@ -1349,6 +1374,7 @@ namespace ps2_stubs
         }
         else
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
             if (hasSeededGsClearPacket(db.clear1))
@@ -1377,10 +1403,12 @@ namespace ps2_stubs
         applyGsDispEnv(runtime, db.disp[which]);
         if (which == 0u)
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
         }
         else
         {
+            ps2xGsThreadSync(4u); // GS thread: drain queued packets first
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
         }
 
@@ -1456,14 +1484,10 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint64_t tick = ps2_syscalls::WaitForNextVSyncTick(rdram, runtime);
-        if (g_gparam.interlace != 0u)
-        {
-            setReturnS32(ctx, getGsSyncVFieldForTick(tick));
-            return;
-        }
-
-        setReturnS32(ctx, 1);
+        ps2_syscalls::WaitVSyncTick(rdram,
+                                    ctx,
+                                    runtime,
+                                    g_gparam.interlace != 0u ? -1 : 1);
     }
 
     void sceGsSyncVCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1474,17 +1498,9 @@ namespace ps2_stubs
         const uint32_t gp = getRegU32(ctx, 28);
         const uint32_t sp = getRegU32(ctx, 29);
 
-        uint32_t oldCallback = 0u;
-        {
-            std::lock_guard<std::mutex> lock(g_gs_sync_v_callback_mutex);
-            oldCallback = g_gs_sync_v_callback_func;
-            g_gs_sync_v_callback_func = newCallback;
-            if (newCallback != 0u)
-            {
-                g_gs_sync_v_callback_gp = gp;
-                g_gs_sync_v_callback_sp = sp;
-            }
-        }
+        EeScheduler &ee = runtime->eeScheduler();
+        ee.bindMainContextForSyscall(*ctx, rdram);
+        const uint32_t oldCallback = ee.setGsVSyncCallback(newCallback, gp, sp);
 
         static uint32_t s_syncVCallbackLogCount = 0u;
         if (s_syncVCallbackLogCount < 128u)
@@ -1499,11 +1515,6 @@ namespace ps2_stubs
                                                               << std::dec << std::endl);
             });
             ++s_syncVCallbackLogCount;
-        }
-
-        if (newCallback != 0u)
-        {
-            ps2_syscalls::EnsureVSyncWorkerRunning(rdram, runtime);
         }
 
         setReturnU32(ctx, oldCallback);

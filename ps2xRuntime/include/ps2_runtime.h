@@ -7,6 +7,7 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <functional>
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -19,21 +20,34 @@
 #include <atomic>
 #include <array>
 #include <mutex>
-#include <condition_variable>
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "ps2_log.h"
-#include "ps2_scheduler.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu.h"
-#include "runtime/ps2_iop.h"
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_rom_device.h"
+#include "runtime/ps2_vfs.h"
+#include "ps2x/iop/iop_types.h"
+
+namespace ps2x::iop
+{
+    class IopSubsystem;
+}
+
+class PS2IopHostAdapter;
+class PS2IopTransport;
+class EeScheduler;
+struct EeEvent;
 
 enum PS2Exception
 {
@@ -145,10 +159,10 @@ struct alignas(16) R5900Context
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value
-        // cop0_status = 0x400000; // BEV set, ERL clear, kernel mode
-        // 0x00400000 = BEV (Boot Exception Vectors).
-        // 0x00000000 = Normal mode (after BIOS handoff).
-        cop0_status = 0x00000000;
+        // Status as the EE kernel leaves it at handoff. IE (bit 0) and EIE
+        // (bit 16) are separate enables and guest code reads both; libkernel's
+        // StartThread refuses to run while IE is clear.
+        cop0_status = 0x00010001; // EIE | IE
         cop0_prid = 0x00002e20; // CPU ID for R5900
 
         in_delay_slot = false;
@@ -470,6 +484,17 @@ public:
     bool loadELF(const std::string &elfPath);
     void run();
 
+    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
+    [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
+    uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
+    bool freeIopMemory(uint32_t address);
+    bool readIopMemory(uint32_t address, void *destination, size_t size) const;
+    bool writeIopMemory(uint32_t address, const void *source, size_t size);
+    bool zeroIopMemory(uint32_t address, size_t size);
+    bool isIopMemoryRange(uint32_t address, size_t size) const;
+
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
                              DebugUiCallback drawCallback,
@@ -500,32 +525,6 @@ public:
 
         // Escape hatch only: skip missing calls by returning to fallthrough (it can hide guest bugs)
         SkipCallDebug = 3,
-    };
-
-    // No-op RAII guards. Only one fiber ever executes guest code at a time
-    // under the N=1 cooperative scheduler, and exclusion between the fiber
-    // executor and borrowed host worker threads is provided by
-    // ps2sched::async_guest_begin/async_guest_end (AsyncGuestScope). Kept as
-    // no-ops only so code that still references them (MPEG/IPU decoder stubs)
-    // compiles unchanged.
-    class GuestExecutionScope
-    {
-    public:
-        explicit GuestExecutionScope(PS2Runtime *) noexcept {}
-        ~GuestExecutionScope() = default;
-
-        GuestExecutionScope(const GuestExecutionScope &) = delete;
-        GuestExecutionScope &operator=(const GuestExecutionScope &) = delete;
-    };
-
-    class GuestExecutionReleaseScope
-    {
-    public:
-        explicit GuestExecutionReleaseScope(PS2Runtime *) noexcept {}
-        ~GuestExecutionReleaseScope() = default;
-
-        GuestExecutionReleaseScope(const GuestExecutionReleaseScope &) = delete;
-        GuestExecutionReleaseScope &operator=(const GuestExecutionReleaseScope &) = delete;
     };
 
     bool replaceFunction(uint32_t address, RecompiledFunction func);
@@ -585,12 +584,34 @@ public:
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
-    void dispatchLoop(uint8_t *rdram, R5900Context *ctx);
     void drainCompletedDmacHandlers(uint8_t *rdram);
-    bool shouldPreemptGuestExecution();
+
     void requestStop();
     void requestStopFlagOnly();
     bool isStopRequested() const;
+
+    EeScheduler &eeScheduler();
+    const EeScheduler &eeScheduler() const;
+    void postEeEvent(EeEvent event);
+    bool eeCheckpointDue(uint32_t cycles = 32u) noexcept;
+    // Compat shim: control_flow_emitter.cpp emits eeCheckpointDue() now, but
+    // Kernel/recovered/*.cpp (hole-recovery output, not yet regenerated -- a
+    // ~30h ps2_recomp.exe run) still calls this old name. Remove once that
+    // regen has landed and no callers of this name remain.
+    bool shouldPreemptGuestExecution() noexcept { return eeCheckpointDue(); }
+    [[noreturn]] void eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc);
+
+    struct EeExitHandlerRegistration
+    {
+        uint32_t function = 0;
+        uint32_t argument = 0;
+    };
+    void addEeExitHandler(int threadId, uint32_t function, uint32_t argument);
+    std::vector<EeExitHandlerRegistration> takeEeExitHandlers(int threadId);
+    void removeEeExitHandlers(int threadId);
+    bool findEeSyscallOverride(uint32_t syscallNumber, uint32_t &handler) const;
+    void setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, uint32_t handler);
+    void initializeEeKernelState(uint8_t *rdram);
 
     uint8_t Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr);
     uint16_t Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr);
@@ -631,12 +652,14 @@ public:
     inline VU1Interpreter &vu1() { return m_vu1; }
     inline const VU1Interpreter &vu1() const { return m_vu1; }
 
-    inline ps2_iop &iop() { return m_iop; }
-    inline const ps2_iop &iop() const { return m_iop; }
     inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
     inline PSPadBackend &padBackend() { return m_padBackend; }
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
+    inline PS2RomDevice &romDevice() { return m_romDevice; }
+    inline const PS2RomDevice &romDevice() const { return m_romDevice; }
+    inline PS2Vfs &vfs() { return m_vfs; }
+    inline const PS2Vfs &vfs() const { return m_vfs; }
 
 private:
     struct GuestHeapBlock
@@ -659,17 +682,34 @@ private:
     void coalesceGuestHeapLocked();
 
     void HandleIntegerOverflow(R5900Context *ctx);
+    [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
+    [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
+    [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
+    void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
+    void advanceIopEeCycles(uint64_t eeCycles) noexcept;
+    void resetIop();
+
+    friend class PS2IopTransport;
+    friend class EeScheduler;
 
 private:
     PS2Memory m_memory;
     GifArbiter m_gifArbiter;
     GS m_gs;
-    ps2_iop m_iop;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
-    VU1Interpreter m_vu0;
-    VU1Interpreter m_vu1;
+    std::unique_ptr<PS2IopHostAdapter> m_iopHost;
+    std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
+    PS2RomDevice m_romDevice;
+    PS2Vfs m_vfs;
+    VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
+    VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
+    std::unique_ptr<EeScheduler> m_eeScheduler;
+    mutable std::mutex m_eeKernelStateMutex;
+    std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
+    std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
+    std::unordered_set<uint32_t> m_eeSyscallMirrorAddresses;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;
     std::vector<GuestHeapBlock> m_guestHeapBlocks;

@@ -15,6 +15,8 @@
 #include "ps2_gs_gpr.h"
 #include "types.h"
 
+class PS2Runtime;
+
 enum GSPrimType : uint8_t
 {
     GS_PRIM_POINT = 0,
@@ -282,7 +284,7 @@ public:
     GS();
     ~GS() = default;
 
-    void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
+    void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr, PS2Runtime *runtime = nullptr);
     void reset();
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -379,6 +381,7 @@ private:
     inline void EndTransfer();
 
 private:
+    PS2Runtime *m_runtime = nullptr;
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;
     struct GSRegisters *m_privRegs = nullptr;

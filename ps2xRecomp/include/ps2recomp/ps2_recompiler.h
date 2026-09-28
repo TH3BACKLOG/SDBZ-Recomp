@@ -37,15 +37,20 @@ namespace ps2recomp
         bool recompile();
         void generateOutput();
         void printReport() const;
+        const RecompilerReporter::Counters &reportCounters() const { return m_reporter.counters(); }
 
         static StubTarget resolveStubTarget(const std::string& name);
+        static bool IsCorrectnessCriticalFunctionName(const std::string &name);
         static size_t DiscoverAdditionalEntryPoints(
             std::vector<Function> &functions,
             std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
             const std::vector<Section> &sections);
-        static size_t ResliceEntryFunctions(
-            std::vector<Function> &functions,
-            std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions);
+        static size_t ResliceEntryFunctions(std::vector<Function> &functions, std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions);
+        static size_t CollectInternalEntryTargets(
+            const std::vector<Function> &functions,
+            const std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
+            const std::unordered_set<uint32_t> &entryAddresses,
+            std::unordered_map<uint32_t, std::vector<uint32_t>> &targetsByOwner);
 
         static std::string ClampFilenameLength(const std::string& baseName, const std::string& extension, std::size_t maxLength);
 
@@ -93,6 +98,8 @@ namespace ps2recomp
         std::unordered_set<std::string> m_stubFunctions;
         std::unordered_set<uint32_t> m_stubFunctionStarts;
         std::unordered_map<uint32_t, std::string> m_stubHandlerBindingsByStart;
+        std::unordered_set<uint32_t> m_entryPointHintStarts;
+        std::unordered_set<uint32_t> m_correctnessCriticalFunctionStarts;
         std::map<uint32_t, std::string> m_generatedStubs;
         std::unordered_map<uint32_t, std::string> m_functionRenames;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
@@ -105,6 +112,9 @@ namespace ps2recomp
         void emitExternalCallTargetManifest();
         bool shouldSkipFunction(const Function &function) const;
         bool isStubFunction(const Function &function) const;
+        bool isCorrectnessCriticalFunction(const Function &function) const;
+        bool hasResolvedStubHandler(const Function &function) const;
+        void collectCorrectnessCriticalFunctionStarts();
         bool generateFunctionHeader();
         bool generateStubHeader();
         bool writeToFile(const std::string &path, const std::string &content);

@@ -2,6 +2,8 @@
 # Usage: .\build.ps1 [Debug|RelWithDebInfo] [parallelism]
 # Example: .\build.ps1 Debug 2
 # Example: .\build.ps1 Debug -Test    # build the ps2x_tests unit-test runner
+# Example: .\build.ps1 Debug 6 -Test -Clean         # rebuild ps2x_tests from scratch
+# Example: .\build.ps1 Debug 6 -Clean -Full         # wipe build\, reconfigure, rebuild
 
 param(
     [string]$Config = "Debug",
@@ -9,8 +11,24 @@ param(
     [switch]$Recomp,    # Build the ps2xRecomp tool instead of the runtime
     [switch]$Studio,    # Build ps2xStudio instead of the runtime
     [switch]$Debugger,  # Build ps2xDebugger instead of the runtime
-    [switch]$Test       # Build the ps2x_tests unit-test runner instead of the runtime
+    [switch]$Test,      # Build the ps2x_tests unit-test runner instead of the runtime
+    [switch]$Clean,     # Clean build: MSBuild /t:Rebuild on the selected target
+    [switch]$Full,      # With -Clean: park build\ and re-run CMake configure first
+    [switch]$Force      # Skip the confirmation prompt on a destructive clean
 )
+
+# $Config is passed straight to MSBuild's /p:Configuration, which silently
+# matches no ItemDefinitionGroup (and fails deep inside the VC targets with an
+# opaque MSB8013) if it doesn't EXACTLY match a config name in the vcxproj.
+# Trailing punctuation/whitespace picked up from terminal autocomplete or a
+# pasted sentence is an easy, invisible way to hit this -- normalize and
+# validate up front so the failure is immediate and readable instead.
+$Config = $Config.Trim().TrimEnd('.', ',', ';')
+$validConfigs = @('Debug', 'Release', 'MinSizeRel', 'RelWithDebInfo')
+if ($Config -notin $validConfigs) {
+    Write-Error "Invalid -Config '$Config'. Valid values: $($validConfigs -join ', ')"
+    exit 1
+}
 
 $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe not found - VS installer missing?"; exit 1 }
@@ -19,6 +37,104 @@ if (-not $vsRoot) { Write-Error "No VS installation found via vswhere"; exit 1 }
 $vsdev   = "$vsRoot\Common7\Tools\VsDevCmd.bat"
 $msbuild = "$vsRoot\MSBuild\Current\Bin\amd64\MSBuild.exe"
 $root    = $PSScriptRoot
+
+# ---------------------------------------------------------------------------
+# -Clean / -Full
+#
+#   -Clean         MSBuild /t:Rebuild on the SELECTED target only. No CMake
+#                  reconfigure. Minutes for ps2x_tests and the tools.
+#   -Clean -Full   Park build\ wholesale, re-run CMake configure, then build.
+#
+# COST OF -Full: the runtime is ~17,086 generated TUs -> 30+ HOURS, and it
+# re-downloads ~500 MB of FetchContent dependencies (raylib, SDL2, imgui...).
+# There is NO compiler cache to soften it: PS2X_ENABLE_SCCACHE wires
+# CMAKE_<LANG>_COMPILER_LAUNCHER (ps2xRuntime/CMakeLists.txt:24-33), which CMake
+# honours only for the Makefile and Ninja generators. Under "Visual Studio 18
+# 2026" that option is inert regardless of whether sccache is installed.
+#
+# The reconfigure REPLAYS the PS2X_* options out of the CMakeCache.txt it is
+# replacing, so a clean can never silently revert a setting to its CMakeLists
+# default. A hand-written "cmake -S . -B build" carries none of them; e.g.
+# PS2X_ENABLE_RUNTIME_LOGS defaults to OFF (ps2xRuntime/CMakeLists.txt:18) and
+# would take 189 RUNTIME_LOG sites with it. It is PUBLIC on ps2_runtime, so
+# noticing after the fact costs a SECOND full rebuild.
+# ---------------------------------------------------------------------------
+$buildDir = "$root\build"
+
+function Confirm-Destructive([string]$message) {
+    if ($Force) { return $true }
+    Write-Host ""
+    Write-Host $message -ForegroundColor Yellow
+    $answer = Read-Host "Type yes to proceed (anything else aborts)"
+    if ($answer -eq 'yes') { return $true }   # -eq is case-insensitive: yes / YES / Yes
+    Write-Host "Got '$answer', expected 'yes'." -ForegroundColor DarkGray
+    return $false
+}
+
+if ($Full -and -not $Clean) {
+    Write-Error "-Full has no meaning on its own. Use: .\build.ps1 $Config $Jobs -Clean -Full"
+    exit 1
+}
+
+if ($Clean -and $Full) {
+    $cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
+    if (-not $cmake) { Write-Error "cmake not found on PATH - required for -Clean -Full"; exit 1 }
+
+    # Inherit the configuration we are about to destroy.
+    $cacheFile = "$buildDir\CMakeCache.txt"
+    $generator = "Visual Studio 18 2026"
+    $platform  = "x64"
+    $cmakeArgs = @()
+    if (Test-Path $cacheFile) {
+        foreach ($line in (Get-Content $cacheFile)) {
+            if ($line -match '^CMAKE_GENERATOR:INTERNAL=(.+)$')          { $generator = $matches[1]; continue }
+            if ($line -match '^CMAKE_GENERATOR_PLATFORM:INTERNAL=(.+)$') { $platform  = $matches[1]; continue }
+            if ($line -match '^CMAKE_INSTALL_PREFIX:PATH=(.+)$')         { $cmakeArgs += "-DCMAKE_INSTALL_PREFIX:PATH=$($matches[1])"; continue }
+            if ($line -match '^(PS2X_[A-Z0-9_]+):(BOOL|STRING|PATH|FILEPATH)=(.*)$') {
+                $name = $matches[1]; $type = $matches[2]; $value = $matches[3]
+                # Skip unresolved find_* results so the fresh configure re-searches.
+                if ($value -like '*-NOTFOUND') { continue }
+                $cmakeArgs += "-D${name}:${type}=${value}"
+            }
+        }
+        Write-Host "Inheriting $($cmakeArgs.Count) cached option(s) from the build being replaced:" -ForegroundColor DarkCyan
+        $cmakeArgs | Sort-Object | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    } else {
+        Write-Host "No CMakeCache.txt at $cacheFile - configuring with CMakeLists defaults." -ForegroundColor Yellow
+        Write-Host "Check PS2X_ENABLE_RUNTIME_LOGS afterwards; it defaults to OFF." -ForegroundColor Yellow
+    }
+
+    if (Test-Path $buildDir) {
+        # -Full wipes the WHOLE tree, including the ~17,086 runner .obj files, even
+        # when the target being built is small. Say so before asking.
+        if ($Test -or $Recomp -or $Studio -or $Debugger) {
+            $only = ''
+            if ($Test)     { $only += ' -Test' }
+            if ($Recomp)   { $only += ' -Recomp' }
+            if ($Studio)   { $only += ' -Studio' }
+            if ($Debugger) { $only += ' -Debugger' }
+            Write-Host ""
+            Write-Host "NOTE: -Full discards the RUNTIME objects too, not just this target." -ForegroundColor Yellow
+            Write-Host "      For a clean build of this target only, drop -Full:" -ForegroundColor Yellow
+            Write-Host "      .\build.ps1 $Config $Jobs$only -Clean" -ForegroundColor Cyan
+        }
+        $parked = "$root\build.prev-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+        $msg = "FULL CLEAN" + [Environment]::NewLine +
+               "  park:      $buildDir" + [Environment]::NewLine +
+               "  ->         $parked" + [Environment]::NewLine +
+               "  then:      cmake configure + build $Config" + [Environment]::NewLine +
+               "A runtime build from scratch is 30+ HOURS and there is no compiler cache."
+        if (-not (Confirm-Destructive $msg)) { Write-Host "Aborted - nothing was moved." -ForegroundColor Red; exit 1 }
+        Move-Item $buildDir $parked
+        Write-Host "Parked -> $parked" -ForegroundColor DarkCyan
+        Write-Host "It is NOT deleted. Remove it yourself once the new build is verified." -ForegroundColor DarkGray
+    }
+
+    Write-Host "Configuring: $generator / $platform" -ForegroundColor Yellow
+    & $cmake -S $root -B $buildDir -G $generator -A $platform @cmakeArgs
+    if ($LASTEXITCODE -ne 0) { Write-Error "CMake configure failed (exit $LASTEXITCODE)"; exit $LASTEXITCODE }
+    Write-Host "Configure complete." -ForegroundColor Green
+}
 
 if ($Recomp) {
     $target = "$root\build\ps2xRecomp\ps2_recomp.vcxproj"
@@ -35,6 +151,21 @@ if ($Recomp) {
 } else {
     $target = "$root\build\ps2xRuntime\ps2EntryRunner.vcxproj"
     $total  = 12
+}
+
+# A fresh configure already produced a clean tree, so /t:Rebuild would only
+# duplicate the work. -Clean alone is the targeted case.
+$msbuildTarget = ""
+if ($Clean -and -not $Full) {
+    $isRuntime = -not ($Recomp -or $Studio -or $Debugger -or $Test)
+    if ($isRuntime) {
+        if (-not (Confirm-Destructive "-Clean on ps2EntryRunner discards every generated runner .obj and rebuilds all ~17,086 TUs: 30+ HOURS.")) {
+            Write-Host "Aborted - nothing was deleted." -ForegroundColor Red
+            exit 1
+        }
+    }
+    $msbuildTarget = "/t:Rebuild "
+    Write-Host "Clean build: /t:Rebuild on $(Split-Path $target -Leaf)" -ForegroundColor Yellow
 }
 
 $done     = 0
@@ -59,7 +190,7 @@ Set-Content $buildLog ""  # clear/create
 if ($Recomp) {
     Write-Host "Building ps2xRecomp tool ($Config)" -ForegroundColor Yellow
     Write-Host ""
-    $cmdLine = "`"$vsdev`" -arch=amd64 && `"$msbuild`" `"$target`" /p:Configuration=$Config /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m:$Jobs /v:minimal"
+    $cmdLine = "`"$vsdev`" -arch=amd64 && `"$msbuild`" `"$target`" $msbuildTarget/p:Configuration=$Config /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m:$Jobs /v:minimal"
     cmd /c $cmdLine 2>&1 | ForEach-Object {
         Write-Host $_
         Add-Content $buildLog $_
@@ -222,7 +353,7 @@ $preBuild = ""
 if (-not $Recomp -and -not $Studio -and -not $Debugger -and -not $Test -and (Test-Path $rlimguiTarget)) {
     $preBuild = "`"$msbuild`" `"$rlimguiTarget`" /p:Configuration=$Config /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m:$Jobs /v:minimal && "
 }
-$cmdLine = "`"$vsdev`" -arch=amd64 && $preBuild`"$msbuild`" `"$target`" /p:Configuration=$Config /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m:$Jobs /v:minimal"
+$cmdLine = "`"$vsdev`" -arch=amd64 && $preBuild`"$msbuild`" `"$target`" $msbuildTarget/p:Configuration=$Config /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m:$Jobs /v:minimal"
 cmd /c $cmdLine 2>&1 | ForEach-Object {
     Write-Host $_
     Add-Content $buildLog $_

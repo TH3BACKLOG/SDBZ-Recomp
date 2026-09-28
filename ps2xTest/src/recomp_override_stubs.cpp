@@ -68,3 +68,20 @@ void singleton_get_camera_0x199db0(uint8_t *, R5900Context *, PS2Runtime *)
 {
     ps2xTestGuestStub("singleton_get_camera_0x199db0");
 }
+
+// Called by recovered bodies in ps2xRuntime/src/lib/Kernel/recovered/, which are
+// part of ps2_runtime; the callees are generated runner bodies.
+void sub_00175B68_0x175b68(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00175B68_0x175b68");
+}
+
+void array_call_dtor_0x171bb0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("array_call_dtor_0x171bb0");
+}
+
+void mem_copy_0x18e250(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("mem_copy_0x18e250");
+}

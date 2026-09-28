@@ -4,6 +4,7 @@
 
 namespace ps2_stubs
 {
+    bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize) noexcept;
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

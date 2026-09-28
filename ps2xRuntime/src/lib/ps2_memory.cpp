@@ -5,15 +5,18 @@
 #include "runtime/ps2_diag.h"
 #include "Kernel/Ipu/ps2_ipu_core.h"
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
+#include <chrono>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
 #include <vector>
+
+void ps2xGsThreadSync(uint32_t reason); // ps2_gif_arbiter.cpp
 
 // ---- [chainord] -- Stage 5.11 run 33 ------------------------------------
 // PCSX2 ground truth (2026-08-09, game paused on the memory-card dialog):
@@ -234,6 +237,31 @@ namespace
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
 
+    // GS runs on its own thread (ps2_gif_arbiter.cpp). SIGLBLID is written by
+    // the GS, so wait for queued packets before the game touches it.
+    //
+    // CSR does NOT wait by default. The GS only sets SIGNAL/FINISH (bits 0-1),
+    // and SDBZ never reads those: its CSR reads are FIELD (bit 13, set by the
+    // scheduler) in 0x102870 / 0x104c00 and the revision byte in 0x171fd8;
+    // its writes clear FINISH (0x102870/0x102a60/0x1030c0) or reset. Waiting
+    // on every CSR read cost ~47 ms per frame (1 read per frame, 09-27 run).
+    // PS2X_GS_THREAD_CSR_SYNC=1 restores the wait.
+    inline void syncGsThreadForPrivReg(uint32_t regOff)
+    {
+        static const bool csrSync = []
+        {
+            const char *v = std::getenv("PS2X_GS_THREAD_CSR_SYNC");
+            return v && v[0] == '1';
+        }();
+        if (regOff == kGsCsrRegOffset)
+        {
+            if (csrSync)
+                ps2xGsThreadSync(1u);
+        }
+        else if (regOff == 0x1080u)
+            ps2xGsThreadSync(2u);
+    }
+
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
     // write-one-to-clear; everything else is a plain merge. Uses compare_exchange
@@ -276,35 +304,55 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    constexpr uint32_t kEeTimerBase[4] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+    constexpr std::array<uint32_t, 4> kEeTimerBases = {
+        0x10000000u,
+        0x10000800u,
+        0x10001000u,
+        0x10001800u,
+    };
+    constexpr uint32_t kEeTimerCountOffset = 0x00u;
     constexpr uint32_t kEeTimerModeOffset = 0x10u;
     constexpr uint32_t kEeTimerCompareOffset = 0x20u;
     constexpr uint32_t kEeTimerHoldOffset = 0x30u;
+    constexpr uint32_t kEeTimerModeClksMask = 0x3u;
+    constexpr uint32_t kEeTimerModeConfigMask = 0x3FFu;
+    constexpr uint32_t kEeTimerModeStatusMask = 0xC00u;
+    constexpr uint32_t kEeTimerModeZret = 1u << 6;
     constexpr uint32_t kEeTimerModeCue = 1u << 7;
-    // BUSCLK-gated tick rate. T0/T1 have a HBLANK clock-select option (MODE.CLKS) that this
-    // model does not distinguish; all four timers use the same CUE-gated rate as the
-    // pre-existing Timer0 fix, which is sufficient to unstick guest CUE-gated wait loops.
-    constexpr uint64_t kEeTimerTicksPerSecond = 15720ull;
-    constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
+    constexpr uint32_t kEeTimerModeCmpe = 1u << 8;
+    constexpr uint32_t kEeTimerModeOvfe = 1u << 9;
+    constexpr uint32_t kEeTimerModeEquf = 1u << 10;
+    constexpr uint32_t kEeTimerModeOvff = 1u << 11;
+    constexpr uint64_t kEeClockHz = 294912000ull;
+    constexpr std::array<uint64_t, 4> kEeTimerClockHz = {
+        147456000ull,
+        9216000ull,
+        576000ull,
+        15734ull,
+    };
 
-    inline int eeTimerIndexForAddress(uint32_t address)
+    inline bool decodeEeTimerRegister(uint32_t address, size_t &timerIndex, uint32_t &offset)
     {
-        for (int i = 0; i < 4; ++i)
+        for (size_t index = 0; index < kEeTimerBases.size(); ++index)
         {
-            const uint32_t base = kEeTimerBase[i];
-            if (address == base || address == base + kEeTimerModeOffset ||
-                address == base + kEeTimerCompareOffset || address == base + kEeTimerHoldOffset)
+            const uint32_t candidateOffset = address - kEeTimerBases[index];
+            if (candidateOffset == kEeTimerCountOffset ||
+                candidateOffset == kEeTimerModeOffset ||
+                candidateOffset == kEeTimerCompareOffset ||
+                (index < 2u && candidateOffset == kEeTimerHoldOffset))
             {
-                return i;
+                timerIndex = index;
+                offset = candidateOffset;
+                return true;
             }
         }
-        return -1;
+        return false;
     }
 
-    inline uint64_t steadyClockNs()
+    constexpr uint64_t ticksUntilMatch(uint32_t count, uint32_t target)
     {
-        using namespace std::chrono;
-        return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+        const uint32_t distance = (target - count) & 0xFFFFu;
+        return distance == 0u ? 0x10000ull : static_cast<uint64_t>(distance);
     }
 
     struct DmaTagView
@@ -446,11 +494,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
-    for (int i = 0; i < 4; ++i)
-    {
-        m_timerLastHostNs[i] = 0;
-        m_timerFractionNs[i] = 0;
-    }
+    resetEeTimers();
 
     try
     {
@@ -503,6 +547,7 @@ bool PS2Memory::initialize(size_t ramSize)
         m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
         std::memset(m_vu1Code, 0, PS2_VU1_CODE_SIZE);
         std::memset(m_vu1Data, 0, PS2_VU1_DATA_SIZE);
+        markVU0CodeModified();
         markVU1CodeModified();
 
         // Initialize VIF registers
@@ -676,40 +721,127 @@ bool PS2Memory::iopSelfTest()
     return ok;
 }
 
-void PS2Memory::updateEeTimerCounter(unsigned timerIndex)
+void PS2Memory::resetEeTimers() noexcept
 {
-    const uint32_t countAddr = kEeTimerBase[timerIndex];
-    const uint32_t modeAddr = countAddr + kEeTimerModeOffset;
+    m_eeTimers = {};
+}
 
-    const uint64_t nowNs = steadyClockNs();
-    if (m_timerLastHostNs[timerIndex] == 0u)
+uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+{
+    if (eeCycles == 0u)
     {
-        m_timerLastHostNs[timerIndex] = nowNs;
-        return;
+        return 0u;
     }
 
-    const uint32_t mode = m_ioRegisters.count(modeAddr) ? m_ioRegisters[modeAddr] : 0u;
-    if ((mode & kEeTimerModeCue) == 0u)
-    {
-        m_timerLastHostNs[timerIndex] = nowNs;
-        m_timerFractionNs[timerIndex] = 0u;
-        return;
-    }
+    constexpr uint32_t kGifStat = 0x10003020u;
+    constexpr uint32_t kGifFqcMask = 0x1F000000u;
+    auto gifStatIt = m_ioRegisters.find(kGifStat);
+    if (gifStatIt != m_ioRegisters.end())
+        gifStatIt->second &= ~kGifFqcMask;
 
-    const uint64_t elapsedNs = nowNs - m_timerLastHostNs[timerIndex];
-    m_timerLastHostNs[timerIndex] = nowNs;
-    if (elapsedNs == 0u)
+    uint32_t interruptMask = 0u;
+    for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
-        return;
-    }
+        EeTimer &timer = m_eeTimers[index];
+        if ((timer.mode & kEeTimerModeCue) == 0u)
+        {
+            continue;
+        }
 
-    const uint64_t scaled = elapsedNs * kEeTimerTicksPerSecond + m_timerFractionNs[timerIndex];
-    const uint64_t ticks = scaled / kNanosecondsPerSecond;
-    m_timerFractionNs[timerIndex] = scaled % kNanosecondsPerSecond;
-    if (ticks != 0u)
-    {
-        m_ioRegisters[countAddr] = m_ioRegisters[countAddr] + static_cast<uint32_t>(ticks);
+        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+        const uint64_t remainingCycles = eeCycles % kEeClockHz;
+        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+        timer.clockRemainder = scaled % kEeClockHz;
+        if (ticks == 0u)
+        {
+            continue;
+        }
+
+        const uint32_t oldCount = timer.count & 0xFFFFu;
+        const uint32_t compare = timer.compare & 0xFFFFu;
+        const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
+        const uint64_t overflowDistance = 0x10000ull - oldCount;
+        const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
+        const bool compareReached = ticks >= compareDistance;
+        bool overflowReached = false;
+
+        if (zeroReturn)
+        {
+            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+            if (compareReached)
+            {
+                const uint64_t remaining = ticks - compareDistance;
+                timer.count = compare == 0u
+                                  ? static_cast<uint32_t>(remaining & 0xFFFFu)
+                                  : static_cast<uint32_t>(remaining % compare);
+            }
+            else
+            {
+                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+            }
+        }
+        else
+        {
+            overflowReached = ticks >= overflowDistance;
+            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+        }
+
+        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+        {
+            timer.mode |= kEeTimerModeEquf;
+            interruptMask |= 1u << index;
+        }
+        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+        {
+            timer.mode |= kEeTimerModeOvff;
+            interruptMask |= 1u << index;
+        }
     }
+    return interruptMask;
+}
+
+uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    uint64_t nearest = std::numeric_limits<uint64_t>::max();
+    for (const EeTimer &timer : m_eeTimers)
+    {
+        if ((timer.mode & kEeTimerModeCue) == 0u)
+        {
+            continue;
+        }
+
+        const uint32_t count = timer.count & 0xFFFFu;
+        const uint32_t compare = timer.compare & 0xFFFFu;
+        const uint64_t compareDistance = ticksUntilMatch(count, compare);
+        const uint64_t overflowDistance = 0x10000ull - count;
+        uint64_t eventTicks = std::numeric_limits<uint64_t>::max();
+
+        if ((timer.mode & kEeTimerModeCmpe) != 0u &&
+            (timer.mode & kEeTimerModeEquf) == 0u)
+        {
+            eventTicks = compareDistance;
+        }
+        const bool overflowCanOccur = (timer.mode & kEeTimerModeZret) == 0u ||
+                                      overflowDistance <= compareDistance;
+        if (overflowCanOccur &&
+            (timer.mode & kEeTimerModeOvfe) != 0u &&
+            (timer.mode & kEeTimerModeOvff) == 0u)
+        {
+            eventTicks = std::min(eventTicks, overflowDistance);
+        }
+        if (eventTicks == std::numeric_limits<uint64_t>::max())
+        {
+            continue;
+        }
+
+        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+        nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+    }
+    return nearest;
 }
 
 bool PS2Memory::isScratchpad(uint32_t address) const
@@ -936,6 +1068,7 @@ uint32_t PS2Memory::read32(uint32_t address)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             uint64_t val = gs_regs.csr.load();
@@ -983,6 +1116,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             return gs_regs.csr.load();
@@ -1093,7 +1227,9 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
         {
             (void)vuLimit;
             vuMem[vuOffset] = value;
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1134,7 +1270,9 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1160,6 +1298,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1197,7 +1336,9 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1218,6 +1359,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -1251,7 +1393,9 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1273,6 +1417,21 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
+    if (!scratch && physAddr == 0x10004000u) // VIF0_FIFO
+    {
+        alignas(16) uint8_t fifoData[16];
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        processVIF0Data(fifoData, sizeof(fifoData));
+        return;
+    }
+    if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
+    {
+        alignas(16) uint8_t fifoData[16];
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        processVIF1Data(fifoData, sizeof(fifoData));
+        return;
+    }
+
     if (scratch)
     {
         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "write128 scratchpad", address);
@@ -1292,7 +1451,9 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         {
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1321,23 +1482,36 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
-    if (const int timerIndex = eeTimerIndexForAddress(address); timerIndex >= 0)
+    size_t timerIndex = 0u;
+    uint32_t timerOffset = 0u;
+    if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
-        const uint32_t countAddr = kEeTimerBase[timerIndex];
-        if (address == countAddr)
+        EeTimer &timer = m_eeTimers[timerIndex];
+        switch (timerOffset)
         {
-            m_ioRegisters[address] = value;
-            m_timerLastHostNs[timerIndex] = steadyClockNs();
-            m_timerFractionNs[timerIndex] = 0u;
-            return true;
+        case kEeTimerCountOffset:
+            timer.count = value & 0xFFFFu;
+            timer.clockRemainder = 0u;
+            break;
+        case kEeTimerModeOffset:
+        {
+            const uint32_t previousMode = timer.mode;
+            const uint32_t status = (previousMode & kEeTimerModeStatusMask) & ~(value & kEeTimerModeStatusMask);
+            timer.mode = (value & kEeTimerModeConfigMask) | status;
+            if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
+            {
+                timer.clockRemainder = 0u;
+            }
+            break;
         }
-
-        updateEeTimerCounter(static_cast<unsigned>(timerIndex));
-        m_ioRegisters[address] = value;
-        m_timerLastHostNs[timerIndex] = steadyClockNs();
-        if (address == countAddr + kEeTimerModeOffset)
-        {
-            m_timerFractionNs[timerIndex] = 0u;
+        case kEeTimerCompareOffset:
+            timer.compare = value & 0xFFFFu;
+            break;
+        case kEeTimerHoldOffset:
+            timer.hold = value & 0xFFFFu;
+            break;
+        default:
+            return false;
         }
         return true;
     }
@@ -1350,6 +1524,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         m_ioRegisters[address] = value;
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
@@ -1413,9 +1588,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         case 0x10003C10u:     // VIF1_FBRST
             if (value & 0x1u) // RST
             {
+                const bool wasPath3Masked = m_path3Masked;
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_path3Masked = false;
+                if (wasPath3Masked)
+                    flushMaskedPath3Packets();
             }
             if (value & 0x8u) // STC
             {
@@ -1599,8 +1778,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                (m_gsVRAM || channelBase == 0x10008000u))
+            if (tryProcessScratchpadDma(channelBase, value))
+            {
+                return true;
+            }
+
+            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
@@ -1724,7 +1907,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                     };
 
-                    auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
+                    auto appendVifTagData = [&](uint32_t localTagAddr)
                     {
                         uint32_t tagPhys = 0u;
                         const bool tagScratch = isScratchpad(localTagAddr);
@@ -1735,10 +1918,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (tagPhys + 16u > localMax)
                             return;
 
-                        // VIF packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
+                        // CHCR.TTE sends the DMAtag's upper 64 bits to the channel before
+                        // the tag payload. VIF chains use those bytes for two VIFcodes.
                         chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
-                        appendData(localTagAddr + 16u, qwCount);
                     };
+
+                    const bool isVifChannel =
+                        channelBase == 0x10009000u || channelBase == 0x10008000u;
+                    const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
@@ -1864,63 +2051,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        if (ps2_diag::enabled())
-                        {
-                            static std::atomic<uint64_t> s_dmaChainCount{0};
-                            const uint64_t n = s_dmaChainCount.fetch_add(1, std::memory_order_relaxed);
-                            if (ps2_diag::should_log(n, 32, 2000))
-                            {
-                                std::ostringstream dataPreview;
-                                if (hasPayload)
-                                {
-                                    try
-                                    {
-                                        const bool dataInSPR = isScratchpad(dataAddr);
-                                        const uint32_t physData = translateAddress(dataAddr);
-                                        const uint8_t *dataBase = dataInSPR ? m_scratchpad : m_rdram;
-                                        const uint32_t dataMax = dataInSPR ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
-                                        const uint64_t data0 = loadScalar<uint64_t>(dataBase, physData, dataMax,
-                                                                                    "dma chain data preview", dataAddr);
-                                        dataPreview << " data0=0x" << std::hex << data0 << std::dec;
-                                    }
-                                    catch (...)
-                                    {
-                                        // Best-effort preview only; never let a bad/unmapped
-                                        // dataAddr affect the probe or the DMA walk itself.
-                                    }
-                                }
-
-                                RUNTIME_LOG("[dma:chain] n=" << n
-                                                             << " chan=0x" << std::hex << channelBase
-                                                             << " tagAddr=0x" << currentTagAddr
-                                                             << " tag=0x" << tag
-                                                             << std::dec
-                                                             << " id=" << id
-                                                             << " qwc=" << tagQwc
-                                                             << " irq=" << irq
-                                                             << " addr=0x" << std::hex << addr
-                                                             << " dataAddr=0x" << dataAddr
-                                                             << std::dec
-                                                             << " end=" << endChain
-                                                             << dataPreview.str()
-                                                             << std::endl);
-                            }
-                        }
-
-                        // On VIF0/VIF1 the DMAtag's upper 64 bits are VIFcodes and are pushed
-                        // into the VIF FIFO ahead of the link's payload -- for EVERY tag id, not
-                        // just the ones whose payload happens to follow the tag. Restricting this
-                        // to id 1/2/5/6/7 dropped the 8-byte VIFcode header off every REF/REFS
-                        // (id 3/4) link, so those payloads entered the stream unframed and
-                        // desynced the parser for the rest of the buffer.
-                        //
-                        // dataAddr is already the right source for every id (tagAddr+16 for
-                        // 1/2/5/6/7, addr for 0/3/4), so the old currentTagAddr+16 special case
-                        // was redundant where it was correct and wrong where it was not.
-                        const bool vifChannel =
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u);
-                        if (vifChannel)
-                            appendCompactVif1TagData(currentTagAddr, 0u);
+                        if (transferTagData)
+                            appendVifTagData(currentTagAddr);
 
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
@@ -1993,9 +2125,101 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
+bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+{
+    static constexpr uint32_t kSprFromChannel = 0x1000D000u;
+    static constexpr uint32_t kSprToChannel = 0x1000D400u;
+    if (channelBase != kSprFromChannel && channelBase != kSprToChannel)
+        return false;
+
+    const uint32_t mode = (chcr >> 2u) & 0x3u;
+    if (mode != 0u)
+        return false;
+
+    const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+    const uint32_t byteCount = qwc * 16u;
+    const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
+    const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+
+    uint32_t mainOffset = 0u;
+    try
+    {
+        mainOffset = translateAddress(originalMadr);
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+
+    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+        return false;
+
+    const bool fromScratchpad = channelBase == kSprFromChannel;
+    uint32_t scratchOffset = originalSadr;
+    uint32_t bytesLeft = byteCount;
+    uint32_t copied = 0u;
+    while (bytesLeft != 0u)
+    {
+        const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
+        const uint32_t chunk = std::min(bytesLeft, scratchChunk);
+        if (fromScratchpad)
+        {
+            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+            markModified(mainOffset + copied, chunk);
+        }
+        else
+        {
+            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+        }
+
+        copied += chunk;
+        bytesLeft -= chunk;
+        scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+    }
+
+    m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
+    m_ioRegisters[channelBase + 0x20u] = 0u;
+    m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+    completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+    return true;
+}
+
+void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+{
+    static constexpr uint32_t kDStat = 0x1000E010u;
+    m_ioRegisters[channelBase] &= ~0x100u;
+
+    uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
+    dstat |= 1u << cause;
+    const uint32_t status = dstat & 0x3FFu;
+    const uint32_t mask = (dstat >> 16u) & 0x3FFu;
+    if ((status & mask) != 0u)
+        dstat |= 1u << 31u;
+    else
+        dstat &= ~(1u << 31u);
+    m_ioRegisters[kDStat] = dstat;
+    queueCompletedDmacCause(cause);
+}
+
 void PS2Memory::processPendingTransfers()
 {
     const bool hadGif = !m_pendingGifTransfers.empty();
+    uint32_t observedGifQwc = 0u;
+    for (const auto &transfer : m_pendingGifTransfers)
+    {
+        const uint64_t transferQwc = !transfer.chainData.empty()
+                                         ? (transfer.chainData.size() / 16u)
+                                         : transfer.qwc;
+        observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
+    }
+    if (observedGifQwc != 0u)
+    {
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        uint32_t &gifStat = m_ioRegisters[kGifStat];
+        gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+    }
+
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
@@ -2691,12 +2915,33 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    size_t timerIndex = 0u;
+    uint32_t timerOffset = 0u;
+    if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+    {
+        const EeTimer &timer = m_eeTimers[timerIndex];
+        switch (timerOffset)
+        {
+        case kEeTimerCountOffset:
+            return timer.count & 0xFFFFu;
+        case kEeTimerModeOffset:
+            return timer.mode & (kEeTimerModeConfigMask | kEeTimerModeStatusMask);
+        case kEeTimerCompareOffset:
+            return timer.compare & 0xFFFFu;
+        case kEeTimerHoldOffset:
+            return timer.hold & 0xFFFFu;
+        default:
+            return 0u;
+        }
+    }
+
     if (isGsPrivReg(address))
     {
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
@@ -2714,18 +2959,25 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         syncIpuChannels(m_ioRegisters);
         return val;
     }
+
+    if (address == 0x10003020u) // GIF_STAT
+    {
+        uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+        const uint32_t mode = m_ioRegisters.count(0x10003010u) ? m_ioRegisters[0x10003010u] : 0u;
+        const uint32_t ctrl = m_ioRegisters.count(0x10003000u) ? m_ioRegisters[0x10003000u] : 0u;
+
+        // M3R and IMT mirror GIF_MODE, PSE mirrors GIF_CTRL, and M3P is the
+        // effective PATH3 mask controlled by the VIF1 MSKPATH3 command.
+        stat = (stat & ~0xFu) |
+               (mode & 0x1u) |
+               (m_path3Masked ? 0x2u : 0u) |
+               (mode & 0x4u) |
+               (ctrl & 0x8u);
+        return stat;
+    }
+
     if (address >= 0x10000000 && address < 0x10010000)
     {
-        if (const int timerIndex = eeTimerIndexForAddress(address); timerIndex >= 0)
-        {
-            if (address == kEeTimerBase[timerIndex])
-            {
-                updateEeTimerCounter(static_cast<unsigned>(timerIndex));
-            }
-            auto timerIt = m_ioRegisters.find(address);
-            return timerIt != m_ioRegisters.end() ? timerIt->second : 0u;
-        }
-
         // IPU channels answer from the engine: their STR bit is real, and a
         // streaming IPU_FROM stays started until the guest clears it.
         if (address >= 0x1000B000u && address < 0x1000B500u &&

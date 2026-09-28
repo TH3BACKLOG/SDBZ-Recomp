@@ -1802,6 +1802,13 @@ bool ps2_iop_runArkdService(PS2Runtime *runtime,
                 g_arkdCpu->busRead32(g_arkdLoadBase + 0xB310u),
                 (band == 0x20000000u) ? "  <-- INCOMPLETE (mid-transfer)" : "");
         }
+        else
+        {
+            // Past the detailed cap, keep one short line per job so late loads
+            // (character select, stage, fight) stay visible in the log.
+            std::fprintf(stderr, "[ARKD:load] kind=%u name=\"%s\" dest=0x%08x halted=%d\n",
+                         jobKind, jobName, jobDest, g_arkdCpu->halted() ? 1 : 0);
+        }
         if (g_iopTraceOn && (!g_arkdCpu->halted() || g_arkdCpu->pc() != kHaltPc))
             dumpIopTrace("worker did not reach halt sentinel", g_arkdCpu->pc());
         if (arkdStateEnabled()) dumpArkdState("after worker");
