@@ -251,9 +251,14 @@ void report(double windowSec)
     const BOOL initOk = SymInitialize(proc, nullptr, TRUE);
     const bool haveSyms = initOk != FALSE || GetLastError() == ERROR_INVALID_PARAMETER;
 
-    const size_t kMaxThreads = 4;   // deeper is noise; the top few hold the cost
-    const size_t kMaxResolve = 300; // bounds the PDB work against the kill timer
-    const size_t kMaxPrint = 12;
+    const size_t kMaxThreads = 4; // deeper is noise; the top few hold the cost
+    // Bounds the PDB work against the kill timer. 300 used to leave ~75% of a
+    // flat profile (2,700 distinct addrs) unattributed; PS2X_PROFILE_RESOLVE
+    // overrides.
+    size_t kMaxResolve = 3000;
+    if (const char *r = std::getenv("PS2X_PROFILE_RESOLVE"))
+        kMaxResolve = static_cast<size_t>((std::max)(1, std::atoi(r)));
+    const size_t kMaxPrint = 30;
 
     for (size_t ti = 0; ti < ordered.size() && ti < kMaxThreads; ++ti)
     {
@@ -319,6 +324,41 @@ void report(double windowSec)
                         100.0 * static_cast<double>(syms[i].second) /
                             static_cast<double>(ts.totalWeight),
                         static_cast<double>(syms[i].second) / 1e7, syms[i].first.c_str());
+        std::fflush(stdout);
+
+        // Rollup by owner (module!Class, or "guest code" for recompiled
+        // fn_/sub_ bodies). A flat profile hides its cost in the tail; this
+        // says which subsystem the tail belongs to.
+        uint64_t resolvedWeight = 0;
+        std::unordered_map<std::string, uint64_t> byOwner;
+        for (const auto &s : syms)
+        {
+            resolvedWeight += s.second;
+            const size_t bang = s.first.find('!');
+            const std::string mod = bang == std::string::npos ? std::string() : s.first.substr(0, bang);
+            std::string fn = bang == std::string::npos ? s.first : s.first.substr(bang + 1);
+            if (!fn.empty() && fn[0] == '`')
+                fn.erase(0, 1);
+            std::string owner;
+            if (fn.rfind("fn_", 0) == 0 || fn.rfind("sub_", 0) == 0)
+                owner = "(guest code fn_/sub_)";
+            else
+            {
+                const size_t sep = fn.find("::");
+                owner = mod + "!" + (sep == std::string::npos ? fn : fn.substr(0, sep));
+            }
+            byOwner[owner] += s.second;
+        }
+        std::printf("[hostprof]      -- resolved %.1f%% of samples; rollup by owner:\n",
+                    100.0 * static_cast<double>(resolvedWeight) / static_cast<double>(ts.totalWeight));
+        std::vector<std::pair<std::string, uint64_t>> owners(byOwner.begin(), byOwner.end());
+        std::sort(owners.begin(), owners.end(),
+                  [](const auto &a, const auto &b) { return a.second > b.second; });
+        for (size_t i = 0; i < owners.size() && i < 15; ++i)
+            std::printf("[hostprof]      owner %5.1f%%  %s\n",
+                        100.0 * static_cast<double>(owners[i].second) /
+                            static_cast<double>(ts.totalWeight),
+                        owners[i].first.c_str());
         std::fflush(stdout);
     }
 
