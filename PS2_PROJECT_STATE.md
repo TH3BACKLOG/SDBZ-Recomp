@@ -268,6 +268,25 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
 
+## Part 163 (2026-09-28) -- VU1 recompiler + multi-threaded GS raster; fast guest stalls at Auto-Save notice
+
+**Commits (local, NOT pushed):** `80b31be7` VU1 static recompiler, `31ed67a9` MT CPU rasterizer.
+- MT raster: `ps2_gs_raster_mt.inl`, `PS2X_GS_RASTER_THREADS` (default 4; 0 = old path). Off when DIAG / skipbg / meshdump.
+- Hazard flushes are hooked in `ps2_gs_gpu.cpp` (uploads, CLUT load, local-to-local, readback, clears).
+- GS bench `fight_a16.gsr`: 336 -> 86 ms, VRAM hash unchanged (`e3361ce8186f6df4`).
+
+**OPEN BLOCKER -- in-game fight vbl/s not yet measured with MT raster:**
+- Guest sticks on "Super Dragon Ball Z uses an Auto-Save feature... X button to continue" (`gstate=0,0,0,1` forever).
+- Correlates with speed across 16 archived runs: every run at >=25 vbl/s on this screen sticks, every run at 13-20 passes.
+- Not caused by MT raster, /Ob2, or the VU1 recompiler (bisected). Opening-movie skip (`PS2X_FMV=host PS2X_FMV_OP=<missing>`) does not help. Autopress 60 also sticks.
+- Pad reaches the guest (`[pad] change btns=0xbfff`).
+- Clue (unverified): `[thsync]` at the stuck point shows thread 2 `st=16` (DORMANT); a good run at the same point has thread 2 `st=4 wt=2 wid=3` (waiting on sema 3).
+- **NEXT:** find what this screen waits on (static via `decomp.py`, or PCSX2) -- pad edge vs memory-card/IOP result vs thread 2 lifecycle.
+
+### Learned patterns (2026-09-28)
+- **Speedups expose guest timing bugs.** When a faster build hangs, compare old archived logs by guest speed at the same screen before bisecting code.
+- **The MT raster must be flushed at every GS read-back and every write from outside the rasterizer.** Missing one shows as stale pixels, not a crash. The GS bench VRAM hash is the gate.
+
 ## Part 162 (2026-09-27) -- upside-down closed; boot ~3x faster; t≈5 crash root-caused and fixed
 
 **State:** fights run UPRIGHT on the full-regen build (sqrt.s fix `564cb9f9`, user-confirmed).
