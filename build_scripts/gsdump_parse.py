@@ -356,6 +356,25 @@ def emit_cpp(info, regs, packets, out_path):
     )
 
 
+VRAM_SIZE = 4 * 1024 * 1024
+# GSState::Freeze (state version 9) ends with VRAM, then 4 x (GIF tag 16 +
+# reg u32 4) path records, then Q (float). Anchor on the end so the size of the
+# register header in front of VRAM does not matter.
+STATE_TAIL_V9 = 4 * (16 + 4) + 4
+
+
+def emit_vram(state, out_path):
+    version = struct.unpack_from("<I", state, 0)[0]
+    if version != 9:
+        raise SystemExit(f"--emit-vram: state version {version} not handled (only 9)")
+    start = len(state) - STATE_TAIL_V9 - VRAM_SIZE
+    if start < 4:
+        raise SystemExit(f"--emit-vram: state too small ({len(state)} bytes)")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(state[start:start + VRAM_SIZE])
+    print(f"wrote {VRAM_SIZE} bytes of VRAM (state offset {start}) to {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dump", type=Path)
@@ -364,6 +383,7 @@ def main():
     ap.add_argument("--emit-bin", type=Path, help="concatenate GIF payloads to a flat .bin")
     ap.add_argument("--emit-cpp", type=Path, help="emit a C++ .inc for a replay test")
     ap.add_argument("--dump-regs", type=Path, help="write the 8 KiB priv-register block")
+    ap.add_argument("--emit-vram", type=Path, help="write the 4 MiB VRAM image from the GS state (feeds ps2x_gs_bench)")
     ap.add_argument("--path", type=int, choices=[0, 1, 2], help="restrict --emit-bin to one GIF path")
     ap.add_argument("--max-packets", type=int, help="stop after N packets (for probing a suspect dump)")
     args = ap.parse_args()
@@ -377,7 +397,7 @@ def main():
         reader.pos = 0
         raise SystemExit(2)
 
-    if args.summary or not (args.emit_replay or args.emit_bin or args.emit_cpp or args.dump_regs):
+    if args.summary or not (args.emit_replay or args.emit_bin or args.emit_cpp or args.dump_regs or args.emit_vram):
         summarize(info, state, regs, packets)
     if args.emit_replay:
         emit_replay(info, regs, packets, args.emit_replay)
@@ -388,6 +408,8 @@ def main():
     if args.dump_regs:
         args.dump_regs.write_bytes(regs)
         print(f"wrote {len(regs)} bytes to {args.dump_regs}")
+    if args.emit_vram:
+        emit_vram(state, args.emit_vram)
 
 
 if __name__ == "__main__":

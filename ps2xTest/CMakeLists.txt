@@ -92,6 +92,28 @@ if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_vucap_replay)
 endif()
 
+# GS speed benchmark: replays a PCSX2 GS dump (.gsr) through our GS.
+add_executable(ps2x_gs_bench
+    src/gs_bench_main.cpp
+    src/recomp_override_stubs.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+target_include_directories(ps2x_gs_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+)
+
+target_link_libraries(ps2x_gs_bench PRIVATE
+    ps2_runtime
+    ps2_iop
+)
+
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_gs_bench)
+endif()
+
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
 if(PRINT_GENERATED_CODE)
 
