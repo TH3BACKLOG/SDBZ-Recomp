@@ -1596,6 +1596,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         return;
 
     const auto &ctx = gs->activeContext();
+    const bool diagOn = ps2_diag::enabled(); // hoisted: 7 probe gates per pixel below
 
     const auto prim = gs->m_registers.prim;
     const auto pabe = gs->m_registers.pabe;
@@ -1610,7 +1611,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // [glyphfate] (0)/(1). Must sit BEFORE the scissor return -- a scissor kill
     // is one of the fates being measured, and counting after the return would
     // make it indistinguishable from "never happened".
-    if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+    if (diagOn && ps2diag_fbstat::t_glyphDraw)
     {
         using namespace ps2diag_fbstat;
         g_gfIn.fetch_add(1, std::memory_order_relaxed);
@@ -1630,7 +1631,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // site purely because prim/alpha/a are unambiguously in scope here; these
     // three describe the box DRAW, not the outcome of any one store, so
     // sampling them before the scissor return costs nothing and loses nothing.
-    if (ps2_diag::enabled() && ps2diag_fbstat::t_boxDraw)
+    if (diagOn && ps2diag_fbstat::t_boxDraw)
     {
         using namespace ps2diag_fbstat;
         g_boAbe.store(static_cast<uint32_t>(prim.abe), std::memory_order_relaxed);
@@ -1653,7 +1654,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // returns below, which are the two places a red pixel can vanish without
     // touching any existing probe.
     ps2diag_fbstat::t_redPixel = false;
-    if (ps2_diag::enabled() && prim.tme)
+    if (diagOn && prim.tme)
     {
         using namespace ps2diag_fbstat;
 
@@ -1713,7 +1714,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     {
         if (ps2diag_fbstat::t_redPixel)
             ps2diag_fbstat::g_trKillAte.fetch_add(1, std::memory_order_relaxed);
-        if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+        if (diagOn && ps2diag_fbstat::t_glyphDraw)
             ps2diag_fbstat::g_gfAte.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1769,7 +1770,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     {
         if (ps2diag_fbstat::t_redPixel)
             ps2diag_fbstat::g_trKillZ.fetch_add(1, std::memory_order_relaxed);
-        if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+        if (diagOn && ps2diag_fbstat::t_glyphDraw)
             ps2diag_fbstat::g_gfZ.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1851,7 +1852,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         pixel = Rgba8888ToRgba5551(pixel);
     }
 
-    if (ps2_diag::enabled())
+    if (diagOn)
     {
         // Per-frame pixel aggregates consumed by the [gs:frame] probe. The old
         // 1-in-2,000,000 sampled probe was useless here: a full-screen clear is
@@ -1881,7 +1882,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
                                     std::memory_order_relaxed);
     }
 
-    if (ps2_diag::enabled())
+    if (diagOn)
     {
         // Classify the value we are actually about to store. RGB is the
         // low 24 bits for CT32 (see pack32 above); for 16bpp the value
@@ -2312,6 +2313,8 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
     const auto tex = ctx.tex0;
     const auto prim = gs->m_registers.prim;
     const auto texa = gs->m_registers.texa;
+    // Hoisted: samplePoint runs per texel (4x under bilinear).
+    const bool diagOn = ps2_diag::enabled();
 
     int texW = 1 << tex.tw;
     int texH = 1 << tex.th;
@@ -2358,7 +2361,7 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
             // Perf (09-27): everything below up to the CLUT lookup is probe
             // bookkeeping -- several locked RMWs per texel, 4x under bilinear.
             // Skip it entirely when the diag gate is off.
-            if (!ps2_diag::enabled())
+            if (!diagOn)
                 return applyTexa(texa, tex.psm,
                                  gs->ReadClutCache(tex.cpsm, static_cast<u8>(out), tex.csa));
 
