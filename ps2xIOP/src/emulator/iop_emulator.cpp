@@ -18,6 +18,7 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <map>
@@ -25,11 +26,181 @@
 #include <span>
 #include <sstream>
 #include <utility>
+#include <vector>
+
+// Host pad state for the SIO2 pad HLE below (Part 165). Written by the runtime's
+// present loop (ps2_pad.cpp, the thread that owns raylib input), read on the IOP
+// thread. Defined here so IOP-only binaries still link.
+//   buttons: libpad wire order, active-low -- low byte = first digital byte
+//            (Select..Left), high byte = second (L2..Square).
+//   analog : rx | ry << 8 | lx << 16 | ly << 24.
+//   served : count of port-0 pad polls answered; the runtime stops its own
+//            direct buffer push once this is non-zero (PADMAN owns the buffer).
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_buttons{0xFFFFu};
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_analog{0x7F7F7F7Fu};
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_served{0u};
 
 namespace ps2x::iop::detail
 {
     namespace
     {
+        // DualShock2 on SIO2 port 0, ported from PCSX2 pcsx2/SIO/Pad/PadDualshock2.cpp
+        // (SendCommandByte and the per-command handlers). commandBytesReceived
+        // starts at 1 after the SIO2 mode byte (PadBase::SoftReset), so the reply
+        // to a PAD packet is 0xFF, mode, 0x5A, data...
+        struct Ds2Pad
+        {
+            uint8_t mode = 0x41; // DIGITAL until the game negotiates
+            bool inConfig = false;
+            bool analogLight = false;
+            bool analogLocked = false;
+            bool commandStage = false;
+            uint32_t responseBytes = 0u;
+            uint8_t smallMotorCfg = 0xFFu;
+            uint8_t largeMotorCfg = 0xFFu;
+            uint8_t command = 0u;
+            uint32_t n = 1u;
+
+            void softReset() { n = 1u; }
+
+            // PCSX2 bit k of its 16-bit button word (first wire byte = bits 8..15)
+            // -> our libpad-order word (first wire byte = bits 0..7). Active-low.
+            static bool pressed(uint16_t buttons, int k)
+            {
+                const int ours = k >= 8 ? k - 8 : k + 8;
+                return ((buttons >> ours) & 1u) == 0u;
+            }
+
+            uint8_t send(uint8_t b, uint16_t buttons, uint32_t analog)
+            {
+                uint8_t ret = 0u;
+                if (n == 1u)
+                {
+                    command = b;
+                    ret = inConfig ? 0xF3u : mode;
+                }
+                else if (n == 2u)
+                {
+                    ret = 0x5Au;
+                }
+                else
+                {
+                    ret = handle(b, buttons, analog);
+                }
+                ++n;
+                return ret;
+            }
+
+            uint8_t handle(uint8_t b, uint16_t buttons, uint32_t analog)
+            {
+                switch (command)
+                {
+                case 0x40: // Mystery
+                    return n == 5u ? 0x02u : n == 8u ? 0x5Au : 0x00u;
+                case 0x41: // ButtonQuery
+                    if (mode == 0x73u || mode == 0x79u)
+                        return (n == 3u || n == 4u) ? 0xFFu : n == 5u ? 0x03u : n == 8u ? 0x5Au : 0x00u;
+                    return 0x00u;
+                case 0x42: // Poll
+                {
+                    static constexpr int kPressureBits[12] = {13, 15, 12, 14, 4, 5, 6, 7, 2, 3, 0, 1};
+                    if (n == 3u)
+                        return static_cast<uint8_t>(buttons & 0xFFu);
+                    if (n == 4u)
+                        return static_cast<uint8_t>(buttons >> 8);
+                    if (n >= 5u && n <= 8u)
+                        return static_cast<uint8_t>(analog >> ((n - 5u) * 8u));
+                    if (n >= 9u && n <= 20u)
+                        return pressed(buttons, kPressureBits[n - 9u]) ? 0xFFu : 0x00u;
+                    return 0x00u;
+                }
+                case 0x43: // Config
+                    if (n == 3u)
+                        inConfig = b != 0u;
+                    return 0x00u;
+                case 0x44: // ModeSwitch
+                    if (n == 3u)
+                    {
+                        analogLight = b != 0u;
+                        mode = analogLight ? 0x73u : 0x41u;
+                    }
+                    else if (n == 4u)
+                    {
+                        analogLocked = b == 0x03u;
+                    }
+                    return 0x00u;
+                case 0x45: // StatusInfo
+                    switch (n)
+                    {
+                    case 3u: return 0x03u; // PhysicalType::STANDARD
+                    case 4u: return 0x02u;
+                    case 5u: return analogLight ? 0x01u : 0x00u;
+                    case 6u: return 0x02u;
+                    case 7u: return 0x01u;
+                    default: return 0x00u;
+                    }
+                case 0x46: // Constant1
+                    switch (n)
+                    {
+                    case 3u: commandStage = b != 0u; return 0x00u;
+                    case 5u: return 0x01u;
+                    case 6u: return commandStage ? 0x01u : 0x02u;
+                    case 7u: return commandStage ? 0x01u : 0x00u;
+                    case 8u: return commandStage ? 0x14u : 0x0Au;
+                    default: return 0x00u;
+                    }
+                case 0x47: // Constant2
+                    return n == 5u ? 0x02u : n == 7u ? 0x01u : 0x00u;
+                case 0x4C: // Constant3
+                    if (n == 3u)
+                        commandStage = b != 0u;
+                    return n == 6u ? (commandStage ? 0x07u : 0x04u) : 0x00u;
+                case 0x4D: // VibrationMap
+                {
+                    uint8_t prev = 0xFFu;
+                    if (n == 3u)
+                    {
+                        prev = smallMotorCfg;
+                        smallMotorCfg = b;
+                    }
+                    else if (n == 4u)
+                    {
+                        prev = largeMotorCfg;
+                        largeMotorCfg = b;
+                    }
+                    return prev;
+                }
+                case 0x4F: // ResponseBytes
+                    if (n == 3u)
+                        responseBytes = b;
+                    else if (n == 4u)
+                        responseBytes |= static_cast<uint32_t>(b) << 8;
+                    else if (n == 5u)
+                    {
+                        responseBytes |= static_cast<uint32_t>(b) << 16;
+                        if (responseBytes == 0x3Fu)
+                        {
+                            analogLight = true;
+                            mode = 0x73u;
+                        }
+                        else if (responseBytes == 0x3FFFFu)
+                        {
+                            analogLight = true;
+                            mode = 0x79u;
+                        }
+                        else
+                        {
+                            analogLight = false;
+                            mode = 0x41u;
+                        }
+                    }
+                    return n == 8u ? 0x5Au : 0x00u;
+                default:
+                    return 0x00u;
+                }
+            }
+        };
+
         constexpr uint32_t kRamSize = IopMemory::RamSize;
         constexpr uint32_t kKernelHeapBase = IopMemory::HeapBase;
         constexpr uint32_t kKernelHeapLimit = IopMemory::HeapLimit;
@@ -122,6 +293,7 @@ namespace ps2x::iop::detail
             imports.reset();
             rpc.reset();
             cdvd.reset();
+            ds2Pad = {};
             intrman.reset();
             timrman.reset();
             vblank.reset();
@@ -343,6 +515,8 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
+            if (iequals(call.library, "sio2man") && dispatchSio2man(call.ordinal, cpu))
+                return ImportDisposition::Handled;
 
             const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
             if (target != 0u)
@@ -358,6 +532,135 @@ namespace ps2x::iop::detail
             log(LogLevel::Warning, out.str());
             setV0(0);
             return ImportDisposition::Missing;
+        }
+
+        // sio2man (v2 export table, ps2sdk iop/sio/sio2man/src/exports.tab) as
+        // used by the disc PADMAN.IRX: 11 stat70_get, 46 pad_transfer_init2,
+        // 51 transfer2, 52 transfer_reset2, 57 mtap_change_slot, 58
+        // mtap_get_slot_max, 60 mtap_update_slots. The SIO2 bus is not emulated,
+        // so transfer2 answers the packet directly the way PCSX2's Sio2::Write /
+        // Sio2::Pad do. Before this, every call returned 0: PADMAN got empty
+        // transfers and SIF-DMAed id-0 frames into libpad's buffer, racing the
+        // runtime's pad push, so most button presses never reached the game.
+        bool dispatchSio2man(uint16_t ordinal, CpuState &cpu)
+        {
+            switch (ordinal)
+            {
+            case 11: // sio2_stat70_get -- PortStat::DEFAULT
+                cpu.gpr[2] = 0xFu;
+                return true;
+            case 46: // sio2_pad_transfer_init2 (transfer lock; single IOP user here)
+            case 52: // sio2_transfer_reset2 (unlock)
+            case 60: // sio2_mtap_update_slots (default callback is empty)
+                cpu.gpr[2] = 0u;
+                return true;
+            case 57: // sio2_mtap_change_slot -- sio2man default callback
+            {
+                const uint32_t arg = cpu.gpr[4];
+                uint32_t sum = 0u;
+                for (uint32_t i = 0; i < 4u; ++i)
+                {
+                    const int32_t slot = static_cast<int32_t>(memory.read32(arg + i * 4u));
+                    const uint32_t ok = (slot + 1) < 2 ? 1u : 0u;
+                    memory.write32(arg + (i + 4u) * 4u, ok);
+                    sum += ok;
+                }
+                cpu.gpr[2] = sum == 4u ? 1u : 0u;
+                return true;
+            }
+            case 58: // sio2_mtap_get_slot_max -- default: one slot
+                cpu.gpr[2] = 1u;
+                return true;
+            case 51: // sio2_transfer2
+                sio2Transfer(cpu.gpr[4]);
+                cpu.gpr[2] = 1u;
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        // sio2_transfer_data_t: stat6c +0x00, port_ctrl1[4] +0x04, port_ctrl2[4]
+        // +0x14, stat70 +0x24, regdata[16] +0x28, stat74 +0x68, in_size +0x6C,
+        // out_size +0x70, in +0x74, out +0x78 (layout confirmed by PADMAN's own
+        // accesses at 0x9310..0x9388).
+        void sio2Transfer(uint32_t td)
+        {
+            const uint32_t inSize = memory.read32(td + 0x6Cu);
+            const uint32_t outSize = memory.read32(td + 0x70u);
+            const uint32_t inPtr = memory.read32(td + 0x74u);
+            const uint32_t outPtr = memory.read32(td + 0x78u);
+            const uint16_t buttons = static_cast<uint16_t>(g_ps2x_sio2_pad_buttons.load(std::memory_order_relaxed));
+            const uint32_t analog = g_ps2x_sio2_pad_analog.load(std::memory_order_relaxed);
+
+            std::vector<uint8_t> out;
+            uint32_t cmdStat = 0u;
+            uint32_t inPos = 0u;
+            const auto portOpened = [&]()
+            {
+                if (cmdStat & 0x100u)
+                {
+                    cmdStat &= ~0x100u;
+                    cmdStat |= 0x200u;
+                }
+                else
+                {
+                    cmdStat |= 0x100u;
+                }
+            };
+            for (uint32_t i = 0; i < 16u; ++i)
+            {
+                const uint32_t reg = memory.read32(td + 0x28u + i * 4u);
+                const uint32_t length = (reg >> 8) & 0x3FFu;
+                if (reg == 0u || length == 0u)
+                    break;
+                const uint32_t port = reg & 1u;
+                const auto inByte = [&](uint32_t k) -> uint8_t
+                {
+                    return inPos + k < inSize ? memory.read8(inPtr + inPos + k) : 0u;
+                };
+                const uint8_t sioMode = inByte(0u);
+                if (sioMode == 0x01u) // PAD
+                {
+                    portOpened();
+                    cmdStat |= 0x1000u; // NO_DEVICES_MISSING, always set
+                    out.push_back(0xFFu);
+                    if (port == 0u)
+                    {
+                        ds2Pad.softReset();
+                        for (uint32_t k = 1; k < length; ++k)
+                            out.push_back(ds2Pad.send(inByte(k), buttons, analog));
+                        if (ds2Pad.command == 0x42u)
+                            g_ps2x_sio2_pad_served.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        cmdStat |= 0x2D000u; // PORT_2_MISSING
+                        for (uint32_t k = 1; k < length; ++k)
+                            out.push_back(0xFFu);
+                    }
+                }
+                else if (sioMode == 0x21u) // MULTITAP, none attached
+                {
+                    portOpened();
+                    cmdStat |= 0x1000u | 0x1D000u;
+                    for (uint32_t k = 0; k < length; ++k)
+                        out.push_back(0xFFu);
+                }
+                else
+                {
+                    cmdStat = 0x1D100u; // DISCONNECTED
+                    for (uint32_t k = 0; k < length; ++k)
+                        out.push_back(0xFFu);
+                }
+                inPos += length;
+            }
+
+            for (uint32_t k = 0; k < outSize; ++k)
+                memory.write8(outPtr + k, k < out.size() ? out[k] : 0xFFu);
+            memory.write32(td + 0x00u, cmdStat);
+            memory.write32(td + 0x24u, 0xFu);
+            memory.write32(td + 0x68u, 0u);
         }
 
         bool step(CpuState &cpu)
@@ -705,6 +1008,7 @@ namespace ps2x::iop::detail
         IopSysmem sysmem;
         IopKernel kernel;
         IopCdvd cdvd;
+        Ds2Pad ds2Pad;
         IopVblank vblank;
         IopRpcBridge rpc;
         IopSysclib sysclib;

@@ -5,7 +5,7 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are (Part 162 is the top of the file, 2026-09-27):** fights run upright; boot is about 3x faster; the t≈5 recursive-preempt crash is fixed (`6ef281fc`). The next target is VU1 interpreter speed (about 33% of fight CPU). Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
+**Where we are (Part 164 is the top of the file, 2026-09-28):** fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
 -- 09-15 run, Goku's select model on screen (Part 117). Warped 3D: our VIF1 + VU1 match PCSX2 bit-exact
 on a replayed capture (Part 118). Smeared 3D FIXED 09-16 -- two GS bugs (Part 119); open: Ranking-screen
 sky dome looks upside down. 09-17: that same object (`0x632b90`, RANKING/GAME OVER) also produces a
@@ -267,6 +267,73 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 165 (2026-09-28, AFK loop) -- title stall = ARKD SE bank load parked on the CD token
+
+**WATCH run 22:38 (stalled):** title `CAppTitleMain` reached sub 2 at t=101; slot 7 (bank load) stuck in state 3, slot 8 queued. EE status word `0x561880[12]`: `0x3000c270` (boot bank done) -> `0x20000000` at t=100 and never changes = IOP ARKD accepted RPC 257 and its SE worker entered the load body, never finished.
+
+**Chain (decomp, verified):**
+- EE loader = CSEDataAse (resource type 18, vt `0x4E77E0`); done-poll `0x1BC5F0` reads `0x561880[12]` (top nibble 3 done / 4 error / F,1,2 busy); load = `rpc_call(0x5A9380, 257, ...)` -> sid **0x501** in **ARKD_DVD.IRX** (IOP base `0x2BC00`), dispatcher `0x2700`, 257 -> `0x250C` queues `B310=2`, SE worker `0x21B0` (thread entry `0x2DDB0`) -> `0x1A58` sets `B300=0x20000000`, then `WaitSema(B4C8)`, per chunk `WaitSema(B4C0)` + `CdReadRetryLoop 0xCCC`.
+- `0xCCC`: `674(2)` = Wait+Signal `B314`; `7A4` = Wait `B314` + `sceCdRead`; `674(2)` again. **`B314` = one-CD-op-in-flight token (init 1, max 1)**, returned only by ARKD's CD callback `0x634` -> `iSignalSema(B314)` (installed via `sceCdCallback`).
+- `8B8`/`998`/`9FC` = Wait `B314` + `sceCdStandby`(5) / `sceCdPause`(38) / `sceCdStop`(15). RPC 259 (`0x2608`) -> `B310=3` -> `0x1EB0` runs these by EE-supplied id.
+- **Runtime gap:** `ps2xIOP/.../iop_cdvd.cpp` fired the callback only for Read/Seek. Standby returned 1 with NO callback (token leak), Stop/Pause were unhandled (would spin). Real cdvdman calls the callback for all N-commands.
+- Correlation: every stalled run went through CAppDemoMovie + skip; 3 runs that skipped straight to the title passed (`204142`, 2 runs this session, gstate `1,3,0,1`).
+
+**Fix (behavioral, not faking):** Standby/Stop/Pause now complete with callback reasons 5/6/7 + `[iop:cdctl]` log (first 32). Diagnostic `[iopthreads]` 10 s dump (threads, semas, ARKD globals) added in `iop_kernel.cpp::beginNextReady` -- remove once closed.
+- Hypothesis status: the Standby leak is the leading explanation, NOT yet confirmed by a stalled run with the dump (the two dump runs never played the demo movie).
+- **CONFIRMED (fix build, 2 runs through the demo movie + skip):** `[iop:cdctl] fid=5 cb=0x2c234` (= ARKD `0x634`) fires once at boot and once ~5 s after CAppDemoMovie starts (the skip). Run 1: title passed -> gstate `1,5,0,1` at t=198. Run 2 (300 s perf): IOP fully idle (`B300=0x30000000`, all ARKD threads parked on their own semas, bank-load count 3 -> 13), title cycles title -> `0x4f9ad0` -> title -> DemoMain -> title. White-screen stall CLOSED.
+- **New limiter (test harness, not the game):** run 2 lost 179 s on the Auto-Save X and never landed a Start at the title. Autopress held each button 6 pad frames; edges are computed once per GameUpdate, so short pulses fall between updates. Added `PS2X_PAD_AUTOPRESS_HOLD` (default 6, `ps2_pad.cpp`).
+  - **CORRECTED -- hold length was not the cause.** WATCH on libpad's buffer (`*0x568990` halves, counters +88/+216) and the game pad object (`*0x502280`, `+32` prev, `+34` trigger = `~prev & now`, computed at `0x198dd8`) showed halves mostly `00000000` (id 0, all bits 0), our frames `ffff7300` only intermittently. **Two writers:** the disc PADMAN.IRX runs for real (IOP id 4) and SIF-DMAs a half per vblank (`sub_360`), but SIO2MAN is HLE and every sio2man import returned 0 -> PADMAN sent empty frames that raced the runtime's direct push (`ps2x_pad_push_frame`). Almost certainly also the 09-23 "Start reaches the buffer but title never advances" mystery.
+  - Serving PADMAN from HLE instead (`preferHle`) broke boot: nothing serves sid `0x80000100` on the #244 path. Reverted.
+  - **FIX:** sio2man HLE in `ps2xIOP/src/emulator/iop_emulator.cpp::dispatchSio2man` (v2 table: 11 stat70=0xF, 46/52 lock/unlock, 51 transfer2, 57 mtap_change_slot default cb, 58 slot_max=1, 60 no-op). `transfer2` answers packets like PCSX2 `Sio2::Write/Pad` (regdata len `(r>>8)&0x3FF`, port `r&1`, reply `0xFF`+pad bytes, stat6c `0x1000|port bits`, port 1 `0x2D000` missing) with a DualShock2 ported from PCSX2 `PadDualshock2.cpp`. Host input shared via `extern "C" std::atomic` `g_ps2x_sio2_pad_{buttons,analog,served}` (defined in IOP lib); `ps2_pad.cpp` publishes each frame and stops its direct push once PADMAN serves a poll.
+  - Result (120 s, default hold 6): PADMAN negotiated DS2 native (id `0x79`), both halves valid, presses reach `+32/+34` each cycle; Auto-Save X at t=11, warning done t=24 (was 218), past title to menus by t=93.
+  - Other additions this part: WATCH deref syntax `name=*0xPTR+OFF` (`ps2_runtime.cpp`); `PS2X_PAD_AUTOPRESS_HOLD` kept (harmless).
+
+**FIGHT PERF (all fixes, 300 s, DIAG=0, autopress 120, quantum 3000):** boot -> fight gstate `1,6,0,1` at **t=101** (never reached on the fast build before). Fight avg **13.74 vbl/s** over 198 rows vs **6.79** baseline (VU1 recomp, pre-MT raster) = **2.0x**.
+- Profile (samples t=150..294 = 144 s; `PS2X_PROFILE_START` IS honored, the printed "294 s window" is just run length): **GameThread 142.8 s CPU = saturated, the wall**; GS raster workers ~86 s (~60%). GameThread split: VU1 recomp progs ~32% (`d9b37c38` 18.8%, `6eda6633` 10.5%), **`advanceEeTimers` 11.8%**, readIORegister 3.3%, Fnv1a hash 2.4%, checkpointDue 2.2%. GsThread mostly asleep (NtDelayExecution 45%). Raster workers: drawTriangle 34%, drawSprite 13%, lerpChannel 10% of their time.
+- Next perf target: `advanceEeTimers` (cheap), then raster per-row x-span.
+- **DONE:** cached GIF_STAT node in `advanceEeTimers` (file-static generation bumped at `m_ioRegisters.clear()`): 11.8% -> 4.5%, fight **14.76 vbl/s**. GIF_STAT/CHCR single-lookup in `readIORegister` + `[iopthreads]` made opt-in (`PS2X_IOP_THREADDUMP=1`): **15.03 vbl/s** (noise-level; readIORegister still 4.4% -> hot address is elsewhere, profile per-address before touching it again).
+- Remaining GameThread: VU1 progs ~33% (`d9b37c38`, `6eda6633`), `_NLG_Return2` 3.8% (exception unwinding in a hot path), advanceEeTimers 4.5% (timer divides), readIORegister 4.4%.
+- **All Part 165 changes are UNCOMMITTED** (files: ps2xIOP `iop_cdvd.cpp`, `iop_emulator.cpp`, `iop_kernel.cpp`; runtime `ps2_pad.cpp`, `ps2_runtime.cpp`, `ps2_memory.cpp`). `iop_subsystem.cpp` was reverted to original.
+
+## Part 164 (2026-09-28) -- Auto-Save stall located (static + archived logs, no new run yet)
+
+**Where it parks:** `CAppWarning` (obj `0x6330d0`) sub-state **1**, which polls `0x4076A0(h160)` every frame; `h160 = 0x16a0400` in every run.
+- Good runs leave sub 1 at t≈15-19. Stuck runs stay (t=138 in `035056`, never in `035915`/`040215`/`220511`/`222710`).
+- The main loop is healthy while stuck (th1 at vsync wait `0x175210` + `GameUpdate`); it is NOT blocked inside libmc.
+
+**`0x4076A0` gate (verified by decomp):** `[a1+1]` 0 = per-port memcard check (`0x407860`, port `[a1+0]` 0 then 1); then shows **msg 209** (the Auto-Save text), `[a1+1]`=1 waits text box closed, 2 waits fade.
+- Per-port struct at `a1+4+32*port`; state byte 1 polls the MC manager via `0x407A30` -> `reg_save_stub_z_2027` (async; can also raise msg 208 "no card" / 211 "continue without saving?").
+- Text box = `a1+80`: `+108` anim (1 fade-in, 2 input, 3 fade-out), `+109` mode; mode 3 closes on `input_check_btn_80` = trigger bit `0x80` = **CROSS** (remap table `0x43BA30` decoded). Trigger calc `0x198dd8` (`~prev & now`), once per `GameUpdate` via `GameState_ReadInput`.
+
+**Falsified this session:**
+- "thread 2 DORMANT" clue = shutdown artifact (every run's LAST thsync shows `st=16`).
+- "autopress too short": Cross reaches the push every ~6 s in stuck runs, plus a rapid Cross burst at t=53 (`035056`) -- still not dismissed.
+- Run `230447` (slow, "stuck") is a DIFFERENT stall: threads 3-6 spawn at t=104, th3 SUSPEND at `0x11e7e0` (the `sub_11E8D0` worker family).
+
+**Open question:** is the gate waiting on MC (per-port state stuck) or on X (`[a1+1]==1`)? -> WATCH run below.
+
+**WATCH run 20:41 (exe 04:11 = committed `31ed67a9`) -- did NOT stall:**
+- t=6-9 MC check port 0 then 1 (both OK); t=11 box up (`[a1+1]`=1, mode 3); t=22 X accepted; gstate left `0,0,0,1` at t=86, `1,6,0,1` by t=137. ~32 vbl/s on the notice.
+- By exe build: 03:26 = 4/4 stuck, 03:47 = 4/4 stuck (both pre-commit WIP MT raster), 04:11 = 1/1 pass. The ">=25 vbl/s sticks" correlation is broken.
+- NEXT: 3 more WATCH runs on the 04:11 build. All pass -> close as fixed by committed build; any stick -> WATCH says MC vs X.
+
+**RESULT (3 repeat runs 20:48 / 20:51 / 22:12, same exe): gate passed 4/4 on the committed build. CLOSED as not reproduced.**
+- Every run: MC check done t=9, box up t=11, X accepted at t=34 / 19 / 24 (run 1: 22), CAppWarning reaches sub 4 with the 4 s timer done.
+- The 90 s runs end at gstate `0,0,0,1` only because the next step takes ~55 s after sub 4 (run 1 left at t=86). That is NOT the old stall (old runs sat in sub **1**).
+- Cause of the 03:26/03:47 8/8 stall: unknown. Hypothesis only: a missing hazard flush in the pre-commit MT raster. No 03:47 source copy exists to diff.
+- Side note (open, low priority): X takes 8-23 s to register although autopress sends X every ~6 s, so some X edges are missed.
+
+**⚠ CORRECTION (22:20, perf run 300 s, same exe) -- the stall was NEVER the Auto-Save gate.**
+- Re-read of all old "stuck" runs: 9/10 left sub 1 and finished CAppWarning (`sub=4 acc=4.0167` = the app's normal DONE state, not a hang). Only `040215` stayed in sub 1.
+- The perf run: warning done -> DemoMain -> `0x4faf10` -> LogoMain -> **CAppDemoMovie** (`[st4b:stat]` ret1=4, acc=1000.02 = the movie-end/skip exit) all by t≈64. Then white screen, gstate `0,0,0,1` forever, guest idle (vbl/s 33 -> 43).
+- SofDec starts at t=62 (PS2RNA IOP heap allocs, threads 3-6 spawn), `[wakeswallow] id=6` x2 (wakeup swallowed, suspendCount=1), thsync `GATE-OPEN-BUT-DEAD` at t=64, workers gone by t=65.
+- The only run that got past (`204142`) never ran CAppDemoMovie (no `st4b`, no SofDec) -- it took another branch at t=86 (likely an autopress Start at the logos).
+- **Real blocker = what follows CAppDemoMovie's exit on the fast guest.** Not yet identified: which app/state is live after t=64.
+- **IDENTIFIED (static + archived logs):** last `[lstick:stat]` in 11/13 stuck runs = **CAppTitleMain** vt `0x4fa210` obj `0x632eb0`, outer phase 2, `CAppTitleMain_Tick 0x3F8A00`. Passing runs went through it. SofDec teardown is clean by t=65 -- not the FMV.
+  - Title sub `[obj+52]`: 0 release sound slots -> 1 wait all 16 slots of `0x5D6B80` idle (`+36` in {0,1}), queue banks 7/8 -> 2 wait idle again -> 3 `mgr_c_0` texture loads (`0x3F0920`) -> 4 fade, return 1. Title art appears only after 3, so white = stuck in 1/2/3.
+  - Slot loader `0x2FCF10` (40-byte slots): `+36` 2 create, 3 poll loader `vt+56`, 4/5 error, 6-9 stream, 10 release; `+32` loader obj. `0x2FCC00` stops at the first busy slot.
+  - Hypothesis (unverified): one slot stuck in 3/7. NEXT: WATCH `ts=0x632EE4` + 16 slot words (`0x5D6BA4+40i`, loader `0x5D6BA0+40i`) with `PS2X_DEBUGSHM=1` for a live read.
 
 ## Part 163 (2026-09-28) -- VU1 recompiler + multi-threaded GS raster; fast guest stalls at Auto-Save notice
 

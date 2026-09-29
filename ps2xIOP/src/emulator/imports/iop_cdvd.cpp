@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <system_error>
@@ -34,6 +35,9 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCdvdInitExit = 5u;
         constexpr uint32_t kCdvdCallbackRead = 1u;
         constexpr uint32_t kCdvdCallbackSeek = 4u;
+        constexpr uint32_t kCdvdCallbackStandby = 5u;
+        constexpr uint32_t kCdvdCallbackStop = 6u;
+        constexpr uint32_t kCdvdCallbackPause = 7u;
         constexpr uint32_t kCdvdInterruptReadyBits = 0x29u;
         constexpr uint32_t kEventFlagMulti = 2u;
         constexpr uint32_t kCdvdStreamTimeout = 5000u;
@@ -223,9 +227,36 @@ namespace ps2x::iop::detail
                 cpu.gpr[2] = 1u;
                 return true;
 
-            case 5: // sceCdStandby
+            case 5:  // sceCdStandby
+            case 15: // sceCdStop
+            case 38: // sceCdPause
+            {
+                // Real cdvdman runs these as async N-commands and fires the
+                // sceCdCallback on completion, exactly like Read/Seek. ARKD_DVD
+                // relies on it: sub_8B8/9FC/998 WaitSema(B314) and only the
+                // callback (sub_634 -> iSignalSema(B314)) hands the token back.
+                // Without the callback the token leaked and the next SE bank
+                // load parked forever at status 0x20000000 (Part 165).
+                const uint32_t reason = ordinal == 5u ? kCdvdCallbackStandby
+                                        : ordinal == 15u ? kCdvdCallbackStop
+                                                         : kCdvdCallbackPause;
+                static uint32_t s_ctlLogs = 0u;
+                if (s_ctlLogs++ < 32u)
+                    std::cerr << "[iop:cdctl] fid=" << ordinal << " reason=" << reason
+                              << " cb=0x" << std::hex << callback.address << std::dec << std::endl;
+                lastError = kCdvdErrorNone;
+                signalCommandComplete();
+                if (callback.address != 0u)
+                {
+                    completionCallback = CompletionCallback{
+                        callback.address,
+                        callback.gp,
+                        reason,
+                    };
+                }
                 cpu.gpr[2] = 1u;
                 return true;
+            }
 
             case 6: // sceCdRead
                 if (readSectors(a0, a1, a2))

@@ -6620,10 +6620,15 @@ void PS2Runtime::run()
                     // Silent unless PS2X_TRACE_WATCH is set.
                     // -----------------------------------------------------------
                     {
+                        // `name=0xADDR` reads [ADDR]; `name=*0xPTR+0xOFF`
+                        // reads [[PTR]+OFF] (one dereference, for fields
+                        // behind a $gp-held object pointer).
                         struct WatchSpec
                         {
                             std::string name;
                             uint32_t addr;
+                            bool deref = false;
+                            uint32_t off = 0u;
                         };
                         static std::vector<WatchSpec> s_watchSpecs;
                         static bool s_watchParsed = false;
@@ -6642,14 +6647,26 @@ void PS2Runtime::run()
                                         if (eq != std::string::npos && eq != 0u)
                                         {
                                             char *end = nullptr;
-                                            const std::string valText = cur.substr(eq + 1);
+                                            std::string valText = cur.substr(eq + 1);
+                                            const bool deref = !valText.empty() && valText[0] == '*';
+                                            if (deref)
+                                                valText.erase(0, 1);
                                             const unsigned long long a =
                                                 std::strtoull(valText.c_str(), &end, 0);
-                                            if (end != valText.c_str() && *end == '\0')
+                                            unsigned long long off = 0u;
+                                            bool ok = end != valText.c_str();
+                                            if (ok && deref && *end == '+')
+                                            {
+                                                const char *offText = end + 1;
+                                                off = std::strtoull(offText, &end, 0);
+                                                ok = end != offText;
+                                            }
+                                            if (ok && *end == '\0')
                                             {
                                                 s_watchSpecs.push_back(
                                                     WatchSpec{cur.substr(0, eq),
-                                                              static_cast<uint32_t>(a)});
+                                                              static_cast<uint32_t>(a), deref,
+                                                              static_cast<uint32_t>(off)});
                                             }
                                         }
                                         cur.clear();
@@ -6688,6 +6705,8 @@ void PS2Runtime::run()
                                 try
                                 {
                                     v = m_memory.read32(w.addr);
+                                    if (w.deref)
+                                        v = v != 0u ? m_memory.read32(v + w.off) : 0u;
                                 }
                                 catch (const std::exception &)
                                 {

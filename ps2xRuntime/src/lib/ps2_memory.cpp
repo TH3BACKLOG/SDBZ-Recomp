@@ -324,6 +324,13 @@ namespace
     constexpr uint32_t kEeTimerModeEquf = 1u << 10;
     constexpr uint32_t kEeTimerModeOvff = 1u << 11;
     constexpr uint64_t kEeClockHz = 294912000ull;
+
+    // Bumped whenever m_ioRegisters is cleared. advanceEeTimers runs on every
+    // accountCycles() and its GIF_STAT unordered_map lookup (hash + probe) was
+    // ~3% of the fight game thread on its own (Part 165 profile); it caches the
+    // node pointer (stable across rehash) and re-finds only after a clear.
+    uint64_t g_ioRegistersGeneration = 0u;
+
     constexpr std::array<uint64_t, 4> kEeTimerClockHz = {
         147456000ull,
         9216000ull,
@@ -518,6 +525,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        ++g_ioRegistersGeneration; // invalidates advanceEeTimers' cached GIF_STAT node
 
         // Pre-seed INTC_STAT so the vsync worker's orIORegister() only ever
         // assigns to an existing node — no rehash/insert can race the guest
@@ -735,9 +743,18 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 
     constexpr uint32_t kGifStat = 0x10003020u;
     constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    static const PS2Memory *s_gifStatOwner = nullptr;
+    static uint64_t s_gifStatGeneration = ~0ull;
+    static uint32_t *s_gifStat = nullptr;
+    if (s_gifStat == nullptr || s_gifStatOwner != this || s_gifStatGeneration != g_ioRegistersGeneration)
+    {
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        s_gifStat = gifStatIt != m_ioRegisters.end() ? &gifStatIt->second : nullptr;
+        s_gifStatOwner = this;
+        s_gifStatGeneration = g_ioRegistersGeneration;
+    }
+    if (s_gifStat != nullptr)
+        *s_gifStat &= ~kGifFqcMask;
 
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
@@ -2962,9 +2979,15 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (address == 0x10003020u) // GIF_STAT
     {
-        uint32_t stat = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
-        const uint32_t mode = m_ioRegisters.count(0x10003010u) ? m_ioRegisters[0x10003010u] : 0u;
-        const uint32_t ctrl = m_ioRegisters.count(0x10003000u) ? m_ioRegisters[0x10003000u] : 0u;
+        // One find per register (was count() + operator[] = two hashes each).
+        const auto valueOr0 = [this](uint32_t reg) -> uint32_t
+        {
+            const auto it = m_ioRegisters.find(reg);
+            return it != m_ioRegisters.end() ? it->second : 0u;
+        };
+        uint32_t stat = valueOr0(address);
+        const uint32_t mode = valueOr0(0x10003010u);
+        const uint32_t ctrl = valueOr0(0x10003000u);
 
         // M3R and IMT mirror GIF_MODE, PSE mirrors GIF_CTRL, and M3P is the
         // effective PATH3 mask controlled by the VIF1 MSKPATH3 command.
@@ -2992,9 +3015,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
-                uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
-                m_ioRegisters[address] = channelStatus;
-                return channelStatus;
+                uint32_t &channelReg = m_ioRegisters[address];
+                channelReg &= ~0x100u;
+                return channelReg;
             }
         }
 

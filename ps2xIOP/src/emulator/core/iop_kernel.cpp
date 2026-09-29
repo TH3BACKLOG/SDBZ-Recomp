@@ -4,6 +4,10 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
 
 namespace ps2x::iop::detail
 {
@@ -671,6 +675,59 @@ namespace ps2x::iop::detail
 
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
+        // 2026-09-28 Part 165 diagnostic: every 10 s of host time, dump every
+        // IOP thread and semaphore plus the ARKD_DVD SE-loader globals (module
+        // base 0x2BC00: B300 status, B310 cmd, B30C cancel, B318/B4C0/B4C8
+        // sema ids). The title-screen bank load parks with B300=0x20000000
+        // and nothing host-side shows which IOP wait holds it.
+        // Opt-in (PS2X_IOP_THREADDUMP=1): steady_clock::now() on every call was
+        // 1.6% of the saturated fight game thread.
+        static const bool s_dumpEnabled = []
+        {
+            const char *v = std::getenv("PS2X_IOP_THREADDUMP");
+            return v != nullptr && *v != '\0' && *v != '0';
+        }();
+        if (s_dumpEnabled)
+        {
+            static auto s_lastDump = std::chrono::steady_clock::now();
+            static uint32_t s_dumps = 0u;
+            const auto now = std::chrono::steady_clock::now();
+            if (s_dumps < 60u && now - s_lastDump >= std::chrono::seconds(10))
+            {
+                s_lastDump = now;
+                ++s_dumps;
+                std::ostringstream out;
+                out << "[iopthreads] n=" << m_threads.size() << std::hex;
+                for (const auto &[id, thread] : m_threads)
+                {
+                    out << " [" << std::dec << id << ":st=" << static_cast<int>(thread.state)
+                        << ",pri=" << thread.priority << ",wid=" << thread.waitId << std::hex
+                        << ",entry=0x" << thread.entry << ",pc=0x" << thread.cpu.pc
+                        << ",ra=0x" << thread.cpu.gpr[31] << "]";
+                }
+                out << " semas:";
+                for (const auto &[id, sema] : m_semaphores)
+                {
+                    uint32_t waiters = 0u;
+                    for (const auto &[tid, thread] : m_threads)
+                    {
+                        if (thread.state == IopThreadState::Semaphore && thread.waitId == id)
+                            ++waiters;
+                    }
+                    out << " " << std::dec << id << "=" << sema.current << "/" << sema.maximum << "w" << waiters;
+                }
+                out << std::hex << " arkd:B300=0x" << m_memory.read32(0x36F00u)
+                    << ",B30C=0x" << m_memory.read32(0x36F0Cu)
+                    << ",B310=0x" << m_memory.read32(0x36F10u)
+                    << ",B318=0x" << m_memory.read32(0x36F18u)
+                    << ",B4C0=0x" << m_memory.read32(0x370C0u)
+                    << ",B4C8=0x" << m_memory.read32(0x370C8u)
+                    << ",B420=0x" << m_memory.read32(0x37020u)
+                    << ",B42C=0x" << m_memory.read32(0x3702Cu);
+                std::cerr << out.str() << std::endl;
+            }
+        }
+
         for (auto &[id, thread] : m_threads)
         {
             if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)

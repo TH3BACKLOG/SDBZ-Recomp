@@ -1,6 +1,7 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include "ps2_log.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -134,12 +135,23 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         const char *s = std::getenv("PS2X_PAD_AUTOPRESS");
         return (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 0u;
     }();
+    // PS2X_PAD_AUTOPRESS_HOLD=N (default 6) sets how many pad frames each pulse
+    // is held. The game computes button edges once per GameUpdate, so when the
+    // guest renders several vblanks per update a 6-frame pulse can fall entirely
+    // between two updates and the press is never seen (Part 165: Auto-Save X
+    // took 179 s, title Start never landed).
+    static const uint32_t s_autoHold = []() -> uint32_t
+    {
+        const char *s = std::getenv("PS2X_PAD_AUTOPRESS_HOLD");
+        const uint32_t v = (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 6u;
+        return v == 0u ? 6u : v;
+    }();
     if (s_autoPeriod >= 16u)
     {
         static std::atomic<uint32_t> s_autoFrame{0u};
         const uint32_t frame = s_autoFrame.fetch_add(1u, std::memory_order_relaxed);
         const uint32_t phase = frame % s_autoPeriod;
-        if (phase < 6u)
+        if (phase < std::min(s_autoHold, s_autoPeriod / 2u))
         {
             constexpr uint16_t kCycle[3] = {PAD_CROSS, PAD_CIRCLE, PAD_START};
             clearBit(kCycle[(frame / s_autoPeriod) % 3u]);
@@ -230,6 +242,15 @@ namespace
     constexpr int32_t kPadCounterWrap = 0x40000000;
 
     PSPadBackend g_padPushBackend; // PSPadBackend is stateless / default-constructible
+}
+
+// Defined in ps2xIOP/src/emulator/iop_emulator.cpp (SIO2 pad HLE).
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_buttons;
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_analog;
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_served;
+
+namespace
+{
 
     inline uint32_t padRead32(const uint8_t *rdram, uint32_t addr)
     {
@@ -270,6 +291,34 @@ extern "C" void ps2x_pad_push_frame(uint8_t *rdram)
     constexpr int kPushLogCap = 8;
     constexpr int kChangeLogCap = 64;
 
+    // Read the host pad once per frame (readState also advances the autopress
+    // cycle) and publish it to the IOP's SIO2 pad HLE (iop_emulator.cpp), which
+    // answers the disc PADMAN.IRX's DualShock2 polls. Once PADMAN is actually
+    // being served, it owns libpad's buffer (it SIF-DMAs each frame itself), so
+    // this direct push stands down instead of racing it (Part 165).
+    uint8_t hostStatus[32];
+    const bool hostOk = g_padPushBackend.readState(0, 0, hostStatus, sizeof(hostStatus));
+    if (hostOk)
+    {
+        g_ps2x_sio2_pad_buttons.store(static_cast<uint32_t>(hostStatus[2] | (hostStatus[3] << 8)),
+                                      std::memory_order_relaxed);
+        g_ps2x_sio2_pad_analog.store(static_cast<uint32_t>(hostStatus[4]) |
+                                         (static_cast<uint32_t>(hostStatus[5]) << 8) |
+                                         (static_cast<uint32_t>(hostStatus[6]) << 16) |
+                                         (static_cast<uint32_t>(hostStatus[7]) << 24),
+                                     std::memory_order_relaxed);
+    }
+    if (g_ps2x_sio2_pad_served.load(std::memory_order_relaxed) != 0u)
+    {
+        static bool s_handoffLogged = false;
+        if (!s_handoffLogged)
+        {
+            s_handoffLogged = true;
+            RUNTIME_LOG("[pad] PADMAN is serving SIO2 pad polls -- direct buffer push disabled\n");
+        }
+        return;
+    }
+
     for (int port = 0; port < kPadMaxPorts; ++port)
     {
         for (int slot = 0; slot < kPadMaxSlots; ++slot)
@@ -308,8 +357,9 @@ extern "C" void ps2x_pad_push_frame(uint8_t *rdram)
             const bool isHostPad = (port == 0 && slot == 0);
             if (isHostPad)
             {
-                if (!g_padPushBackend.readState(port, slot, status, sizeof(status)))
+                if (!hostOk)
                     continue;
+                std::memcpy(status, hostStatus, sizeof(status));
             }
             else
             {
