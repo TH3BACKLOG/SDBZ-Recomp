@@ -268,13 +268,22 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
 
+## Part 168 (2026-09-30) -- pad diagnostics; "fight" runs were NOT fights
+
+- Added `PS2X_PAD_AUTOPRESS_SECS` (stop pulses N s after first pad poll) and `[pad] host change` edge log. Both verified: pad edges reach `readState`; PADMAN serves SIO2 polls.
+- Ground truth via `PS2X_REC=1 PS2X_REC_INTERVAL=30` (writes a PNG only when the presented frame changes; needs no code). View the PNGs.
+- AUTOPRESS_SECS=30 or 100: only 3 pulses land before the Auto-Save notice; the game sits on it ("X button to continue") to t=220. Lost input is NOT the cause here; the pulses just fired too early.
+- Autopress forever (260 s): frames change constantly (title -> attract -> white screens -> Ranking demo over a tilted terrain background). That is attract mode, NOT a fight.
+- vbl/s in these runs: 50 (stuck on notice), 74 mean/20-133 (attract). The earlier flat "19-20 vbl/s fight" numbers were never confirmed to be a fight; treat Part 166/167 perf comparisons as UNVERIFIED workload.
+- Follow-ups: (1) reach a real fight: press Cross AFTER the notice appears (t~65) then navigate menus; use PNG frames to confirm; (2) Ranking demo shows a rotated background -- check if real.
+
 ## Part 167 (2026-09-30) -- raster threads, test triage
 
-- `PS2X_GS_RASTER_THREADS=8` fight: vbl/s 19-20 over t=60..230 (4 threads = 19.2) -> no gain. `busy%=53`, `vblWaitMs` 8.7 s/240 s (EE barely waits on GS now), `rasterWaitMs` 53.9 s. vbl/s is likely capped by `PS2X_DET_VBLANK_QUANTUM=3000`; measure with a fixed-vblank wall time or higher quantum. Not yet verified.
+- `PS2X_GS_RASTER_THREADS=8` fight: vbl/s 19-20 over t=60..230 (4 threads = 19.2) -> no gain. `busy%=53`, `vblWaitMs` 8.7 s/240 s (EE barely waits on GS now), `rasterWaitMs` 53.9 s. ~~vbl/s capped by `PS2X_DET_VBLANK_QUANTUM=3000`~~ REFUTED: raising the quantum only lowers vbl/s; vbl/s is a valid metric at a fixed quantum. Caveat: these fight runs may have been sitting in the Start pause menu (autopress Start) -- see Part 168 pad diagnostics.
 - `ps2x_tests Memory` with `PS2X_GS_RASTER_THREADS=0`: 49/53. "native GIF packed chain matches generic" PASSES without MT raster, so it is an MT race: `GS::ReadVram` (`gs/gs_frontend.cpp:1664`) takes the state mutex but does not call `ps2xGsRasterFlush`, and the test reads VRAM right after `processGIFPacket`. Remaining 4 fails (SPR_FROM, SPR_TO, 2x VIF1 DIRECT image) are unrelated to raster threads.
 - Test exe: `build\ps2xTest\RelWithDebInfo\ps2x_tests.exe`. `run_log.txt` is UTF-16 (`iconv -f UTF-16 -t UTF-8`).
 
-- Tooling (09-30): `build_scripts/perf_summary.py` = vbl/s + busy% over an active window from `[watchdog]` lines (A/B compare). `logq.ps1` / `analyze_run.py` already handle UTF-16. Packed-chain test now calls `ps2xGsRasterFlush()` before `ReadVram` (needs test rebuild to confirm). Existing run_log: vbl/s max=20 across t=80..240 (mean 19.0) -- looks capped; quantum-cap hypothesis still unverified.
+- Tooling (09-30): `build_scripts/perf_summary.py` = vbl/s + busy% over an active window from `[watchdog]` lines (A/B compare). `logq.ps1` / `analyze_run.py` already handle UTF-16. Packed-chain test now calls `ps2xGsRasterFlush()` before `ReadVram` (needs test rebuild to confirm). Existing run_log: vbl/s max=20 across t=80..240 (mean 19.0) -- quantum-cap hypothesis REFUTED (see above); flat 19-20 may instead mean a paused fight.
 
 ## Part 166 (2026-09-29, AFK loop) -- game-thread perf: fight 15.7 -> 19.2 vbl/s
 
