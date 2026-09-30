@@ -23585,3 +23585,8 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 7. NEVER patch fn_*.cpp — game_overrides.cpp ONLY
 
 - **VU1 scoreboard elision (2026-09-30):** `vu1_recomp.py find_pending` = forward dataflow bounding (ready - cyc) per vf/vi/acc entry; reads that can't stall lose their `rd = max(...)` term (biggest program 937 -> 28). Stamps kept (finish() reads viR). Gates: `vu1_bench -Verify` 2000 runs 0 mismatches, VU1 median 71.7 -> 65.9 ms; `gs_bench` VRAM hash e3361ce8186f6df4 PASS. Fight t=145..200: vbl/s median 21.0 (was 19-20), mean 23.9 (one 66 outlier). Generated dir is gitignored: regen with `vu1_recomp.py generate logs/vu1recomp/images ps2xRuntime/src/lib/Kernel/Vu1Recomp/generated`.
+
+## Part 168b (2026-09-30) -- checkpointDue + raster threads: no gain
+- `checkpointDue`: not changed. Forwarder is a tail call; the TLS `&127` counter feeds vblank-quantum pacing; local ceiling 2-3% < run spread. Only real lever = emit fewer checks in `control_flow_emitter.cpp:180` (full regen).
+- `PS2X_GS_RASTER_THREADS=8` fight A/B (t=145..200): mean 22.1 / median 18.0 vs baseline 23.9 / 21.0. **No gain, raster threads not the limit** (waits are full drains: r6 upload, r10 per-frame latch). Default 4 kept.
+- Next lever: cut the per-frame full drains (r10 latch, r6 upload) without deadlocking `m_stateMutex`.
