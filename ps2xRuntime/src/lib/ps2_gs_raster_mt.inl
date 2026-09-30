@@ -924,6 +924,9 @@ struct Engine
 
     void waitDone(uint64_t target)
     {
+        if (minDone() >= target)
+            return;
+        const auto t0 = std::chrono::steady_clock::now();
         uint32_t spins = 0;
         while (minDone() < target)
         {
@@ -932,6 +935,14 @@ struct Engine
             else
                 std::this_thread::yield();
         }
+        const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+        const int why = g_gsmtWaitReason < 16 ? g_gsmtWaitReason : 0;
+        g_gsmtWaitDoneCalls.fetch_add(1u, std::memory_order_relaxed);
+        g_gsmtWaitDoneNs.fetch_add(ns, std::memory_order_relaxed);
+        g_gsmtWaitByReason[why][0].fetch_add(1u, std::memory_order_relaxed);
+        g_gsmtWaitByReason[why][1].fetch_add(ns, std::memory_order_relaxed);
+        g_gsmtWaitReason = 0;
     }
 
     void flush()
@@ -984,7 +995,10 @@ struct Engine
     {
         const uint64_t idx = w.load(std::memory_order_relaxed);
         if (idx >= kRingSize)
+        {
+            g_gsmtWaitReason = 7;
             waitDone(idx - kRingSize + 1u);
+        }
         ring[idx & (kRingSize - 1u)] = job;
         w.store(idx + 1u, std::memory_order_seq_cst);
         if (sleepers.load(std::memory_order_seq_cst) != 0)
@@ -1080,6 +1094,7 @@ void submit(Job &job, const uint8_t *clutSrc, const void *owner)
     ++e.stJobs;
     if (job.vram != e.lastVram)
     {
+        g_gsmtWaitReason = 1;
         e.flush();
         g_epoch.fetch_add(1u, std::memory_order_release);
         e.lastVram = job.vram;
@@ -1169,7 +1184,10 @@ void submit(Job &job, const uint8_t *clutSrc, const void *owner)
             e.clutCur = (e.clutCur + 1u) % kClutSlots;
             cur = &e.clut[e.clutCur];
             if (cur->used)
+            {
+                g_gsmtWaitReason = 2;
                 e.waitDone(cur->lastUse + 1u);
+            }
             std::memcpy(cur->data, clutSrc, sizeof(cur->data));
             cur->used = true;
             e.clutOwner = owner;
@@ -1186,6 +1204,7 @@ void submit(Job &job, const uint8_t *clutSrc, const void *owner)
         // Samples its own render target: the result depends on pixel order,
         // so draw it here, alone, in the old order.
         ++e.stSolo;
+        g_gsmtWaitReason = 3;
         e.flush();
         runJob(job, *e.producerCache, 1, 0);
         for (int k = 0; k < nwr; ++k)
@@ -1195,6 +1214,7 @@ void submit(Job &job, const uint8_t *clutSrc, const void *owner)
     if (hazard)
     {
         ++e.stBarriers;
+        g_gsmtWaitReason = 4;
         e.flush();
     }
 
@@ -1240,17 +1260,34 @@ void ps2xGsRasterSyncRect(uint32_t baseBlock, uint32_t bw, uint32_t psm,
     if (w == 0u || h == 0u)
         return;
     e.prune();
+    // Wait only for the last queued job that touches these blocks (a range's
+    // seq is the newest job using it; workers finish jobs in order), not for
+    // the whole queue. Host->local texture uploads land here ~110x/s in a
+    // fight, and a full flush each time kept the GS thread waiting on the
+    // raster workers.
     bool hazard = false;
+    uint64_t lastSeq = 0;
+    auto note = [&](const std::vector<gsmt::Range> &set, uint32_t lo, uint32_t hi)
+    {
+        for (const gsmt::Range &r : set)
+            if (lo < r.hi && r.lo < hi)
+            {
+                hazard = true;
+                lastSeq = std::max(lastSeq, r.seq);
+            }
+    };
     auto check = [&](uint32_t lo, uint32_t hi)
     {
-        if (gsmt::Engine::overlaps(e.writes, lo, hi) || (write && gsmt::Engine::overlaps(e.reads, lo, hi)))
-            hazard = true;
+        note(e.writes, lo, hi);
+        if (write)
+            note(e.reads, lo, hi);
     };
     gsmt::rectBlocks(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u, check);
     if (hazard)
     {
         ++e.stBarriers;
-        e.flush();
+        g_gsmtWaitReason = write ? 6 : 5;
+        e.waitDone(lastSeq + 1u);
     }
     if (write)
         gsmt::rectBlocks(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u,

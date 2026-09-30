@@ -149,14 +149,25 @@ constexpr size_t kGsThreadMaxQueuedBytes = 16u * 1024u * 1024u;
 // and the memory card screen never saw a new press (09-27 run).
 std::atomic<int> g_presenterWaiting{0};
 std::atomic<uint64_t> g_presenterYields{0};
+std::atomic<uint64_t> g_presenterYieldNs{0};
+}
+extern std::atomic<uint64_t> g_gsmtWaitDoneNs; // ps2_gs_rasterizer.cpp
+extern std::atomic<uint64_t> g_gsmtWaitDoneCalls;
+extern std::atomic<uint64_t> g_gsmtWaitByReason[16][2];
+namespace
+{
 
 void waitForPresenter()
 {
     if (g_presenterWaiting.load(std::memory_order_acquire) == 0)
         return;
     g_presenterYields.fetch_add(1u, std::memory_order_relaxed);
+    const auto t0 = std::chrono::steady_clock::now();
     while (g_presenterWaiting.load(std::memory_order_acquire) != 0)
         std::this_thread::yield();
+    g_presenterYieldNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - t0).count()),
+                                 std::memory_order_relaxed);
 }
 
 struct GsThread
@@ -233,13 +244,24 @@ struct GsThread
             return;
         lastPrint = now;
         std::printf("[gsthread] submits=%llu syncWaits=%llu waitMs=%.1f fullWaits=%llu vblWaits=%llu vblWaitMs=%.1f"
-                    " presYields=%llu sync{csr=%llu siglbl=%llu local2host=%llu gsdirect=%llu nativechain=%llu other=%llu}\n",
+                    " presYields=%llu presMs=%.1f rasterWaits=%llu rasterWaitMs=%.1f sync{csr=%llu siglbl=%llu local2host=%llu gsdirect=%llu nativechain=%llu other=%llu}\n",
                     (unsigned long long)submits, (unsigned long long)syncWaits, syncWaitNs / 1e6,
                     (unsigned long long)fullWaits, (unsigned long long)vblankWaits, vblankWaitNs / 1e6,
                     (unsigned long long)g_presenterYields.load(std::memory_order_relaxed),
+                    g_presenterYieldNs.load(std::memory_order_relaxed) / 1e6,
+                    (unsigned long long)g_gsmtWaitDoneCalls.load(std::memory_order_relaxed),
+                    g_gsmtWaitDoneNs.load(std::memory_order_relaxed) / 1e6,
                     (unsigned long long)syncs[1], (unsigned long long)syncs[2],
                     (unsigned long long)syncs[3], (unsigned long long)syncs[4], (unsigned long long)syncs[5],
                     (unsigned long long)syncs[0]);
+        std::printf("[gsraster-wait]");
+        for (int r = 0; r < 16; ++r)
+        {
+            const uint64_t c = g_gsmtWaitByReason[r][0].load(std::memory_order_relaxed);
+            if (c)
+                std::printf(" r%d=%llu/%.1fms", r, (unsigned long long)c, g_gsmtWaitByReason[r][1].load(std::memory_order_relaxed) / 1e6);
+        }
+        std::printf("\n");
         std::fflush(stdout);
     }
 };

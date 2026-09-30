@@ -63,8 +63,9 @@ namespace vu1rc
         }
 
         const uint32_t qwordOffset = kickCopied;
-        for (uint32_t i = 0; i < 16u; ++i)
-            packet[kickCopied + i] = mem[(kickSrc + kickCopied + i) & memMask];
+        // kickSrc and kickCopied are qword multiples and the memory size is a
+        // power of two, so a qword never wraps: one 16-byte copy.
+        std::memcpy(packet + kickCopied, mem + ((kickSrc + kickCopied) & memMask), 16u);
         kickCopied += 16u;
         kickLastBoundary = kickIssue + 1u + 2u * (kickCopied / 16u - 1u);
 

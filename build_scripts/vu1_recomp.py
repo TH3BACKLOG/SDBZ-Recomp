@@ -516,6 +516,68 @@ class Gen:
         # Pairs whose VI read goes through readBranchVi.
         self.bk_reader = {pc for pc, p in self.pairs.items()
                           if p.is_branch() and (p.lo.viRead & 0xFFFE)}
+        self.find_dead_flags()
+
+    @staticmethod
+    def pushes_fmac_flags(p):
+        """True when emit_upper emits r.fmacFlags for this pair."""
+        u = p.upper
+        if (u & 0x7FF) in (0x2FF, 0x33C):
+            return False
+        return fmac_form(u) is not None and bool(dest_lanes(DEST(u)))
+
+    @staticmethod
+    def touches_flags(p):
+        """FSEQ/FSSET/FSAND/FSOR/FMEQ/FMAND/FMOR: reads MAC/status or FSSET."""
+        return not p.iBit and p.lowerOpHi in (0x14, 0x15, 0x16, 0x17, 0x18, 0x1A, 0x1B)
+
+    def find_dead_flags(self):
+        """FMAC pairs whose MAC/status FIFO entry nobody can observe.
+
+        Entry of pair P is dead when, walking the straight-line pairs after it,
+        the next flag-writing FMAC J comes before any label (so no budget stop
+        can end the run between them), and no flag read / FSSET sits in
+        [P, J+3] with no control transfer out before J+3. Every later read
+        then issues >= 4 cycles after J (ready(J) = issue(J) + 4), so it sees J
+        or a later entry; a stop/E-bit end commits J after P. J overwrites MAC
+        and the current status bits; P's sticky bits are carried into J.
+        """
+        self.dead_flags = set()
+        for pc, p in self.pairs.items():
+            if not self.pushes_fmac_flags(p) or self.touches_flags(p):
+                continue
+            q = pc
+            j = None
+            ok = True
+            after = 0
+            while True:
+                if q in self.delay_of or q in self.ebit_slot:
+                    # Control leaves after q (branch delay slot / E-bit end).
+                    ok = j is not None and (q in self.ebit_slot and not self.delay_of.get(q))
+                    break
+                if self.pairs[q].is_branch():
+                    pass  # its delay slot is the transfer point
+                nq = q + 8
+                if nq not in self.pairs:
+                    ok = False
+                    break
+                if j is None and nq in self.labels:
+                    ok = False
+                    break
+                qp = self.pairs[nq]
+                if self.touches_flags(qp):
+                    ok = False
+                    break
+                q = nq
+                if j is None:
+                    if self.pushes_fmac_flags(qp):
+                        j = q
+                else:
+                    after += 1
+                    if after >= 3:
+                        break
+            if ok and j is not None:
+                self.dead_flags.add(pc)
 
     def successors(self, pc):
         """Pairs that can execute right after pc (None = next program run)."""
@@ -634,14 +696,21 @@ class Gen:
             elif rk == "i":
                 self.w("            const float i_ = N(s.i);")
             self.w("            uint8_t lf[4] = {0, 0, 0, 0};")
+            product_form = kind in ("kMadd", "kMsub", "kOpmsub")
+            if product_form:
+                # lane() ORs each product's sticky bits into ps_ (one multiply
+                # per lane instead of a second one in productSticky).
+                self.w("            uint32_t ps_ = 0u;")
             for c in lanes:
-                a = "N(acc[%d])" % c if kind in ("kMadd", "kMsub", "kOpmsub") else "0.0f"
+                a = "N(acc[%d])" % c if product_form else "0.0f"
                 opmw = "true" if (c == 3 and kind in ("kOpmsub", "kOpmula")) else "false"
-                self.w("            const float r%d = lane<%s>(%s, %s, %s, %s, lf[%d]);" % (c, kind, left(c), right(c), a, opmw, c))
-            ex = "0u"
-            if kind in ("kMadd", "kMsub", "kOpmsub"):
-                ex = " | ".join("productSticky(%s, %s)" % (left(c), right(c)) for c in lanes)
-            self.w("            r.fmacFlags(lf, %d, %s);" % (dest, ex))
+                tail = ", ps_" if product_form else ""
+                self.w("            const float r%d = lane<%s>(%s, %s, %s, %s, lf[%d]%s);" % (c, kind, left(c), right(c), a, opmw, c, tail))
+            ex = "ps_" if product_form else "0u"
+            if p.pc in self.dead_flags:
+                self.w("            r.fmacStickyOnly(lf, %d, %s); // entry dead, see find_dead_flags" % (dest, ex))
+            else:
+                self.w("            r.fmacFlags(lf, %d, %s);" % (dest, ex))
             for c in lanes:
                 self.w("            %s[%d] = r%d;" % (out, c, c))
             self.w("        }")

@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -349,6 +350,46 @@ void report(double windowSec)
             }
             byOwner[owner] += s.second;
         }
+        // PS2X_PROFILE_LINES=<substr>: for symbols containing <substr>, also
+        // break the samples down by source line (inlined helpers report their
+        // own header lines). Top 60 lines.
+        if (const char *lineFilter = std::getenv("PS2X_PROFILE_LINES"); lineFilter && *lineFilter)
+        {
+            std::unordered_map<std::string, uint64_t> byLine;
+            uint64_t matched = 0;
+            for (size_t i = 0; i < hot.size() && i < kMaxResolve; ++i)
+            {
+                const std::string name = symbolOf(proc, hot[i].first);
+                if (name.find(lineFilter) == std::string::npos)
+                    continue;
+                matched += hot[i].second;
+                IMAGEHLP_LINE64 line{};
+                line.SizeOfStruct = sizeof(line);
+                DWORD lineDisp = 0;
+                char key[512];
+                if (SymGetLineFromAddr64(proc, hot[i].first, &lineDisp, &line))
+                {
+                    const char *file = line.FileName ? line.FileName : "?";
+                    const char *slash = std::strrchr(file, '\\');
+                    std::snprintf(key, sizeof(key), "%s:%lu", slash ? slash + 1 : file,
+                                  static_cast<unsigned long>(line.LineNumber));
+                }
+                else
+                    std::snprintf(key, sizeof(key), "?:0x%llx", static_cast<unsigned long long>(hot[i].first));
+                byLine[key] += hot[i].second;
+            }
+            std::vector<std::pair<std::string, uint64_t>> lines(byLine.begin(), byLine.end());
+            std::sort(lines.begin(), lines.end(),
+                      [](const auto &a, const auto &b) { return a.second > b.second; });
+            std::printf("[hostprof]      -- lines of *%s* (%.1f%% of thread):\n", lineFilter,
+                        100.0 * static_cast<double>(matched) / static_cast<double>(ts.totalWeight));
+            for (size_t i = 0; i < lines.size() && i < 60; ++i)
+                std::printf("[hostprof]      line %5.1f%%  %s\n",
+                            100.0 * static_cast<double>(lines[i].second) / static_cast<double>(matched ? matched : 1),
+                            lines[i].first.c_str());
+            std::fflush(stdout);
+        }
+
         std::printf("[hostprof]      -- resolved %.1f%% of samples; rollup by owner:\n",
                     100.0 * static_cast<double>(resolvedWeight) / static_cast<double>(ts.totalWeight));
         std::vector<std::pair<std::string, uint64_t>> owners(byOwner.begin(), byOwner.end());

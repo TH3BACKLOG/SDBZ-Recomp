@@ -2165,12 +2165,64 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+// Defined in ps2_memory.cpp / iop_emulator.cpp (see the comments there); the
+// definitions must stay identical. accountCycles() runs on every guest
+// checkpoint with a handful of cycles, and the two calls below were ~6% of
+// the fight game thread in call overhead alone, almost always to bank the
+// cycles. The no-step tests are repeated here so those calls are skipped;
+// every call that could step a timer or run the IOP still goes through.
+struct Ps2xEeTimerBatch
+{
+    const PS2Memory *owner = nullptr;
+    uint64_t pending = 0u;
+    uint64_t flushAt = 0u;
+    bool gifFqcDirty = true;
+};
+extern Ps2xEeTimerBatch g_ps2xEeTimerBatch;
+struct Ps2xIopEeBatch
+{
+    uint64_t room = 0u;
+    uint64_t generation = 0u;
+};
+extern Ps2xIopEeBatch g_ps2xIopEeBatch;
+
+namespace
+{
+    // EE cycles held back from advanceIopEeCycles() (<= g_ps2xIopEeBatch.room).
+    struct IopHold
+    {
+        const EeScheduler *owner = nullptr;
+        uint64_t cycles = 0u;
+        uint64_t generation = 0u;
+    };
+    IopHold s_iopHold;
+}
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-    m_runtime.advanceIopEeCycles(elapsed);
+
+    PS2Memory &memory = m_runtime.memory();
+    Ps2xEeTimerBatch &timers = g_ps2xEeTimerBatch;
+    if (timers.owner == &memory && !timers.gifFqcDirty && timers.pending + elapsed < timers.flushAt)
+        timers.pending += elapsed; // exactly what advanceEeTimers() would do
+    else
+        m_pendingEeTimerInterrupts |= memory.advanceEeTimers(elapsed);
+
+    IopHold &hold = s_iopHold;
+    if (hold.owner != this || hold.generation != g_ps2xIopEeBatch.generation)
+        hold = IopHold{this, 0u, g_ps2xIopEeBatch.generation};
+    const uint64_t held = hold.cycles + elapsed;
+    if (held <= g_ps2xIopEeBatch.room)
+    {
+        hold.cycles = held; // the IOP would only bank these
+    }
+    else
+    {
+        hold.cycles = 0u;
+        m_runtime.advanceIopEeCycles(held);
+    }
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);

@@ -92,12 +92,81 @@ namespace vu1rc
     // normalizeFmacExactResult. Not inlined: rare path.
     uint8_t normalizeExact(float &value, long double exact);
 
+    VU1RC_INLINE bool signOf(float f)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        return (bits >> 31) != 0u;
+    }
+
+    // Flags of one FMAC lane result (normalizeFmacExactResult). res is the
+    // float result; l/r/a the normalized operands it came from.
+    template <Kind K>
+    VU1RC_INLINE float laneFinish(float res, float l, float r, float a, uint8_t &flags)
+    {
+        if (fastNormalFlags(res, flags))
+            return res;
+        // Exact zeros without the long double pass. Operands are normalized
+        // (no denormals), so: a float +-0 sum/difference is an exact zero; a
+        // product is exactly zero iff a factor is; a + l*r is exactly zero
+        // when both the product and a are. The sign of an exact IEEE zero is
+        // the same in float and long double, so res already carries it.
+        if (res == 0.0f)
+        {
+            bool exactZero;
+            if constexpr (K == kAdd || K == kSub)
+                exactZero = true;
+            else if constexpr (K == kMadd || K == kMsub || K == kOpmsub)
+                exactZero = a == 0.0f && (l == 0.0f || r == 0.0f);
+            else
+                exactZero = l == 0.0f || r == 0.0f;
+            if (exactZero)
+            {
+                flags = signOf(res) ? 0x3u : 0x1u;
+                return res;
+            }
+        }
+        long double exact;
+        const long double L = l, R = r, A = a;
+        if constexpr (K == kAdd)
+            exact = L + R;
+        else if constexpr (K == kSub)
+            exact = L - R;
+        else if constexpr (K == kMadd)
+            exact = A + L * R;
+        else if constexpr (K == kMsub || K == kOpmsub)
+            exact = A - L * R;
+        else
+            exact = L * R;
+        flags = normalizeExact(res, exact);
+        return res;
+    }
+
+    // Sticky bits of an already computed product l*r
+    // (calculateFmacProductSticky).
+    VU1RC_INLINE uint32_t productStickyOf(float product, float l, float r)
+    {
+        uint8_t f = 0u;
+        if (fastNormalFlags(product, f))
+            return f;
+        if (l == 0.0f || r == 0.0f) // exact zero, sign as float
+            return signOf(product) ? 0x3u : 0x1u;
+        const long double exact = static_cast<long double>(l) * static_cast<long double>(r);
+        return normalizeExact(product, exact) & 0xFu;
+    }
+
     // One FMAC lane. l/r/a are the normalized left, right and ACC operands of
     // this lane (for OPM* forms, l/r are the crossed lanes). Returns the float
     // result exactly as execUpper computes it and fills the lane flags.
     template <Kind K>
     VU1RC_INLINE float lane(float l, float r, float a, bool opmW, uint8_t &flags)
     {
+        if (opmW)
+        {
+            // normalizeExact(+0) : zero flag, +0.
+            flags = 0x1u;
+            return 0.0f;
+        }
         float res;
         if constexpr (K == kAdd)
             res = l + r;
@@ -109,38 +178,30 @@ namespace vu1rc
             res = a - l * r;
         else
             res = l * r;
+        return laneFinish<K>(res, l, r, a, flags);
+    }
+
+    // MADD/MSUB/OPMSUB lane with its product sticky bits ORed into sticky:
+    // the product is computed once instead of again by productSticky.
+    template <Kind K>
+    VU1RC_INLINE float lane(float l, float r, float a, bool opmW, uint8_t &flags, uint32_t &sticky)
+    {
+        static_assert(K == kMadd || K == kMsub || K == kOpmsub, "product forms only");
+        const float product = l * r;
+        sticky |= productStickyOf(product, l, r);
         if (opmW)
-            res = 0.0f;
-        if (!opmW && fastNormalFlags(res, flags))
-            return res;
-        long double exact = 0.0L;
-        if (!opmW)
         {
-            const long double L = l, R = r, A = a;
-            if constexpr (K == kAdd)
-                exact = L + R;
-            else if constexpr (K == kSub)
-                exact = L - R;
-            else if constexpr (K == kMadd)
-                exact = A + L * R;
-            else if constexpr (K == kMsub || K == kOpmsub)
-                exact = A - L * R;
-            else
-                exact = L * R;
+            flags = 0x1u;
+            return 0.0f;
         }
-        flags = normalizeExact(res, exact);
-        return res;
+        const float res = (K == kMadd) ? a + product : a - product;
+        return laneFinish<K>(res, l, r, a, flags);
     }
 
     // Product sticky bits of one MADD/MSUB/OPMSUB lane.
     VU1RC_INLINE uint32_t productSticky(float l, float r)
     {
-        float product = l * r;
-        uint8_t f = 0u;
-        if (fastNormalFlags(product, f))
-            return f;
-        const long double exact = static_cast<long double>(l) * static_cast<long double>(r);
-        return normalizeExact(product, exact) & 0xFu;
+        return productStickyOf(l * r, l, r);
     }
 
     // --- Pipeline state -------------------------------------------------------
@@ -170,6 +231,7 @@ namespace vu1rc
         // Flag pipeline, FIFO (every entry is ready = issue + 4).
         FlagEntry fl[16];
         uint32_t flHead = 0, flTail = 0, flMaxReady = 0;
+        uint32_t stickyCarry = 0; // see fmacStickyOnly
 
         bool fdivValid = false;
         uint32_t fdivReady = 0;
@@ -272,28 +334,38 @@ namespace vu1rc
 
         VU1RC_INLINE void fmacFlags(const uint8_t lf[4], uint8_t dest, uint32_t extraSticky)
         {
+            // Lane flag bit k (Z,S,U,O) lands at MAC bit 4k + (3 - c).
+            static constexpr uint16_t kSpread[16] = {
+                0x0000, 0x0001, 0x0010, 0x0011, 0x0100, 0x0101, 0x0110, 0x0111,
+                0x1000, 0x1001, 0x1010, 0x1011, 0x1100, 0x1101, 0x1110, 0x1111};
             uint32_t mac = 0u, status = 0u;
             for (uint32_t c = 0; c < 4u; ++c)
             {
-                const uint32_t ln = 1u << (3u - c);
-                if ((dest & ln) == 0u)
+                if ((dest & (1u << (3u - c))) == 0u)
                     continue;
-                const uint32_t f = lf[c];
-                if (f & 1u)
-                    mac |= ln;
-                if (f & 2u)
-                    mac |= ln << 4;
-                if (f & 4u)
-                    mac |= ln << 8;
-                if (f & 8u)
-                    mac |= ln << 12;
+                const uint32_t f = lf[c] & 0xFu;
+                mac |= static_cast<uint32_t>(kSpread[f]) << (3u - c);
                 status |= f;
             }
             FlagEntry &e = pushFlag();
             e.mac = mac;
             e.status = status;
-            e.extra = extraSticky;
+            e.extra = extraSticky | stickyCarry;
+            stickyCarry = 0u;
             e.what = 3u;
+        }
+
+        // An FMAC whose MAC/status entry no reader or stop can observe (the
+        // generator proves a later FMAC in the same straight-line run replaces
+        // it first): only its sticky contribution survives, carried into the
+        // next pushed entry.
+        VU1RC_INLINE void fmacStickyOnly(const uint8_t lf[4], uint8_t dest, uint32_t extraSticky)
+        {
+            uint32_t status = 0u;
+            for (uint32_t c = 0; c < 4u; ++c)
+                if (dest & (1u << (3u - c)))
+                    status |= lf[c] & 0xFu;
+            stickyCarry |= status | extraSticky;
         }
 
         // FSSET / FCSET cancel the same-cycle entry's status / clip write.

@@ -40,6 +40,19 @@ extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_buttons{0xFFFFu};
 extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_analog{0x7F7F7F7Fu};
 extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_served{0u};
 
+// EE cycles EeScheduler::accountCycles() may keep back from runEeCycles()
+// without changing when the IOP runs: runEeCycles() only banks while
+// carry + cycles < kBatchEe, so a sum of calls that stays within `room`
+// lands on the same threshold call. `generation` bumps on reset so the
+// scheduler drops cycles banked for the old carry. Plain globals: both
+// sides run on the EE executor thread.
+struct Ps2xIopEeBatch
+{
+    uint64_t room = 0u;
+    uint64_t generation = 0u;
+};
+Ps2xIopEeBatch g_ps2xIopEeBatch;
+
 namespace ps2x::iop::detail
 {
     namespace
@@ -305,6 +318,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            ++g_ps2xIopEeBatch.generation;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -1088,10 +1102,12 @@ namespace ps2x::iop::detail
         if (total < kBatchEe)
         {
             m_impl->eeCycleCarry = total;
+            g_ps2xIopEeBatch.room = kBatchEe - 1u - total;
             return;
         }
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
+        g_ps2xIopEeBatch.room = kBatchEe - 1u - m_impl->eeCycleCarry;
         if (iopCycles)
             m_impl->runCycles(iopCycles);
     }

@@ -1499,6 +1499,16 @@ namespace
     }
 }
 
+// Time the GS thread spends waiting on the raster workers (printed by
+// PS2X_GS_THREAD_STATS=1 in ps2_gif_arbiter.cpp).
+#include <chrono>
+std::atomic<uint64_t> g_gsmtWaitDoneNs{0};
+std::atomic<uint64_t> g_gsmtWaitDoneCalls{0};
+// [reason][0]=calls [1]=ns. 1 vram ptr, 2 clut slot, 3 self-sampling, 4 prim
+// hazard, 5 syncRect read, 6 syncRect write, 7 ring full, 8+ external flush
+// (set by the ps2_gs_gpu.cpp caller), 0 unknown.
+std::atomic<uint64_t> g_gsmtWaitByReason[16][2];
+int g_gsmtWaitReason = 0;
 #include "ps2_gs_raster_mt.inl"
 
 void GSRasterizer::drawPrimitive(GS *gs)

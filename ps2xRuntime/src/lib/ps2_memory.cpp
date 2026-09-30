@@ -331,6 +331,33 @@ namespace
     // node pointer (stable across rehash) and re-finds only after a clear.
     uint64_t g_ioRegistersGeneration = 0u;
 
+    // EE timer batching. advanceEeTimers runs on every accountCycles() with a
+    // handful of cycles; its per-timer tick math was ~7% of the fight game
+    // thread. Cycles now accumulate in `pending` and the timers only step when
+    // pending reaches `flushAt` (= cyclesUntilNextEeTimerInterrupt() at the
+    // last step, exact: a ceiling of the same tick formula) or when the guest
+    // touches a timer register. The tick math carries its remainder, so one
+    // step of N cycles equals N steps of 1, and an interrupt is raised on the
+    // same accountCycles() call as before. A global (not a member) because the
+    // member layout lives in ps2_memory.h; keyed to the owning PS2Memory.
+    // EeScheduler::accountCycles() repeats the no-step test inline (same
+    // struct, declared there) so the common case skips the call entirely.
+    // gifFqcDirty: GIF_STAT.FQC may be nonzero, so the next accountCycles()
+    // must come through here to clear it (as it did on every call before).
+}
+struct Ps2xEeTimerBatch
+{
+    const PS2Memory *owner = nullptr;
+    uint64_t pending = 0u;
+    uint64_t flushAt = 0u;
+    bool gifFqcDirty = true;
+};
+Ps2xEeTimerBatch g_ps2xEeTimerBatch;
+namespace
+{
+    using EeTimerBatch = Ps2xEeTimerBatch;
+    EeTimerBatch &g_eeTimerBatch = g_ps2xEeTimerBatch;
+
     constexpr std::array<uint64_t, 4> kEeTimerClockHz = {
         147456000ull,
         9216000ull,
@@ -732,11 +759,18 @@ bool PS2Memory::iopSelfTest()
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    g_eeTimerBatch = EeTimerBatch{this, 0u, 0u, true};
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 {
-    if (eeCycles == 0u)
+    // eeCycles == 0: flush the batch only (timer register access).
+    EeTimerBatch &batch = g_eeTimerBatch;
+    if (batch.owner != this)
+    {
+        batch = EeTimerBatch{this, 0u, 0u, true};
+    }
+    if (eeCycles == 0u && batch.pending == 0u)
     {
         return 0u;
     }
@@ -753,8 +787,20 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         s_gifStatOwner = this;
         s_gifStatGeneration = g_ioRegistersGeneration;
     }
-    if (s_gifStat != nullptr)
-        *s_gifStat &= ~kGifFqcMask;
+    if (eeCycles != 0u)
+    {
+        if (s_gifStat != nullptr)
+            *s_gifStat &= ~kGifFqcMask;
+        batch.gifFqcDirty = false;
+    }
+
+    batch.pending += eeCycles;
+    if (eeCycles != 0u && batch.pending < batch.flushAt)
+    {
+        return 0u;
+    }
+    eeCycles = batch.pending;
+    batch.pending = 0u;
 
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
@@ -816,6 +862,7 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             interruptMask |= 1u << index;
         }
     }
+    batch.flushAt = cyclesUntilNextEeTimerInterrupt();
     return interruptMask;
 }
 
@@ -857,6 +904,15 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
         const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+    }
+    // The timers still hold the state of the last batch step; cycles banked
+    // since then shorten every distance by the same amount (same formula, and
+    // pending < nearest or the batch would have stepped).
+    const EeTimerBatch &batch = g_eeTimerBatch;
+    if (batch.owner == this && batch.pending != 0u &&
+        nearest != std::numeric_limits<uint64_t>::max())
+    {
+        nearest = nearest > batch.pending ? nearest - batch.pending : 1u;
     }
     return nearest;
 }
@@ -1079,6 +1135,27 @@ uint32_t PS2Memory::read32(uint32_t address)
     if (address & 3)
     {
         throw std::runtime_error("Unaligned 32-bit read at address: 0x" + std::to_string(address));
+    }
+
+    if (address == 0x1000F000u)
+    {
+        // INTC_STAT: the WaitVSync spin at 0x175210 polls it ~450k times/s,
+        // and the generic path (scratchpad/TLB/VU checks, then
+        // readIORegister's decoders and a hash lookup) was ~15% of the fight
+        // game thread. Same value: readIORegister falls through to the map
+        // node, which initialize() pre-seeds and only its clear() invalidates.
+        static const PS2Memory *s_owner = nullptr;
+        static uint64_t s_generation = ~0ull;
+        static uint32_t *s_node = nullptr;
+        if (s_owner != this || s_generation != g_ioRegistersGeneration)
+        {
+            const auto it = m_ioRegisters.find(address);
+            s_node = it != m_ioRegisters.end() ? &it->second : nullptr;
+            s_owner = this;
+            s_generation = g_ioRegistersGeneration;
+        }
+        if (s_node != nullptr)
+            return *s_node;
     }
 
     if (isGsPrivReg(address))
@@ -1499,10 +1576,18 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (address == 0x10003020u)
+        g_eeTimerBatch.gifFqcDirty = true;
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        advanceEeTimers(0u); // bring the timers up to now (no event can be due)
+        struct RecomputeFlushAt
+        {
+            PS2Memory *mem;
+            ~RecomputeFlushAt() { g_eeTimerBatch.flushAt = mem->cyclesUntilNextEeTimerInterrupt(); }
+        } recompute{this};
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2235,6 +2320,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        g_eeTimerBatch.gifFqcDirty = true;
     }
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
@@ -2922,6 +3008,8 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
 void PS2Memory::orIORegister(uint32_t address, uint32_t bits)
 {
     // Assumes the node exists (see initialize() pre-seed for 0x1000F000).
+    if (address == 0x10003020u)
+        g_eeTimerBatch.gifFqcDirty = true;
     m_ioRegisters[address] |= bits;
 }
 
@@ -2936,6 +3024,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        advanceEeTimers(0u); // bring the timers up to now (no event can be due)
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {

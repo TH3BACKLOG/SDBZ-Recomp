@@ -5,7 +5,7 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are (Part 164 is the top of the file, 2026-09-28):** fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
+**Where we are (Part 166 is the top of the file, 2026-09-29):** fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
 -- 09-15 run, Goku's select model on screen (Part 117). Warped 3D: our VIF1 + VU1 match PCSX2 bit-exact
 on a replayed capture (Part 118). Smeared 3D FIXED 09-16 -- two GS bugs (Part 119); open: Ranking-screen
 sky dome looks upside down. 09-17: that same object (`0x632b90`, RANKING/GAME OVER) also produces a
@@ -267,6 +267,37 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 166 (2026-09-29, AFK loop) -- game-thread perf: fight 15.7 -> 19.2 vbl/s
+
+Perf settings as Part 165 (DIAG=0, autopress 120, quantum 3000, `PS2X_PROFILE_START=190`, `-HostProfile`). Fight gstate `1,6,0,1` now from t~65; steady vbl/s measured t=80..240.
+
+| Change | Files | Effect |
+|---|---|---|
+| VU1 recomp: fused product, exact-zero shortcut, `signOf` bit test (MSVC /Ob1 does not inline `std::signbit`), 16-byte XGKICK memcpy | `vu1_recomp_rt.h/.cpp`, `vu1_recomp.py` | bench 130.6 -> 125.8 ms |
+| MAC flag spread via `kSpread[16]` table | same | 125.8 -> 97.8 ms |
+| Dead flag-FIFO entries (`find_dead_flags`: no read of MAC/status/clip in the 4-pair window) push sticky bits only (`fmacStickyOnly`) | same | 97.8 -> 71.7 ms; `d9b37c38` 68/78 entries dead |
+| INTC_STAT (`0x1000F000`) fast path at top of `read32` (cached node, generation-keyed) | `ps2_memory.cpp` | WaitVSync spin polls it ~450k/s |
+| EE timer batching (`pending` / `flushAt` = exact `cyclesUntilNextEeTimerInterrupt`, flush on timer reg access) | `ps2_memory.cpp` | fight **19.0 vbl/s** (all rows above together) |
+| `accountCycles` repeats the no-step tests inline: timer batch (global `g_ps2xEeTimerBatch` + `gifFqcDirty`) and IOP hold (`g_ps2xIopEeBatch.room` = kBatchEe-1-carry, reset bumps `generation`) | `EeScheduler.cpp`, `ps2_memory.cpp`, `iop_emulator.cpp` | advanceEeTimers + runEeCycles gone from profile; GameThread CPU 52.0 -> 49.9 s; **19.2 vbl/s** |
+| `PS2X_PROFILE_LINES=<substr>`: per source line breakdown for matching symbols | `HostSampler.cpp` | tool |
+
+- VU1 gate `vu1_bench.ps1 -Build -Verify` passes (0 mismatches, 4000 runs x 2 captures). VU1 total **-45%**.
+- Tests: Memory 48/53, the 5 failures (SPR_FROM/TO, 2x VIF1 DIRECT image, GIF packed chain) are DMA/VIF/GIF, none on changed paths; all timer tests pass. Full suite: remaining failures are GS/CLUT/IPU/map tests (known PR144 set).
+- **Remaining GameThread (fight):** VU1 progs ~42% (`d9b37c38` 21%, `6eda6633` 13%, `fa242bd5` 6.5%), `ZwWaitForAlertByThreadId` 10% (**game thread now waits** on another thread -- find who: GS submit queue / `gsmt::waitDone`?), checkpointDue+accountCycles 9%, WaitVSync 4%, `_NLG_Return2` 2.8%, processVIF1Data 2.7%, IOP beginNextReady+nextWakeCycle 3.8%.
+- **The wait, found (`PS2X_GS_THREAD_STATS=1`):** `ps2xGsThreadVblank` (EE waits at each vblank until the GS thread finishes the previous frame): ~1 wait per vblank, ~12 ms each, **~21% of EE wall time**. The GS thread is the frame pacer now. It spends **~57% of its time in raster `waitDone`** (~7 full waits per frame, ~4 ms each); presenter yields are negligible (~6 ms/s).
+- **Instrumentation added (uncommitted, stats-only):** `presMs`, `rasterWaits/rasterWaitMs`, and a `[gsraster-wait] rN=calls/ms` line per reason. Reasons: 1 vram ptr change, 2 clut slot reuse, 3 self-sampling prim, 4 prim hazard, 5/6 syncRect read/write, 7 ring full, 8 snapshotVRAM, 9 copyFrameToHostRgba, 10 latchHostPresentationFrame, 11 local->host, 12 CLUT CSM1 reload. Files: `ps2_gif_arbiter.cpp`, `ps2_gs_raster_mt.inl`, `ps2_gs_rasterizer.cpp`, `ps2_gs_gpu.cpp`. Run done.
+- **Wait reasons measured (per 50 s, read with `grep -a -o "\[gsraster-wait\][^\[]*"`):**
+  - r6 syncRect write (host->local texture upload): ~5.5-7.2k waits, **~15 s**. The upload reuses a texture slot right after the draw that sampled it.
+  - r10 latchHostPresentationFrame: ~935 waits (1 per frame), **~11 s**. A full drain every frame.
+  - r2 CLUT slot reuse: small. Others: negligible.
+- **Tried: syncRect waits only up to the last overlapping job** (`ps2_gs_raster_mt.inl`, `note`/`check` lambdas, `waitDone(lastSeq+1)`). gs_bench gate PASS (hash `e3361ce8186f6df4`). **No in-game gain (18.85 vbl/s):** the overlapping job is almost always the newest, so it is still a full drain. Kept (harmless, exact).
+- **Rejected:**
+  - Upload as a ring barrier job: `processImageData` mixes transfer state with read-modify-write pixel writes.
+  - Async latch: it takes the recursive `m_stateMutex` on a worker while the GS thread holds it and waits on that worker -> deadlock risk.
+- **Next (not run yet):** raster thread count. Default is 4 (`PS2X_GS_RASTER_THREADS`, max 16, line ~1050 of `ps2_gs_raster_mt.inl`); the machine has 12 logical cores; bench mt6 99.5 ms, mt8 85 ms. Run the fight with `PS2X_GS_RASTER_THREADS=8`, then 6. If faster: raise the default, re-run the gs_bench gate. After that, VU1 per-line (`PS2X_PROFILE_LINES=prog_d9b37c38`).
+- ⚠ `ps2x_tests` (Memory filter) 48/53: "native GIF packed chain matches generic" fails. Was listed as pre-existing above; recheck whether it depends on raster threads (try `PS2X_GS_RASTER_THREADS=0`).
+- Part 166 changes committed (see git log).
 
 ## Part 165 (2026-09-28, AFK loop) -- title stall = ARKD SE bank load parked on the CD token
 
@@ -23306,6 +23337,12 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - rpc=0x001 WARNING gone
 
 ## Learned Patterns
+
+### 2026-09-29
+- **★★★ Tag every wait site with a reason before cutting any of them.** `[gsraster-wait] rN` showed two reasons (upload r6, latch r10) own ~90% of the raster drain time. Without the tag, the "~7 full waits per frame" had no owner.
+- **★★ A partial wait only helps if the hazard is old.** The syncRect wait was narrowed to the last overlapping job, but that job is almost always the newest one. Measure the age of the hazard (newest seq − lastSeq) before building a partial-wait change.
+- **★★ A hot function's exact no-op test can be repeated inline in its caller.** `accountCycles` checks "timer batch not due" and "IOP hold fits in room" itself, using shared globals the callee keeps up to date. Result: two functions gone from the profile, with the same behaviour.
+- **★ A tee'd log may have no newlines.** Read tags with `grep -a -o "\[tag\][^\[]*"`. `run_log.txt` is UTF-16LE.
 
 ### 2026-09-12
 - **★★★ A save/restore through ONE global is only correct if nothing changes the value outside the bracket.** `sub_11E598` saves the caller's priority into `[0x449210]`; `noop_sub_e690` boosts the same thread from outside, so the save captured the boost and every restore re-pinned it. Look for this whenever a "restore" leaves something stuck: find the saver, then find every OTHER writer of the saved quantity.

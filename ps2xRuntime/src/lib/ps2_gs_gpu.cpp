@@ -21,6 +21,7 @@
 // Threaded rasterizer (ps2_gs_raster_mt.inl): wait for, or tell it about, VRAM
 // accesses made outside it. Declared here, not in a header.
 void ps2xGsRasterFlush();
+extern int g_gsmtWaitReason; // stats only (ps2_gs_rasterizer.cpp)
 void ps2xGsRasterReset();
 void ps2xGsRasterSyncRect(uint32_t baseBlock, uint32_t bw, uint32_t psm,
                           uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool write);
@@ -1606,6 +1607,7 @@ void GS::snapshotVRAM()
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_vram || m_vramSize == 0)
         return;
+    g_gsmtWaitReason = 8;
     ps2xGsRasterFlush();
     std::lock_guard<std::mutex> lock(m_snapshotMutex);
     m_displaySnapshot.resize(m_vramSize);
@@ -1933,6 +1935,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     {
         return false;
     }
+    g_gsmtWaitReason = 9;
     ps2xGsRasterFlush();
 
     outPixels.resize(kHostFrameWidth * kHostFrameHeight * 4u);
@@ -2072,6 +2075,7 @@ void GS::latchHostPresentationFrame()
 
 void GS::latchHostPresentationFrameUnlocked()
 {
+    g_gsmtWaitReason = 10;
     ps2xGsRasterFlush();
     // [present] probe (PS2X_DIAG=1). Stage 5.7: the rasterizer is demonstrably
     // busy (GSRasterizer::writePixel dominates the EE thread) yet the screen is
@@ -6438,6 +6442,7 @@ void GS::performLocalToHostToBuffer()
 
     if (!m_vram)
         return;
+    g_gsmtWaitReason = 11;
     ps2xGsRasterFlush();
 
     const auto bitbltbuf = m_registers.bitbltbuf;
@@ -6984,7 +6989,7 @@ void GS::ReloadClutCache(u32 psm, u32 cpsm, u32 cbp, u8 csm, u8 csa, u8 cld)
     if (csm == 0)
         ps2xGsRasterSyncRect(cbp, 1u, cpsm, 0u, 0u, 16u, 16u, false);
     else
-        ps2xGsRasterFlush();
+        { g_gsmtWaitReason = 12; ps2xGsRasterFlush(); }
     ps2xGsRasterClutChanged();
 
     switch (csm)
