@@ -607,6 +607,9 @@ namespace GSMem
 	void WritePixelZ16(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WritePixelZ16S(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WritePixelP8(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+	// Bulk PSMT8 upload of n pixels along row y starting at x. Bit-identical to n
+	// WritePixelP8 calls with x+i, but the page/block/row lookup is hoisted.
+	void WriteRowP8(u8* data, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 n);
 	void WritePixelP8H(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WritePixelP4(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WritePixelP4HH(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);

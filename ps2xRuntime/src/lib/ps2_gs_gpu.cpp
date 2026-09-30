@@ -6201,15 +6201,21 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         break;
 
     case GS_PSM_T8:
+        // Row-at-a-time: identical order of effects to the per-pixel loop
+        // (write, advance, wrap at the row end, EndTransfer at the total).
         while (data_offset < sizeBytes)
         {
-            u8 c = data[data_offset];
+            const u32 rowLeft = rrw - (m_transferState.copied_pixels % rrw);
+            const u32 totalLeft = m_transferState.copied_pixels < m_transferState.total_pixels
+                                        ? m_transferState.total_pixels - m_transferState.copied_pixels
+                                        : 1u;
+            const u32 n = std::min({rowLeft, sizeBytes - data_offset, totalLeft});
 
-            GSMem::WritePixelP8(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
+            GSMem::WriteRowP8(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, &data[data_offset], n);
 
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 1;
+            m_transferState.x += n;
+            m_transferState.copied_pixels += n;
+            data_offset += n;
 
             if ((m_transferState.copied_pixels % rrw) == 0)
             {

@@ -546,6 +546,25 @@ namespace GSMem
         WritePixelAddressP8(data, LookupPixelAddressP8(bp, bw, x, y), value);
     }
 
+    void WriteRowP8(u8* data, u32 bp, u32 bw, u32 x, u32 y, const u8* src, u32 n)
+    {
+        // Same math as PixelStorageTraits<P8>::Address + Write (byte address =
+        // pixel address & (MEMORY_SIZE - 1)), with the y/block terms hoisted.
+        constexpr auto page_extent = P8Traits::PageExtent();
+        const u32 base_page = bp / static_cast<u32>(P8Traits::BlocksPerPage());
+        const u32 row_pages = (bw * 64u) / page_extent.x;
+        const u32 page_row = base_page + (y / page_extent.y) * row_pages;
+        const auto& row = PageTableP8[bp % P8Traits::BlocksPerPage()][y % page_extent.y];
+
+        for (u32 i = 0; i < n; ++i)
+        {
+            const u32 px = x + i;
+            const u32 page = page_row + px / page_extent.x;
+            const u32 address = page * static_cast<u32>(P8Traits::PixelsPerPage()) + row[px % page_extent.x];
+            data[address & (MEMORY_SIZE - 1)] = src[i];
+        }
+    }
+
     void WritePixelP8H(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         WritePixelAddressP8H(data, LookupPixelAddressCT32(bp, bw, x, y), value);
