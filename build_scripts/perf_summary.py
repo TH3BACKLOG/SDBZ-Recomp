@@ -54,7 +54,15 @@ def main():
     ap.add_argument("logs", nargs="*", default=[DEFAULT_LOG])
     ap.add_argument("--from", dest="lo", type=int, default=80)
     ap.add_argument("--to", dest="hi", type=int, default=240)
+    ap.add_argument("--hostprof", action="store_true",
+                    help="print only the [hostprof] report lines (startswith filter)")
     a = ap.parse_args()
+    if a.hostprof:
+        for p in a.logs:
+            for ln in read_text_any(p).splitlines():
+                if ln.startswith("[hostprof]"):
+                    print(ln)
+        return 0
     res = [summarize(p, a.lo, a.hi) for p in a.logs]
     if len(res) == 2 and all(res):
         d = res[1]["vbl_mean"] / res[0]["vbl_mean"] - 1.0

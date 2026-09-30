@@ -25,6 +25,10 @@ param(
     # naming the functions the host is actually burning CPU in. Not $Profile --
     # that is a PowerShell automatic variable.
     [switch]$HostProfile,
+    # Fight-run workload preset: Cross-only autopress (Start would open the fight
+    # pause menu), quantum 3000, DIAG off. Reaches a live fight at t~140..205, so
+    # pair with -RunSeconds 206 and PS2X_PROFILE_START=145 for a profile.
+    [switch]$Fight,
     # Arm the DR0 hardware watchpoint on the rpc_call saved-$ra slot. Off by
     # default since 2026-07-28 -- it costs ~20% of the run's CPU. Turn it on
     # only when hunting a memory writer, never during a perf measurement.
@@ -219,6 +223,16 @@ if (-not $NoDebugger) {
     # Must clear, not just skip: env vars persist across runs in the same shell.
     Remove-Item Env:PS2X_DEBUGSHM -ErrorAction SilentlyContinue
     Write-Host "[launch_recomp] -NoDebugger: debug shm writer disabled (PS2X_DEBUGSHM unset)" -ForegroundColor DarkGray
+}
+
+if ($Fight) {
+    $env:PS2X_DIAG = '0'
+    $env:PS2X_PAD_AUTOPRESS = '120'
+    $env:PS2X_PAD_AUTOPRESS_BTNS = 'X'
+    $env:PS2X_PAD_AUTOPRESS_HOLD = '20'
+    $env:PS2X_DET_VBLANK_QUANTUM = '3000'
+    if (-not $env:PS2X_PROFILE_START) { $env:PS2X_PROFILE_START = '145' }
+    Write-Host "[launch_recomp] -Fight: X-only autopress, quantum 3000, DIAG=0, PROFILE_START=$($env:PS2X_PROFILE_START)" -ForegroundColor Cyan
 }
 
 # Host CPU sampling profiler (src/lib/Kernel/HostSampler.cpp). Same env-directly
