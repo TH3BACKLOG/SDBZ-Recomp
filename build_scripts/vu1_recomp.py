@@ -517,6 +517,7 @@ class Gen:
         self.bk_reader = {pc for pc, p in self.pairs.items()
                           if p.is_branch() and (p.lo.viRead & 0xFFFE)}
         self.find_dead_flags()
+        self.find_pending()
 
     @staticmethod
     def pushes_fmac_flags(p):
@@ -614,19 +615,103 @@ class Gen:
             return "0"
         return "(bkReg == %d ? bkVal : vi[%d])" % (reg, reg)
 
-    def emit_stall(self, p):
-        terms = []
+    @staticmethod
+    def stall_keys(p):
+        """Scoreboard entries the pair's stall reads, in emission order, de-duplicated."""
+        keys = []
         for us in (p.up, p.lo):
             for reg, lanes in us.vfRead:
                 for c in range(4):
                     if lanes & lane(c):
-                        terms.append("r.vfR[%d][%d]" % (reg, c))
+                        keys.append(("vf", reg, c))
             for reg in range(1, 16):
                 if us.viRead & (1 << reg):
-                    terms.append("r.viR[%d]" % reg)
+                    keys.append(("vi", reg, 0))
             for c in range(4):
                 if us.accRead & lane(c):
-                    terms.append("r.accR[%d]" % c)
+                    keys.append(("acc", c, 0))
+        seen = set()
+        return [k for k in keys if not (k in seen or seen.add(k))]
+
+    @staticmethod
+    def pair_stamps(p):
+        """Scoreboard stamps markPairWrites emits, in emission order: (key, latency)."""
+        out = []
+        lw_reg, lw_lanes = p.lo.vfWrite
+        if lw_reg and p.suppressedLowerVf != lw_reg:
+            lat = p.lo.vfLatency or p.lo.latency
+            for c in range(4):
+                if lw_lanes & lane(c):
+                    out.append((("vf", lw_reg, c), lat))
+        uw_reg, uw_lanes = p.up.vfWrite
+        if uw_reg:
+            lat = p.up.vfLatency or p.up.latency
+            for c in range(4):
+                if uw_lanes & lane(c):
+                    out.append((("vf", uw_reg, c), lat))
+        viw = p.lo.viWrite & 0xFFFE
+        if viw:
+            lat = p.lo.viLatency or p.lo.latency
+            for reg in range(1, 16):
+                if viw & (1 << reg):
+                    out.append((("vi", reg, 0), lat))
+        for c in range(4):
+            if p.up.accWrite & lane(c):
+                out.append((("acc", c, 0), 1))
+        return out
+
+    def find_pending(self):
+        """Forward dataflow: upper bound of (ready - cyc) per scoreboard entry
+        at each pair's entry. Every run starts with a fresh R (cyc 0, all
+        ready 0), and cyc rises by >= 1 per pair, so an entry whose bound is 0
+        can never stall the pair: its `rd = max(...)` term is dropped.
+        Stamps are still emitted (finish() reads viR)."""
+        self.pending_in = {}
+        work = []
+        for e in self.entries:
+            if e in self.pairs:
+                self.pending_in[e] = {}
+                work.append(e)
+        while work:
+            pc = work.pop()
+            p = self.pairs[pc]
+            s = dict(self.pending_in[pc])
+            for k in self.stall_keys(p):
+                s.pop(k, None)
+            s = {k: d - 1 for k, d in s.items() if d > 1}
+            for k, lat in self.pair_stamps(p):
+                if lat > 1:
+                    s[k] = lat - 1
+                else:
+                    s.pop(k, None)
+            for n in self.successors(pc):
+                if n is None or n not in self.pairs:
+                    continue
+                cur = self.pending_in.get(n)
+                if cur is None:
+                    self.pending_in[n] = dict(s)
+                    work.append(n)
+                    continue
+                changed = False
+                for k, d in s.items():
+                    if cur.get(k, 0) < d:
+                        cur[k] = d
+                        changed = True
+                if changed:
+                    work.append(n)
+
+    def emit_stall(self, p):
+        terms = []
+        pend = self.pending_in.get(p.pc)
+        for k in self.stall_keys(p):
+            if pend is not None and k not in pend:
+                continue
+            if k[0] == "vf":
+                terms.append("r.vfR[%d][%d]" % (k[1], k[2]))
+            elif k[0] == "vi":
+                terms.append("r.viR[%d]" % k[1])
+            else:
+                terms.append("r.accR[%d]" % k[1])
         extra = []
         lo = p.lo
         if lo.pipeline == "fdiv":
@@ -639,9 +724,6 @@ class Gen:
             extra.append("if (r.kickActive) rd = std::max(rd, r.kickFinishAll());")
         if not terms and not extra:
             return
-        # de-duplicate, keep order
-        seen = set()
-        terms = [t for t in terms if not (t in seen or seen.add(t))]
         self.w("        {")
         self.w("            uint32_t rd = r.cyc;")
         for t in terms:
@@ -1043,26 +1125,13 @@ class Gen:
             W("        vf[0][0] = 0.0f; vf[0][1] = 0.0f; vf[0][2] = 0.0f; vf[0][3] = 1.0f;")
 
         # markPairWrites
-        lw_reg, lw_lanes = p.lo.vfWrite
-        if lw_reg and p.suppressedLowerVf != lw_reg:
-            lat = p.lo.vfLatency or p.lo.latency
-            for c in range(4):
-                if lw_lanes & lane(c):
-                    W("        r.vfR[%d][%d] = r.cyc + %du;" % (lw_reg, c, lat))
-        uw_reg, uw_lanes = p.up.vfWrite
-        if uw_reg:
-            lat = p.up.vfLatency or p.up.latency
-            for c in range(4):
-                if uw_lanes & lane(c):
-                    W("        r.vfR[%d][%d] = r.cyc + %du;" % (uw_reg, c, lat))
-        if viw:
-            lat = p.lo.viLatency or p.lo.latency
-            for reg in range(1, 16):
-                if viw & (1 << reg):
-                    W("        r.viR[%d] = r.cyc + %du;" % (reg, lat))
-        for c in range(4):
-            if p.up.accWrite & lane(c):
-                W("        r.accR[%d] = r.cyc + 1u;" % c)
+        for key, lat in self.pair_stamps(p):
+            if key[0] == "vf":
+                W("        r.vfR[%d][%d] = r.cyc + %du;" % (key[1], key[2], lat))
+            elif key[0] == "vi":
+                W("        r.viR[%d] = r.cyc + %du;" % (key[1], lat))
+            else:
+                W("        r.accR[%d] = r.cyc + 1u;" % key[1])
 
         if bk:
             if record:

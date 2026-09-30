@@ -23583,3 +23583,5 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 5. NEVER list/scan runner/ directories (30k+ files)
 6. NEVER fake IOP output values — use real ARKD_DVD.IRX
 7. NEVER patch fn_*.cpp — game_overrides.cpp ONLY
+
+- **VU1 scoreboard elision (2026-09-30):** `vu1_recomp.py find_pending` = forward dataflow bounding (ready - cyc) per vf/vi/acc entry; reads that can't stall lose their `rd = max(...)` term (biggest program 937 -> 28). Stamps kept (finish() reads viR). Gates: `vu1_bench -Verify` 2000 runs 0 mismatches, VU1 median 71.7 -> 65.9 ms; `gs_bench` VRAM hash e3361ce8186f6df4 PASS. Fight t=145..200: vbl/s median 21.0 (was 19-20), mean 23.9 (one 66 outlier). Generated dir is gitignored: regen with `vu1_recomp.py generate logs/vu1recomp/images ps2xRuntime/src/lib/Kernel/Vu1Recomp/generated`.
