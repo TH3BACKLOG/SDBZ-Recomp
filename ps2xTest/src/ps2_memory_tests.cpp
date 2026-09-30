@@ -13,6 +13,10 @@
 #include <cstring>
 #include <vector>
 
+// MT rasterizer: GS::ReadVram does not drain the raster queue, so tests that
+// read pixels straight after processGIFPacket must flush first.
+void ps2xGsRasterFlush();
+
 namespace
 {
     uint32_t makeVifCmd(uint8_t opcode, uint8_t num, uint16_t imm)
@@ -1259,6 +1263,7 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u,
                      "native packed GIF chain should clear GIF STR");
 
+            ps2xGsRasterFlush();
             const uint32_t nativePixel = nativeGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 1u);
             const uint32_t genericPixel = genericGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 1u);
             t.IsTrue(genericPixel != 0u, "generic packed primitive packet should draw a test pixel");

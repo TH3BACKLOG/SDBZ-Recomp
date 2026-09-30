@@ -5,7 +5,7 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are (Part 166 is the top of the file, 2026-09-29):** fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
+**Where we are (Part 167 is the top of the file, 2026-09-30):** fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
 -- 09-15 run, Goku's select model on screen (Part 117). Warped 3D: our VIF1 + VU1 match PCSX2 bit-exact
 on a replayed capture (Part 118). Smeared 3D FIXED 09-16 -- two GS bugs (Part 119); open: Ranking-screen
 sky dome looks upside down. 09-17: that same object (`0x632b90`, RANKING/GAME OVER) also produces a
@@ -267,6 +267,14 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 167 (2026-09-30) -- raster threads, test triage
+
+- `PS2X_GS_RASTER_THREADS=8` fight: vbl/s 19-20 over t=60..230 (4 threads = 19.2) -> no gain. `busy%=53`, `vblWaitMs` 8.7 s/240 s (EE barely waits on GS now), `rasterWaitMs` 53.9 s. vbl/s is likely capped by `PS2X_DET_VBLANK_QUANTUM=3000`; measure with a fixed-vblank wall time or higher quantum. Not yet verified.
+- `ps2x_tests Memory` with `PS2X_GS_RASTER_THREADS=0`: 49/53. "native GIF packed chain matches generic" PASSES without MT raster, so it is an MT race: `GS::ReadVram` (`gs/gs_frontend.cpp:1664`) takes the state mutex but does not call `ps2xGsRasterFlush`, and the test reads VRAM right after `processGIFPacket`. Remaining 4 fails (SPR_FROM, SPR_TO, 2x VIF1 DIRECT image) are unrelated to raster threads.
+- Test exe: `build\ps2xTest\RelWithDebInfo\ps2x_tests.exe`. `run_log.txt` is UTF-16 (`iconv -f UTF-16 -t UTF-8`).
+
+- Tooling (09-30): `build_scripts/perf_summary.py` = vbl/s + busy% over an active window from `[watchdog]` lines (A/B compare). `logq.ps1` / `analyze_run.py` already handle UTF-16. Packed-chain test now calls `ps2xGsRasterFlush()` before `ReadVram` (needs test rebuild to confirm). Existing run_log: vbl/s max=20 across t=80..240 (mean 19.0) -- looks capped; quantum-cap hypothesis still unverified.
 
 ## Part 166 (2026-09-29, AFK loop) -- game-thread perf: fight 15.7 -> 19.2 vbl/s
 
@@ -23560,9 +23568,3 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 5. NEVER list/scan runner/ directories (30k+ files)
 6. NEVER fake IOP output values — use real ARKD_DVD.IRX
 7. NEVER patch fn_*.cpp — game_overrides.cpp ONLY
-
-## Part 167 (2026-09-30) -- raster threads, test triage
-
-- `PS2X_GS_RASTER_THREADS=8` fight: vbl/s 19-20 over t=60..230 (4 threads = 19.2) -> no gain. `busy%=53`, `vblWaitMs` 8.7 s/240 s (EE barely waits on GS now), `rasterWaitMs` 53.9 s. vbl/s is likely capped by `PS2X_DET_VBLANK_QUANTUM=3000`; measure with a fixed-vblank wall time or higher quantum. Not yet verified.
-- `ps2x_tests Memory` with `PS2X_GS_RASTER_THREADS=0`: 49/53. "native GIF packed chain matches generic" PASSES without MT raster, so it is an MT race: `GS::ReadVram` (`gs/gs_frontend.cpp:1664`) takes the state mutex but does not call `ps2xGsRasterFlush`, and the test reads VRAM right after `processGIFPacket`. Remaining 4 fails (SPR_FROM, SPR_TO, 2x VIF1 DIRECT image) are unrelated to raster threads.
-- Test exe: `build\ps2xTest\RelWithDebInfo\ps2x_tests.exe`. `run_log.txt` is UTF-16 (`iconv -f UTF-16 -t UTF-8`).
