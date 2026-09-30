@@ -3,6 +3,7 @@
 #include "ps2_log.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -146,7 +147,19 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         const uint32_t v = (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 6u;
         return v == 0u ? 6u : v;
     }();
-    if (s_autoPeriod >= 16u)
+    // PS2X_PAD_AUTOPRESS_SECS=N (default 0 = never stop) ends the pulses N wall
+    // seconds after the first pad poll. Start in the pulse cycle opens the fight's
+    // pause menu, so perf runs stop it once the match has begun.
+    static const auto s_autoT0 = std::chrono::steady_clock::now();
+    static const uint32_t s_autoSecs = []() -> uint32_t
+    {
+        const char *s = std::getenv("PS2X_PAD_AUTOPRESS_SECS");
+        return (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 0u;
+    }();
+    const bool autoExpired =
+        s_autoSecs != 0u &&
+        std::chrono::steady_clock::now() - s_autoT0 > std::chrono::seconds(s_autoSecs);
+    if (s_autoPeriod >= 16u && !autoExpired)
     {
         static std::atomic<uint32_t> s_autoFrame{0u};
         const uint32_t frame = s_autoFrame.fetch_add(1u, std::memory_order_relaxed);
