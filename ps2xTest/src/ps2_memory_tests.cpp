@@ -2144,7 +2144,7 @@ void register_ps2_memory_tests()
             gs.writeRegister(GS_REG_TRXDIR, 0ull);
 
             std::vector<uint8_t> packet;
-            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
+            appendU32(packet, makeVifCmd(0x50u, 0u, 2u)); // DIRECT 2 QW payload: GIF IMAGE tag + 1 QW of pixels (payload must cover the data; no carry-over guessing).
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
             for (uint32_t i = 0; i < 16u; ++i)
@@ -2193,7 +2193,7 @@ void register_ps2_memory_tests()
             gs.writeRegister(GS_REG_TRXDIR, 0ull);
 
             std::vector<uint8_t> packet;
-            appendU32(packet, makeVifCmd(0x50u, 0u, 3u)); // PACKED tag + A+D + IMAGE tag.
+            appendU32(packet, makeVifCmd(0x50u, 0u, 4u)); // PACKED tag + A+D + IMAGE tag + 1 QW of pixels, all inside the DIRECT payload.
             appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 1u, false));
             appendU64(packet, 0x0Eull);
             appendU64(packet, 0x8000008000ull); // TEXA, harmless setup preceding the IMAGE tag.
