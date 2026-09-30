@@ -23560,3 +23560,9 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 5. NEVER list/scan runner/ directories (30k+ files)
 6. NEVER fake IOP output values — use real ARKD_DVD.IRX
 7. NEVER patch fn_*.cpp — game_overrides.cpp ONLY
+
+## Part 167 (2026-09-30) -- raster threads, test triage
+
+- `PS2X_GS_RASTER_THREADS=8` fight: vbl/s 19-20 over t=60..230 (4 threads = 19.2) -> no gain. `busy%=53`, `vblWaitMs` 8.7 s/240 s (EE barely waits on GS now), `rasterWaitMs` 53.9 s. vbl/s is likely capped by `PS2X_DET_VBLANK_QUANTUM=3000`; measure with a fixed-vblank wall time or higher quantum. Not yet verified.
+- `ps2x_tests Memory` with `PS2X_GS_RASTER_THREADS=0`: 49/53. "native GIF packed chain matches generic" PASSES without MT raster, so it is an MT race: `GS::ReadVram` (`gs/gs_frontend.cpp:1664`) takes the state mutex but does not call `ps2xGsRasterFlush`, and the test reads VRAM right after `processGIFPacket`. Remaining 4 fails (SPR_FROM, SPR_TO, 2x VIF1 DIRECT image) are unrelated to raster threads.
+- Test exe: `build\ps2xTest\RelWithDebInfo\ps2x_tests.exe`. `run_log.txt` is UTF-16 (`iconv -f UTF-16 -t UTF-8`).
