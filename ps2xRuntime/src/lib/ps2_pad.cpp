@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -171,6 +172,14 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         }
     }
 
+    // Host-side edge log: proves keys/autopress reach readState even when PADMAN
+    // serves SIO2 polls (the [pad] change log in ps2x_pad_push_frame is then off).
+    {
+        static std::atomic<uint32_t> s_lastHostBtns{0xFFFFu};
+        const uint32_t prev = s_lastHostBtns.exchange(btns, std::memory_order_relaxed);
+        if (prev != btns)
+            std::printf("[pad] host change btns=0x%04x -> 0x%04x\n", prev, static_cast<unsigned>(btns));
+    }
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
     return true;
