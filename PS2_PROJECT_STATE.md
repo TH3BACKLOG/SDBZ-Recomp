@@ -275,6 +275,7 @@ reached only because the earlier rungs now hold.
 - AUTOPRESS_SECS=30 or 100: only 3 pulses land before the Auto-Save notice; the game sits on it ("X button to continue") to t=220. Lost input is NOT the cause here; the pulses just fired too early.
 - Autopress forever (260 s): frames change constantly (title -> attract -> white screens -> Ranking demo over a tilted terrain background). That is attract mode, NOT a fight.
 - vbl/s in these runs: 50 (stuck on notice), 74 mean/20-133 (attract). The earlier flat "19-20 vbl/s fight" numbers were never confirmed to be a fight; treat Part 166/167 perf comparisons as UNVERIFIED workload.
+- **REAL FIGHT REACHED** (new `PS2X_PAD_AUTOPRESS_BTNS=X`, HOLD=20, period 120, `PS2X_REC=1 PS2X_REC_INTERVAL=60`, 300 s): title -> Ranking -> live Vegeta vs Trunks fight (attacks/effects, frames vary; NOT paused) at t~140..205; vbl/s 16-20 there, gstate `0,0,0,1`. Then the demo loops back to the Funimation logo. So the 19-20 vbl/s fight numbers are a live fight: Parts 166/167 comparisons STAND (retracts the 'unverified' line above). The `1,6,0,1` state was something else (menu/notice), not the fight.
 - Follow-ups: (1) reach a real fight: press Cross AFTER the notice appears (t~65) then navigate menus; use PNG frames to confirm; (2) Ranking demo shows a rotated background -- check if real.
 
 ## Part 167 (2026-09-30) -- raster threads, test triage

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace
 {
@@ -167,8 +168,19 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         const uint32_t phase = frame % s_autoPeriod;
         if (phase < std::min(s_autoHold, s_autoPeriod / 2u))
         {
-            constexpr uint16_t kCycle[3] = {PAD_CROSS, PAD_CIRCLE, PAD_START};
-            clearBit(kCycle[(frame / s_autoPeriod) % 3u]);
+            // PS2X_PAD_AUTOPRESS_BTNS=X|O|S letters pick the rotation (default "XOS");
+            // "X" alone keeps menus advancing without Start pausing a fight.
+            static const std::string s_cycle = []() -> std::string
+            {
+                const char *s = std::getenv("PS2X_PAD_AUTOPRESS_BTNS");
+                std::string r;
+                for (const char *p = (s && *s) ? s : "XOS"; *p; ++p)
+                    if (*p == 'X' || *p == 'O' || *p == 'S')
+                        r.push_back(*p);
+                return r.empty() ? std::string("XOS") : r;
+            }();
+            const char c = s_cycle[(frame / s_autoPeriod) % s_cycle.size()];
+            clearBit(c == 'X' ? PAD_CROSS : c == 'O' ? PAD_CIRCLE : PAD_START);
         }
     }
 
