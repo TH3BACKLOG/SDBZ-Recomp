@@ -274,7 +274,39 @@ def emit_bin(packets, out_path, path_filter=None):
     print(f"wrote {n} transfer payloads to {out_path}")
 
 
-def emit_replay(info, regs, packets, out_path):
+# GSState::Freeze v9 begins with u32 version, then GSDrawingEnvironment as packed
+# u64s (verified on a SLUS-21442 dump: PRIM@4, COLCLAMP@0x44, ctx0@0x7c with
+# XYOFFSET=0x7000/0x7200, SCISSOR@+0x30, ALPHA@+0x38=0x44, FRAME@+0x50), ctx
+# stride 0x60.  The packet stream only re-sends what the game changed, so
+# anything still at its freeze value (often ALPHA_1) is missing from a replay
+# unless it is injected first.
+_ENV_REGS = ((0x04, 0x00), (0x1C, 0x1C), (0x24, 0x3B), (0x2C, 0x3D), (0x34, 0x44),
+             (0x3C, 0x45), (0x44, 0x46), (0x4C, 0x49))  # PRIM, TEXCLUT, TEXA, FOGCOL, DIMX, DTHE, COLCLAMP, PABE
+_CTX_REGS = ((0x00, 0x18), (0x08, 0x06), (0x10, 0x14), (0x18, 0x08), (0x20, 0x34),
+             (0x28, 0x36), (0x30, 0x40), (0x38, 0x42), (0x40, 0x47), (0x48, 0x4A),
+             (0x50, 0x4C), (0x58, 0x4E))  # XYOFFSET TEX0 TEX1 CLAMP MIPTBP1/2 SCISSOR ALPHA TEST FBA FRAME ZBUF
+_CTX_BASE = 0x7C
+_CTX_STRIDE = 0x60
+
+
+def init_state_packet(state):
+    """One GIF PACKED A+D transfer that restores the freeze's register state."""
+    if struct.unpack_from("<I", state, 0)[0] != 9:
+        raise SystemExit("--init-state: only freeze version 9 handled")
+    ad = []
+    for off, reg in _ENV_REGS:
+        ad.append((struct.unpack_from("<Q", state, off)[0], reg))
+    for c in (0, 1):
+        for off, reg in _CTX_REGS:
+            ad.append((struct.unpack_from("<Q", state, _CTX_BASE + c * _CTX_STRIDE + off)[0], reg + c))
+    tag = len(ad) | (1 << 15) | (0 << 58) | (1 << 60) | (0xE << 64)  # NLOOP, EOP, FLG=PACKED, NREG=1, REGS=A+D
+    blob = struct.pack("<Q", tag & 0xFFFFFFFFFFFFFFFF) + struct.pack("<Q", 0xE)
+    for data, reg in ad:
+        blob += struct.pack("<QQ", data, reg)
+    return {"id": PACKET_TRANSFER, "path": 0, "size": len(blob), "data": blob, "offset": 0}
+
+
+def emit_replay(info, regs, packets, out_path, init_state=None):
     """
     Write a .gsr replay container that ps2x_tests loads at runtime.
 
@@ -295,6 +327,8 @@ def emit_replay(info, regs, packets, out_path):
     GS::processGIFPacket(const uint8_t *, uint32_t).
     """
     transfers = [p for p in packets if p["id"] == PACKET_TRANSFER]
+    if init_state is not None:
+        transfers.insert(0, init_state_packet(init_state))
     blob = bytearray()
     index = bytearray()
     for p in transfers:
@@ -326,6 +360,8 @@ def emit_cpp(info, regs, packets, out_path):
     the table for triage only.
     """
     transfers = [p for p in packets if p["id"] == PACKET_TRANSFER]
+    if init_state is not None:
+        transfers.insert(0, init_state_packet(init_state))
     blob = bytearray()
     entries = []
     for p in transfers:
@@ -383,6 +419,7 @@ def main():
     ap.add_argument("--emit-bin", type=Path, help="concatenate GIF payloads to a flat .bin")
     ap.add_argument("--emit-cpp", type=Path, help="emit a C++ .inc for a replay test")
     ap.add_argument("--dump-regs", type=Path, help="write the 8 KiB priv-register block")
+    ap.add_argument("--init-state", action="store_true", help="with --emit-replay: prepend a synthetic packet restoring the freeze's GS registers (ALPHA/TEST/CLAMP..); shifts transfer indices by 1")
     ap.add_argument("--emit-vram", type=Path, help="write the 4 MiB VRAM image from the GS state (feeds ps2x_gs_bench)")
     ap.add_argument("--path", type=int, choices=[0, 1, 2], help="restrict --emit-bin to one GIF path")
     ap.add_argument("--max-packets", type=int, help="stop after N packets (for probing a suspect dump)")
@@ -400,7 +437,7 @@ def main():
     if args.summary or not (args.emit_replay or args.emit_bin or args.emit_cpp or args.dump_regs or args.emit_vram):
         summarize(info, state, regs, packets)
     if args.emit_replay:
-        emit_replay(info, regs, packets, args.emit_replay)
+        emit_replay(info, regs, packets, args.emit_replay, state if args.init_state else None)
     if args.emit_bin:
         emit_bin(packets, args.emit_bin, args.path)
     if args.emit_cpp:

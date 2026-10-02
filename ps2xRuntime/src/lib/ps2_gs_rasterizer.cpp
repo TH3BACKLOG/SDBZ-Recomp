@@ -1272,6 +1272,26 @@ namespace
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
     }
 
+    // CLAMP_1/2 WMS/WMT: 0 REPEAT, 1 CLAMP, 2 REGION_CLAMP, 3 REGION_REPEAT.
+    // sampleTexture used to clamp unconditionally, so scrolling REPEAT strips
+    // (menu clouds) sampled the edge texel instead of wrapping. Same formulas
+    // as gs/gs_cpu_backend.cpp wrapTextureCoordinate.
+    int wrapTexCoord(int coord, int size, unsigned mode, int regMin, int regMax)
+    {
+        switch (mode & 0x3u)
+        {
+        case 0:
+            return static_cast<int>(static_cast<uint32_t>(coord) & static_cast<uint32_t>(size - 1));
+        case 1:
+            return std::min(std::max(coord, 0), size - 1);
+        case 2:
+            return std::min(std::max(coord, regMin), regMax);
+        default:
+            return static_cast<int>((static_cast<uint32_t>(coord) & static_cast<uint32_t>(regMin)) |
+                                    static_cast<uint32_t>(regMax));
+        }
+    }
+
     u16 Rgba8888ToRgba5551(u32 c)
     {
         uint32_t r = ((c >> 0)  & 0xFF) >> 3;
@@ -1690,36 +1710,59 @@ void GSRasterizer::drawPrimitive(GS *gs)
 
     const auto prim = gs->m_registers.prim;
 
-    // 2026-10-01 probe: Krillin "stretched triangle" artifact. Log triangles
-    // that have a vertex far outside the scissor (a runaway vertex). Capped.
+    // 2026-10-01 probe (v2): Krillin "stretched triangle" artifact. v1 flagged
+    // ordinary off-screen geometry in a 512x448 render target, so it filled its
+    // cap in one frame. Now: a triangle is "stretched" only if its longest edge
+    // exceeds 1200 px AND its bbox overlaps the scissor (i.e. it is visible).
+    // Capped per vsync and in total; logs vsync tick, tbp0 and psm.
     if (prim.prim == GS_PRIM_TRIANGLE || prim.prim == GS_PRIM_TRISTRIP || prim.prim == GS_PRIM_TRIFAN)
     {
         static int s_runaway = 0;
-        if (s_runaway < 60)
+        static uint64_t s_runTick = ~0ull;
+        static int s_runInTick = 0;
+        if (s_runaway < 200)
         {
             const float ox = static_cast<float>(ctx.xyoffset.ofx >> 4);
             const float oy = static_cast<float>(ctx.xyoffset.ofy >> 4);
-            const float lo = -700.0f, hi = 700.0f;
-            bool bad = false;
+            float bx0 = 1.0e9f, bx1 = -1.0e9f, by0 = 1.0e9f, by1 = -1.0e9f, maxEdge = 0.0f;
             for (int i = 0; i < 3; ++i)
             {
                 const GSVertex &q = gs->m_vtxQueue[i];
+                const GSVertex &n = gs->m_vtxQueue[(i + 1) % 3];
                 const float qx = q.x - ox, qy = q.y - oy;
-                if (qx < lo || qx > hi + 640.0f || qy < lo || qy > hi + 448.0f)
-                    bad = true;
+                bx0 = std::min(bx0, qx);
+                bx1 = std::max(bx1, qx);
+                by0 = std::min(by0, qy);
+                by1 = std::max(by1, qy);
+                maxEdge = std::max(maxEdge, std::hypot(q.x - n.x, q.y - n.y));
             }
-            if (bad)
+            const bool visible = bx1 >= static_cast<float>(ctx.scissor.x0) && bx0 <= static_cast<float>(ctx.scissor.x1) &&
+                                 by1 >= static_cast<float>(ctx.scissor.y0) && by0 <= static_cast<float>(ctx.scissor.y1);
+            if (maxEdge > 1200.0f && visible)
             {
-                ++s_runaway;
-                std::cerr << "[runaway] prim=" << static_cast<int>(prim.prim)
-                          << " ofs=(" << ox << "," << oy << ")"
-                          << " scis=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-("
-                          << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")"
-                          << " tme=" << static_cast<int>(prim.tme)
-                          << " v0=(" << gs->m_vtxQueue[0].x << "," << gs->m_vtxQueue[0].y << "," << gs->m_vtxQueue[0].z << ")"
-                          << " v1=(" << gs->m_vtxQueue[1].x << "," << gs->m_vtxQueue[1].y << "," << gs->m_vtxQueue[1].z << ")"
-                          << " v2=(" << gs->m_vtxQueue[2].x << "," << gs->m_vtxQueue[2].y << "," << gs->m_vtxQueue[2].z << ")"
-                          << " fbp=" << ctx.frame.fbp << std::endl;
+                const uint64_t tk = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+                if (tk != s_runTick)
+                {
+                    s_runTick = tk;
+                    s_runInTick = 0;
+                }
+                if (s_runInTick < 5)
+                {
+                    ++s_runInTick;
+                    ++s_runaway;
+                    std::cerr << "[runaway] tick=" << tk << " prim=" << static_cast<int>(prim.prim)
+                              << " edge=" << maxEdge
+                              << " ofs=(" << ox << "," << oy << ")"
+                              << " scis=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-("
+                              << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")"
+                              << " tme=" << static_cast<int>(prim.tme)
+                              << " tbp0=0x" << std::hex << ctx.tex0.tbp0 << std::dec
+                              << " psm=" << static_cast<int>(ctx.tex0.psm)
+                              << " v0=(" << gs->m_vtxQueue[0].x << "," << gs->m_vtxQueue[0].y << "," << gs->m_vtxQueue[0].z << ")"
+                              << " v1=(" << gs->m_vtxQueue[1].x << "," << gs->m_vtxQueue[1].y << "," << gs->m_vtxQueue[1].z << ")"
+                              << " v2=(" << gs->m_vtxQueue[2].x << "," << gs->m_vtxQueue[2].y << "," << gs->m_vtxQueue[2].z << ")"
+                              << " fbp=" << ctx.frame.fbp << std::endl;
+                }
             }
         }
     }
@@ -1782,6 +1825,24 @@ void GSRasterizer::drawPrimitive(GS *gs)
                               << static_cast<int>(gs->m_vtxQueue[0].g) << ","
                               << static_cast<int>(gs->m_vtxQueue[0].b) << ","
                               << static_cast<int>(gs->m_vtxQueue[0].a)
+                              << " wms=" << static_cast<int>(ctx.clamp.wms)
+                              << " wmt=" << static_cast<int>(ctx.clamp.wmt)
+                              << " minu=" << static_cast<int>(ctx.clamp.minu)
+                              << " maxu=" << static_cast<int>(ctx.clamp.maxu)
+                              << " minv=" << static_cast<int>(ctx.clamp.minv)
+                              << " maxv=" << static_cast<int>(ctx.clamp.maxv)
+                              << " cld=" << static_cast<int>(ctx.tex0.cld)
+                              << " csa=" << static_cast<int>(ctx.tex0.csa)
+                              << " csm=" << static_cast<int>(ctx.tex0.csm)
+                              << " tbw=" << static_cast<int>(ctx.tex0.tbw)
+                              << " stq0=(" << gs->m_vtxQueue[0].s << "," << gs->m_vtxQueue[0].t << "," << gs->m_vtxQueue[0].q << ")"
+                              << " stq1=(" << gs->m_vtxQueue[1].s << "," << gs->m_vtxQueue[1].t << "," << gs->m_vtxQueue[1].q << ")"
+                              << " scis=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-("
+                              << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")"
+                              << " ofx=" << (ctx.xyoffset.ofx >> 4) << " ofy=" << (ctx.xyoffset.ofy >> 4)
+                              << " rawx=(" << gs->m_vtxQueue[0].x << "," << gs->m_vtxQueue[1].x << ")"
+                              << " fbw=" << static_cast<int>(ctx.frame.fbw)
+                              << " fpsm=" << static_cast<int>(ctx.frame.psm)
                               << std::endl;
                 }
             }
@@ -2562,8 +2623,10 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
 
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
     {
-        sampleU = clampInt(sampleU, 0, texW - 1);
-        sampleV = clampInt(sampleV, 0, texH - 1);
+        sampleU = wrapTexCoord(sampleU, texW, static_cast<unsigned>(ctx.clamp.wms),
+                               static_cast<int>(ctx.clamp.minu), static_cast<int>(ctx.clamp.maxu));
+        sampleV = wrapTexCoord(sampleV, texH, static_cast<unsigned>(ctx.clamp.wmt),
+                               static_cast<int>(ctx.clamp.minv), static_cast<int>(ctx.clamp.maxv));
 
         u32 out = gs->ReadTexturePageCache(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 

@@ -118,6 +118,65 @@ namespace
         std::fclose(f);
         return true;
     }
+
+    size_t envIndex(const char *name, size_t fallback)
+    {
+        const char *v = std::getenv(name);
+        return (v && *v) ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : fallback;
+    }
+
+    // PS2X_GSBENCH_WATCH="fbp,fbw,x,y,w,h": after each transfer, hash that screen rect of
+    // the frame buffer and list the draws whose bbox overlaps it, so a missing region can
+    // be blamed on a draw (or on no draw at all).
+    struct Watch
+    {
+        bool on = false;
+        int fbp = 0;
+        unsigned fbw = 0, x = 0, y = 0, w = 0, h = 0;
+    };
+
+    // Raw GS coordinates in the debug history still carry XYOFFSET; menu/fight use 1792/1824.
+    constexpr float kOfx = 1792.0f;
+    constexpr float kOfy = 1824.0f;
+
+    void reportWatch(GS &gs, const Watch &wt, size_t transferIdx, uint64_t &lastHash)
+    {
+        ps2xGsRasterFlush();
+        uint64_t h = 1469598103934665603ull;
+        unsigned nonBlack = 0;
+        for (unsigned y = wt.y; y < wt.y + wt.h; ++y)
+            for (unsigned x = wt.x; x < wt.x + wt.w; ++x)
+            {
+                const uint32_t p = gs.ReadVram(0u, static_cast<uint32_t>(wt.fbp), wt.fbw, x, y);
+                h = (h ^ p) * 1099511628211ull;
+                nonBlack += (p & 0x00FFFFFFu) != 0u;
+            }
+        const bool changed = h != lastHash;
+        lastHash = h;
+        bool anyDraw = false;
+        for (const GSDebugHistoryEntry &e : gs.getDebugHistory())
+        {
+            if (e.kind != GSDebugEventKind::Draw)
+                continue;
+            const float x0 = e.xMin - kOfx, y0 = e.yMin - kOfy, x1 = e.xMax - kOfx, y1 = e.yMax - kOfy;
+            if (x1 < wt.x || x0 > wt.x + wt.w || y1 < wt.y || y0 > wt.y + wt.h)
+                continue;
+            anyDraw = true;
+            std::printf("[watch] t=%zu changed=%d nonblack=%u hash=%016llx draw bbox=(%.2f,%.2f)-(%.2f,%.2f) "
+                        "prim=%u tme=%u abe=%u fbp=0x%x tbp0=%u cbp=%u tpsm=%u ate=%u atst=%u zte=%u ztst=%u verts=%u\n",
+                        transferIdx, changed ? 1 : 0, nonBlack, static_cast<unsigned long long>(h), x0, y0, x1, y1,
+                        static_cast<unsigned>(e.prim.prim), e.prim.tme ? 1u : 0u, e.prim.abe ? 1u : 0u,
+                        static_cast<unsigned>(e.frame.fbp), static_cast<unsigned>(e.tex0.tbp0),
+                        static_cast<unsigned>(e.tex0.cbp), static_cast<unsigned>(e.tex0.psm),
+                        static_cast<unsigned>(e.test & 1u), static_cast<unsigned>((e.test >> 1) & 7u),
+                        static_cast<unsigned>((e.test >> 16) & 1u), static_cast<unsigned>((e.test >> 17) & 3u),
+                        e.vertexCount);
+        }
+        if (changed && !anyDraw)
+            std::printf("[watch] t=%zu changed=1 nonblack=%u hash=%016llx nodraw\n", transferIdx, nonBlack,
+                        static_cast<unsigned long long>(h));
+        gs.clearDebugHistory();
+    }
 }
 
 int main(int argc, char **argv)
@@ -148,6 +207,16 @@ int main(int argc, char **argv)
     if (threaded)
         std::printf("[gsbench] threaded: packets go through the GS thread queue\n");
 
+    // Debug options for tools/gfx_scene_diff.py. All opt-in, none affect timing runs.
+    const size_t stopAt = envIndex("PS2X_GSBENCH_STOP", SIZE_MAX);
+    const size_t skipAt = envIndex("PS2X_GSBENCH_SKIP", SIZE_MAX);
+    Watch watch;
+    if (const char *spec = std::getenv("PS2X_GSBENCH_WATCH"))
+        watch.on = std::sscanf(spec, "%i,%u,%u,%u,%u,%u", &watch.fbp, &watch.fbw, &watch.x, &watch.y,
+                               &watch.w, &watch.h) == 6;
+    if (watch.on)
+        std::printf("[gsbench] watch fbp=0x%x rect=%u,%u %ux%u\n", watch.fbp, watch.x, watch.y, watch.w, watch.h);
+
     std::vector<uint8_t> vram(kVramSize);
     std::vector<double> times;
     ps2x_host_sampler_start();
@@ -160,15 +229,28 @@ int main(int argc, char **argv)
         GS gs;
         gs.init(vram.data(), kVramSize, nullptr);
 
+        const bool watching = watch.on && r == repeat - 1;
+        if (watching)
+            gs.setDebugHistoryPaused(false);
+        uint64_t lastHash = 0u;
+        size_t transferIdx = 0u;
         const auto t0 = std::chrono::steady_clock::now();
         for (const GsrTransfer &t : transfers)
-            if (t.size != 0u)
-            {
-                if (threaded)
-                    ps2xGsThreadSubmit(&gs, payload + t.offset, t.size);
-                else
-                    gs.processGIFPacket(payload + t.offset, t.size);
-            }
+        {
+            const size_t cur = transferIdx++;
+            if (t.size == 0u)
+                continue;
+            if (cur >= stopAt)
+                break;
+            if (cur == skipAt)
+                continue;
+            if (threaded)
+                ps2xGsThreadSubmit(&gs, payload + t.offset, t.size);
+            else
+                gs.processGIFPacket(payload + t.offset, t.size);
+            if (watching)
+                reportWatch(gs, watch, cur, lastHash);
+        }
         if (threaded)
             ps2xGsThreadSync(0u);
         ps2xGsRasterFlush(); // raster threads finish before the clock stops

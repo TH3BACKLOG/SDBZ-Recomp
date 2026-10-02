@@ -16,6 +16,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 // Threaded rasterizer (ps2_gs_raster_mt.inl): wait for, or tell it about, VRAM
@@ -5918,8 +5919,130 @@ void GS::vertexKick(bool drawing)
     }
 }
 
+// [texhash] -- missing-graphics audit, layer L3. Opt-in: PS2X_TEXHASH_LOG=<path>.
+// One JSONL line per completed host->local image transfer: tick, destination,
+// size, and an FNV-1a 64 hash over exactly the transfer's pixel bytes (padding
+// past rrw*rrh pixels is excluded so PCSX2 dumps hash identically). Costs one
+// getenv when unset. Lives here so no header changes.
+namespace
+{
+    std::FILE *texhashFile()
+    {
+        static std::FILE *f = []() -> std::FILE *
+        {
+            const char *p = std::getenv("PS2X_TEXHASH_LOG");
+            if (!p || !*p)
+                return nullptr;
+            std::FILE *o = std::fopen(p, "wb");
+            if (o)
+                std::cerr << "[texhash] ACTIVE path=" << p << std::endl;
+            else
+                std::cerr << "[texhash] FAILED to open path=" << p << std::endl;
+            return o;
+        }();
+        return f;
+    }
+
+    uint32_t texhashBitsPerPixel(uint32_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT32:
+        case GS_PSM_Z32:
+            return 32;
+        case GS_PSM_CT24:
+        case GS_PSM_Z24:
+            return 24;
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            return 16;
+        case GS_PSM_T4:
+        case GS_PSM_T4HL:
+        case GS_PSM_T4HH:
+            return 4;
+        default: // T8, T8H
+            return 8;
+        }
+    }
+
+    struct TexhashScopeExit
+    {
+        std::function<void()> fn;
+        ~TexhashScopeExit() { fn(); }
+    };
+}
+
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    std::FILE *const thFile = texhashFile();
+    const bool thOn = thFile && data && m_registers.trxdir.xdir == 0;
+    const auto thBuf = m_registers.bitbltbuf;
+    const auto thReg = m_registers.trxreg;
+    const auto thPos = m_registers.trxpos;
+    static uint64_t s_thHash = 0;
+    static uint64_t s_thBytes = 0;
+    static uint64_t s_thWant = 0;
+    // Optional raw payload dump (PS2X_TEXHASH_DUMPDIR=<existing dir>): one
+    // .bin per unique hash so textures can be decoded and looked at offline.
+    static const char *const thDumpDir = []() -> const char *
+    {
+        const char *p = std::getenv("PS2X_TEXHASH_DUMPDIR");
+        return (p && *p) ? p : nullptr;
+    }();
+    static std::vector<uint8_t> s_thPayload;
+    static std::unordered_set<uint64_t> s_thDumped;
+    if (thOn)
+    {
+        if (m_transferState.copied_pixels == 0)
+        {
+            s_thHash = 1469598103934665603ull;
+            s_thBytes = 0;
+            s_thWant = (static_cast<uint64_t>(thReg.rrw) * thReg.rrh * texhashBitsPerPixel(thBuf.dpsm) + 7u) / 8u;
+        }
+        if (m_transferState.copied_pixels == 0)
+            s_thPayload.clear();
+        const uint64_t take = std::min<uint64_t>(sizeBytes, s_thWant > s_thBytes ? s_thWant - s_thBytes : 0ull);
+        for (uint64_t i = 0; i < take; ++i)
+            s_thHash = (s_thHash ^ data[i]) * 1099511628211ull;
+        if (thDumpDir)
+            s_thPayload.insert(s_thPayload.end(), data, data + take);
+        s_thBytes += take;
+    }
+    TexhashScopeExit thEnd{[&]()
+    {
+        if (!thOn || m_registers.trxdir.xdir != 3)
+            return;
+        const uint64_t tick = m_runtime ? ps2_syscalls::GetCurrentVSyncTick(m_runtime) : 0ull;
+        std::fprintf(thFile,
+                     "{\"k\":\"T\",\"v\":%llu,\"dbp\":%u,\"dbw\":%u,\"dpsm\":%u,\"x\":%u,\"y\":%u,"
+                     "\"w\":%u,\"h\":%u,\"bytes\":%llu,\"want\":%llu,\"h64\":\"%016llx\"}\n",
+                     static_cast<unsigned long long>(tick),
+                     static_cast<unsigned>(thBuf.dbp), static_cast<unsigned>(thBuf.dbw),
+                     static_cast<unsigned>(thBuf.dpsm),
+                     static_cast<unsigned>(thPos.dsax), static_cast<unsigned>(thPos.dsay),
+                     static_cast<unsigned>(thReg.rrw), static_cast<unsigned>(thReg.rrh),
+                     static_cast<unsigned long long>(s_thBytes),
+                     static_cast<unsigned long long>(s_thWant),
+                     static_cast<unsigned long long>(s_thHash));
+        std::fflush(thFile);
+        if (thDumpDir && s_thBytes == s_thWant && s_thDumped.insert(s_thHash).second)
+        {
+            char name[512];
+            std::snprintf(name, sizeof(name), "%s/%016llx_%ux%u_psm%u.bin", thDumpDir,
+                          static_cast<unsigned long long>(s_thHash),
+                          static_cast<unsigned>(thReg.rrw), static_cast<unsigned>(thReg.rrh),
+                          static_cast<unsigned>(thBuf.dpsm));
+            if (std::FILE *o = std::fopen(name, "wb"))
+            {
+                std::fwrite(s_thPayload.data(), 1, s_thPayload.size(), o);
+                std::fclose(o);
+            }
+        }
+        s_thBytes = 0;
+    }};
+
     if (ps2_diag::enabled())
     {
         // Image-transfer byte counter consumed by the [gs-activity] probe;

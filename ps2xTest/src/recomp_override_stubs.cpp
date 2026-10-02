@@ -85,3 +85,145 @@ void mem_copy_0x18e250(uint8_t *, R5900Context *, PS2Runtime *)
 {
     ps2xTestGuestStub("mem_copy_0x18e250");
 }
+
+// Callees of the recovered sub_293200 (ps2_runtime.lib); same abort-stub rule as above.
+void blend_state_get_field410_0x1c60e0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_get_field410_0x1c60e0");
+}
+
+void blend_state_is_idle_0x1c62a0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_is_idle_0x1c62a0");
+}
+
+void blend_state_start_0x1c6320(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_start_0x1c6320");
+}
+
+void blend_state_stop_0x1c62d0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_stop_0x1c62d0");
+}
+
+void camera_fade_is_active_0x2c1bb0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("camera_fade_is_active_0x2c1bb0");
+}
+
+void camera_fade_set_0x2c1830(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("camera_fade_set_0x2c1830");
+}
+
+void camera_set_mode_0x2c1c20(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("camera_set_mode_0x2c1c20");
+}
+
+void math_acos_f_0x185bd8(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("math_acos_f_0x185bd8");
+}
+
+void math_asin_f_0x185e78(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("math_asin_f_0x185e78");
+}
+
+void mem_fill_z_31_clone_18_0x2926d0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("mem_fill_z_31_clone_18_0x2926d0");
+}
+
+void noop_wrapper____0x1f59c0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("noop_wrapper____0x1f59c0");
+}
+
+void noop_wrapper____0x240710(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("noop_wrapper____0x240710");
+}
+
+void obj_change_state_0x1cbe80(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_change_state_0x1cbe80");
+}
+
+void obj_enable_sphere_collide_0x1e6290(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_enable_sphere_collide_0x1e6290");
+}
+
+void obj_get_sub_entry_field_0x23a080(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_get_sub_entry_field_0x23a080");
+}
+
+void obj_set_fields_0x1e6260(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_set_fields_0x1e6260");
+}
+
+void singleton_sub_2be0_clone_01_0x23ad00(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("singleton_sub_2be0_clone_01_0x23ad00");
+}
+
+void sound_play_3d_0x2fd640(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sound_play_3d_0x2fd640");
+}
+
+void sub_0019E440_0x19e440(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_0019E440_0x19e440");
+}
+
+void sub_001CB750_0x1cb750(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_001CB750_0x1cb750");
+}
+
+void sub_001CD9D0_0x1cd9d0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_001CD9D0_0x1cd9d0");
+}
+
+void sub_001CDAF0_0x1cdaf0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_001CDAF0_0x1cdaf0");
+}
+
+void sub_00292450_0x292450(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00292450_0x292450");
+}
+
+void sub_00292570_0x292570(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00292570_0x292570");
+}
+
+void sub_00294900_0x294900(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00294900_0x294900");
+}
+
+void sub_00294A90_0x294a90(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00294A90_0x294a90");
+}
+
+void sub_00294B40_0x294b40(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00294B40_0x294b40");
+}
+
+void table_entry_get_stride8_0x3a32f0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("table_entry_get_stride8_0x3a32f0");
+}
+
