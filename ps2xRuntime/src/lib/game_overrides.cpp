@@ -282,6 +282,10 @@ void sdbzPoolBaseProbe199DB0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runt
     singleton_get_camera_0x199db0(rdram, ctx, runtime);
     const uint32_t base = GPR_U32(ctx, 2);
     const int64_t offset = static_cast<int64_t>(0x8a6440u) - static_cast<int64_t>(base);
+    // Capped: called ~1.5M times/run (10-02 run: 219 MB log, main slowdown).
+    static int s_poolbaseLogged = 0;
+    if (s_poolbaseLogged++ >= 16)
+        return;
     RUNTIME_LOG("[poolbase] base=0x" << std::hex << base
         << " target=0x8a6440 offset=0x" << offset
         << " inRange=" << std::dec << ((offset >= 0 && offset < 0xC000) ? 1 : 0));

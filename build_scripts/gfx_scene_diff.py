@@ -55,14 +55,29 @@ def prepare(dump, out):
     return gsr
 
 
-def display_geometry(dump, out):
+def gsr_regs(gsr):
+    """Privileged register block stored in a .gsr (PCSX2 layout)."""
+    import struct
+    raw = Path(gsr).read_bytes()
+    if raw[:4] != b"GSR1":
+        sys.exit(f"{gsr} is not a GSR1 file")
+    regs_size = struct.unpack_from("<I", raw, 12)[0]
+    return raw[24:24 + regs_size]
+
+
+def display_geometry(dump, out, regs_bytes=None):
     """Read DISPFB/DISPLAY/PMODE from the dump's privileged registers -> (fbp, fbw, w, h)."""
     import struct
-    regs = out / "regs.bin"
-    rc, txt = run([sys.executable, str(PARSE), str(dump), "--dump-regs", str(regs)])
-    if rc != 0 or not regs.exists():
+    if regs_bytes is not None:
+        r = regs_bytes
+    else:
+        regs = out / "regs.bin"
+        rc, txt = run([sys.executable, str(PARSE), str(dump), "--dump-regs", str(regs)])
+        if rc != 0 or not regs.exists():
+            return None
+        r = regs.read_bytes()
+    if len(r) < 0xA8:
         return None
-    r = regs.read_bytes()
     q = lambda off: struct.unpack_from("<Q", r, off)[0]
     pmode = q(0x00)
     use2 = bool(pmode & 2) and not (pmode & 1)
@@ -172,9 +187,36 @@ def verdict(rows):
     return f"last pixel-changing draw: {describe(changers[-1])}"
 
 
+def steps(gsr, rect, fbp, fbw, out, rows, limit):
+    """One frame per transfer that changed the rect: replay up to and including it."""
+    ts = sorted({r["t"] for r in rows if r["changed"]})
+    if len(ts) > limit:
+        print(f"    {len(ts)} changing transfers; keeping the last {limit} (raise --steps-max)")
+        ts = ts[-limit:]
+    x, y, w, h = rect
+    sdir = out / "steps"
+    sdir.mkdir(exist_ok=True)
+    for old in sdir.glob("step_*.png"):
+        old.unlink()
+    for t in ts:
+        bmp = sdir / "step.bmp"
+        if bmp.exists():
+            bmp.unlink()
+        render(gsr, bmp, fbp, fbw, {"PS2X_GSBENCH_STOP": str(t + 1)})
+        img = load(bmp)
+        img.save(sdir / f"step_{t:05d}.png")
+        crop = np.asarray(img)[y:y + h, x:x + w]
+        what = "; ".join(describe(r) for r in rows if r["t"] == t)[:230]
+        print(f"      step t={t} rect lum={crop.mean():.1f} nonblack={int((crop.sum(axis=2) > 0).sum())}  {what}")
+    print(f"    {len(ts)} step frame(s) -> {sdir}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("dump")
+    ap.add_argument("dump", help="PCSX2 .gs/.gs.zst dump, or a .gsr from a live PS2X_GSCAP capture")
+    ap.add_argument("--steps", action="store_true",
+                    help="with --rect: write one frame per transfer that changed the rect (out/steps)")
+    ap.add_argument("--steps-max", type=int, default=40)
     ap.add_argument("--ref", help="PCSX2 frame image (default: sibling .png of the dump)")
     ap.add_argument("--out", help="output dir (default: gsdump/scene_<dumpname>)")
     ap.add_argument("--fbp", type=lambda s: int(s, 0), help="presented frame buffer (default: from the dump's DISPFB)")
@@ -193,9 +235,12 @@ def main():
     out = Path(a.out) if a.out else ROOT / "gsdump" / ("scene_" + re.sub(r"\W+", "_", dump.name.split(".gs")[0]))
     out.mkdir(parents=True, exist_ok=True)
 
-    gsr = prepare(dump, out)
+    live = dump.suffix.lower() == ".gsr"
+    if live and not dump.with_suffix(".vram").exists():
+        print(f"    WARNING no {dump.with_suffix('.vram').name} next to the capture: VRAM starts zeroed")
+    gsr = dump if live else prepare(dump, out)
     global W, H
-    geo = display_geometry(dump, out)
+    geo = display_geometry(dump, out, gsr_regs(gsr) if live else None)
     if geo:
         gfbp, gfbw, W, H = geo
         print(f"    display from dump regs: fbp=0x{gfbp:x} fbw={gfbw} {W}x{H}")
@@ -218,6 +263,10 @@ def main():
         render(gsr, ref_bmp, a.fbp, a.fbw)
         ref_img = load(ref_bmp)
         ref_note = "ref = full replay (self-test)"
+    elif live and not a.ref:
+        # A live capture has no oracle frame: blame/steps only.
+        ref_img = load(ours_bmp)
+        ref_note = "no ref (live capture): pass --ref <png> to compare, --rect to blame"
     else:
         ref_path = Path(a.ref) if a.ref else dump.with_name(dump.name.split(".gs")[0] + ".png")
         if not ref_path.exists():
@@ -234,7 +283,7 @@ def main():
     regions, d = find_regions(ours, ref, a.thresh)
     tot = float(d.mean())
     print(f"[3] mean abs diff {tot:.2f}; {len(regions)} differing region(s) (block {BLOCK}px, thresh {a.thresh})")
-    if not regions:
+    if not regions and not (live and not a.ref):
         print("    no regions differ: our rasterizer reproduces PCSX2's frame for this dump.")
 
     todo = [(f"region#{i}", r["rect"], r) for i, r in enumerate(regions[: a.top])]
@@ -256,6 +305,10 @@ def main():
             print("      " + describe(q))
         if skip is not None and any(q["t"] == skip for q in rows):
             print(f"    self-test: transfer {skip} appears in the blame list -> PASS")
+        if a.steps and r is None:
+            fbps = sorted({q["fbp"] for q in draws})
+            print(f"    draws over this rect target fbp {', '.join(fbps) or 'none'}; watching fbp=0x{a.fbp:x} (--fbp to change)")
+            steps(gsr, rect, a.fbp, a.fbw, out, rows, a.steps_max)
 
     # side-by-side image
     gap = np.full((H, 4, 3), 255, np.uint8)

@@ -533,6 +533,105 @@ namespace
         return std::string(gsDumpDir()) + buf;
     }
 
+    // ---------------------------------------------------------------------
+    // [gscap] -- live GIF stream capture for the offline replay.
+    //
+    // PS2X_GSCAP="<tick>,<frames>,<path>" writes <path>.vram (VRAM at the
+    // start) and <path>.gsr (every packet handed to processGIFPacket for
+    // <frames> vsync ticks), the same container ps2x_gs_bench.exe replays
+    // from a PCSX2 dump. Transfer 0 is a synthetic A+D packet restoring the
+    // GS registers, as gsdump_parse.py --init-state does, so bench transfer
+    // indices line up the same way. Opt-in: a normal run pays one getenv.
+    //
+    // Not captured: the CLUT buffer (the replay reloads it from VRAM on the
+    // TEX0 write) and a primitive whose vertices straddle the start.
+    // ---------------------------------------------------------------------
+    struct GsCap
+    {
+        bool wanted = false;
+        bool active = false;
+        bool done = false;
+        uint64_t startTick = 0;
+        uint64_t frames = 1;
+        uint64_t beginTick = 0;
+        std::string path;
+        std::vector<uint8_t> regs;
+        std::vector<uint32_t> index; // {offset, size, path} per transfer
+        std::vector<uint8_t> payload;
+    };
+
+    constexpr size_t kGsCapMaxPayload = 256u * 1024u * 1024u;
+
+    GsCap &gsCap()
+    {
+        static GsCap cap = [] {
+            GsCap c;
+            if (const char *spec = std::getenv("PS2X_GSCAP"))
+            {
+                unsigned long long tick = 0ull, frames = 0ull;
+                char out[512] = {};
+                if (std::sscanf(spec, "%llu,%llu,%511[^\n]", &tick, &frames, out) == 3 && frames != 0ull && out[0])
+                {
+                    c.wanted = true;
+                    c.startTick = tick;
+                    c.frames = frames;
+                    c.path = out;
+                    std::cerr << "[gscap] armed tick=" << tick << " frames=" << frames << " path=" << c.path << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[gscap] bad PS2X_GSCAP (want \"<tick>,<frames>,<path>\"): " << spec << std::endl;
+                }
+            }
+            return c;
+        }();
+        return cap;
+    }
+
+    void gsCapAppend(GsCap &cap, const uint8_t *data, uint32_t sizeBytes)
+    {
+        cap.index.push_back(static_cast<uint32_t>(cap.payload.size()));
+        cap.index.push_back(sizeBytes);
+        cap.index.push_back(0u);
+        cap.payload.insert(cap.payload.end(), data, data + sizeBytes);
+    }
+
+    bool gsCapWriteVram(const GsCap &cap, const uint8_t *vram, uint32_t vramSize)
+    {
+        std::FILE *f = std::fopen((cap.path + ".vram").c_str(), "wb");
+        if (!f)
+            return false;
+        const bool ok = std::fwrite(vram, 1, vramSize, f) == vramSize;
+        std::fclose(f);
+        return ok;
+    }
+
+    void gsCapFinish(GsCap &cap, uint64_t endTick)
+    {
+        cap.active = false;
+        cap.done = true;
+        const std::string out = cap.path + ".gsr";
+        std::FILE *f = std::fopen(out.c_str(), "wb");
+        if (!f)
+        {
+            std::cerr << "[gscap] cannot write " << out << std::endl;
+            return;
+        }
+        const uint32_t fields[5] = {1u, static_cast<uint32_t>(cap.index.size() / 3u),
+                                    static_cast<uint32_t>(cap.regs.size()),
+                                    static_cast<uint32_t>(cap.payload.size()), 0u};
+        std::fwrite("GSR1", 1, 4, f);
+        std::fwrite(fields, sizeof(uint32_t), 5, f);
+        std::fwrite(cap.regs.data(), 1, cap.regs.size(), f);
+        std::fwrite(cap.index.data(), sizeof(uint32_t), cap.index.size(), f);
+        std::fwrite(cap.payload.data(), 1, cap.payload.size(), f);
+        std::fclose(f);
+        std::cerr << "[gscap] wrote " << out << " transfers=" << fields[1] << " bytes=" << fields[3]
+                  << " ticks=" << cap.beginTick << ".." << endTick << std::endl;
+        cap.index = {};
+        cap.payload = {};
+    }
+
     // Uncompressed 32-bit TGA, top-left origin. Input is the host RGBA buffer
     // produced by copyFrameToHostRgbaUnlocked; TGA wants BGRA.
     bool writeTgaRgba(const std::string &path, uint32_t w, uint32_t h,
@@ -4643,6 +4742,103 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!data || sizeBytes == 0 || !m_vram)
         return;
+
+    // [gscap] see gsCap() above.
+    if (GsCap &cap = gsCap(); cap.wanted && !cap.done)
+    {
+        const uint64_t tk = m_runtime ? ps2_syscalls::GetCurrentVSyncTick(m_runtime) : 0ull;
+        if (!cap.active && tk >= cap.startTick)
+        {
+            // Start between transfers so the first recorded packet begins with
+            // a GIFtag; after 60 ticks of waiting start anyway and say so.
+            const bool idle = m_pendingImageBytes == 0 &&
+                              m_transferState.copied_pixels >= m_transferState.total_pixels;
+            if (idle || tk >= cap.startTick + 60ull)
+            {
+                ps2xGsRasterFlush();
+                if (!gsCapWriteVram(cap, m_vram, m_vramSize))
+                {
+                    std::cerr << "[gscap] cannot write " << cap.path << ".vram" << std::endl;
+                    cap.done = true;
+                }
+                else
+                {
+                    // Privileged block in PCSX2's layout (PMODE@0, DISPFB1@0x70,
+                    // DISPLAY1@0x80, DISPFB2@0x90, DISPLAY2@0xA0) for the tools.
+                    cap.regs.assign(8192u, uint8_t{0});
+                    if (m_privRegs)
+                    {
+                        const uint64_t priv[5][2] = {{0x00u, m_privRegs->pmode},
+                                                     {0x70u, m_privRegs->dispfb1},
+                                                     {0x80u, m_privRegs->display1},
+                                                     {0x90u, m_privRegs->dispfb2},
+                                                     {0xA0u, m_privRegs->display2}};
+                        for (const auto &p : priv)
+                            std::memcpy(cap.regs.data() + p[0], &p[1], sizeof(uint64_t));
+                    }
+
+                    std::vector<uint64_t> ad; // {data, reg} pairs
+                    const auto put = [&ad](uint32_t reg, uint64_t value) {
+                        ad.push_back(value);
+                        ad.push_back(reg);
+                    };
+                    put(GS_REG_PRMODECONT, m_registers.prmodecont.data);
+                    put(GS_REG_PRMODE, m_registers.prmode.data);
+                    put(GS_REG_TEXCLUT, m_registers.texclut.data);
+                    put(GS_REG_SCANMSK, m_registers.scanmsk.data);
+                    put(GS_REG_TEXA, m_registers.texa.data);
+                    put(GS_REG_FOGCOL, m_registers.fogcol.data);
+                    put(GS_REG_DIMX, m_registers.dimx.data);
+                    put(GS_REG_DTHE, m_registers.dthe.data);
+                    put(GS_REG_COLCLAMP, m_registers.colclamp.data);
+                    put(GS_REG_PABE, m_registers.pabe.data);
+                    put(GS_REG_FOG, m_registers.fog.data);
+                    put(GS_REG_BITBLTBUF, m_registers.bitbltbuf.data);
+                    put(GS_REG_TRXPOS, m_registers.trxpos.data);
+                    put(GS_REG_TRXREG, m_registers.trxreg.data);
+                    for (uint8_t c = 0u; c < 2u; ++c)
+                    {
+                        const GSContext &x = m_registers.ctx[c];
+                        put(GS_REG_XYOFFSET_1 + c, x.xyoffset.data);
+                        put(GS_REG_TEX1_1 + c, x.tex1.data);
+                        put(GS_REG_CLAMP_1 + c, x.clamp.data);
+                        put(GS_REG_MIPTBP1_1 + c, x.miptbp1.data);
+                        put(GS_REG_MIPTBP2_1 + c, x.miptbp2.data);
+                        put(GS_REG_SCISSOR_1 + c, x.scissor.data);
+                        put(GS_REG_ALPHA_1 + c, x.alpha.data);
+                        put(GS_REG_TEST_1 + c, x.test.data);
+                        put(GS_REG_FBA_1 + c, x.fba.data);
+                        put(GS_REG_FRAME_1 + c, x.frame.data);
+                        put(GS_REG_ZBUF_1 + c, x.zbuf.data);
+                        put(GS_REG_TEX0_1 + c, x.tex0.data); // after TEXCLUT: reloads the CLUT
+                    }
+                    put(GS_REG_RGBAQ, m_registers.rgbaq.data);
+                    put(GS_REG_ST, m_registers.st.data);
+                    put(GS_REG_UV, m_registers.uv.data);
+                    put(GS_REG_PRIM, m_registers.prim.data);
+
+                    // PACKED, NREG=1, REGS=A+D, EOP.
+                    const uint64_t tag[2] = {(ad.size() / 2u) | (1ull << 15) | (1ull << 60), 0xEull};
+                    std::vector<uint8_t> init(sizeof(tag) + ad.size() * sizeof(uint64_t));
+                    std::memcpy(init.data(), tag, sizeof(tag));
+                    std::memcpy(init.data() + sizeof(tag), ad.data(), ad.size() * sizeof(uint64_t));
+                    gsCapAppend(cap, init.data(), static_cast<uint32_t>(init.size()));
+
+                    cap.active = true;
+                    cap.beginTick = tk;
+                    std::cerr << "[gscap] start tick=" << tk << " idle=" << (idle ? 1 : 0)
+                              << " pendingImage=" << m_pendingImageBytes << std::endl;
+                }
+            }
+        }
+        if (cap.active)
+        {
+            if (tk >= cap.beginTick + cap.frames || cap.payload.size() + sizeBytes > kGsCapMaxPayload)
+                gsCapFinish(cap, tk);
+            else
+                gsCapAppend(cap, data, sizeBytes);
+        }
+    }
 
     // Drain any IMAGE payload still owed from a previous packet before this
     // buffer is interpreted as GIFtags -- the leading qwords are raw pixel

@@ -93,6 +93,7 @@ void sub_00240980_0x240980(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtim
 void sub_00240B10_0x240b10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00241C90_0x241c90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00241CB0_0x241cb0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_293200_0x293200(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_002972F0_0x2972f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_2B1310_tail002B6880_0x2b6880(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_002B8AC0_0x2b8ac0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -196,6 +197,7 @@ inline constexpr RecoveredFn kRecoveredFns[] = {
     {0x00240B10u, 0x00240B30u, &sub_00240B10_0x240b10},
     {0x00241C90u, 0x00241CD0u, &sub_00241C90_0x241c90},
     {0x00241CB0u, 0x00241CCCu, &sub_00241CB0_0x241cb0},
+    {0x00293200u, 0x002944D4u, &sub_293200_0x293200},
     {0x002972F0u, 0x00297310u, &sub_002972F0_0x2972f0},
     {0x002B6880u, 0x002B6900u, &sub_2B1310_tail002B6880_0x2b6880},
     {0x002B8AC0u, 0x002B8ADCu, &sub_002B8AC0_0x2b8ac0},

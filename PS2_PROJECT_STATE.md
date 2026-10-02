@@ -268,6 +268,15 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
 
+## Part 171 (2026-10-02) -- revise protocol: stop probing, replay our own GS frame offline
+
+- Session-start check: exe 05:05 already contains the `0x293200` recovery and the `[botdraw]` scis fields; 900 s run at 05:51 has `missing-target`=0 (reach of `0x23a830` unproven) and `[runaway]`=0.
+- VERIFIED from that log: cloud strips reach the rasterizer every sampled tick with `scis=(0,0)-(511,447)`; scissor drop FALSIFIED. Draw order at tick 5310 (fbp=112): bg, full-screen alpha-64 tint, 2 tris, strip x 233..745, strip x -278..233, 4 small clouds, **panel (24,272)-(488,448) cbp 11804 AFTER the clouds**, clear of fbp=0.
+- HYPOTHESIS A: the panel overpaints the clouds (its texels should be transparent there). HYPOTHESIS B: left strip paints wrong texels.
+- New tooling (syntax-checked, NOT built/run): `PS2X_GSCAP="<tick>,<frames>,<path>"` in `ps2_gs_gpu.cpp` writes `<path>.gsr` + `<path>.vram` from a live run. `gfx_scene_diff.py` now accepts a `.gsr` and has `--steps` (one PNG per transfer that changed `--rect`). Script side verified on `gsdump\frame.gsr`.
+- NEXT: build RelWithDebInfo; one menu run with `PS2X_GSCAP` + `PS2X_REC=1`; control = replay final frame vs REC PNG; then `--rect 0,320,512,128 --steps`. Same method for Krillin.
+- Upstream: only #256 (README). PCSX2 MCP not connected; a Shift+F8 menu dump is still wanted as the oracle.
+
 ## Part 168 (2026-09-30) -- pad diagnostics; "fight" runs were NOT fights
 
 - Added `PS2X_PAD_AUTOPRESS_SECS` (stop pulses N s after first pad poll) and `[pad] host change` edge log. Both verified: pad edges reach `readState`; PADMAN serves SIO2 polls.
