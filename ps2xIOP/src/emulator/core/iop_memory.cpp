@@ -247,6 +247,14 @@ namespace ps2x::iop::detail
         }
 
         m_hardware[address] = value;
+        // 2026-10-01: SPU2 is a plain register store, so ENDX (core0 0x340/342,
+        // core1 0x740/742) never latched. ARKD_DVD's voice poller (sub_2C90)
+        // only clears a voice's busy bit in sreg14/15 once ENDX reports it, so
+        // voices 3 and 17 stayed busy forever => scene node 0x1C stuck (PLEASE
+        // WAIT, looping outro). KON is word 0x188 / 0x588: report every keyed
+        // voice as ended at once (no sample playback to time it against).
+        if (address == 0x1F900188u || address == 0x1F900588u)
+            m_hardware[address + 0x1B8u] |= (value & 0x00FFFFFFu);
         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
             return;
 
