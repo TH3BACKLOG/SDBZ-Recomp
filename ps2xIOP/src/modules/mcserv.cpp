@@ -299,9 +299,10 @@ namespace ps2x::iop::detail
                 case Operation::Delete:
                     return call(MemoryCardOperation::Delete, port, slot, nameAddress);
                 case Operation::GetDir:
-                    // MCSERV normally DMA-writes entries. The existing HLE returns
-                    // zero entries instead of fabricating directory contents.
-                    return kSucceeded;
+                    // Host adapter lists the host card directory and writes the
+                    // entry table straight into guest RAM (a3 = table, stack = maxent).
+                    return call(MemoryCardOperation::GetDir, port, slot, nameAddress, parameter.pointer,
+                                static_cast<uint32_t>(parameter.maxEntries));
                 case Operation::GetEnt:
                     return 1024;
                 default:

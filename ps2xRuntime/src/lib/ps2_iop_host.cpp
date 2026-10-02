@@ -1,3 +1,4 @@
+#include <atomic>
 #include "ps2_iop_host.h"
 
 #include "ps2_runtime.h"
@@ -470,11 +471,40 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
 
     // EE n32 ABI: the fifth argument travels in $t0, matching the sceMc* stubs.
     setRegU32(&context, 8, request.arguments[4]);
+    if (request.operation == ps2x::iop::MemoryCardOperation::GetDir)
+    {
+        setRegU32(&context, 9, request.arguments[3]); // table address (t1)
+    }
 
     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
             &context,
             &m_runtime);
-    return ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
+    const int32_t mcResult = ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
+    {
+        // save-detection probe: every mcserv request the guest makes + our answer
+        static std::atomic<uint32_t> s_mcLogs{0u};
+        if (s_mcLogs.fetch_add(1u, std::memory_order_relaxed) < 3000u)
+        {
+            char name[48] = {};
+            const uint32_t np = request.arguments[2] & 0x1FFFFFFFu;
+            if (np && np < 0x01FFFFC0u)
+            {
+                const uint8_t *r = m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM();
+                for (size_t i = 0; i + 1 < sizeof(name); ++i)
+                {
+                    const uint8_t c = r[np + i];
+                    if (c < 0x20u || c > 0x7Eu) break;
+                    name[i] = static_cast<char>(c);
+                }
+            }
+            std::fprintf(stderr,
+                         "[mcreq] op=%d a=%08X,%08X,%08X,%08X,%08X name='%s' -> %d\n",
+                         static_cast<int>(request.operation),
+                         request.arguments[0], request.arguments[1], request.arguments[2],
+                         request.arguments[3], request.arguments[4], name, mcResult);
+        }
+    }
+    return mcResult;
 }
 
 bool PS2IopHostAdapter::hasGuestFunction(uint32_t address) const
