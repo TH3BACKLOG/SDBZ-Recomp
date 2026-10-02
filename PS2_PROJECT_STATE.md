@@ -23590,3 +23590,10 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 - `checkpointDue`: not changed. Forwarder is a tail call; the TLS `&127` counter feeds vblank-quantum pacing; local ceiling 2-3% < run spread. Only real lever = emit fewer checks in `control_flow_emitter.cpp:180` (full regen).
 - `PS2X_GS_RASTER_THREADS=8` fight A/B (t=145..200): mean 22.1 / median 18.0 vs baseline 23.9 / 21.0. **No gain, raster threads not the limit** (waits are full drains: r6 upload, r10 per-frame latch). Default 4 kept.
 - Next lever: cut the per-frame full drains (r10 latch, r6 upload) without deadlocking `m_stateMutex`.
+
+## Part 169 (2026-10-01) -- PLEASE WAIT / looping outro FIXED (SPU2 ENDX); two probes pending a run
+- ROOT CAUSE (IDA, ARKD_DVD.IRX sub_2C90): voice poller clears a voice's busy bit in sreg14/15 only when SPU2 ENDX (0x1F900340/342, 0x740/742) reports it. ps2xIOP SPU2 is a plain register store => ENDX never latched => voices 3,17 busy => sreg14=0x20008 => scene node 0x1C stuck => EndCard_Update (0x3E64F0) parked, outro loops.
+- FIX (iop_memory.cpp writeHardware32, uncommitted): KON write (0x1F900188 / 0x1F900588) ORs voice bits into ENDX (+0x1B8). VERIFIED by user + log: sreg14 -> 0, sreg12=0x300006c0 (= PCSX2), EndCard reaches state 7, round 2 starts, outro stops. Caveat: instant-end, no real SPU2 timing / music.
+- Save detection (mcserv GetDir) fixed earlier; verified.
+- OPEN: (a) Krillin "stretched triangle off his back toward top-left", frequent; probe `[runaway]` (ps2_gs_rasterizer.cpp, pre-dispatch, cap 60) built, UNRUN. (b) Main-menu bottom yellow clouds missing + vertical seam at x~1253 in the text box + Z Survivor panel frame; texmiss (scene 300-326s) = 153/153 textures OK => missing DRAW not texture; probe `[botdraw]` (draws with y1>=380, every 30th vsync) built, UNRUN. (c) Intro auto-end unconfirmed. (d) ~251 hitches >100ms in a 1330s run (clusters 360, 690-750, 990-1050s), unattributed. (e) PS2X_REC=0 effect on menu stutter unanswered.
+- Run: build.ps1 RelWithDebInfo; env PS2X_REC=0, unset PS2X_TEXMISS_LOG (1 GB log); sit on menu ~20s, then Goku vs Krillin until line shows.

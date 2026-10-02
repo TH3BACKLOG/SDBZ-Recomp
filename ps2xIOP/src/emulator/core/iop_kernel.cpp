@@ -723,7 +723,9 @@ namespace ps2x::iop::detail
                     << ",B4C0=0x" << m_memory.read32(0x370C0u)
                     << ",B4C8=0x" << m_memory.read32(0x370C8u)
                     << ",B420=0x" << m_memory.read32(0x37020u)
-                    << ",B42C=0x" << m_memory.read32(0x3702Cu);
+                    << ",B42C=0x" << m_memory.read32(0x3702Cu)
+                    << ",B430=0x" << m_memory.read32(0x37030u)
+                    << ",B434=0x" << m_memory.read32(0x37034u);
                 std::cerr << out.str() << std::endl;
             }
         }

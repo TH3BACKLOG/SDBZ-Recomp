@@ -6212,6 +6212,23 @@ namespace
     std::atomic<uint32_t> g_warnFadeState{0xFFFFFFFFu}; // [gp-8735], read 0x2C1BCC
     std::atomic<uint64_t> g_warnFadeBusy{0u};   // samples where fade_is_active()!=0
     std::atomic<uint64_t> g_warnSamples{0u};
+    // --- CAppFightDemoEndCard_Update (0x3E64F0) wait conditions -----------
+    // Playtest 09-30: after the post-match save the load screen parked in
+    // state 4 with vt40 == 0x3E64F0 for 200+ s ("PLEASE WAIT", no round 2).
+    // Slots, each bound to the instruction/function that consumes it:
+    //   0 [obj+48] sub-state (switch 0x3E64F0)  1 [obj+49]  2 [obj+50]
+    //   3 [obj+52] step in 0x3E6A30 (0 spawn, 1 wait str_decode, 2 done)
+    //   4 [obj+54]  5 [obj+56] spawned object ptr (0x3E6A30 step 1)
+    //   6 [[obj+56]+0] str_decode_complex_z_107 state (0x404950)
+    //   7 [0x5E6B3C] battle-mgr field 0c (get_field_val_z_251)
+    //   8 byte[gp-3852] flags_test_mask_d (bit 4)
+    //   9 byte[mgr_2d07+1] (0x2D2280: result = byte != 0xB)
+    //  10 [0x5D6E00+0x1C*4] scene node 0x1C (0x2FDBC0; nonzero => may block)
+    //  11 byte[obj+8] flags  12 byte[obj+18]
+    std::atomic<uint32_t> g_endcardV[16];
+    std::atomic<uint32_t> g_endcardW[8]; // bitmap words 0-3 @gp-10368; node 0x1C words +0,+4,+8,+12
+    std::atomic<uint32_t> g_endcardObj{0u};
+    std::atomic<uint64_t> g_endcardSamples{0u};
     std::atomic<uint32_t> g_nullcbSlotAddr{0u};
     std::atomic<uint32_t> g_nullcbSlot{0xFFFFFFFFu};
     std::atomic<uint32_t> g_nullcbA0C0{0xFFFFFFFFu};
@@ -6704,6 +6721,53 @@ namespace
                     g_warnFadeBusy.fetch_add(1u, std::memory_order_relaxed);
             }
 
+            // [endcard] gated on the SHAPE of the state-4 arm (vt40), see above.
+            if (vt40 == 0x003E64F0u)
+            {
+                const uint32_t gpE = GPR_U32(ctx, 28);
+                g_endcardSamples.fetch_add(1u, std::memory_order_relaxed);
+                g_endcardObj.store(a0, std::memory_order_relaxed);
+                const uint32_t spawned = sofdecRead32(rdram, a0 + 56u);
+                g_endcardV[0].store(sofdecRead8(rdram, a0 + 48u), std::memory_order_relaxed);
+                g_endcardV[1].store(sofdecRead8(rdram, a0 + 49u), std::memory_order_relaxed);
+                g_endcardV[2].store(sofdecRead8(rdram, a0 + 50u), std::memory_order_relaxed);
+                g_endcardV[3].store(sofdecRead8(rdram, a0 + 52u), std::memory_order_relaxed);
+                g_endcardV[4].store(sofdecRead8(rdram, a0 + 54u), std::memory_order_relaxed);
+                g_endcardV[5].store(spawned, std::memory_order_relaxed);
+                g_endcardV[6].store(spawned != 0u ? sofdecRead32(rdram, spawned) : 0xFFFFFFFFu,
+                                    std::memory_order_relaxed);
+                g_endcardV[7].store(sofdecRead32(rdram, 0x005E6B3Cu), std::memory_order_relaxed);
+                g_endcardV[8].store(sofdecRead8(rdram, gpE - 3852u), std::memory_order_relaxed);
+                g_endcardV[9].store(sofdecRead8(rdram, 0x005D4970u + 1u), std::memory_order_relaxed);
+                g_endcardV[10].store(sofdecRead32(rdram, 0x005D6E00u + 0x1Cu * 4u),
+                                     std::memory_order_relaxed);
+                g_endcardV[11].store(sofdecRead8(rdram, a0 + 8u), std::memory_order_relaxed);
+                g_endcardV[12].store(sofdecRead8(rdram, a0 + 18u), std::memory_order_relaxed);
+                // 13 scene_node_unk(node 0x1C) bit; 14 byte[[0x5E3C00]+2160] (mem_fill_z_432 state);
+                // 15 id word [[node+4]]
+                {
+                    const uint32_t node = sofdecRead32(rdram, 0x005D6E00u + 0x1Cu * 4u);
+                    const uint32_t p4 = (node != 0u && node != 0xFFFFFFFFu) ? sofdecRead32(rdram, node + 4u) : 0u;
+                    const uint32_t id = (p4 != 0u && p4 != 0xFFFFFFFFu) ? sofdecRead32(rdram, p4) : 0xFFFFFFFFu;
+                    uint32_t bit = 0xFFFFFFFFu;
+                    if (id != 0xFFFFFFFFu)
+                    {
+                        const uint32_t w = sofdecRead32(rdram, gpE - 10368u + 4u * (id >> 5));
+                        bit = (w >> (id & 31u)) & 1u;
+                    }
+                    g_endcardV[13].store(bit, std::memory_order_relaxed);
+                    g_endcardV[14].store(sofdecRead8(rdram, sofdecRead32(rdram, 0x005E3C00u) + 2160u),
+                                         std::memory_order_relaxed);
+                    g_endcardV[15].store(id, std::memory_order_relaxed);
+                    for (uint32_t k = 0u; k < 4u; ++k)
+                    {
+                        g_endcardW[k].store(sofdecRead32(rdram, gpE - 10368u + 4u * k), std::memory_order_relaxed);
+                        g_endcardW[4u + k].store(node != 0u ? sofdecRead32(rdram, node + 4u * k) : 0u,
+                                                 std::memory_order_relaxed);
+                    }
+                }
+            }
+
             // ---- [heapwatch] (Part 150) -------------------------------------
             // Sampled here because 0x3E0E60 is per-frame and already has rdram
             // and a trustworthy $gp -- no new hook, no hot-path cost, and the
@@ -7118,6 +7182,22 @@ namespace
         }
         oss << "other:" << g_lstickStateOther.load(std::memory_order_relaxed)
             << "\n";
+
+        // [endcard:stat]: slot meanings are documented at g_endcardV.
+        oss << "[endcard:stat] why=" << why
+            << " samples=" << g_endcardSamples.load(std::memory_order_relaxed)
+            << std::hex << " obj=0x" << g_endcardObj.load(std::memory_order_relaxed)
+            << " v=";
+        for (size_t i = 0; i < 16u; ++i)
+        {
+            oss << g_endcardV[i].load(std::memory_order_relaxed) << (i + 1u < 16u ? "," : "");
+        }
+        oss << " W=";
+        for (size_t i = 0; i < 8u; ++i)
+        {
+            oss << g_endcardW[i].load(std::memory_order_relaxed) << (i + 1u < 8u ? "," : "");
+        }
+        oss << std::dec << "\n";
 
         // [warn:stat] answers "which of CAppWarning_Update's four waits are we
         // parked in". sub is the switch value read at 0x3FC0D0:
@@ -7538,6 +7618,40 @@ namespace
                     std::this_thread::sleep_for(
                         std::chrono::seconds(kSofdecStatPeriodSec));
                     sofdecStatLine("periodic");
+                }
+            }).detach();
+        });
+
+        // [hitch] playtest probe: polls the vblank counter every 2 ms and logs
+        // any gap > 100 ms between ticks (menu scroll / back-out freezes), with
+        // wall time, the tick number and the game state word. Capped at 400.
+        static std::once_flag hitchOnce;
+        std::call_once(hitchOnce, [] {
+            std::thread([] {
+                using clk = std::chrono::steady_clock;
+                const auto t00 = clk::now();
+                uint64_t last = ps2x_vblank_ticks();
+                auto lastT = clk::now();
+                uint32_t logged = 0u;
+                for (;;)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    const uint64_t v = ps2x_vblank_ticks();
+                    const auto now = clk::now();
+                    if (v != last)
+                    {
+                        const double ms =
+                            std::chrono::duration<double, std::milli>(now - lastT).count();
+                        if (ms > 100.0 && logged < 400u)
+                        {
+                            ++logged;
+                            std::cerr << "[hitch] t="
+                                      << std::chrono::duration<double>(now - t00).count()
+                                      << "s gap_ms=" << ms << " vbl=" << std::dec << v << '\n';
+                        }
+                        last = v;
+                        lastT = now;
+                    }
                 }
             }).detach();
         });

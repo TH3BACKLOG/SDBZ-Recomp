@@ -1690,6 +1690,104 @@ void GSRasterizer::drawPrimitive(GS *gs)
 
     const auto prim = gs->m_registers.prim;
 
+    // 2026-10-01 probe: Krillin "stretched triangle" artifact. Log triangles
+    // that have a vertex far outside the scissor (a runaway vertex). Capped.
+    if (prim.prim == GS_PRIM_TRIANGLE || prim.prim == GS_PRIM_TRISTRIP || prim.prim == GS_PRIM_TRIFAN)
+    {
+        static int s_runaway = 0;
+        if (s_runaway < 60)
+        {
+            const float ox = static_cast<float>(ctx.xyoffset.ofx >> 4);
+            const float oy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+            const float lo = -700.0f, hi = 700.0f;
+            bool bad = false;
+            for (int i = 0; i < 3; ++i)
+            {
+                const GSVertex &q = gs->m_vtxQueue[i];
+                const float qx = q.x - ox, qy = q.y - oy;
+                if (qx < lo || qx > hi + 640.0f || qy < lo || qy > hi + 448.0f)
+                    bad = true;
+            }
+            if (bad)
+            {
+                ++s_runaway;
+                std::cerr << "[runaway] prim=" << static_cast<int>(prim.prim)
+                          << " ofs=(" << ox << "," << oy << ")"
+                          << " scis=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-("
+                          << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")"
+                          << " tme=" << static_cast<int>(prim.tme)
+                          << " v0=(" << gs->m_vtxQueue[0].x << "," << gs->m_vtxQueue[0].y << "," << gs->m_vtxQueue[0].z << ")"
+                          << " v1=(" << gs->m_vtxQueue[1].x << "," << gs->m_vtxQueue[1].y << "," << gs->m_vtxQueue[1].z << ")"
+                          << " v2=(" << gs->m_vtxQueue[2].x << "," << gs->m_vtxQueue[2].y << "," << gs->m_vtxQueue[2].z << ")"
+                          << " fbp=" << ctx.frame.fbp << std::endl;
+            }
+        }
+    }
+
+    // 2026-10-01 probe: main-menu bottom clouds missing. Log wide draws that
+    // reach the bottom strip (y1 >= 380), for 30 draws on every 30th vsync.
+    if (prim.prim == GS_PRIM_SPRITE || prim.prim == GS_PRIM_TRIANGLE ||
+        prim.prim == GS_PRIM_TRISTRIP || prim.prim == GS_PRIM_TRIFAN)
+    {
+        const int nv = (prim.prim == GS_PRIM_SPRITE) ? 2 : 3;
+        const float ox = static_cast<float>(ctx.xyoffset.ofx >> 4);
+        const float oy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+        float bx0 = 1.0e9f, bx1 = -1.0e9f, by0 = 1.0e9f, by1 = -1.0e9f;
+        for (int i = 0; i < nv; ++i)
+        {
+            const GSVertex &q = gs->m_vtxQueue[i];
+            bx0 = std::min(bx0, q.x - ox);
+            bx1 = std::max(bx1, q.x - ox);
+            by0 = std::min(by0, q.y - oy);
+            by1 = std::max(by1, q.y - oy);
+        }
+        if (by1 >= 380.0f && by0 < 460.0f && (bx1 - bx0) >= 40.0f)
+        {
+            static int s_botTotal = 0;
+            static uint64_t s_botTick = ~0ull;
+            static int s_botInTick = 0;
+            if (s_botTotal < 4000)
+            {
+                const uint64_t tk = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+                if (tk != s_botTick)
+                {
+                    s_botTick = tk;
+                    s_botInTick = 0;
+                }
+                if ((tk % 30ull) == 0ull && s_botInTick < 30)
+                {
+                    ++s_botInTick;
+                    ++s_botTotal;
+                    std::cerr << "[botdraw] tick=" << tk << " prim=" << static_cast<int>(prim.prim)
+                              << " bbox=(" << bx0 << "," << by0 << ")-(" << bx1 << "," << by1 << ")"
+                              << " fbp=" << ctx.frame.fbp
+                              << " tme=" << static_cast<int>(prim.tme)
+                              << " abe=" << static_cast<int>(prim.abe)
+                              << " fst=" << static_cast<int>(prim.fst)
+                              << " tbp0=" << ctx.tex0.tbp0
+                              << " psm=" << static_cast<int>(ctx.tex0.psm)
+                              << " tw=" << static_cast<int>(ctx.tex0.tw)
+                              << " th=" << static_cast<int>(ctx.tex0.th)
+                              << " cbp=" << ctx.tex0.cbp
+                              << " ate=" << static_cast<int>(ctx.test.ate)
+                              << " atst=" << static_cast<int>(ctx.test.atst)
+                              << " aref=" << static_cast<int>(ctx.test.aref)
+                              << " zte=" << static_cast<int>(ctx.test.zte)
+                              << " ztst=" << static_cast<int>(ctx.test.ztst)
+                              << " abcd=" << static_cast<int>(ctx.alpha.a) << static_cast<int>(ctx.alpha.b)
+                              << static_cast<int>(ctx.alpha.c) << static_cast<int>(ctx.alpha.d)
+                              << " uv0=(" << (gs->m_vtxQueue[0].u >> 4) << "," << (gs->m_vtxQueue[0].v >> 4) << ")"
+                              << " uv1=(" << (gs->m_vtxQueue[1].u >> 4) << "," << (gs->m_vtxQueue[1].v >> 4) << ")"
+                              << " rgba0=" << static_cast<int>(gs->m_vtxQueue[0].r) << ","
+                              << static_cast<int>(gs->m_vtxQueue[0].g) << ","
+                              << static_cast<int>(gs->m_vtxQueue[0].b) << ","
+                              << static_cast<int>(gs->m_vtxQueue[0].a)
+                              << std::endl;
+                }
+            }
+        }
+    }
+
     switch (prim.prim)
     {
     case GS_PRIM_SPRITE:

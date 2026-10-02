@@ -15,7 +15,21 @@
 // bytes by absolute LBN -- honors feedback_no_iop_faking.
 bool ps2_iop_cdReadSectors(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
 {
-    return readCdSectors(lbn, sectors, dst, byteCount);
+    // [asset:read] playtest probe: every FAILED read, and every read slower
+    // than 20 ms (menu-load stutter), with LBN/size. Capped so it cannot flood.
+    static std::atomic<uint32_t> s_reads{0u}, s_logged{0u};
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = readCdSectors(lbn, sectors, dst, byteCount);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    const uint32_t n = s_reads.fetch_add(1u, std::memory_order_relaxed);
+    if ((!ok || ms > 20.0) && s_logged.fetch_add(1u, std::memory_order_relaxed) < 600u)
+    {
+        std::cerr << "[asset:read] #" << std::dec << n << " lbn=0x" << std::hex << lbn
+                  << " sectors=" << std::dec << sectors << " bytes=" << byteCount
+                  << " ok=" << (ok ? 1 : 0) << " ms=" << ms << "\n";
+    }
+    return ok;
 }
 
 // S2.2c-2: expose the ISO9660 filename->(LBN,size) resolver to the ARKD loader.
