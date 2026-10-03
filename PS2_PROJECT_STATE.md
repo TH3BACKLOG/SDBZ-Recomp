@@ -291,7 +291,15 @@ reached only because the earlier rungs now hold.
 - Lint: tour2 182 flagged triangles (fight, tbp0 0x2b20 family), tour 3. Wrong INPUT class (EE/VU1), not checked by the oracle.
 - **10-03 FIXED (verified by oracle):** (1) `drawSprite` keeps UV fraction (`v.u/16.0f`) and evaluates U/V at integer pixel x/y from exact sub-pixel X0/Y0 -> blur class gone. (2) `drawTriangle` rewritten: 1/16 fixed-point edge functions, integer sample points, top-left fill rule (`ceil(left) <= x < ceil(right)`), OFX/OFY fraction kept -> 1-px offset class gone.
 - ★★★ TRAP: the game (and gs_bench) draws with raster WORKERS (`ps2_gs_raster_mt.inl`, default 4 threads), which have their OWN drawSprite/drawTriangle/drawLine. The oracle had forced `PS2X_GS_RASTER_THREADS=0`, so it graded a copy the game never runs. Both fixes ported to the `.inl`; oracle now grades MT (`PS2X_ORACLE_RASTER_THREADS`, default 4). **Any raster fix must touch BOTH files.**
-- Result on MT: tour 146/146 MATCH (1-px class 51 -> 0, suspects 1 -> 0); tour2 43/43 MATCH (1-px class 30 -> 0). gs_bench fight_a16 142.8 -> 99.8 ms; VRAM hash baseline reset e3361ce8186f6df4 -> 2a2f535240ebe764 (next bench run saves it). Game NOT rebuilt yet. Rasterizer has no known gap vs PCSX2 on any toured screen; open = stream-lint input class (Krillin tris) + tour coverage.
+- Result on MT: tour 146/146 MATCH (1-px class 51 -> 0, suspects 1 -> 0); tour2 43/43 MATCH (1-px class 30 -> 0). gs_bench fight_a16 142.8 -> 99.8 ms; VRAM hash baseline reset e3361ce8186f6df4 -> 2a2f535240ebe764 (saved 10-03, bench 103.8 ms). Game rebuilt 10-03 with both fixes (build.ps1 OK). Rasterizer has no known gap vs PCSX2 on any toured screen; open = stream-lint input class (Krillin tris) + tour coverage.
+- 10-03 Krillin triangle hunt (no play, unfinished):
+  - VERIFIED: lint on 4 PCSX2 SDBZ dumps = 0 visible hits; ours = 185 hits in 15 tour caps (all fans, 176 clamp=1).
+  - VERIFIED: PCSX2 dumps also kick clamped fan verts (208-536 per dump), so clamped fans are normal clipper output. In PCSX2 they stay off screen; ours reach the screen. `tour2\cap_t8085` t=82 has a vertex at (-768,-800), the top-left corner (x and y both at min clamp).
+  - VERIFIED: EE COP2 VFTOI (`vu_translation_helpers.cpp:750`, `_mm_cvttps_epi32`) does not saturate (+overflow -> 0x80000000); VDIV /0 -> 0. Still unfixed.
+  - VERIFIED: VU1 interpreter maps Inf/NaN -> +-max. VU1 recomp DIV/MINI/MAX/CLIP not yet checked.
+  - HYPOTHESIS: NaN/Inf/overflow vertex + microcode MAX/MINI clamp -> min corner.
+  - Next: (1) read `vu1_recomp_rt.cpp` helpers vs PS2 float rules; (2) tour run with PS2X_VUCAP, then check the VU1 input of each visible clamp fan (garbage in = EE side); (3) more PCSX2 fight dumps as control.
+  - Memory: project_krillin_clamp_fans_1003.
 
 ## Part 171 (2026-10-02) -- revise protocol: stop probing, replay our own GS frame offline
 
@@ -23395,6 +23403,10 @@ registerLibsd() added — implements ARKD_DVD.IRX's libsd imports
 - rpc=0x001 WARNING gone
 
 ## Learned Patterns
+
+### 2026-10-03
+- **★★★ Run a lint rule on PCSX2's own dumps before trusting it.** "Vertex on the guard-band clamp" fired on ours AND on PCSX2 (normal clipper output). The real difference was only "clamped fan reaches the screen". Without the PCSX2 control, the rule would have blamed normal geometry.
+- **★★★ A raster fix must touch both raster copies.** The game uses the MT copy (`ps2_gs_raster_mt.inl`). Grading only the single-thread copy hid two fixes from the bench hash.
 
 ### 2026-09-29
 - **★★★ Tag every wait site with a reason before cutting any of them.** `[gsraster-wait] rN` showed two reasons (upload r6, latch r10) own ~90% of the raster drain time. Without the tag, the "~7 full waits per frame" had no owner.
