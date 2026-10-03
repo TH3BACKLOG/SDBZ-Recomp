@@ -44,8 +44,11 @@ def parse_tim2(d, base):
             # mip headers sit between the picture header and the data; hash the
             # whole payload so a mismatch is still detected.
             pass
-        blob = bytes(d[img_off:img_off + img_sz]) + bytes(d[clut_off:clut_off + clut_sz])
+        img = bytes(d[img_off:img_off + img_sz])
+        blob = img + bytes(d[clut_off:clut_off + clut_sz])
         yield {
+            "imgMd5": hashlib.md5(img).hexdigest(),
+            "imgHead": hashlib.md5(img[:1024]).hexdigest(),
             "w": w, "h": h, "mips": mips,
             "type": IMG_TYPE.get(img_t, f"?{img_t}"),
             "clutType": clut_t, "clutColors": ncol,
@@ -57,11 +60,109 @@ def parse_tim2(d, base):
         p += total
 
 
+# Bits per pixel of a host->local IMAGE transfer, by BITBLTBUF.DPSM.
+_XFER_BPP = {0x00: 32, 0x01: 24, 0x02: 16, 0x0A: 16, 0x13: 8, 0x14: 4, 0x1B: 8, 0x24: 4, 0x2C: 4,
+             0x30: 32, 0x31: 24, 0x32: 16, 0x3A: 16}
+
+
+def gsr_uploads(path):
+    """Host->local IMAGE uploads in a PS2X_GSCAP .gsr -> list of upload byte strings.
+    IMAGE data that runs past the end of a transfer continues in the next one (as in ps2_gs_gpu)."""
+    raw = open(path, "rb").read()
+    _, count, regs_size, _payload, _ = struct.unpack_from("<5I", raw, 4)
+    ia = 24 + regs_size
+    pa = ia + count * 12
+    idx = struct.unpack_from(f"<{count * 3}I", raw, ia)
+    bitblt, trxreg = 0, 0
+    cur, want, pending = None, 0, 0
+    done = []
+
+    def take(chunk):
+        nonlocal cur
+        if cur is None:
+            return
+        cur += chunk
+        if len(cur) >= want:
+            done.append(bytes(cur[:want]))
+            cur = None
+
+    for i in range(count):
+        blob = raw[pa + idx[3 * i]: pa + idx[3 * i] + idx[3 * i + 1]]
+        off, end = 0, len(blob)
+        if pending:
+            n = min(pending * 16, end)
+            take(blob[:n])
+            off, pending = n, pending - n // 16
+        while off + 16 <= end:
+            lo, hi = struct.unpack_from("<QQ", blob, off)
+            off += 16
+            nloop, flg = lo & 0x7FFF, (lo >> 58) & 3
+            nreg = ((lo >> 60) & 0xF) or 16
+            if flg == 0:
+                regs = [(hi >> (4 * k)) & 0xF for k in range(nreg)]
+                for _ in range(nloop):
+                    for r in regs:
+                        if off + 16 > end:
+                            break
+                        a, b = struct.unpack_from("<QQ", blob, off)
+                        off += 16
+                        if r != 0xE:
+                            continue
+                        reg = b & 0xFF
+                        if reg == 0x50:
+                            bitblt = a
+                        elif reg == 0x52:
+                            trxreg = a
+                        elif reg == 0x53 and (a & 3) == 0:  # TRXDIR host->local starts an upload
+                            bpp = _XFER_BPP.get((bitblt >> 56) & 0x3F, 32)
+                            want = (trxreg & 0xFFF) * ((trxreg >> 32) & 0xFFF) * bpp // 8
+                            cur = bytearray() if want else None
+            elif flg == 1:
+                off += ((nloop * nreg + 1) // 2) * 16
+            else:
+                n = min(nloop * 16, end - off)
+                take(blob[off:off + n])
+                off += n
+                pending = nloop - n // 16
+    return done
+
+
+def coverage(pics, dirs):
+    """Which disc pictures were uploaded during the captured tour(s)."""
+    full, head = set(), set()
+    nup = 0
+    for d in dirs:
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".gsr"):
+                for up in gsr_uploads(os.path.join(d, f)):
+                    nup += 1
+                    full.add(hashlib.md5(up).hexdigest())
+                    head.add(hashlib.md5(up[:1024]).hexdigest())
+    seen_files = collections.defaultdict(lambda: [0, 0])
+    for p in pics:
+        hit = p["imgMd5"] in full or p["imgHead"] in head
+        seen_files[p["file"]][0] += 1
+        seen_files[p["file"]][1] += hit
+    hit_pics = sum(v[1] for v in seen_files.values())
+    print(f"uploads in captures: {nup} ({len(full)} distinct)")
+    print(f"disc pictures uploaded at least once: {hit_pics}/{len(pics)}")
+    touched = {k: v for k, v in seen_files.items() if v[1]}
+    print(f".pix files touched: {len(touched)}/{len(seen_files)}")
+    by_dir = collections.Counter(k.rsplit("/", 1)[0] if "/" in k else "." for k in seen_files)
+    hit_dir = collections.Counter(k.rsplit("/", 1)[0] if "/" in k else "." for k in touched)
+    print("never-touched .pix by folder (the screens the tour did not reach):")
+    for folder, n in by_dir.most_common():
+        if hit_dir[folder] < n:
+            print(f"  {folder:<40} {n - hit_dir[folder]:>4}/{n} untouched")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--json")
     ap.add_argument("--other", action="store_true")
+    ap.add_argument("--coverage", nargs="+", metavar="TOUR_DIR",
+                    help="match IMAGE uploads in PS2X_GSCAP tour captures against the disc pictures")
     a = ap.parse_args()
 
     toc = arkd_toc.Toc(os.path.join(a.root, "INFO.DAT"))
@@ -101,6 +202,8 @@ def main():
     print("size buckets:", collections.Counter(f"{p['w']}x{p['h']}" for p in ok).most_common(8))
     for n, h in bad[:10]:
         print("  no TIM2:", n, h)
+    if a.coverage:
+        coverage(ok, a.coverage)
     if a.json:
         with open(a.json + ".tmp", "w", encoding="utf-8") as f:
             json.dump(out, f)

@@ -280,8 +280,14 @@ def emit_bin(packets, out_path, path_filter=None):
 # stride 0x60.  The packet stream only re-sends what the game changed, so
 # anything still at its freeze value (often ALPHA_1) is missing from a replay
 # unless it is injected first.
-_ENV_REGS = ((0x04, 0x00), (0x1C, 0x1C), (0x24, 0x3B), (0x2C, 0x3D), (0x34, 0x44),
-             (0x3C, 0x45), (0x44, 0x46), (0x4C, 0x49))  # PRIM, TEXCLUT, TEXA, FOGCOL, DIMX, DTHE, COLCLAMP, PABE
+# Freeze order (GSState.cpp Freeze): PRIM PRMODECONT TEXCLUT SCANMSK TEXA FOGCOL DIMX DTHE
+# COLCLAMP PABE BITBLTBUF TRXDIR TRXPOS TRXREG TRXREG. TEXCLUT is 0x14, not 0x1C (0x1C is
+# SCANMSK; fixed 10-02, it used to load SCANMSK's value into TEXCLUT).
+_ENV_REGS = ((0x04, 0x00), (0x0C, 0x1A), (0x14, 0x1C), (0x1C, 0x22), (0x24, 0x3B), (0x2C, 0x3D),
+             (0x34, 0x44), (0x3C, 0x45), (0x44, 0x46), (0x4C, 0x49))  # PRIM PRMODECONT TEXCLUT SCANMSK TEXA FOGCOL DIMX DTHE COLCLAMP PABE
+# Transfer regs are restored in the freeze only (writing TRXDIR in a packet would start a transfer).
+_XFER_REGS = ((0x54, 0x50), (0x64, 0x51), (0x6C, 0x52), (0x74, 0x52))  # BITBLTBUF TRXPOS TRXREG TRXREG(obsolete copy)
+_V_REGS = ((0x13C, 0x01), (0x144, 0x02), (0x14C, 0x03), (0x154, 0x0A))  # m_v RGBAQ ST UV FOG
 _CTX_REGS = ((0x00, 0x18), (0x08, 0x06), (0x10, 0x14), (0x18, 0x08), (0x20, 0x34),
              (0x28, 0x36), (0x30, 0x40), (0x38, 0x42), (0x40, 0x47), (0x48, 0x4A),
              (0x50, 0x4C), (0x58, 0x4E))  # XYOFFSET TEX0 TEX1 CLAMP MIPTBP1/2 SCISSOR ALPHA TEST FBA FRAME ZBUF
@@ -411,6 +417,133 @@ def emit_vram(state, out_path):
     print(f"wrote {VRAM_SIZE} bytes of VRAM (state offset {start}) to {out_path}")
 
 
+# ---- .gsr -> PCSX2 .gs (so PCSX2's GSRunner can render our own captures as an oracle) ----
+
+# Default freeze template: any real SDBZ PCSX2 dump. Only its size and version are used;
+# every register, m_tr, path tag and VRAM byte is overwritten.
+TEMPLATE_DUMP = Path(r"F:\SDBZ Recomp\PCSX2\snaps\Super Dragon Ball Z_SLUS-21442_20260423093815.gs.zst")
+GS_PATH3 = 2  # GSTransferPath::Path3 (Path1Old=0 is capped at 16 KB by the replayer)
+
+
+def read_gsr(path):
+    """-> (regs, [(path, payload bytes)]) from a GSR1 container."""
+    raw = Path(path).read_bytes()
+    if raw[:4] != GSR_MAGIC:
+        raise SystemExit(f"{path} is not a GSR1 file")
+    _ver, count, regs_size, payload_size, _ = struct.unpack_from("<5I", raw, 4)
+    p = 24
+    regs = raw[p:p + regs_size]
+    p += regs_size
+    idx = struct.unpack_from(f"<{count * 3}I", raw, p)
+    p += count * 12
+    payload = raw[p:p + payload_size]
+    return regs, [(idx[3 * i + 2], payload[idx[3 * i]:idx[3 * i] + idx[3 * i + 1]]) for i in range(count)]
+
+
+def ad_pairs(blob):
+    """Register values from one PACKED A+D GIF tag (the synthetic transfer 0 of a .gsr)."""
+    lo, hi = struct.unpack_from("<QQ", blob, 0)
+    nloop, flg, nreg = lo & 0x7FFF, (lo >> 58) & 3, (lo >> 60) & 0xF
+    if flg != 0 or nreg != 1 or (hi & 0xF) != 0xE or 16 + nloop * 16 > len(blob):
+        raise SystemExit("transfer 0 is not a single PACKED A+D tag: not a register-restore packet")
+    vals = {}
+    for i in range(nloop):
+        data, addr = struct.unpack_from("<QQ", blob, 16 + i * 16)
+        vals[addr & 0xFF] = data
+    return vals
+
+
+def build_freeze(template_state, vram, regvals):
+    """GSState::Freeze v9 image: template size, registers from regvals, our VRAM, idle paths."""
+    if struct.unpack_from("<I", template_state, 0)[0] != 9:
+        raise SystemExit("template freeze is not version 9")
+    vstart = len(template_state) - STATE_TAIL_V9 - VRAM_SIZE
+    if len(vram) != VRAM_SIZE:
+        raise SystemExit(f"VRAM image is {len(vram)} bytes, expected {VRAM_SIZE}")
+    st = bytearray(len(template_state))
+    struct.pack_into("<I", st, 0, 9)
+    slots = list(_ENV_REGS) + list(_XFER_REGS) + list(_V_REGS)
+    for c in (0, 1):
+        slots += [(_CTX_BASE + c * _CTX_STRIDE + off, reg + c) for off, reg in _CTX_REGS]
+    for off, reg in slots:
+        if reg in regvals:
+            struct.pack_into("<Q", st, off, regvals[reg])
+    if 0x01 not in regvals:
+        struct.pack_into("<Q", st, 0x13C, 0x3F800000_80808080)  # RGBAQ, Q=1.0
+    # m_tr stays zero (total=0: no transfer in flight); GIF path tags zero (NLOOP=0: idle).
+    st[vstart:vstart + VRAM_SIZE] = vram
+    struct.pack_into("<f", st, len(st) - 4, 1.0)  # m_q
+    return bytes(st)
+
+
+def probe_packet(fbp, fbw, psm, w, h):
+    """Set up a GS->host read of buffer fbp (w x h at 0,0). Followed by a ReadFIFO2 packet,
+    GSRunner `-dump tr` saves it as `*_read_<SBP>_*.bmp` straight from VRAM, so no draw
+    state can hide it. (A 1-pixel sprite probe was silently dropped by PCSX2 for FBP 0.)"""
+    ad = [
+        ((fbp * 32) | fbw << 16 | psm << 24, 0x50),           # BITBLTBUF: SBP (blocks), SBW, SPSM
+        (0, 0x51),                                            # TRXPOS: source (0,0)
+        (w | h << 32, 0x52),                                  # TRXREG
+        (1, 0x53),                                            # TRXDIR: local -> host
+    ]
+    tag = len(ad) | (1 << 15) | (1 << 60)
+    blob = struct.pack("<QQ", tag, 0xE)
+    for data, reg in ad:
+        blob += struct.pack("<QQ", data, reg)
+    return blob
+
+
+def emit_gs(gsr_path, out_path, template=TEMPLATE_DUMP, stop=None, probe=None):
+    """Write a PCSX2 .gs (new header, uncompressed) from a .gsr + sibling .vram.
+
+    stop:  only transfers [0, stop) (same meaning as PS2X_GSBENCH_STOP)
+    probe: (fbp, fbw, psm, w, h) -> a VSync, probe_packet + ReadFIFO2, then a final VSync.
+           Render with GSRunner `-renderer sw -dump tr -loop 1`: `*_read_*.bmp` is buffer
+           fbp at the cut."""
+    regs, transfers = read_gsr(gsr_path)
+    vram_path = Path(gsr_path).with_suffix(".vram")
+    if not vram_path.exists():
+        raise SystemExit(f"missing {vram_path}: the oracle needs the starting VRAM")
+    traw = decompress(template, template.read_bytes())
+    tinfo, tstate, _tregs, _ = parse_container(traw)
+    freeze = build_freeze(tstate, vram_path.read_bytes(), ad_pairs(transfers[0][1]))
+    if stop is not None:
+        transfers = transfers[:stop]
+    # Live captures record path 0 for everything: send them as PATH3. PCSX2-origin .gsr keep
+    # their path, except an oversized Path1Old (the replayer drops those).
+    all_zero = all(p == 0 for p, _ in transfers)
+    serial = b"SLUS-21442"
+    crc = tinfo.get("crc") or 0
+    header = struct.pack("<9I", 9, len(freeze), 36, len(serial), crc, 0, 0, 36 + len(serial), 0)
+    with open(out_path, "wb") as f:
+        f.write(struct.pack("<II", 0xFFFFFFFF, len(header) + len(serial)))
+        f.write(header + serial)
+        f.write(freeze)
+        f.write(regs)
+
+        def transfer(path, data):
+            f.write(struct.pack("<BBI", PACKET_TRANSFER, path, len(data)))
+            f.write(data)
+
+        def vsync():
+            f.write(struct.pack("<B", PACKET_REGISTERS))
+            f.write(regs)
+            f.write(struct.pack("<BB", PACKET_VSYNC, 0))
+
+        for path, data in transfers:
+            if all_zero or (path == 0 and len(data) > 16384):
+                path = GS_PATH3
+            transfer(path, data)
+        if probe is not None:
+            vsync()  # flush pending draws first
+            transfer(GS_PATH3, probe_packet(*probe))
+            _, _, _, pw, ph = probe
+            bpp = {0: 32, 1: 24, 2: 16, 0xA: 16}.get(probe[2] & 0xF, 32)
+            f.write(struct.pack("<BI", PACKET_READFB, (pw * ph * bpp // 8 + 15) // 16))
+        vsync()
+    print(f"wrote {out_path}: {len(transfers)} transfers{' + probe' if probe else ''}, freeze {len(freeze)} bytes")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dump", type=Path)
@@ -423,7 +556,18 @@ def main():
     ap.add_argument("--emit-vram", type=Path, help="write the 4 MiB VRAM image from the GS state (feeds ps2x_gs_bench)")
     ap.add_argument("--path", type=int, choices=[0, 1, 2], help="restrict --emit-bin to one GIF path")
     ap.add_argument("--max-packets", type=int, help="stop after N packets (for probing a suspect dump)")
+    ap.add_argument("--gsr-to-gs", type=Path, metavar="OUT.gs", help="input is a .gsr (+ sibling .vram): write a PCSX2 .gs that GSRunner can replay")
+    ap.add_argument("--template", type=Path, default=TEMPLATE_DUMP, help="with --gsr-to-gs: real PCSX2 dump whose freeze size/version is reused")
+    ap.add_argument("--stop", type=int, help="with --gsr-to-gs: keep transfers [0, N) only")
+    ap.add_argument("--probe", metavar="FBP,FBW,PSM,W,H", help="with --gsr-to-gs: append the 1-pixel probe draw into buffer FBP (pages)")
     args = ap.parse_args()
+
+    if args.dump.suffix.lower() == ".gsr":
+        if not args.gsr_to_gs:
+            raise SystemExit("a .gsr input needs --gsr-to-gs OUT.gs")
+        probe = tuple(int(v, 0) for v in args.probe.split(",")) if args.probe else None
+        emit_gs(args.dump, args.gsr_to_gs, args.template, args.stop, probe)
+        return
 
     raw = decompress(args.dump, args.dump.read_bytes())
     info, state, regs, reader = parse_container(raw)

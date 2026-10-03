@@ -38,11 +38,14 @@ WATCH_RE = re.compile(
     r"prim=(\d+) tme=(\d) abe=(\d) fbp=(0x[0-9a-f]+) tbp0=(\d+) cbp=(\d+) tpsm=(\d+) ate=(\d) atst=(\d) zte=(\d) ztst=(\d) verts=(\d+)|( nodraw))")
 
 
-def run(cmd, env=None):
+def run(cmd, env=None, timeout=None):
     e = dict(os.environ)
     if env:
         e.update(env)
-    p = subprocess.run(cmd, capture_output=True, text=True, env=e, errors="replace")
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, env=e, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as t:
+        return -1, f"TIMEOUT after {timeout}s: {t.stdout or ''}{t.stderr or ''}"
     return p.returncode, p.stdout + p.stderr
 
 
@@ -107,9 +110,26 @@ def load(path):
     return Image.open(path).convert("RGB")
 
 
-def find_regions(ours, ref, thresh=24.0):
+def pixel_diff(ours, ref, shift=0):
+    """Per-pixel mean abs diff. shift=1: best match within +-1 px of ref, so the same art drawn
+    a pixel off (edges only) does not count; missing or different art still does."""
+    o = ours.astype(np.int16)
+    r = ref.astype(np.int16)
+    if not shift:
+        return np.abs(o - r).mean(axis=2)
+    p = np.pad(r, ((shift, shift), (shift, shift), (0, 0)), mode="edge")
+    h, w = o.shape[:2]
+    best = None
+    for dy in range(2 * shift + 1):
+        for dx in range(2 * shift + 1):
+            d = np.abs(o - p[dy:dy + h, dx:dx + w]).mean(axis=2)
+            best = d if best is None else np.minimum(best, d)
+    return best
+
+
+def find_regions(ours, ref, thresh=24.0, shift=0):
     """Block-wise mean abs diff -> connected regions of differing blocks."""
-    d = np.abs(ours.astype(np.int16) - ref.astype(np.int16)).mean(axis=2)
+    d = pixel_diff(ours, ref, shift)
     gh, gw = H // BLOCK, W // BLOCK
     blocks = d[: gh * BLOCK, : gw * BLOCK].reshape(gh, BLOCK, gw, BLOCK).mean(axis=(1, 3))
     flag = blocks > thresh
@@ -269,6 +289,279 @@ def tour(folder, out):
     print(f"{len(caps)} capture(s), {len(frames)} distinct frame(s) -> {sheet_path}")
 
 
+# ---- oracle: PCSX2 GSRunner renders the same capture; no human judges any frame ----
+
+ORACLE_SHIFT = 1  # px of position slack: a 1-px offset is its own (reported) class, not missing art
+
+def find_gsrunner():
+    p = os.environ.get("PS2X_GSRUNNER")
+    if p:
+        return Path(p)
+    hits = sorted(Path(r"F:\PCSX2-src\bin").glob("pcsx2-gsrunner*.exe"))
+    return hits[0] if hits else None
+
+
+def gsr_transfers(gsr):
+    import struct
+    raw = Path(gsr).read_bytes()
+    _, count, regs_size, payload_size, _ = struct.unpack_from("<5I", raw, 4)
+    ia = 24 + regs_size
+    pa = ia + count * 12
+    idx = struct.unpack_from(f"<{count * 3}I", raw, ia)
+    return [raw[pa + idx[3 * i]: pa + idx[3 * i] + idx[3 * i + 1]] for i in range(count)]
+
+
+def oracle_frame(gsr, fbp, fbw, psm, stop, work, runner):
+    """PCSX2 SW renderer's view of buffer fbp after transfers [0, stop) -> RGB array, or None."""
+    gs = work / "oracle.gs"
+    cmd = [sys.executable, str(PARSE), str(gsr), "--gsr-to-gs", str(gs), "--probe", f"{fbp},{fbw},{psm},{W},{H}"]
+    if stop is not None:
+        cmd += ["--stop", str(stop)]
+    rc, txt = run(cmd)
+    if rc != 0:
+        print(f"    gsr->gs failed: {txt[-400:]}")
+        return None
+    rt = work / "rt"
+    rt.mkdir(exist_ok=True)
+    for old in rt.glob("*"):
+        old.unlink()
+    # The probe is a GS->host read of the buffer; `-dump tr` saves it as *_read_<SBP>_*.bmp.
+    # -loop 1: the replayer loops forever unless told (DumpReplayLoopCount defaults to 0).
+    # Absolute dumpdir: a relative one lands under Documents\PCSX2.
+    rc, txt = run([str(runner), "-renderer", "sw", "-dump", "tr", "-dumpdir", str(rt.resolve()), "-loop", "1",
+                   "-surfaceless", "-noshadercache", "--", str(gs.resolve())], {"PCSX2_NOCONSOLE": "1"}, timeout=600)
+    hits = sorted(rt.glob(f"*_read_{fbp * 32:05x}_*.*"), key=lambda p: int(p.name.split("_", 1)[0]))  # .png in practice
+    if not hits:
+        print(f"    GSRunner wrote no read-back dump (rc={rc}): {txt[-400:]}")
+        return None
+    img = np.asarray(load(hits[-1]))
+    if img.shape[0] < H or img.shape[1] < W:
+        print(f"    GSRunner rt0 is {img.shape[1]}x{img.shape[0]}, expected {W}x{H}")
+        return None
+    return img[:H, :W].copy()
+
+
+# GIF decode for the lint (PACKED / REGLIST / IMAGE carried across transfers like ps2_gs_gpu).
+_PRIM_VERTS = {0: 1, 1: 2, 2: 2, 3: 3, 4: 3, 5: 3, 6: 2}
+
+
+def lint(gsr):
+    """Flag primitives that are wrong INPUT (PCSX2 would draw them wrong too): triangles with an
+    edge > 1200 px that still reach the screen (same rule as the [runaway] probe), and vertices
+    on the VU1 guard-band clamp (raw 0x4000 / 0xBFFF). -> list of finding dicts."""
+    import struct
+    found = []
+    prim, ofs, tex0 = 0, [(1792 * 16, 1824 * 16), (1792 * 16, 1824 * 16)], [0, 0]
+    q = []
+    pending = 0
+
+    def setreg(r, v, t):
+        nonlocal prim, q
+        if r == 0x00:
+            prim, q = v & 0x7FF, []
+        elif r in (0x18, 0x19):
+            ofs[r - 0x18] = (v & 0xFFFF, (v >> 32) & 0xFFFF)
+        elif r in (0x06, 0x07):
+            tex0[r - 0x06] = v
+        elif r in (0x04, 0x05, 0x0C, 0x0D):
+            vert(v & 0xFFFF, (v >> 16) & 0xFFFF, r in (0x04, 0x05), t)
+
+    def vert(x, y, kick, t):
+        nonlocal q
+        q.append((x, y))
+        kind = prim & 7
+        if kind not in (3, 4, 5):
+            q = q[-_PRIM_VERTS.get(kind, 1):]
+            return
+        if len(q) < 3:
+            return
+        tri = q[-3:] if kind != 5 else [q[0], q[-2], q[-1]]
+        # list: start over; strip: keep the last two; fan: keep the hub and the last one
+        q = [] if kind == 3 else (q[-2:] if kind == 4 else [q[0], q[-1]])
+        if not kick:
+            return
+        check(tri, t)
+
+    def check(tri, t):
+        ctx = (prim >> 9) & 1
+        ox, oy = ofs[ctx]
+        pts = [((a - ox) / 16.0, (b - oy) / 16.0) for a, b in tri]
+        edge = max(((pts[i][0] - pts[i - 1][0]) ** 2 + (pts[i][1] - pts[i - 1][1]) ** 2) ** 0.5 for i in range(3))
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        visible = max(xs) >= 0 and min(xs) < W and max(ys) >= 0 and min(ys) < H
+        clamp = any(a in (0x4000, 0xBFFF) or b in (0x4000, 0xBFFF) for a, b in tri)
+        if visible and (edge > 1200 or clamp):
+            found.append({"t": t, "prim": prim & 7, "edge": edge, "clamp": clamp,
+                          "tbp0": tex0[ctx] & 0x3FFF, "bbox": (min(xs), min(ys), max(xs), max(ys))})
+
+    for t, blob in enumerate(gsr_transfers(gsr)):
+        off, end = 0, len(blob)
+        if pending:
+            take = min(pending * 16, end)
+            off += take
+            pending -= take // 16
+        while off + 16 <= end:
+            lo, hi = struct.unpack_from("<QQ", blob, off)
+            off += 16
+            nloop, pre, flg = lo & 0x7FFF, (lo >> 46) & 1, (lo >> 58) & 3
+            nreg = ((lo >> 60) & 0xF) or 16
+            regs = [(hi >> (4 * i)) & 0xF for i in range(nreg)]
+            if pre and flg != 2:
+                setreg(0x00, (lo >> 47) & 0x7FF, t)
+            if flg == 0:
+                for _ in range(nloop):
+                    for r in regs:
+                        if off + 16 > end:
+                            break
+                        a, b = struct.unpack_from("<QQ", blob, off)
+                        off += 16
+                        if r == 0xE:
+                            setreg(b & 0xFF, a, t)
+                        elif r == 0x00:
+                            setreg(0x00, a & 0x7FF, t)
+                        elif r in (0x4, 0x5):  # packed XYZF2/XYZ2: x lo16, y bits 32..47, ADC bit 111
+                            adc = (b >> 47) & 1
+                            vert(a & 0xFFFF, (a >> 32) & 0xFFFF, not adc, t)
+                        elif r in (0x6, 0x7):
+                            tex0[r - 0x6] = a
+            elif flg == 1:
+                n = nloop * nreg
+                for i in range(n):
+                    p = off + 8 * i
+                    if p + 8 > end:
+                        break
+                    setreg(regs[i % nreg], struct.unpack_from("<Q", blob, p)[0], t)
+                off += ((n + 1) // 2) * 16
+            else:
+                avail = (end - off) // 16
+                if nloop > avail:
+                    pending = nloop - avail
+                    off = end
+                else:
+                    off += nloop * 16
+    return found
+
+
+def first_divergent(gsr, rect, rows, fbp, fbw, psm, work, runner, thresh, env, cache):
+    """Bisect the cut over the draws that touch rect: the first draw after which our rect
+    differs from PCSX2's -> that transfer index (or None). A full-screen overlay drawn later
+    no longer hides the culprit. cache: cut -> rect diff, shared by a capture's regions."""
+    x, y, w, h = rect
+    ts = sorted({r["t"] for r in rows if not r.get("nodraw")})
+
+    def diverged(cut):
+        if cut not in cache:
+            bmp = work / "ours_cut.bmp"
+            if bmp.exists():
+                bmp.unlink()
+            render(gsr, bmp, fbp, fbw, dict(env, PS2X_GSBENCH_STOP=str(cut)))
+            ours = np.asarray(load(bmp))
+            ref = oracle_frame(gsr, fbp, fbw, psm, cut, work, runner)
+            cache[cut] = None if ref is None else pixel_diff(ours, ref, ORACLE_SHIFT)
+        d = cache[cut]
+        return d is not None and float(d[y:y + h, x:x + w].mean()) > thresh / 2
+
+    lo, hi = -1, len(ts) - 1           # ts[hi] diverges (the full cut did); find the first one
+    if hi < 0 or not diverged(ts[hi] + 1):
+        return None
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if diverged(ts[mid] + 1):
+            hi = mid
+        else:
+            lo = mid
+    return ts[hi]
+
+
+def oracle(folder, out, runner, thresh, only="*", skip=None):
+    """Every capture in a tour dir: our replay vs PCSX2 GSRunner at the same cut -> report.md.
+    skip = seeded fault: drop that transfer from OUR replay only; the report must blame it."""
+    global W, H
+    caps = sorted(folder.glob(only + ".gsr"), key=lambda p: int(re.search(r"_t(\d+)$", p.stem).group(1)) if re.search(r"_t(\d+)$", p.stem) else 0)
+    if not caps:
+        sys.exit(f"no .gsr captures in {folder}")
+    out.mkdir(parents=True, exist_ok=True)
+    work = out / "work"
+    work.mkdir(exist_ok=True)
+    lines, groups, lint_rows, offset_caps = [], {}, [], []
+    for gsr in caps:
+        regs = gsr_regs(gsr)
+        geo = display_geometry(gsr, out, regs)
+        dfbp, fbw = (geo[0], geo[1]) if geo else (0x70, 8)
+        W, H = (geo[2], geo[3]) if geo else (512, 448)
+        import struct
+        pmode = struct.unpack_from("<Q", regs, 0)[0]
+        psm = (struct.unpack_from("<Q", regs, 0x90 if (pmode & 2 and not pmode & 1) else 0x70)[0] >> 15) & 0x1F
+        lcf = last_complete_frame(gsr, fbw)
+        fbp, stop, _ = lcf if lcf else (dfbp, None, 0)
+        for f in lint(gsr):
+            if stop is None or f["t"] < stop:
+                lint_rows.append((gsr.stem, f))
+        bmp = work / "ours.bmp"
+        if bmp.exists():
+            bmp.unlink()
+        env = {"PS2X_GSBENCH_STOP": str(stop)} if stop is not None else {}
+        if skip is not None:
+            env["PS2X_GSBENCH_SKIP"] = str(skip)
+        render(gsr, bmp, fbp, fbw, env)
+        ours = np.asarray(load(bmp))
+        ref = oracle_frame(gsr, fbp, fbw, psm, stop, work, runner)
+        if ref is None:
+            lines.append(f"| {gsr.stem} | ERROR | GSRunner gave no frame | |")
+            continue
+        regions, d = find_regions(ours, ref, thresh, ORACLE_SHIFT)
+        # Same art drawn about a pixel off: differs exactly but matches within +-1 px. Counted, not blamed.
+        raw = pixel_diff(ours, ref)
+        offpx = float(((raw > thresh) & (d <= thresh)).mean() * 100)
+        if offpx >= 0.5:
+            offset_caps.append((gsr.stem, offpx))
+        if not regions:
+            lines.append(f"| {gsr.stem} | MATCH | mean diff {float(d.mean()):.2f} (exact {float(raw.mean()):.2f}, 1-px offset px {offpx:.1f}%) | |")
+            print(f"  {gsr.stem}: MATCH")
+            continue
+        gap = np.full((H, 4, 3), 255, np.uint8)
+        heat = np.clip(d * 3, 0, 255).astype(np.uint8)
+        Image.fromarray(np.concatenate([ours, gap, ref, gap, np.stack([heat] * 3, axis=2)], axis=1)).save(out / f"{gsr.stem}.png")
+        cache = {}
+        benv = {"PS2X_GSBENCH_SKIP": str(skip)} if skip is not None else {}
+        for r in regions[:4]:
+            rows, _ = blame(gsr, r["rect"], fbp, fbw)
+            rows = [q for q in rows if stop is None or q["t"] < stop]
+            ft = first_divergent(gsr, r["rect"], rows, fbp, fbw, psm, work, runner, thresh, benv, cache)
+            if skip is not None:
+                ok = ft == skip
+                print(f"    self-test: first divergent draw = {ft}, seeded {skip} -> {'PASS' if ok else 'FAIL'}")
+            first = next((q for q in rows if q["t"] == ft and not q.get("nodraw")), None)
+            key = (f"prim={first['prim']} tme={first['tme']} abe={first['abe']} psm={first['psm']} "
+                   f"ate={first['ate']} atst={first['atst']}") if first else "no divergent draw found"
+            who = "ours darker" if r["ours_lum"] < r["ref_lum"] - 5 else ("ours brighter" if r["ours_lum"] > r["ref_lum"] + 5 else "different")
+            x, y, w, h = r["rect"]
+            groups.setdefault(key, []).append((gsr.stem, first["tbp0"] if first else None))
+            why = f"first divergent draw: {describe(first)}" if first else verdict(rows)
+            lines.append(f"| {gsr.stem} | DIFF | ({x},{y}) {w}x{h} {who}, diff {r['diff']:.0f} | {why[:180]} |")
+        print(f"  {gsr.stem}: DIFF {len(regions)} region(s)")
+    rep = out / "report.md"
+    with open(rep, "w", encoding="utf-8") as f:
+        f.write(f"# Oracle report: {folder}\n\nOurs (ps2x_gs_bench) vs PCSX2 GSRunner (sw) at the last complete frame of each capture.\n\n")
+        f.write("## Distinct suspects (grouped by blamed draw state)\n\n")
+        for key, hits in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            caps_hit = sorted({s for s, _ in hits})
+            tbps = sorted({t for _, t in hits if t is not None})
+            f.write(f"- {key}: {len(hits)} region(s) in {len(caps_hit)} capture(s), first {caps_hit[0]}; "
+                    f"tbp0 {', '.join(f'{t:#x}' for t in tbps[:12])}{' ...' if len(tbps) > 12 else ''}\n")
+        f.write(f"\n## 1-pixel offset class (same art, edges differ; not blamed)\n\n"
+                f"{len(offset_caps)} capture(s) with >=0.5% of pixels off by about a pixel: "
+                + ", ".join(f"{s} {p:.1f}%" for s, p in offset_caps[:60]) + "\n")
+        f.write("\n## Per capture\n\n| capture | result | region | blame |\n|---|---|---|---|\n")
+        f.write("\n".join(lines) + "\n")
+        f.write(f"\n## Stream lint (bad input; PCSX2 draws these too)\n\n{len(lint_rows)} flagged triangle(s).\n\n")
+        for stem, fnd in lint_rows[:200]:
+            b = fnd["bbox"]
+            f.write(f"- {stem} t={fnd['t']} prim={fnd['prim']} edge={fnd['edge']:.0f} clamp={int(fnd['clamp'])} "
+                    f"tbp0={fnd['tbp0']:#x} bbox=({b[0]:.0f},{b[1]:.0f})-({b[2]:.0f},{b[3]:.0f})\n")
+    print(f"{len(caps)} capture(s) -> {rep}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dump", help="PCSX2 .gs/.gs.zst dump, or a .gsr from a live PS2X_GSCAP capture")
@@ -285,11 +578,28 @@ def main():
     ap.add_argument("--top", type=int, default=4, help="regions to blame (default 4)")
     ap.add_argument("--selftest-skip", type=int, metavar="T",
                     help="control: skip transfer T in OUR replay, ref = full replay; the tool must blame T")
+    ap.add_argument("--oracle", action="store_true",
+                    help="with a tour dir: grade every capture against PCSX2 GSRunner (sw) -> <dir>/oracle/report.md")
+    ap.add_argument("--only", default="*", help="with --oracle: capture name glob, e.g. cap_t7095")
+    ap.add_argument("--lint", action="store_true", help="with a tour dir or .gsr: list runaway/clamped triangles only (no GSRunner)")
     a = ap.parse_args()
 
     if not BENCH.exists():
         sys.exit(f"missing {BENCH} (build: build_scripts\\gs_bench.ps1 -Build)")
     dump = Path(a.dump)
+    if a.lint:
+        for gsr in ([dump] if not dump.is_dir() else sorted(dump.glob("*.gsr"))):
+            for f in lint(gsr):
+                b = f["bbox"]
+                print(f"{gsr.stem} t={f['t']} prim={f['prim']} edge={f['edge']:.0f} clamp={int(f['clamp'])} "
+                      f"tbp0={f['tbp0']:#x} bbox=({b[0]:.0f},{b[1]:.0f})-({b[2]:.0f},{b[3]:.0f})")
+        return
+    if dump.is_dir() and a.oracle:
+        runner = find_gsrunner()
+        if not runner or not runner.exists():
+            sys.exit("no PCSX2 GSRunner: build F:\\PCSX2-src pcsx2-gsrunner, or set PS2X_GSRUNNER=<exe>")
+        oracle(dump, Path(a.out) if a.out else dump / "oracle", runner, a.thresh, a.only, a.selftest_skip)
+        return
     if dump.is_dir():
         tour(dump, Path(a.out) if a.out else dump / "frames")
         return

@@ -268,6 +268,28 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
 
+## Part 172 (2026-10-02) -- revise protocol: find missing graphics with no play and no eyeballing
+
+- Ask: "a process where it doesn't take playing the game to figure out what we are missing". Reaching screens was already unattended (Part 171 tour); the human step left was JUDGING frames. Plan: `C:\Users\mwlab\.claude\plans\binary-leaping-owl.md`.
+- Oracle = PCSX2 GSRunner (`F:\PCSX2-src\pcsx2-gsrunner`, source present, **not built yet**). `-renderer sw -dump rt` writes each draw's render target. Our captures go in as PCSX2 dumps; a 1-pixel probe draw after two VSyncs makes its `rt0` BMP = the buffer at the cut (`-dumprangef 1` keeps only that draw).
+- DONE (scripts, no runtime change):
+  - `gsdump_parse.py <cap>.gsr --gsr-to-gs out.gs [--stop N] [--probe fbp,fbw,psm,w,h]`: freeze v9 built from transfer 0 regs + `.vram`; live path 0 sent as PATH3 (Path1Old >16 KB is dropped by the replayer). Round-trips through our own parser.
+  - VERIFIED bug fixed: `--init-state` mapped freeze slot 0x1C (SCANMSK) to TEXCLUT; TEXCLUT is 0x14. Also restores PRMODECONT now. Fight control after fix: mean diff 6.12 (was 6.1).
+  - `gfx_scene_diff.py <dir> --oracle [--only cap_tN] [--selftest-skip T]` -> `<dir>\oracle\report.md`: per capture MATCH/DIFF + blame, suspects grouped by draw state, plus lint section.
+  - `gfx_scene_diff.py <dir|gsr> --lint`: triangles with edge >1200 px reaching the screen or a vertex on the VU1 clamp (raw 0x4000/0xBFFF). tour2 fight (Goku vs A16): 184 hits, tbp0 0x2b20 (same texture family as the Krillin `[runaway]` hits) -> the stretched-triangle class is NOT Krillin-only. tour (attract): 4 hits, tbp0 0x3340.
+  - `audit_disc_textures.py --coverage <dirs>`: IMAGE uploads vs disc TIM2. tour+tour2: 547/3367 pictures, 204/730 .pix files (lower bound: atlas/split uploads do not match). Untouched = unreached screens (most `ply/pNN` fighters, many `eff/`, `stg/`).
+  - `gfx_tour.ps1 -Oracle` runs all three after the tour.
+- NEXT: build GSRunner (user), then the two controls: `--oracle --only cap_t7095 --selftest-skip 132` must PASS; then `gsdump\tour2` + `gsdump\tour` full oracle.
+- **GSRunner built + controls PASS (same day).** Build: `MSBuild F:\PCSX2-src\pcsx2-gsrunner\pcsx2-gsrunner.vcxproj /p:SolutionDir=F:\PCSX2-src\ /p:Configuration="Release AVX2" /p:Platform=x64` (the `.slnx` `/t:pcsx2-gsrunner` form fails with MSB4057) -> `F:\PCSX2-src\bin\pcsx2-gsrunnerx64-avx2.exe`. GSRunner traps found + fixed:
+  - loops the dump FOREVER unless `-loop 1` (DumpReplayLoopCount defaults 0; the help text saying "defaults to 1" is wrong) -> the first run "stalled".
+  - relative `-dumpdir` resolves under `Documents\PCSX2`; draw dumps are `.png`, not `.bmp`.
+  - PCSX2 merges consecutive prims into one draw: its draw numbers != our transfer numbers.
+  - The 1-pixel probe DRAW is silently dropped for FBP 0 (FBP 1 / 0x70 work; cause not found; ZBP != FBP did not fix it). Replaced by a GS->host READ (BITBLTBUF/TRXPOS/TRXREG/TRXDIR=1 + a ReadFIFO2 packet); `-dump tr` saves it as `*_read_<SBP>_*.png` straight from VRAM.
+  - The first "self-test PASS" was VACUOUS: the whole screen differed (wrong snapshot), so 132 was in any blame list. Now: unseeded cap_t7095 = MATCH (mean diff 3.58); seeded `SKIP=132` = DIFF in the bottom clouds, and the new **bisect blame** (cut stepped over the draws touching the region, ours vs PCSX2 at each cut) names exactly t=132 for all 3 regions. The old "last pixel-changing draw" blame named the full-screen fade t=152 instead.
+- **First full oracle runs (10-03), 189 captures, 0 errors:** tour 143 MATCH / 3 DIFF; tour2 36 MATCH / 7 DIFF. The first tour2 pass had 29 DIFF but all were edge-only (same art ~1 px off); the diff now allows +-1 px slack (`ORACLE_SHIFT`) and counts those as a separate "1-pixel offset class" (tour 51 caps, tour2 30 caps). **No missing art found at the GS-rasterizer level on any captured screen.** Every remaining DIFF is one class: prim sprite/strip, T8 (psm 19), TME+ABE, alpha test on, mostly 128x16 labels and full-screen logos -> ours BLURRIER (edge sharpness 10.7 vs 14.3 on world-map labels; faint lines at sprite borders).
+- HYPOTHESIS (strong, not tested): attributes are evaluated at pixel centre x+0.5 (`ps2_gs_rasterizer.cpp:3149/3154` sprite `tx/ty`, likely also the triangle path ~3373) but the GS samples at integer pixel coords. Sofdec logo t=21 (cap_t2100): TEX1=0x60 (bilinear), u0=0.5 on a 512 texture at x=0 -> GS samples texel 0 exactly; ours gets u=1.0 -> blend of texels 0 and 1 = blur. With nearest filtering the same +0.5 gives a 1-texel shift = the offset class. Test = drop the +0.5 in the sprite attribute step only, rebuild bench, rerun oracle: DIFF + offset class should fall to ~0; gs_bench VRAM hash will change (expected).
+- Lint: tour2 182 flagged triangles (fight, tbp0 0x2b20 family), tour 3. Wrong INPUT class (EE/VU1), not checked by the oracle.
+
 ## Part 171 (2026-10-02) -- revise protocol: stop probing, replay our own GS frame offline
 
 - Session-start check: exe 05:05 already contains the `0x293200` recovery and the `[botdraw]` scis fields; 900 s run at 05:51 has `missing-target`=0 (reach of `0x23a830` unproven) and `[runaway]`=0.
