@@ -292,6 +292,9 @@ def tour(folder, out):
 # ---- oracle: PCSX2 GSRunner renders the same capture; no human judges any frame ----
 
 ORACLE_SHIFT = 1  # px of position slack: a 1-px offset is its own (reported) class, not missing art
+# The oracle grades the raster path the GAME runs: worker threads (ps2_gs_raster_mt.inl), the
+# default. render() alone forces 0 = the single-thread copy, which the game never uses.
+ORACLE_RASTER_THREADS = os.environ.get("PS2X_ORACLE_RASTER_THREADS", "4")
 
 def find_gsrunner():
     p = os.environ.get("PS2X_GSRUNNER")
@@ -501,6 +504,7 @@ def oracle(folder, out, runner, thresh, only="*", skip=None):
         if bmp.exists():
             bmp.unlink()
         env = {"PS2X_GSBENCH_STOP": str(stop)} if stop is not None else {}
+        env["PS2X_GS_RASTER_THREADS"] = ORACLE_RASTER_THREADS
         if skip is not None:
             env["PS2X_GSBENCH_SKIP"] = str(skip)
         render(gsr, bmp, fbp, fbw, env)
@@ -524,6 +528,7 @@ def oracle(folder, out, runner, thresh, only="*", skip=None):
         Image.fromarray(np.concatenate([ours, gap, ref, gap, np.stack([heat] * 3, axis=2)], axis=1)).save(out / f"{gsr.stem}.png")
         cache = {}
         benv = {"PS2X_GSBENCH_SKIP": str(skip)} if skip is not None else {}
+        benv["PS2X_GS_RASTER_THREADS"] = ORACLE_RASTER_THREADS
         for r in regions[:4]:
             rows, _ = blame(gsr, r["rect"], fbp, fbw)
             rows = [q for q in rows if stop is None or q["t"] < stop]

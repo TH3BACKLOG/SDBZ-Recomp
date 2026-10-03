@@ -2930,10 +2930,12 @@ void GSRasterizer::drawSprite(GS *gs)
         float u0f, v0f, u1f, v1f;
         if (prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            // Keep the 4 fraction bits: games send u0=0.5 so texel centres
+            // land on pixels; truncating to whole texels shifted every sprite.
+            u0f = static_cast<float>(v0.u) / 16.0f;
+            v0f = static_cast<float>(v0.v) / 16.0f;
+            u1f = static_cast<float>(v1.u) / 16.0f;
+            v1f = static_cast<float>(v1.v) / 16.0f;
         }
         else
         {
@@ -2945,12 +2947,17 @@ void GSRasterizer::drawSprite(GS *gs)
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
 
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
+        // GS evaluates sprite attributes at INTEGER pixel coordinates, linearly
+        // from v0's exact (sub-pixel) position to v1's, independent of vertex
+        // order: U(x) = U0 + (x - X0) * (U1 - U0) / (X1 - X0).
+        const float ofxF = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+        const float ofyF = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+        const float vx0 = v0.x - ofxF;
+        const float vy0 = v0.y - ofyF;
+        const float spanXf = (v1.x - ofxF) - vx0;
+        const float spanYf = (v1.y - ofyF) - vy0;
+        const float duDx = (spanXf != 0.0f) ? (u1f - u0f) / spanXf : 0.0f;
+        const float dvDy = (spanYf != 0.0f) ? (v1f - v0f) / spanYf : 0.0f;
 
         // [uvspan] -- Stage 5.11 run 23. Reading table at the counters above.
         // Gate is SHAPE ONLY -- psm/tbw/tw/th, no address. The dump says the
@@ -3146,13 +3153,11 @@ void GSRasterizer::drawSprite(GS *gs)
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
-            float texVf = v0f + (v1f - v0f) * ty;
+            float texVf = v0f + (static_cast<float>(y) - vy0) * dvDy;
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
-                float texUf = u0f + (u1f - u0f) * tx;
+                float texUf = u0f + (static_cast<float>(x) - vx0) * duDx;
                 uint32_t texel = 0xFFFF00FFu;
                 if (prim.fst)
                 {
@@ -3340,47 +3345,73 @@ void GSRasterizer::drawTriangle(GS *gs)
         ps2diag_meshdump::dumpTriangle(meshdumpTick, v0, v1, v2, ctx, prim.tme != 0, prim.fst != 0);
     }
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    // GS samples pixels at INTEGER coordinates (not x+0.5) with a top-left fill
+    // rule: a pixel is in if ceil(left) <= x < ceil(right), same for y. Done in
+    // the GS's own 1/16-pixel fixed point so ties (vertex exactly on a pixel)
+    // resolve exactly; XYOFFSET keeps its fraction bits.
+    const int64_t ofx16 = static_cast<int64_t>(ctx.xyoffset.ofx);
+    const int64_t ofy16 = static_cast<int64_t>(ctx.xyoffset.ofy);
+    const int64_t X[3] = {static_cast<int64_t>(std::lround(v0.x * 16.0f)) - ofx16,
+                          static_cast<int64_t>(std::lround(v1.x * 16.0f)) - ofx16,
+                          static_cast<int64_t>(std::lround(v2.x * 16.0f)) - ofx16};
+    const int64_t Y[3] = {static_cast<int64_t>(std::lround(v0.y * 16.0f)) - ofy16,
+                          static_cast<int64_t>(std::lround(v1.y * 16.0f)) - ofy16,
+                          static_cast<int64_t>(std::lround(v2.y * 16.0f)) - ofy16};
 
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
+    // Twice the signed area; orient so the inside of every edge is positive.
+    int64_t area2 = (X[1] - X[0]) * (Y[2] - Y[0]) - (Y[1] - Y[0]) * (X[2] - X[0]);
+    if (area2 == 0)
+        return;
+    const int64_t sgn = (area2 < 0) ? -1 : 1;
+    area2 *= sgn;
 
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
+    // Edge i is opposite vertex i: A = vertex (i+1)%3, B = vertex (i+2)%3.
+    // E_i(P) = sgn * ((Bx-Ax)(Py-Ay) - (By-Ay)(Px-Ax)); E_i(vertex i) = area2.
+    int64_t edx[3], edy[3], bias[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        const int a = (i + 1) % 3, b = (i + 2) % 3;
+        edx[i] = sgn * (X[b] - X[a]);
+        edy[i] = sgn * (Y[b] - Y[a]);
+        // Left edge (inside to its right: edy < 0) or top edge (horizontal,
+        // inside below: edx > 0) includes pixels exactly on it; others don't.
+        const bool topLeft = (edy[i] < 0) || (edy[i] == 0 && edx[i] > 0);
+        bias[i] = topLeft ? 0 : -1;
+    }
 
-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
+    auto ceil16 = [](int64_t v) -> int { return static_cast<int>((v >= 0) ? (v + 15) / 16 : -((-v) / 16)); };
+    int minX = ceil16(std::min({X[0], X[1], X[2]}));
+    int maxX = ceil16(std::max({X[0], X[1], X[2]})) - 1;
+    int minY = ceil16(std::min({Y[0], Y[1], Y[2]}));
+    int maxY = ceil16(std::max({Y[0], Y[1], Y[2]})) - 1;
 
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    minX = std::max(minX, static_cast<int>(ctx.scissor.x0));
+    maxX = std::min(maxX, static_cast<int>(ctx.scissor.x1));
+    minY = std::max(minY, static_cast<int>(ctx.scissor.y0));
+    maxY = std::min(maxY, static_cast<int>(ctx.scissor.y1));
+    if (minX > maxX || minY > maxY)
         return;
 
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
+    const float invArea = 1.0f / static_cast<float>(area2);
 
     for (int y = minY; y <= maxY; ++y)
     {
-        float py = static_cast<float>(y) + 0.5f;
-        for (int x = minX; x <= maxX; ++x)
+        const int64_t py = static_cast<int64_t>(y) * 16;
+        const int64_t px0 = static_cast<int64_t>(minX) * 16;
+        int64_t e[3];
+        for (int i = 0; i < 3; ++i)
         {
-            float px = static_cast<float>(x) + 0.5f;
-
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            const int a = (i + 1) % 3;
+            e[i] = edx[i] * (py - Y[a]) - edy[i] * (px0 - X[a]);
+        }
+        for (int x = minX; x <= maxX; ++x, e[0] -= edy[0] * 16, e[1] -= edy[1] * 16, e[2] -= edy[2] * 16)
+        {
+            if (e[0] + bias[0] < 0 || e[1] + bias[1] < 0 || e[2] + bias[2] < 0)
                 continue;
+
+            const float w0 = static_cast<float>(e[0]) * invArea;
+            const float w1 = static_cast<float>(e[1]) * invArea;
+            const float w2 = 1.0f - w0 - w1;
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
 
