@@ -1561,8 +1561,8 @@ void GSRasterizer::drawPrimitive(GS *gs)
             const int uy0 = y0;
             const int ux1 = ux0 + std::max(1, x1 - x0) - 1;
             const int uy1 = uy0 + std::max(1, y1 - y0) - 1;
-            const bool outside = ux1 < ctx.scissor.x0 || ux0 > ctx.scissor.x1 ||
-                                 uy1 < ctx.scissor.y0 || uy0 > ctx.scissor.y1;
+            const bool outside = ux1 < static_cast<int>(ctx.scissor.x0) || ux0 > static_cast<int>(ctx.scissor.x1) ||
+                                 uy1 < static_cast<int>(ctx.scissor.y0) || uy0 > static_cast<int>(ctx.scissor.y1);
             const uint64_t alphaReg = ctx.alpha.data;
             const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
             const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
@@ -2835,8 +2835,11 @@ void GSRasterizer::drawSprite(GS *gs)
     const int unclippedY1 = unclippedY0 + spanY - 1;
 
     // If the sprite rectangle is fully outside scissor, nothing should render.
-    if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
-        unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
+    // SCISSOR fields are unsigned 64-bit bitfields: compare as int, or a sprite
+    // whose left/top edge is negative converts to a huge value and is culled
+    // (main-menu bottom cloud strip at x=-18.5 vanished, 2026-10-02).
+    if (unclippedX1 < static_cast<int>(ctx.scissor.x0) || unclippedX0 > static_cast<int>(ctx.scissor.x1) ||
+        unclippedY1 < static_cast<int>(ctx.scissor.y0) || unclippedY0 > static_cast<int>(ctx.scissor.y1))
     {
         // maybe a log here idk ?
         return;

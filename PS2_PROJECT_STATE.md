@@ -276,6 +276,7 @@ reached only because the earlier rungs now hold.
 - New tooling (syntax-checked, NOT built/run): `PS2X_GSCAP="<tick>,<frames>,<path>"` in `ps2_gs_gpu.cpp` writes `<path>.gsr` + `<path>.vram` from a live run. `gfx_scene_diff.py` now accepts a `.gsr` and has `--steps` (one PNG per transfer that changed `--rect`). Script side verified on `gsdump\frame.gsr`.
 - NEXT: build RelWithDebInfo; one menu run with `PS2X_GSCAP` + `PS2X_REC=1`; control = replay final frame vs REC PNG; then `--rect 0,320,512,128 --steps`. Same method for Krillin.
 - Upstream: only #256 (README). PCSX2 MCP not connected; a Shift+F8 menu dump is still wanted as the oracle.
+- **RESOLVED same day (offline):** `PS2X_GSCAP_EVERY` periodic capture + `gfx_scene_diff.py <dir>` contact sheet (`gfx_tour.ps1`) toured boot -> menu -> char select -> world map -> fight in one autopress run. Menu capture t7095: left cloud strip (x -18.5) byte-identical to the right one except x, paints nothing; patched-x replays prove ANY negative x0 is dropped. ROOT CAUSE: sprite cull compares int edges with unsigned 64-bit SCISSOR bitfields. Fixed with `static_cast<int>` in `drawSprite` (single + threaded) and the threaded display-copy pre-check. Re-replay: 12/43 tour-2 screens gain art (menu clouds + stage backdrop, char-select and world-map starfield); tour 1 unchanged; gs_bench gate PASS. Live-window confirmation still pending.
 
 ## Part 168 (2026-09-30) -- pad diagnostics; "fight" runs were NOT fights
 

@@ -554,6 +554,8 @@ namespace
         uint64_t startTick = 0;
         uint64_t frames = 1;
         uint64_t beginTick = 0;
+        uint64_t every = 0; // PS2X_GSCAP_EVERY=N: re-arm N ticks after each capture starts
+        std::string base;
         std::string path;
         std::vector<uint8_t> regs;
         std::vector<uint32_t> index; // {offset, size, path} per transfer
@@ -575,8 +577,12 @@ namespace
                     c.wanted = true;
                     c.startTick = tick;
                     c.frames = frames;
+                    c.base = out;
                     c.path = out;
-                    std::cerr << "[gscap] armed tick=" << tick << " frames=" << frames << " path=" << c.path << std::endl;
+                    if (const char *ev = std::getenv("PS2X_GSCAP_EVERY"))
+                        c.every = std::strtoull(ev, nullptr, 10);
+                    std::cerr << "[gscap] armed tick=" << tick << " frames=" << frames << " every=" << c.every
+                              << " path=" << c.path << std::endl;
                 }
                 else
                 {
@@ -630,6 +636,12 @@ namespace
                   << " ticks=" << cap.beginTick << ".." << endTick << std::endl;
         cap.index = {};
         cap.payload = {};
+        if (cap.every != 0ull)
+        {
+            // Periodic mode: files are <path>_t<tick>.gsr/.vram.
+            cap.done = false;
+            cap.startTick = cap.beginTick + cap.every;
+        }
     }
 
     // Uncompressed 32-bit TGA, top-left origin. Input is the host RGBA buffer
@@ -4755,6 +4767,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                               m_transferState.copied_pixels >= m_transferState.total_pixels;
             if (idle || tk >= cap.startTick + 60ull)
             {
+                if (cap.every != 0ull)
+                    cap.path = cap.base + "_t" + std::to_string(tk);
                 ps2xGsRasterFlush();
                 if (!gsCapWriteVram(cap, m_vram, m_vramSize))
                 {

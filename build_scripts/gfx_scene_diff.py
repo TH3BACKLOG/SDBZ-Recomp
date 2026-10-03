@@ -93,7 +93,8 @@ def display_geometry(dump, out, regs_bytes=None):
 
 
 def render(gsr, bmp, fbp, fbw, extra=None):
-    env = {"PS2X_GSBENCH_BMP": f"{fbp},{fbw},{W},{H},{bmp}", "PS2X_GS_RASTER_THREADS": "0"}
+    # The bench hands fbp straight to GS::ReadVram, whose base is in BLOCKS; FRAME/DISPFB fbp is in pages (32 blocks).
+    env = {"PS2X_GSBENCH_BMP": f"{fbp * 32},{fbw},{W},{H},{bmp}", "PS2X_GS_RASTER_THREADS": "0"}
     if extra:
         env.update(extra)
     rc, txt = run([str(BENCH), str(gsr), "1"], env)
@@ -144,7 +145,7 @@ def find_regions(ours, ref, thresh=24.0):
 
 def blame(gsr, rect, fbp, fbw, skip=None):
     x, y, w, h = rect
-    env = {"PS2X_GSBENCH_WATCH": f"{fbp},{fbw},{x},{y},{w},{h}", "PS2X_GS_RASTER_THREADS": "0"}
+    env = {"PS2X_GSBENCH_WATCH": f"{fbp * 32},{fbw},{x},{y},{w},{h}", "PS2X_GS_RASTER_THREADS": "0"}
     if skip is not None:
         env["PS2X_GSBENCH_SKIP"] = str(skip)
     rc, txt = run([str(BENCH), str(gsr), "1"], env)
@@ -211,6 +212,63 @@ def steps(gsr, rect, fbp, fbw, out, rows, limit):
     print(f"    {len(ts)} step frame(s) -> {sdir}")
 
 
+def last_complete_frame(gsr, fbw):
+    """A capture stops mid-frame. The newest finished frame is the one sitting in a buffer
+    just before that buffer's last full-screen clear -> (fbp_pages, stop_transfer, clears)."""
+    rows, _ = blame(gsr, (0, 0, W, H), 0, fbw)
+    clears = {}
+    for r in rows:
+        if r.get("nodraw") or r["tme"]:
+            continue
+        b = r["bbox"]
+        if b[2] - b[0] >= W - 32 and b[3] - b[1] >= H - 48:
+            clears.setdefault(int(r["fbp"], 16), []).append(r["t"])
+    if not clears:
+        return None
+    fbp = max(clears, key=lambda k: clears[k][-1])
+    return fbp, clears[fbp][-1], len(clears[fbp])
+
+
+def tour(folder, out):
+    """Replay every PS2X_GSCAP_EVERY capture in a folder -> one frame each + a contact sheet."""
+    global W, H
+    caps = sorted(folder.glob("*.gsr"), key=lambda p: int(re.search(r"_t(\d+)$", p.stem).group(1)) if re.search(r"_t(\d+)$", p.stem) else 0)
+    if not caps:
+        sys.exit(f"no .gsr captures in {folder}")
+    out.mkdir(parents=True, exist_ok=True)
+    frames, prev = [], None
+    for gsr in caps:
+        geo = display_geometry(gsr, out, gsr_regs(gsr))
+        dfbp, fbw = (geo[0], geo[1]) if geo else (0x70, 8)
+        W, H = (geo[2], geo[3]) if geo else (512, 448)
+        lcf = last_complete_frame(gsr, fbw)
+        fbp, stop, n = lcf if lcf else (dfbp, None, 0)
+        bmp = out / "tour.bmp"
+        if bmp.exists():
+            bmp.unlink()
+        render(gsr, bmp, fbp, fbw, {"PS2X_GSBENCH_STOP": str(stop)} if stop is not None else None)
+        img = load(bmp)
+        png = out / (gsr.stem + ".png")
+        img.save(png)
+        same = prev is not None and img.size == prev.size and not np.any(np.asarray(img) != np.asarray(prev))
+        print(f"  {gsr.stem}: fbp=0x{fbp:x} stop={stop} clears={n} {W}x{H}{'  (same as previous)' if same else ''}")
+        if not same:
+            frames.append((gsr.stem, img))
+        prev = img
+    from PIL import ImageDraw
+    cols = 4
+    tw, th = 256, 224
+    sheet = Image.new("RGB", (cols * tw, ((len(frames) + cols - 1) // cols) * (th + 14)), (32, 32, 32))
+    dr = ImageDraw.Draw(sheet)
+    for i, (name, img) in enumerate(frames):
+        x, y = (i % cols) * tw, (i // cols) * (th + 14)
+        sheet.paste(img.resize((tw, th), Image.LANCZOS), (x, y + 14))
+        dr.text((x + 3, y + 1), name, fill=(255, 255, 0))
+    sheet_path = out / "sheet.png"
+    sheet.save(sheet_path)
+    print(f"{len(caps)} capture(s), {len(frames)} distinct frame(s) -> {sheet_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dump", help="PCSX2 .gs/.gs.zst dump, or a .gsr from a live PS2X_GSCAP capture")
@@ -232,7 +290,10 @@ def main():
     if not BENCH.exists():
         sys.exit(f"missing {BENCH} (build: build_scripts\\gs_bench.ps1 -Build)")
     dump = Path(a.dump)
-    out = Path(a.out) if a.out else ROOT / "gsdump" / ("scene_" + re.sub(r"\W+", "_", dump.name.split(".gs")[0]))
+    if dump.is_dir():
+        tour(dump, Path(a.out) if a.out else dump / "frames")
+        return
+    out =Path(a.out) if a.out else ROOT / "gsdump" / ("scene_" + re.sub(r"\W+", "_", dump.name.split(".gs")[0]))
     out.mkdir(parents=True, exist_ok=True)
 
     live = dump.suffix.lower() == ".gsr"

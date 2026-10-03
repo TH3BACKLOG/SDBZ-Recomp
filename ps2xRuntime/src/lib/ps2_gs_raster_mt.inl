@@ -521,8 +521,10 @@ void drawSprite(const Setup &S)
     const int unclippedX1 = unclippedX0 + spanX - 1;
     const int unclippedY1 = unclippedY0 + spanY - 1;
 
-    if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
-        unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
+    // SCISSOR fields are unsigned 64-bit bitfields: compare as int, or a sprite
+    // whose left/top edge is negative converts to a huge value and is culled.
+    if (unclippedX1 < static_cast<int>(ctx.scissor.x0) || unclippedX0 > static_cast<int>(ctx.scissor.x1) ||
+        unclippedY1 < static_cast<int>(ctx.scissor.y0) || unclippedY0 > static_cast<int>(ctx.scissor.y1))
         return;
 
     const int drawX0 = clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
