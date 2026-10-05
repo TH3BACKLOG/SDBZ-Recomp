@@ -42,6 +42,8 @@ void sub_001750C0_0x1750c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtim
 void sub_00177AA8_0x177aa8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00178B58_0x178b58(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_0019C5D0_0x19c5d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001A50E0_0x1a50e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001A5890_0x1a5890(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001AC6F0_0x1ac6f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001AD0B0_0x1ad0b0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001AD5A0_0x1ad5a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -54,6 +56,9 @@ void sub_001BC2A0_0x1bc2a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtim
 void sub_001BC4E0_0x1bc4e0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001BF270_0x1bf270(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001C0040_0x1c0040(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001C1980_0x1c1980(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001C1C70_0x1c1c70(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001C1C80_0x1c1c80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001C97F0_0x1c97f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001CAF20_0x1caf20(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001D06F0_0x1d06f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -77,6 +82,7 @@ void sub_001F5560_0x1f5560(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtim
 void sub_001F56F0_0x1f56f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001F5C90_0x1f5c90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_001F5ED0_0x1f5ed0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_001F87A0_0x1f87a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_0022C6D0_0x22c6d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_0022CA60_0x22ca60(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_0022CDC0_0x22cdc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -93,8 +99,11 @@ void sub_00240980_0x240980(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtim
 void sub_00240B10_0x240b10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00241C90_0x241c90(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00241CB0_0x241cb0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_0027F530_0x27f530(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_293200_0x293200(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00295BE0_0x295be0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_002972F0_0x2972f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_002B6240_0x2b6240(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_2B1310_tail002B6880_0x2b6880(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_002B8AC0_0x2b8ac0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_002B94C0_0x2b94c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -115,9 +124,34 @@ void sub_0038DBC0_0x38dbc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtim
 void sub_0038DCC0_0x38dcc0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_003A24D0_0x3a24d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_003A2D00_0x3a2d00(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003BF8F0_0x3bf8f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003BFA50_0x3bfa50(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_003D0770_0x3d0770(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003EB7F0_0x3eb7f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003EBD00_0x3ebd00(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_003F8820_0x3f8820(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00425028_0x425028(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_00425118_0x425118(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425358_0x425358(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_004253D0_0x4253d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425468_0x425468(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425520_0x425520(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_004255F0_0x4255f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_004256A0_0x4256a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425758_0x425758(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425850_0x425850(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425950_0x425950(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_004259F0_0x4259f0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425AA0_0x425aa0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425B80_0x425b80(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425C68_0x425c68(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425D40_0x425d40(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425E10_0x425e10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00425F30_0x425f30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00426C60_0x426c60(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00426C70_0x426c70(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00426E68_0x426e68(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sub_00426E78_0x426e78(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 void sub_0042A0E8_0x42a0e8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 
 // Guest address -> recovered body. Addresses already claimed by a hand-written
@@ -146,6 +180,8 @@ inline constexpr RecoveredFn kRecoveredFns[] = {
     {0x00177AA8u, 0x00177AB8u, &sub_00177AA8_0x177aa8},
     {0x00178B58u, 0x00178BE8u, &sub_00178B58_0x178b58},
     {0x0019C5D0u, 0x0019C5F0u, &sub_0019C5D0_0x19c5d0},
+    {0x001A50E0u, 0x001A588Cu, &sub_001A50E0_0x1a50e0},
+    {0x001A5890u, 0x001A5C74u, &sub_001A5890_0x1a5890},
     {0x001AC6F0u, 0x001AD0B0u, &sub_001AC6F0_0x1ac6f0},
     {0x001AD0B0u, 0x001AD5A0u, &sub_001AD0B0_0x1ad0b0},
     {0x001AD5A0u, 0x001AD6A0u, &sub_001AD5A0_0x1ad5a0},
@@ -158,6 +194,9 @@ inline constexpr RecoveredFn kRecoveredFns[] = {
     {0x001BC4E0u, 0x001BC510u, &sub_001BC4E0_0x1bc4e0},
     {0x001BF270u, 0x001BF2E0u, &sub_001BF270_0x1bf270},
     {0x001C0040u, 0x001C0060u, &sub_001C0040_0x1c0040},
+    {0x001C1980u, 0x001C1B10u, &sub_001C1980_0x1c1980},
+    {0x001C1C70u, 0x001C1C78u, &sub_001C1C70_0x1c1c70},
+    {0x001C1C80u, 0x001C1C98u, &sub_001C1C80_0x1c1c80},
     {0x001C97F0u, 0x001C9810u, &sub_001C97F0_0x1c97f0},
     {0x001CAF20u, 0x001CAF40u, &sub_001CAF20_0x1caf20},
     {0x001D06F0u, 0x001D07A0u, &sub_001D06F0_0x1d06f0},
@@ -181,6 +220,7 @@ inline constexpr RecoveredFn kRecoveredFns[] = {
     {0x001F56F0u, 0x001F5710u, &sub_001F56F0_0x1f56f0},
     {0x001F5C90u, 0x001F5CB0u, &sub_001F5C90_0x1f5c90},
     {0x001F5ED0u, 0x001F5F10u, &sub_001F5ED0_0x1f5ed0},
+    {0x001F87A0u, 0x001F88F4u, &sub_001F87A0_0x1f87a0},
     {0x0022C6D0u, 0x0022C6F0u, &sub_0022C6D0_0x22c6d0},
     {0x0022CA60u, 0x0022CA80u, &sub_0022CA60_0x22ca60},
     {0x0022CDC0u, 0x0022CDE0u, &sub_0022CDC0_0x22cdc0},
@@ -197,8 +237,11 @@ inline constexpr RecoveredFn kRecoveredFns[] = {
     {0x00240B10u, 0x00240B30u, &sub_00240B10_0x240b10},
     {0x00241C90u, 0x00241CD0u, &sub_00241C90_0x241c90},
     {0x00241CB0u, 0x00241CCCu, &sub_00241CB0_0x241cb0},
+    {0x0027F530u, 0x0028054Cu, &sub_0027F530_0x27f530},
     {0x00293200u, 0x002944D4u, &sub_293200_0x293200},
+    {0x00295BE0u, 0x00297234u, &sub_00295BE0_0x295be0},
     {0x002972F0u, 0x00297310u, &sub_002972F0_0x2972f0},
+    {0x002B6240u, 0x002B6248u, &sub_002B6240_0x2b6240},
     {0x002B6880u, 0x002B6900u, &sub_2B1310_tail002B6880_0x2b6880},
     {0x002B8AC0u, 0x002B8ADCu, &sub_002B8AC0_0x2b8ac0},
     {0x002B94C0u, 0x002B94E0u, &sub_002B94C0_0x2b94c0},
@@ -219,8 +262,33 @@ inline constexpr RecoveredFn kRecoveredFns[] = {
     {0x0038DCC0u, 0x0038DCE0u, &sub_0038DCC0_0x38dcc0},
     {0x003A24D0u, 0x003A24F0u, &sub_003A24D0_0x3a24d0},
     {0x003A2D00u, 0x003A2D20u, &sub_003A2D00_0x3a2d00},
+    {0x003BF8F0u, 0x003BFA44u, &sub_003BF8F0_0x3bf8f0},
+    {0x003BFA50u, 0x003BFA58u, &sub_003BFA50_0x3bfa50},
     {0x003D0770u, 0x003D0790u, &sub_003D0770_0x3d0770},
+    {0x003EB7F0u, 0x003EB7F8u, &sub_003EB7F0_0x3eb7f0},
+    {0x003EBD00u, 0x003EBD08u, &sub_003EBD00_0x3ebd00},
+    {0x003F8820u, 0x003F8828u, &sub_003F8820_0x3f8820},
     {0x00425028u, 0x00425118u, &sub_00425028_0x425028},
     {0x00425118u, 0x004251D8u, &sub_00425118_0x425118},
+    {0x00425358u, 0x004253CCu, &sub_00425358_0x425358},
+    {0x004253D0u, 0x00425464u, &sub_004253D0_0x4253d0},
+    {0x00425468u, 0x0042551Cu, &sub_00425468_0x425468},
+    {0x00425520u, 0x004255ECu, &sub_00425520_0x425520},
+    {0x004255F0u, 0x0042569Cu, &sub_004255F0_0x4255f0},
+    {0x004256A0u, 0x00425758u, &sub_004256A0_0x4256a0},
+    {0x00425758u, 0x00425850u, &sub_00425758_0x425758},
+    {0x00425850u, 0x0042594Cu, &sub_00425850_0x425850},
+    {0x00425950u, 0x004259ECu, &sub_00425950_0x425950},
+    {0x004259F0u, 0x00425A9Cu, &sub_004259F0_0x4259f0},
+    {0x00425AA0u, 0x00425B7Cu, &sub_00425AA0_0x425aa0},
+    {0x00425B80u, 0x00425C64u, &sub_00425B80_0x425b80},
+    {0x00425C68u, 0x00425D3Cu, &sub_00425C68_0x425c68},
+    {0x00425D40u, 0x00425E10u, &sub_00425D40_0x425d40},
+    {0x00425E10u, 0x00425F30u, &sub_00425E10_0x425e10},
+    {0x00425F30u, 0x00426044u, &sub_00425F30_0x425f30},
+    {0x00426C60u, 0x00426C6Cu, &sub_00426C60_0x426c60},
+    {0x00426C70u, 0x00426C7Cu, &sub_00426C70_0x426c70},
+    {0x00426E68u, 0x00426E74u, &sub_00426E68_0x426e68},
+    {0x00426E78u, 0x00426E84u, &sub_00426E78_0x426e78},
     {0x0042A0E8u, 0x0042A150u, &sub_0042A0E8_0x42a0e8},
 };

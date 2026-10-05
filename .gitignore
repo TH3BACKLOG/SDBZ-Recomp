@@ -64,6 +64,7 @@ build_scripts/*
 build_scripts/copilot_packs/*
 !build_scripts/copilot_packs/manifest_*.csv
 !build_scripts/copilot_packs/reply_*.csv
+!build_scripts/sweeps/
 STUDIO_BUG_LOG.md
 
 # Local tooling, dumps, and workspace clutter (not part of the recomp source tree)
@@ -85,6 +86,7 @@ ELF/
 !README*.txt
 !CHANGELOG*.txt
 !CMakeLists.txt
+!build_scripts/sweeps/*.txt
 desktop.ini
 *.7z
 ghidra_*/
@@ -172,6 +174,8 @@ gsdump_replay*.bmp
 # transliterated retail code; textures/meshes are extracted game assets.
 # (11 older recovered/*.cpp are already tracked -- ignore rules don't touch them.)
 ps2xRuntime/src/lib/Kernel/recovered/sub_*.cpp
+# Same for the sqrt(|x|) overrides (2026-10-05): copies of 3 generated game bodies.
+ps2xRuntime/src/lib/Kernel/FpuFixes/
 SDBZ?Textures/
 meshdump/
 _backup_recovered_*/

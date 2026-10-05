@@ -1,0 +1,218 @@
+# discover2.txt - map the 2D main menu (sweep1 showed U/D only moves inside the left column).
+# Run:  .\build_scripts\gfx_tour.ps1 -Name sweep2 -Script build_scripts\sweeps\discover2.txt -Seconds 2400 -Every 90
+# Needs the 10-03 runtime build with `goto ... if` (ps2_pad.cpp).
+# Verified by sweep1 (10-03): Cross does not skip the opening movie; Start at CAppTitleMain opens
+# CAppMenuMain; the menu cursor starts on Original (mode byte 0x5e6b3c -> 1); O does not leave a fight.
+# Hypotheses this run tests (H):
+#   menu grid: left column Original / Z Survivor / Training, middle Versus,
+#              right column Dragon Summoning / Customize / Options (from the sweep1 menu frame);
+#   U x4 + L x4 parks the cursor on Original; each probe logs its mode= value;
+# VERIFIED sweep2 frames t4380-t4560: pause menu = Command List / Controls / Character Select / Main Menu /
+#   Return to Game, cursor on Command List. VERIFIED sweep2 rerun t4650: the Main Menu confirm
+#   ("Quit game and return to main menu?") defaults to NO -> U then X. (Character Select's defaults to Yes.)
+#   VERIFIED sweep2 run3 t5318-t26700: Z Survivor (path D, mode 2) with no character card shows a
+#   'character card must be created' box in CAppSelectMain that X, O, Start and the pause routine never close.
+#   H: Triangle backs out -> each probe now tries O then T before the pause routine.
+#   Start during the round banner
+#   does not open it (retry loop). O does not leave CAppSelectMain.
+
+# --- boot (VERIFIED sweep1 vs sweep2): X skips the warning screen (Start does NOT -- sweep2 sat on it
+# to t=15971); Start at the demo/title opens the main menu. ---
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+# Unlock everything (VERIFIED unlock1 10-04: 5 '?' slots -> all 18 fighters). See unlock_all.txt.
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+
+# Each probe: park on Original, move along one path, X in, dwell, X deeper, dwell, back out.
+# The back-out tries O first, then the pause-menu quit routine when a fight started.
+
+# --- probe 0: (none) -> Original ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+log probe 0 path=none
+press X hold=10 gap=400
+press X hold=10 gap=400
+press O hold=10 gap=60 until app=CAppMenuMain timeout=300
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+goto q0_done if app=CAppMenuMain
+label q0
+press S hold=10 gap=90
+press D hold=6 gap=20
+press D hold=6 gap=20
+press D hold=6 gap=20
+press X hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+wait app=CAppMenuMain timeout=600
+goto q0 4 if app!=CAppMenuMain
+label q0_done
+
+# --- probe 1: D -> Z Survivor (H) ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+log probe 1 path=D
+press X hold=10 gap=400
+press X hold=10 gap=400
+press O hold=10 gap=60 until app=CAppMenuMain timeout=300
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+goto q1_done if app=CAppMenuMain
+label q1
+press S hold=10 gap=90
+press D hold=6 gap=20
+press D hold=6 gap=20
+press D hold=6 gap=20
+press X hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+wait app=CAppMenuMain timeout=600
+goto q1 4 if app!=CAppMenuMain
+label q1_done
+
+# --- probe 2: D D -> Training (H) ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press D hold=6 gap=30
+log probe 2 path=DD
+press X hold=10 gap=400
+press X hold=10 gap=400
+press O hold=10 gap=60 until app=CAppMenuMain timeout=300
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+goto q2_done if app=CAppMenuMain
+label q2
+press S hold=10 gap=90
+press D hold=6 gap=20
+press D hold=6 gap=20
+press D hold=6 gap=20
+press X hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+wait app=CAppMenuMain timeout=600
+goto q2 4 if app!=CAppMenuMain
+label q2_done
+
+# --- probe 3: R -> Versus (H) ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press R hold=6 gap=30
+log probe 3 path=R
+press X hold=10 gap=400
+press X hold=10 gap=400
+press O hold=10 gap=60 until app=CAppMenuMain timeout=300
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+goto q3_done if app=CAppMenuMain
+label q3
+press S hold=10 gap=90
+press D hold=6 gap=20
+press D hold=6 gap=20
+press D hold=6 gap=20
+press X hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+wait app=CAppMenuMain timeout=600
+goto q3 4 if app!=CAppMenuMain
+label q3_done
+
+# --- probe 4: R R -> Dragon Summoning (H) ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press R hold=6 gap=30
+press R hold=6 gap=30
+log probe 4 path=RR
+press X hold=10 gap=400
+press X hold=10 gap=400
+press O hold=10 gap=60 until app=CAppMenuMain timeout=300
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+goto q4_done if app=CAppMenuMain
+label q4
+press S hold=10 gap=90
+press D hold=6 gap=20
+press D hold=6 gap=20
+press D hold=6 gap=20
+press X hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+wait app=CAppMenuMain timeout=600
+goto q4 4 if app!=CAppMenuMain
+label q4_done
+
+# --- probe 5: R R D -> Customize (H) ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press R hold=6 gap=30
+press R hold=6 gap=30
+press D hold=6 gap=30
+log probe 5 path=RRD
+press X hold=10 gap=400
+press X hold=10 gap=400
+press O hold=10 gap=60 until app=CAppMenuMain timeout=300
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+goto q5_done if app=CAppMenuMain
+label q5
+press S hold=10 gap=90
+press D hold=6 gap=20
+press D hold=6 gap=20
+press D hold=6 gap=20
+press X hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+wait app=CAppMenuMain timeout=600
+goto q5 4 if app!=CAppMenuMain
+label q5_done
+
+# --- probe 6: R R D D -> Options (H); walk the Game Options rows for captures ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press R hold=6 gap=30
+press R hold=6 gap=30
+press D hold=6 gap=30
+press D hold=6 gap=30
+log probe 6 path=RRDD
+press X hold=10 gap=400
+press X hold=10 gap=400
+repeat 7
+  press D hold=6 gap=120
+end
+press O hold=10 gap=200
+press D hold=6 gap=120
+press X hold=10 gap=400
+press O hold=10 gap=200
+press D hold=6 gap=120
+press X hold=10 gap=400
+press O hold=10 gap=60 until app=CAppMenuMain timeout=600
+press T hold=10 gap=60 until app=CAppMenuMain timeout=600
+
+log discover2 done

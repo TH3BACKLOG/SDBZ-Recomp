@@ -1,0 +1,41 @@
+# unlock_all.txt - set every unlock flag at the main menu, then walk the Original character grid.
+# Run:  .\build_scripts\gfx_tour.ps1 -Name unlock1 -Script build_scripts\sweeps\unlock_all.txt -Seconds 900 -Every 90
+# Needs the 10-03 runtime build (poke + p1=).
+#
+# Static map (10-04, SLUS_214.42; V = read from the code, H = not yet seen in a run):
+#   0x5E6B30 word = battle-mgr flags (same struct as mode byte 0x5e6b3c). Saved as SYS+1996.
+#     V: Dragon wish grants set 0x30/0xC0/0x300/0xC00/0x3000 with message 179 ("You can now play as %s");
+#        fight-result code sets 0xC000 too. 2 bits per character -> 0xFFF0 = 6 characters.
+#     V: bits 0x1/0x4 are read by 0x3e1d80 (meaning unknown) -> left clear.
+#   0x5EC2F0 word = wish unlocks. Saved as SYS+4. Zeroed only by GameInit (0x382b50) or a memcard load.
+#     V: 0x10/0x20/0x40/0x80/0x100 = narration voices (message 180; Sound Options list 0x33c500)
+#     V: 0x200 = Customize wallpaper (message 183), 0x400 = King Kai's Planet stage (message 181; 0x383020 id 12)
+#     V: 0x2 = title-screen button code entered; 0x4/0x8 = wish requirement met.
+#   H: the poke sticks because the card has no save (no load overwrites it). If the game auto-saves
+#      after this, the unlocks land on the recomp memory card for good.
+
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+wait ticks=120
+
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+log unlock pokes done
+
+# Original -> character select; walk every column so [scene] logs each p1 id the cursor can reach.
+press X hold=10 gap=50 until app=CAppSelectMain timeout=1200
+wait ticks=200
+log grid walk start
+label col
+repeat 6
+  press D hold=6 gap=60
+end
+press R hold=6 gap=60
+goto col 7
+log grid walk done
+wait ticks=300
+press O hold=10 gap=60 until app=CAppMenuMain timeout=600
+log unlock_all done

@@ -5,7 +5,7 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are (Part 167 is the top of the file, 2026-09-30):** fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
+**Where we are (2026-10-05):** READ ORDER: the newest Part at the TOP is Part 174 (10-03 gfx sweep); everything since (Parts 168b-170, 10-04/10-05 notes, HANDOFF 10-05) is APPENDED AT THE BOTTOM -- read the last ~80 lines first. Revised plan 10-05: `C:/Users/mwlab/.claude/plans/logical-forging-bunny.md`. Older summary (09-30, stale): fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
 -- 09-15 run, Goku's select model on screen (Part 117). Warped 3D: our VIF1 + VU1 match PCSX2 bit-exact
 on a replayed capture (Part 118). Smeared 3D FIXED 09-16 -- two GS bugs (Part 119); open: Ranking-screen
 sky dome looks upside down. 09-17: that same object (`0x632b90`, RANKING/GAME OVER) also produces a
@@ -267,6 +267,80 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
+
+## Part 174 (2026-10-03) -- revise protocol: unattended "find all missing graphics" sweep
+
+- Plan: `harmonic-tickling-castle.md` (3rd revise). User launches ONE command and walks away; target = every screen/mode. Memory: `project_auto_gfx_sweep`.
+- Krillin mechanism since Part 173 (VERIFIED, user-played `gsdump\krillin`): the EE writes x86 NaN (0x7FC00000) bone matrices into VU1 q12-19 -> skinning program tpc 0x0e6 outputs XYZ=(0,0) -> strip to the top-left. PCSX2 has valid matrices. `PS2X_TRAPVAL=0x7FC00000`: first NaN store is `math_fabs` 0x185cb0 <- atan2 0x186038 <- quat->Euler 0x1c38b0; the quaternion was already NaN. PENDING: `PS2X_TRAPVAL=0xFFC00000` run -> the real producer (suspect `Ps2FpuSqrtS` on a negative input, H).
+- A. Offline audit (DONE, VERIFIED on old captures, no build):
+  - `gfx_scene_diff.py` lint: `zero=1` = a vertex at raw (0,0) or both axes <= 0x4000. krillin 384, tour 0, tour2 0.
+  - `vucap_memscan.py --x86nan`: lanes exactly 0x7FC00000/0xFFC00000. PCSX2 fight5full 0/4742 runs; krillin NaN in every vucap from t10260 (fight start), 0 before; programs 0x0e6 (+0x000/0x00e/0x02e), qwords 12-129.
+  - `gfx_scene_diff.py --audit <dir>` -> `<dir>\report.md`: BROKEN = zero-vertex lint + host-NaN VU1 + oracle DIFF; normal lint; scene timeline; disc coverage. krillin BROKEN=403, tour 0, tour2 0.
+  - `--oracle --dedupe`: skips GSRunner when our frame equals the last graded one (rows say SAME).
+- B. Pad script engine (cl /Zs EXIT=0, harness-tested, NOT BUILT):
+  - `ps2_pad.cpp`: `PS2X_PAD_SCRIPT=<file>`: `wait app=|app!=|mode=|ticks= [timeout=]`, `press B[+B] [hold= gap=] [until <cond> timeout=]`, `repeat n..end`, `label/goto [n]`, `poke addr val [w=]`, `log`. Ticks = guest vsync (same counter as GSCAP: `EeScheduler.cpp:4639-4640`).
+  - `[scene] tick= app=CAppMain>CAppX vt= mode= p1=` on every change (also without a script when PS2X_GSCAP or PS2X_SCENE_LOG is set). Class name = vtable slot 2 decode; all 54 CApp vtables decode statically. mode 0x5e6b3c / p1 0x5b4070 are H until a sweep logs them.
+  - `ps2_runtime.cpp`: `ps2x_pad_script_set_tick(gs().vsyncTick)` before `ps2x_pad_push_frame` (+1 extern decl).
+  - Offline harness (scratchpad `padh\`): ps2_pad.cpp + stub raylib + ELF in fake RAM: scene names, hold/gap timing, until, repeat, goto n, timeout, poke, Q+L1 all as designed.
+- C. `gfx_tour.ps1 -Script <file>` (implies -Oracle -Audit -Dedupe, VUCAP every 600 ticks, 10 GB disk guard, log into the capture dir), `-Audit`, `-Dedupe`. `build_scripts\sweeps\discover.txt` (151 steps): boot with X/S until CAppMenuMain, then per menu entry 0-7: U x8, D x k, X x3, dwell 900, O until menu.
+- ~~NEXT: build + sweep1~~ DONE 10-03 (B+C built; sweep1 ran 1800 s unattended).
+- D. sweep1 results (VERIFIED, `gsdump\sweep1\report.md`):
+  - Scene decode works in-game: CAppInit -> CAppWarning -> CAppDemoMain (opening movie) -> CAppTitleMain -> CAppMenuMain -> CAppSelectMain -> CAppFightMain. mode byte = 1 once Original is picked. p1 byte = fighter under the select cursor (Goku 1, Krillin 4).
+  - X does NOT skip the opening movie (t728 -> t6835) and does not start the title (title loops back to the demo); Start at the title opens the menu. O does not leave a fight.
+  - Main menu is a 2D panel grid (left Original / Z Survivor / Training, middle Versus, right Dragon Summoning / Customize / Options), so U/D only ever reached Original.
+  - The script picked Krillin by accident for fight 2 -> the audit flagged the Krillin strip with no human: BROKEN=642 (zero-vertex 639 tris in 9 caps from t19770, host-NaN VU1 3 caps), oracle 238 MATCH / 0 DIFF. Goku fight 1: no NaN.
+  - NEW NaN signature in the Krillin fight: tpc 0x084 / 0x026, qwords 13-15 (vu_t20460, vu_t21060), besides the known 0x0e6 q12-19. Not investigated.
+  - Disc coverage 662/3367 pictures (tour+tour2 was 547).
+  - Fight speed 8-9 vbl/s under capture (GSCAP every 90 + `PS2X_GS_RASTER_THREADS=0`, kept: the .vram snapshot vs MT raster is unproven).
+- Fixed after sweep1: `--audit` read the UTF-16 run log as UTF-8 (0 scenes) -> BOM-aware; SCENE_RE tolerates log lines glued onto other output.
+- E. Written, cl /Zs EXIT=0 + harness OK, NOT BUILT:
+  - pad 2: `press ... pad=2`. `iop_emulator.cpp` (ps2xIOP): `ds2Pad2`, `g_ps2x_sio2_pad2_buttons/present`; port 1 answers only while present (else PORT_2_MISSING as before). `ps2_pad.cpp`: `Engine::frame` returns pad 1 bits 0-15 / pad 2 bits 16-31; direct libpad push fills port 1 too; plugged in when a step uses pad=2 or `PS2X_PAD2=1`.
+  - `goto <label> [n] [if app=|app!=|mode=|p1=]`, and `p1=` as a wait/until condition.
+  - Scripts: `sweeps\discover2.txt` (Start boot, 7 menu-grid paths, pause-menu quit fallback, Options rows) and `sweeps\krillin.txt` (Original as Krillin via `until p1=4`, mash, re-enter fights).
+  - ELF strings: Options -> Game Options = Difficulty (Easy/Normal/Hard/Very Hard), Damage, Rounds, Time, Stage Select, Wallpaper; pause menu CMenuPause (Character Select / Main Menu / Return to Game) + CMenuPauseConfirm; Training has Opponent COM/Player + Stamina Indestructible.
+- F. E was BUILT 10-03 13:32. sweep2 + krillin2 (TRAPVAL) ran unattended and WASTED: neither reached CAppMenuMain.
+  - VERIFIED cause = script, not code: Start does NOT skip CAppWarning (sweep2 sat on it until t15971; step 0 `press S until menu` timed out at 12000). sweep1 pressed X and left the warning at t728. Then the blind steps ran on demo/title screens.
+  - Both audits are clean only because nothing was reached: BROKEN=0, oracle 297/260 MATCH, disc 400 and 388 of 3367. No TRAPVAL hit (no Krillin fight).
+  - The new pad code is not convicted: the direct push carried Start (first push btns=0xfff7). The `[pad] host change` log sits in readState, before the script merge, so it no longer shows script presses. pad=2 is still unexercised.
+  - Fixed boot in both scripts: `wait app=CAppWarning` -> `press X until app!=CAppWarning` -> label boot / `press S until app=CAppMenuMain timeout=1500` / `goto boot 6 if app!=CAppMenuMain`. Harness parses 202 / 58 steps.
+- G. Rerun 10-04 (sweep2): boot fix VERIFIED (menu at t1297). Probe 0 (X X from menu) = Original, Goku fight at t2171. Every later probe stayed in Original: never got back to CAppMenuMain.
+  - VERIFIED from frames t4380-t4560: pause menu = Command List / Controls / Character Select / Main Menu / Return to Game, cursor starts on Command List; confirm box "Quit game and return to character select?" defaults to Yes. The old quit routine (D D) chose Character Select. Start during the FINAL ROUND banner did not open the pause menu (t3210-3750). O does not leave CAppSelectMain.
+  - Audit: BROKEN=1 = host-NaN VU1 in the Krillin fight (p1=4, vu_t16260, tpc 0x0e6 + 0x000/0x00e/0x02e, qwords 12-106); zero-vertex 0 (strip not in a capture). Oracle 262 MATCH / 0 DIFF. Disc 805/3367 (was 662). Fighters reached: p1 1, 0x0a, 4.
+  - discover2 quit routine now = S, D D D (Main Menu), X, X (Yes), wait CAppMenuMain; 6 blocks replaced, parses 196 steps.
+- H. krillin2 (TRAPVAL 0xFFC00000) 10-04: picked Krillin (p1=4), fight at t2111, then FROZE at real t≈276 s (gif/s 0, stuckSecs 2111 by the end).
+  - VERIFIED cause: `[guest-branch:missing-target] IndirectCall JALR source=0x204310 target=0x3bf8f0` (a0=0x501d98). 0x3bf8f0 sat in a func-map gap (0x3bf8f0-0x3bfa60) after obj_ctor_init 0x3bf880: one real function 0x3bf8f0-0x3bfa44 (addiu sp,-0x60 ... jr ra 0x3bfa3c) + a `j 0x3b7910` stub at 0x3bfa50.
+  - TRAPVAL: 34 hits, ALL at boot (CAppInit, t<1 s), pc 0x18e284/0x18e294 = qword copy from 0x2d5d90 <- 0x2d6470 = integer data, not the NaN producer. The fight froze before any NaN would appear (sweep2's NaN came about 1900 ticks into the fight). Cap not hit.
+  - Recovered (same route as 0x293200): rows `sub_003BF8F0,0x3bf8f0,0x3bfa44` + `sub_003BFA50,0x3bfa50,0x3bfa58` -> `recovered_3bf8f0.csv` -> apply_recovered_rows.py (map 17085 rows; .bak 20261004-090548); scratch regen `output_scratch_3bf8f0` (config in scratchpad); ONLY the 2 bodies copied to `Kernel/recovered/` (include style matched); `gen_recovered_header.py` (no args) -> 88 bodies, +4 lines; header only included by game_overrides.cpp. cl /Zs EXIT=0 on both bodies + game_overrides.cpp. NOT BUILT.
+- I. sweep2 rerun 10-04 (0x3bf8f0 build): still never returned to CAppMenuMain; FROZE at real t≈2058 s (tick ~12400, still in the Original fight).
+  - VERIFIED from frames t4470-t4650: D D D reaches Main Menu, but its confirm box "Quit game and return to main menu?" defaults to **No** (Character Select's defaults to Yes). The X X routine answered No each retry. First try (t3205) hit the FINAL ROUND banner (no pause).
+  - Fix: quit blocks = S, D D D, X, **U**, X, wait CAppMenuMain (6 blocks); harness parses 202 steps.
+  - VERIFIED freeze cause: `[guest-branch:missing-target] IndirectCall JALR source=0x23a818 target=0x27f530` (a0=0x1dbbbf0). Gap 0x27f528-0x280550 after euler_to_quat_z_1 = ONE function 0x27f530-0x28054c (addiu sp,-0x3e0 ... jr ra 0x280544; big beq switch on [a0+24]->type 0xc9/0xc8/0x66...).
+  - Recovered same route: `recovered_27f530.csv` -> apply_recovered_rows (17086 rows; .bak 20261004-122948); scratch `output_scratch_27f530`; body copied; gen_recovered_header -> 89 bodies (+1 decl, +1 table row). cl /Zs EXIT=0 body + game_overrides.cpp. NOT BUILT.
+  - Audit (nothing new reached): BROKEN 0, oracle 223/0, disc 464/3367. 0x3bf8f0 freeze did not recur (not reached either: no Krillin here).
+- J. krillin2 TRAPVAL rerun 10-04 (0x3bf8f0 build): NO freeze, full 2400 s Krillin fight. 0x3bf8f0 recovery VERIFIED. Audit BROKEN 1357 = zero-vertex 1344 tris in 19 caps (first cap_t4652, tbp0 0x2a00/0x2b20/0x2bc0, bbox from (-1792,-1824)) + host-NaN VU1 in 13 caps (first vu_t4860; tpc 0x0e6/0x000/0x00e/0x02e and 0x084/0x026). Oracle 194/0. Fight from t2110.
+  - TRAPVAL 0xFFC00000: 256 hits (cap hit), 33 boot (known), rest in-fight. Per-pc first hits -> functions with a sqrt.s: 0x2afed0 (2 sites), 0x3107d0 (1), 0x313250 (1); the rest (vec3f_normalize, vu_matrix_load, mem_copy, fabs, sin, vec4f_copy...) have no sqrt = propagation.
+  - VERIFIED statically (own COP1 decoder; mips_r5900_disassembler prints COP1 arith as raw `cop1`): 0x2b0018 sqrt(2*y*h), y = position delta (first in-fight hit #34, ~tick 3490, store 0x2b001c -> 0x5c7614); 0x31101c sqrt(b*b-4ac) quadratic, roots (-b±s)/2a stored 0x311048 (hit #35); 0x313400 sqrt(2*(1+cos)) half-angle. All can be < 0 from finite inputs. R5900/PCSX2 sqrt.s = sqrt(|x|) (macro header comment, read from PCSX2 iFPU.cpp); FPU_SQRT_S gives x86 NaN 0xFFC00000. HYPOTHESIS until a run shows it: these are the only producers.
+  - Fix (no header): `Kernel/FpuFixes/sqrt_abs_overrides.cpp` = the 3 production bodies (byte-identical to output/), renamed sdbzSqrtAbs_*, FPU_SQRT_S -> Ps2FpuSqrtS(fabs(x)). game_overrides.cpp: 3 decls + register every word of each range (after the kRecoveredFns loop). cl /Zs EXIT=0 both. NOT BUILT.
+- 10-04 14:53 BUILT (0x27f530 + sqrt fix); chained run launched ~15:00.
+- sweep2 run3: BROKEN 0, oracle 297/0, no missing-target to t26700 (0x27f530 VERIFIED); U-quit VERIFIED t4767. Path D = mode 2 Z Survivor -> 'character card must be created' box in CAppSelectMain; X/O/S/pause never close it; probes 2-6 never ran. discover2 now tries O then T (H).
+- ✅ krillin2 run3: Krillin FIXED - BROKEN 0 (zero-vertex 0, host-NaN 0, oracle 197/0), Krillin fight t2110-t10690, no missing-target. TRAPVAL: 0 hits at the sqrt sites; 223 hits at pc 0x1a7560 are an integer bit-clear `sw` (mask word 0x5a4130), not NaN.
+- NEXT: user reruns discover2 (T back-out) -> map all modes. Then Original playthrough script, Versus pad 2. Commit when asked (sqrt override, 0x27f530, 0x3bf8f0, sweeps). (pass = BROKEN 0, few/no in-fight trap hits). Then: Original-mode playthrough script, Versus with pad 2.
+
+## Part 173 (2026-10-03) -- revise protocol: the stream-lint premise was wrong
+
+- Plan: `C:\Users\mwlab\.claude\plans\harmonic-tickling-castle.md`. Upstream: only #256 (README). Its FPU macros are the same plain IEEE.
+- VERIFIED: `vu1_bench.ps1 -Verify` PASS: VU1 recomp = interpreter = PCSX2 on fight5full (4000 runs, 0 mismatch) and scores_step6.
+- VERIFIED: the EE FPU can produce Inf/NaN; the R5900 cannot (`ps2_runtime_macros.h:701-704` plain IEEE, `Ps2FpuDivS` x/0 = Inf, CVT/TRUNC_W unsaturated). Fixing the macro = header = 30 h rebuild, so only a targeted override once one function is named.
+- **VERIFIED, falsifies Part 172's lint reading:** PCSX2's OWN VU1 output (`fight5full.vucap`, kick chunks joined) has 40 on-screen clamp fans in 5 frames (~8/frame), tbp0 0x2b20 family. Ours: ~4.7/frame. On-screen clamp fans are normal clipper output. All flagged tour2 caps are oracle MATCH and look clean.
+- Only in ours: corner=1 (14, stage textures, off-screen right/bottom corners) and edge>1200 with no clamp (9). Probably normal too. The "(-768,-800) top-left on cap_t8085" claim was wrong: that corner is (1280,-800).
+- The Krillin symptom (thin black triangle from his back to the TOP-LEFT) was never captured: the tours never play Krillin.
+- Tooling (uncommitted):
+  - `gfx_scene_diff.lint_blobs()` + `corner` field.
+  - `vucap_decode_kick.py --lint` (joins PCSX2 KICKDATA chunks).
+  - `PS2X_VUCAP_AT=t<tick>` tick windows in `VuCapRecorder.cpp` (cl /Zs EXIT=0, NOT BUILT).
+  - `gfx_tour.ps1 -VuCapTicks`.
+  - Scratch tools in `build_scripts\gfx_scratch\`.
+- NEXT: a Krillin capture. User plays original mode as Krillin with GSCAP_EVERY (+ VUCAP ticks once built). Then lint for corner=1 at (4000,4000) on a Krillin texture, then replay + memscan that run.
 
 ## Part 172 (2026-10-02) -- revise protocol: find missing graphics with no play and no eyeballing
 
@@ -23651,3 +23725,42 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 - Link fix: 28 abort stubs for recovered `sub_293200` callees in `ps2xTest/src/recomp_override_stubs.cpp`.
 - Clouds: texture matches PCSX2 (L3 `audit_texhash_vs_pcsx2.py`), wrap falsified (wms=1), strip #7 x-114..398 y320-448 missing; `wrapTexCoord` fix + `[botdraw]` scis/ofx in rasterizer (built). Krillin: 134/200 runaway tris on VU1 guard-band clamp (hypothesis).
 - NEXT: user takes PCSX2 Shift+F8 dumps (menu clouds, Options, Z Survivor, Krillin), run the tool on each. Not committed (0x293200 recovery unrun): game_overrides.cpp, recovered_functions.h, funcmap csv, recovered_293200.csv, imgui.ini, .bak (ask before deleting).
+
+- 10-04 UNLOCK FLAGS (static, VERIFIED from code; run effect H): char flags word 0x5E6B30 (6 chars, 0xFFF0), wish word 0x5EC2F0 (narration 0x10-0x100, wallpaper 0x200, King Kai 0x400, title code 0x2) -> build_scripts/sweeps/unlock_all.txt pokes both at CAppMenuMain. Options bytes 0x5C7940. Detail: memory project_unlock_flags.md.
+
+- ✅ unlock1 run: char unlock VERIFIED (krillin2 grid 5 '?' -> unlock1 all 18 faces), BROKEN 0. Pokes added to discover2.txt + krillin.txt. NEXT: sweep3 (discover2) now also covers unlocked content.
+
+- Unlock All toggle note written (Importaint Text Files/Unlock All Toggle.md); PARKED until new assets are added.
+- NEXT: user runs sweep3 (discover2); I write the Original playthrough script (options bytes 0x5C7940).
+
+- Options bytes VERIFIED: 0x5C7940 Difficulty {1,3,5,8}, 0x5C7941 Damage, 0x5C7942 Time, 0x5C7943 Rounds, 0x5C7944 Stage Select. NEW build_scripts/sweeps/original.txt (Original playthrough, Easy/dmg8/1rd/45s, Goku, mash+X loop), parses, UNRUN.
+- Pad 2 is built but unexercised; versus.txt after sweep3 shows the Versus menu.
+
+- One-hit kills: health = int at health_obj+12 (VERIFIED code, 0x1d2500/0x1d25d0); original.txt pokes community P2 health 0x5B1A1C=1 while in CAppFightMain (H: heap address). Detail: memory project_unlock_flags.md.
+
+- 10-05 sweep3 + orig1: BROKEN 0 both. orig1 fought through to Cell; fixed-address P2 HP poke was unreliable (pool order). Fighter array 0x5ADFB0 (2 x 0x1CD0) VERIFIED; ps2_pad.cpp gained `poke [ptr]+off` (UNBUILT); original.txt uses [0x5B14C0]+12. NEW versus.txt (pad 2, UNRUN). Detail: memory project_unlock_flags.md.
+
+- 10-05 orig2: pointer poke VERIFIED (old=250->1). Froze in Cell fight on unmapped fn 0x295be0 (JALR from 0x23a800). Recovered (func-map row + scratch regen + body + header, cl /Zs EXIT=0), UNBUILT.
+
+- 10-05 static sweep: NEW build_scripts/funcmap/scan_dispatch_holes.py (every ELF reference vs the built dispatch table). 27 holes recovered (6 vtable thunks, 0x1c1980, 16 handlers 0x425358.., 4 error thunks 0x426c60..); 0 HOLE left. Header 120 bodies, cl /Zs EXIT=0, UNBUILT. orig1 also froze on 0x295be0. Detail: memory project_dispatch_hole_scan.md.
+
+- 10-05 05:33 BUILT (user): 0x295be0 + 27 dispatch-scan holes + `poke [ptr]+off`. Clean link.
+- 10-05 orig3 (new build): reached fight 3 (~18 min), 0 missing-target. Then F: hit 0 GB free -> launch_recomp Tee-Object "not enough space" -> game looked frozen; vs1 failed at once. NOT a game bug; Cell (0x295be0) still untested live.
+- 10-05 disk: deleted 2744 graded-clean capture files (14.6 GB) from orig1/sweep1(kept 12 named)/sweep2/sweep3/krillin2; orig2 kept (ungraded). gfx_tour.ps1 now auto-prunes clean caps after a full oracle+audit grade (default with -Script; -Prune / -KeepCaps). User then freed more: 48 GB free.
+
+## HANDOFF 10-05 (end of session)
+
+- State: build current (05:33). All fixes below are BUILT, UNCOMMITTED: sqrt(|x|) override, recovered bodies 0x293200/0x3bf8f0/0x27f530/0x295be0 + 27 scan holes, ps2_pad.cpp script engine + pad 2 + poke [ptr], iop_emulator pad 2, sweep scripts, scan tools, gfx_tour edits. build_scripts/* is gitignored -> needs negations at commit time. Commit only when asked.
+- NEXT (user runs, external window):
+  `Set-Location "F:\SDBZ Recomp"; .\build_scripts\gfx_tour.ps1 -Name orig3 -Script build_scripts\sweeps\original.txt -Seconds 4800 -Every 90; .\build_scripts\gfx_tour.ps1 -Name vs1 -Script build_scripts\sweeps\versus.txt -Seconds 3600 -Every 90`
+- Check after: orig3 = 0 missing-target, past Cell, ending reached, BROKEN 0, prune line printed. vs1 = mode 3 reached, pad-2 presses land, new P2 fighter/stage each loop, BROKEN 0.
+- Later: grade orig2 `.\build_scripts\gfx_tour.ps1 -Name orig2 -ReplayOnly -Oracle -Audit -Prune`. Difficulty option sweep. Unlock-all toggle PARKED.
+- Learned patterns (this session):
+  - A whole-ELF reference scan vs the BUILT dispatch table (scan_dispatch_holes.py) finds freeze holes before a run does; rerun after every func-map change, expect 0 HOLE.
+  - Bound recovered bodies by next CSV/recovered/hole start, not generated slots (stale resume aliases cut bodies short); keep delay-slot nops.
+  - A recovered body that tail-calls another recovered body needs a local forward decl (bodies don't include recovered_functions.h) -> C3861 otherwise.
+  - A "frozen" run with an empty-ish log = check disk space first (Tee-Object "not enough space").
+  - `-ReplayOnly -Audit` without `-Oracle` reports "oracle: not graded"; always pass -Oracle.
+
+- 10-05 session start (revise protocol): upstream = only c5a9d025 #256 (README .recomp.json doc, no code) -> nothing to port. orig3/vs1 still NOT rerun (gsdump/orig3 holds 237 stale files from the disk-full run; gfx_tour clears the dir on rerun). F: 49 GB free. orig2 still ungraded (676 files).
+- 10-05 revise plan approved: (1) audit_disc_textures coverage hashes saved per dir + `--union` across runs (pruned runs lost per-picture data); (2) commit the uncommitted work now (user yes); (3) user grades orig2, then reruns orig3+vs1; (4) SPU2 audio = next thread AFTER graphics (user choice). Verified gap: the oracle grades only our rasterizer (it replays our own stream) -> BROKEN 0 != nothing missing; disc coverage is the stream-level check.

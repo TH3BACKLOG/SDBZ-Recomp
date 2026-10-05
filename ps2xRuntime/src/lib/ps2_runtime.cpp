@@ -77,6 +77,7 @@ extern "C" void ps2x_fmv_host_shutdown(void);
 // header-cost reason as above. Must be called on the thread that polls raylib
 // input, i.e. right after EndDrawing().
 extern "C" void ps2x_pad_push_frame(uint8_t *rdram);
+extern "C" void ps2x_pad_script_set_tick(uint64_t tick); // ps2_pad.cpp, PS2X_PAD_SCRIPT clock
 extern "C" void ps2x_gs_present_begin(); // ps2_gif_arbiter.cpp
 extern "C" void ps2x_gs_present_end();
 extern "C" int ps2x_gs_thread_latches();
@@ -7132,6 +7133,7 @@ void PS2Runtime::run()
 
         // EndDrawing() has just run raylib's PollInputEvents(), so host key /
         // gamepad state is fresh on this thread. Push it to the guest now.
+        ps2x_pad_script_set_tick(m_memory.gs().vsyncTick.load(std::memory_order_acquire));
         ps2x_pad_push_frame(m_memory.getRDRAM());
 
         // RecompDebugger IPC: once-per-video-frame extended telemetry (GS

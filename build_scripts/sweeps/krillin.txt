@@ -1,0 +1,49 @@
+# krillin.txt - walk-away Krillin repro: Original mode as Krillin, mash attacks for a long fight.
+# Run:  .\build_scripts\gfx_tour.ps1 -Name krillin2 -Script build_scripts\sweeps\krillin.txt -Seconds 2400 -Every 90
+# (TRAPVAL run: set $env:PS2X_TRAPVAL first; gfx_tour passes the environment through.)
+# Needs the 10-03 runtime build with p1= and `goto ... if` (ps2_pad.cpp).
+# Verified by sweep1 (10-03): Start at the title opens CAppMenuMain with the cursor on Original;
+# X there -> CAppSelectMain (mode 1); p1 byte = fighter under the cursor (Goku 1, Krillin 4);
+# sweep1's Krillin fight produced the zero-vertex strip + x86 NaN VU1 matrices.
+
+# Boot (VERIFIED sweep1 vs krillin2): X skips the warning screen, Start does not; Start at demo/title -> menu.
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+# Unlock everything (VERIFIED unlock1 10-04: 5 '?' slots -> all 18 fighters). See unlock_all.txt.
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+wait ticks=120
+press X hold=10 gap=50 until app=CAppSelectMain timeout=1200
+wait ticks=200
+
+# Find Krillin: cycle each column with D, step right between columns (H: the grid wraps).
+label col
+press D hold=6 gap=30 until p1=4 timeout=260
+goto picked if p1=4
+press R hold=6 gap=30
+goto col 5
+label picked
+log on Krillin
+wait ticks=30
+
+# Confirm the fighter, then X through the world map / next-stage screens until the fight.
+press X hold=10 gap=120 until app=CAppFightMain timeout=3000
+
+# Fight: mash square / triangle / X with some movement; keep it going across rounds and continues.
+label fight
+repeat 6
+  press Q hold=4 gap=8
+  press Q hold=4 gap=8
+  press T hold=4 gap=8
+  press R hold=20 gap=4
+  press X hold=4 gap=8
+  press L hold=20 gap=4
+end
+goto fight 200 if app=CAppFightMain
+# Out of the fight (result / continue / next stage): X back in; resume mashing.
+press X hold=10 gap=60 until app=CAppFightMain timeout=1500
+goto fight 20 if app=CAppFightMain
+log krillin done

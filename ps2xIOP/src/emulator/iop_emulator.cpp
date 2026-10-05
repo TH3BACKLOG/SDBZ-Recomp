@@ -39,6 +39,10 @@
 extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_buttons{0xFFFFu};
 extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_analog{0x7F7F7F7Fu};
 extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_served{0u};
+// Scripted second pad (PS2X_PAD_SCRIPT `press ... pad=2`, or PS2X_PAD2=1).
+// While present == 0, port 1 keeps answering PORT_2_MISSING as before.
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad2_buttons{0xFFFFu};
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad2_present{0u};
 
 // EE cycles EeScheduler::accountCycles() may keep back from runEeCycles()
 // without changing when the IOP runs: runEeCycles() only banks while
@@ -307,6 +311,7 @@ namespace ps2x::iop::detail
             rpc.reset();
             cdvd.reset();
             ds2Pad = {};
+            ds2Pad2 = {};
             intrman.reset();
             timrman.reset();
             vblank.reset();
@@ -646,6 +651,14 @@ namespace ps2x::iop::detail
                             out.push_back(ds2Pad.send(inByte(k), buttons, analog));
                         if (ds2Pad.command == 0x42u)
                             g_ps2x_sio2_pad_served.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                    else if (g_ps2x_sio2_pad2_present.load(std::memory_order_relaxed) != 0u)
+                    {
+                        const uint16_t buttons2 =
+                            static_cast<uint16_t>(g_ps2x_sio2_pad2_buttons.load(std::memory_order_relaxed));
+                        ds2Pad2.softReset();
+                        for (uint32_t k = 1; k < length; ++k)
+                            out.push_back(ds2Pad2.send(inByte(k), buttons2, 0x7F7F7F7Fu));
                     }
                     else
                     {
@@ -1023,6 +1036,7 @@ namespace ps2x::iop::detail
         IopKernel kernel;
         IopCdvd cdvd;
         Ds2Pad ds2Pad;
+        Ds2Pad ds2Pad2; // port 1, only answered while g_ps2x_sio2_pad2_present
         IopVblank vblank;
         IopRpcBridge rpc;
         IopSysclib sysclib;

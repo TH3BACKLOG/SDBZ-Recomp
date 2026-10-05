@@ -9,6 +9,8 @@ Usage:
     python audit_disc_textures.py                # summary + format census
     python audit_disc_textures.py --json out.json  # full inventory
     python audit_disc_textures.py --other        # census of non-.pix file types
+    python audit_disc_textures.py --coverage gsdump/orig2   # one run (saves coverage_hashes.json)
+    python audit_disc_textures.py --coverage gsdump/*       # union of every run, pruned ones via json
 """
 import argparse
 import collections
@@ -127,17 +129,55 @@ def gsr_uploads(path):
     return done
 
 
+COV_JSON = "coverage_hashes.json"
+
+
+def dir_hashes(d):
+    """Upload hashes of one capture dir. gfx_tour prunes clean .gsr files after grading,
+    so the sets are saved to <dir>/coverage_hashes.json and merged with whatever .gsr
+    files are still there. The json only grows; gfx_tour wipes the dir on a rerun."""
+    full, head, nup = set(), set(), 0
+    jp = os.path.join(d, COV_JSON)
+    if os.path.exists(jp):
+        with open(jp, encoding="utf-8") as f:
+            j = json.load(f)
+        full.update(j["full"])
+        head.update(j["head"])
+        nup = j["uploads"]
+    gsrs = sorted(f for f in os.listdir(d) if f.endswith(".gsr"))
+    if gsrs:
+        fresh = 0
+        for f in gsrs:
+            for up in gsr_uploads(os.path.join(d, f)):
+                fresh += 1
+                full.add(hashlib.md5(up).hexdigest())
+                head.add(hashlib.md5(up[:1024]).hexdigest())
+        nup = max(nup, fresh)
+        with open(jp + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"uploads": nup, "full": sorted(full), "head": sorted(head)}, f)
+        os.replace(jp + ".tmp", jp)
+    if gsrs:
+        src = f"{len(gsrs)} .gsr (saved {COV_JSON})"
+    elif full:
+        src = COV_JSON
+    else:
+        src = "nothing (pruned before coverage was saved)"
+    return full, head, nup, src
+
+
 def coverage(pics, dirs):
-    """Which disc pictures were uploaded during the captured tour(s)."""
+    """Which disc pictures were uploaded during the captured tour(s).
+    Several dirs = the union over all of them (e.g. --coverage gsdump/*)."""
     full, head = set(), set()
     nup = 0
+    dirs = [d for d in dirs if os.path.isdir(d)]
     for d in dirs:
-        for f in sorted(os.listdir(d)):
-            if f.endswith(".gsr"):
-                for up in gsr_uploads(os.path.join(d, f)):
-                    nup += 1
-                    full.add(hashlib.md5(up).hexdigest())
-                    head.add(hashlib.md5(up[:1024]).hexdigest())
+        f_, h_, n_, src = dir_hashes(d)
+        full |= f_
+        head |= h_
+        nup += n_
+        if len(dirs) > 1:
+            print(f"  {os.path.basename(os.path.normpath(d)):<12} {len(f_):>5} distinct uploads  from {src}")
     seen_files = collections.defaultdict(lambda: [0, 0])
     for p in pics:
         hit = p["imgMd5"] in full or p["imgHead"] in head

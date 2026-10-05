@@ -15,6 +15,13 @@ live at fixed qwords per microprogram, vertex data does not.
   python vucap_memscan.py ours.vucap
   python vucap_memscan.py ours.vucap pcsx2.vucap
   python vucap_memscan.py pcsx2.vucap --control 0x084:17   # negative control
+  python vucap_memscan.py --x86nan a.vucap b.vucap ...       # host-NaN audit
+
+--x86nan counts lanes holding exactly 0x7FC00000 or 0xFFC00000 (the x86/C quiet NaN).
+The R5900 FPU and the VUs never produce NaN, so these can only come from a host float
+bug on the EE side (10-03 Krillin: NaN bone matrices -> VU1 tpc 0x0e6 -> XY=(0,0) strip).
+Control: PCSX2 logs\\vucap\\fight5full.vucap must show 0. Last line per file:
+"X86NAN <path> runs=<n> nanruns=<n> lanes=<n>" (gfx_tour.ps1 -Audit greps it).
 
 --control TPC:QWORD writes a NaN into lane x of that qword in every run with
 that tpc before scanning; the report must then show it.
@@ -86,6 +93,52 @@ def scan(path, huge, control):
     return stats, runs_total, runs_nomem
 
 
+X86_NANS = (0x7FC00000, 0xFFC00000)
+
+
+def x86nan(path):
+    """Per tpc: runs, runs with an x86 NaN lane, lanes, qword range, first run."""
+    per = {}
+    runs_total = 0
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        if m[:8] != b"PS2VUCAP":
+            raise SystemExit(f"{path}: bad magic")
+        off, n = 16, len(m)
+        while off + 8 <= n:
+            rtype = m[off]
+            length = struct.unpack_from("<I", m, off + 4)[0]
+            if off + 8 + length > n:
+                break
+            if rtype == 3:
+                run, tpc, _top, _itop, _cm, _cmi, has = struct.unpack_from("<7I", m, off + 8)
+                if has and length >= 28 + STATE_SIZE + VU1_SIZE:
+                    runs_total += 1
+                    raw = np.frombuffer(m, dtype="<u4", count=VU1_SIZE // 4,
+                                        offset=off + 8 + 28 + STATE_SIZE).reshape(QWORDS, 4)
+                    hit = (raw == X86_NANS[0]) | (raw == X86_NANS[1])
+                    e = per.setdefault(tpc, [0, 0, 0, QWORDS, -1, None])
+                    e[0] += 1
+                    lanes = int(hit.sum())
+                    if lanes:
+                        qs = np.nonzero(hit.any(axis=1))[0]
+                        e[1] += 1
+                        e[2] += lanes
+                        e[3] = min(e[3], int(qs[0]))
+                        e[4] = max(e[4], int(qs[-1]))
+                        if e[5] is None:
+                            e[5] = run
+                    del raw, hit  # views into the mmap block its close
+            off += 8 + length
+    nanruns = sum(e[1] for e in per.values())
+    lanes = sum(e[2] for e in per.values())
+    for tpc, e in sorted(per.items(), key=lambda kv: -kv[1][2]):
+        if e[1]:
+            print(f"  tpc {tpc:#05x}: {e[1]}/{e[0]} runs with x86 NaN, {e[2]} lanes, "
+                  f"qwords {e[3]}-{e[4]}, first run {e[5]}")
+    print(f"X86NAN {path} runs={runs_total} nanruns={nanruns} lanes={lanes}")
+    return nanruns
+
+
 def bad_fraction(s):
     return ((s.nonfinite + s.huge).sum(axis=1) > 0).astype(np.float64), (s.nonfinite + s.huge).max(axis=1) / max(s.runs, 1)
 
@@ -136,12 +189,16 @@ def compare(name_a, a, name_b, b, top, ratio):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("capture")
-    ap.add_argument("other", nargs="?", help="second capture to compare against")
+    ap.add_argument("other", nargs="*", help="second capture to compare against (--x86nan: any number)")
+    ap.add_argument("--x86nan", action="store_true", help="count exact host NaN lanes only (see above)")
     ap.add_argument("--huge", type=float, default=1e8, help="|x| at or above this counts as huge (default 1e8)")
     ap.add_argument("--ratio", type=float, default=1e3, help="compare: flag max |x| growth above this (default 1000)")
     ap.add_argument("--top", type=int, default=8, help="qwords listed per start pc")
     ap.add_argument("--control", help="TPC:QWORD negative control applied to the FIRST capture")
     args = ap.parse_args()
+
+    if args.x86nan:
+        return 1 if sum(x86nan(p) > 0 for p in [args.capture] + args.other) else 0
 
     control = None
     if args.control:
@@ -152,9 +209,10 @@ def main():
     a = scan(args.capture, args.huge, control)
     report(args.capture, *a, args.top)
     if args.other:
-        b = scan(args.other, args.huge, None)
-        report(args.other, *b, args.top)
-        compare(args.capture, a[0], args.other, b[0], args.top, args.ratio)
+        other = args.other[0]
+        b = scan(other, args.huge, None)
+        report(other, *b, args.top)
+        compare(args.capture, a[0], other, b[0], args.top, args.ratio)
     return 0
 
 

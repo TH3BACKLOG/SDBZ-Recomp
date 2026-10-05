@@ -352,9 +352,28 @@ def lint(gsr):
     """Flag primitives that are wrong INPUT (PCSX2 would draw them wrong too): triangles with an
     edge > 1200 px that still reach the screen (same rule as the [runaway] probe), and vertices
     on the VU1 guard-band clamp (raw 0x4000 / 0xBFFF). -> list of finding dicts."""
+    return lint_blobs(enumerate(gsr_transfers(gsr)))
+
+
+def lint_broken(f):
+    """zero (top-left/raw-0 vertex) is never normal; plain clamp fans and corner fans at
+    off-screen right/bottom are guard-band clipper output (PCSX2 sends them too)."""
+    return f.get("zero", False)
+
+
+def lint_line(stem, f):
+    b = f["bbox"]
+    return (f"{stem} t={f['t']} prim={f['prim']} edge={f['edge']:.0f} clamp={int(f['clamp'])} corner={int(f['corner'])} "
+            f"zero={int(f.get('zero', False))} tbp0={f['tbp0']:#x} bbox=({b[0]:.0f},{b[1]:.0f})-({b[2]:.0f},{b[3]:.0f})")
+
+
+def lint_blobs(blobs, xyoffset=None):
+    """lint() over any GIF packets: blobs = iterable of (t, bytes), e.g. a .vucap's XGKICK
+    packets with t = run index. xyoffset = raw (OFX, OFY) used until a packet sets XYOFFSET."""
     import struct
     found = []
-    prim, ofs, tex0 = 0, [(1792 * 16, 1824 * 16), (1792 * 16, 1824 * 16)], [0, 0]
+    o = xyoffset or (1792 * 16, 1824 * 16)
+    prim, ofs, tex0 = 0, [tuple(o), tuple(o)], [0, 0]
     q = []
     pending = 0
 
@@ -393,11 +412,20 @@ def lint(gsr):
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         visible = max(xs) >= 0 and min(xs) < W and max(ys) >= 0 and min(ys) < H
         clamp = any(a in (0x4000, 0xBFFF) or b in (0x4000, 0xBFFF) for a, b in tri)
-        if visible and (edge > 1200 or clamp):
-            found.append({"t": t, "prim": prim & 7, "edge": edge, "clamp": clamp,
-                          "tbp0": tex0[ctx] & 0x3FFF, "bbox": (min(xs), min(ys), max(xs), max(ys))})
+        # zero = a vertex at raw (0,0) or clamped top-left (both axes <= 0x4000): what the VU1
+        # skinning program 0x0e6 outputs from NaN bone matrices (the Krillin strip, 10-03).
+        # Never seen in PCSX2 output; always BROKEN.
+        zero = any(a <= 0x4000 and b <= 0x4000 for a, b in tri)
+        if visible and (edge > 1200 or clamp or zero):
+            # corner = one vertex on the clamp in BOTH x and y. Plain clamped fans on screen are
+            # normal VU1 clipper output (PCSX2's own fight5full.vucap kicks have ~8 per frame);
+            # corner and edge>1200-without-clamp were never seen in PCSX2 output (10-03).
+            corner = any(a in (0x4000, 0xBFFF) and b in (0x4000, 0xBFFF) for a, b in tri)
+            found.append({"t": t, "prim": prim & 7, "edge": edge, "clamp": clamp, "corner": corner, "zero": zero,
+                          "tbp0": tex0[ctx] & 0x3FFF, "bbox": (min(xs), min(ys), max(xs), max(ys)),
+                          "raw": [tuple(v) for v in tri]})
 
-    for t, blob in enumerate(gsr_transfers(gsr)):
+    for t, blob in blobs:
         off, end = 0, len(blob)
         if pending:
             take = min(pending * 16, end)
@@ -476,9 +504,11 @@ def first_divergent(gsr, rect, rows, fbp, fbw, psm, work, runner, thresh, env, c
     return ts[hi]
 
 
-def oracle(folder, out, runner, thresh, only="*", skip=None):
+def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False):
     """Every capture in a tour dir: our replay vs PCSX2 GSRunner at the same cut -> report.md.
-    skip = seeded fault: drop that transfer from OUR replay only; the report must blame it."""
+    skip = seeded fault: drop that transfer from OUR replay only; the report must blame it.
+    dedupe = skip GSRunner when our frame equals the last graded one (mean diff < 0.5): a long
+    sweep sits on the same screen for minutes. The stream lint still sees every capture."""
     global W, H
     caps = sorted(folder.glob(only + ".gsr"), key=lambda p: int(re.search(r"_t(\d+)$", p.stem).group(1)) if re.search(r"_t(\d+)$", p.stem) else 0)
     if not caps:
@@ -487,6 +517,7 @@ def oracle(folder, out, runner, thresh, only="*", skip=None):
     work = out / "work"
     work.mkdir(exist_ok=True)
     lines, groups, lint_rows, offset_caps = [], {}, [], []
+    last = None  # (stem, frame) of the last capture GSRunner graded
     for gsr in caps:
         regs = gsr_regs(gsr)
         geo = display_geometry(gsr, out, regs)
@@ -509,6 +540,12 @@ def oracle(folder, out, runner, thresh, only="*", skip=None):
             env["PS2X_GSBENCH_SKIP"] = str(skip)
         render(gsr, bmp, fbp, fbw, env)
         ours = np.asarray(load(bmp))
+        if dedupe and last is not None and last[1].shape == ours.shape \
+                and float(np.abs(last[1].astype(np.int16) - ours).mean()) < 0.5:
+            lines.append(f"| {gsr.stem} | SAME | our frame = {last[0]} (not re-graded) | |")
+            print(f"  {gsr.stem}: SAME as {last[0]}")
+            continue
+        last = (gsr.stem, ours)
         ref = oracle_frame(gsr, fbp, fbw, psm, stop, work, runner)
         if ref is None:
             lines.append(f"| {gsr.stem} | ERROR | GSRunner gave no frame | |")
@@ -559,12 +596,153 @@ def oracle(folder, out, runner, thresh, only="*", skip=None):
                 + ", ".join(f"{s} {p:.1f}%" for s, p in offset_caps[:60]) + "\n")
         f.write("\n## Per capture\n\n| capture | result | region | blame |\n|---|---|---|---|\n")
         f.write("\n".join(lines) + "\n")
-        f.write(f"\n## Stream lint (bad input; PCSX2 draws these too)\n\n{len(lint_rows)} flagged triangle(s).\n\n")
-        for stem, fnd in lint_rows[:200]:
-            b = fnd["bbox"]
-            f.write(f"- {stem} t={fnd['t']} prim={fnd['prim']} edge={fnd['edge']:.0f} clamp={int(fnd['clamp'])} "
-                    f"tbp0={fnd['tbp0']:#x} bbox=({b[0]:.0f},{b[1]:.0f})-({b[2]:.0f},{b[3]:.0f})\n")
+        broken = [(s_, x) for s_, x in lint_rows if lint_broken(x)]
+        normal = [(s_, x) for s_, x in lint_rows if not lint_broken(x)]
+        f.write(f"\n## Stream lint BROKEN (zero=1: vertex at raw (0,0)/top-left clamp; never in PCSX2 output)\n\n"
+                f"{len(broken)} triangle(s) in {len({s_ for s_, _ in broken})} capture(s).\n\n")
+        for stem, fnd in broken[:200]:
+            f.write(f"- {lint_line(stem, fnd)}\n")
+        f.write(f"\n## Stream lint normal (plain clamp / corner fans = guard-band clipper output; PCSX2 sends them too)\n\n"
+                f"{len(normal)} triangle(s).\n\n")
+        for stem, fnd in normal[:60]:
+            f.write(f"- {lint_line(stem, fnd)}\n")
     print(f"{len(caps)} capture(s) -> {rep}")
+
+
+SCENE_RE = re.compile(r"\[scene\] tick=(\d+) (app=\S+ vt=\S+ mode=\d+ p1=0x[0-9a-f]{2})")
+TICK_RE = re.compile(r"_t(\d+)")
+
+
+def _tick(name):
+    m = TICK_RE.search(name)
+    return int(m.group(1)) if m else -1
+
+
+def audit(folder):
+    """One report for a capture dir, no human: oracle grade (if run), BROKEN stream lint,
+    host-NaN VU1 scan, scene label per capture, disc coverage = screens never reached.
+    Writes <dir>/report.md; returns the number of BROKEN findings (lint + NaN + DIFF)."""
+    folder = Path(folder)
+    caps = sorted(folder.glob("*.gsr"), key=lambda p: _tick(p.name))
+    vucaps = sorted(folder.glob("*.vucap"), key=lambda p: _tick(p.name))
+
+    # Scene timeline from the run log (PS2X_PAD_SCRIPT runs log [scene] on every change).
+    scenes = []
+    log = folder / "run_log.txt"
+    if log.exists():
+        raw = log.read_bytes()
+        # launch_recomp -Log tees through PowerShell, which writes UTF-16 LE with a BOM.
+        enc = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8"
+        for line in raw.decode(enc, errors="replace").splitlines():
+            for m in SCENE_RE.finditer(line):  # other logs can share the line
+                scenes.append((int(m.group(1)), m.group(2)))
+    scenes.sort()
+
+    def scene_at(t):
+        lab = "unknown"
+        for st, txt in scenes:
+            if st > t:
+                break
+            lab = txt
+        return lab
+
+    # 1. oracle (only when gfx_tour -Oracle / --oracle already graded this dir)
+    orep = folder / "oracle" / "report.md"
+    diffs, nmatch, graded = [], 0, orep.exists()
+    if graded:
+        for line in orep.read_text(encoding="utf-8").splitlines():
+            if line.startswith("| cap_") or line.startswith("| vu_"):
+                cells = [c.strip() for c in line.strip("|").split("|")]
+                if len(cells) >= 2 and cells[1] in ("MATCH", "SAME"):
+                    nmatch += 1
+                elif len(cells) >= 2 and cells[1] == "DIFF":
+                    diffs.append(cells)
+
+    # 2. stream lint
+    broken, normal = [], 0
+    for gsr in caps:
+        for f in lint(gsr):
+            if lint_broken(f):
+                broken.append((gsr.stem, f))
+            else:
+                normal += 1
+
+    # 3. host NaN in VU1 memory
+    nan_rows = []
+    if vucaps:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import contextlib
+        import io
+        import vucap_memscan
+        for vc in vucaps:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    n = vucap_memscan.x86nan(str(vc))
+                except SystemExit as e:
+                    print(f"  skipped: {e}")
+                    n = 0
+            if n:
+                nan_rows.append((vc.stem, buf.getvalue().strip().splitlines()))
+
+    # 4. disc coverage
+    cov = []
+    if caps or (folder / "coverage_hashes.json").exists():  # json survives gfx_tour's prune
+        r = subprocess.run([sys.executable, str(ROOT / "build_scripts" / "audit_disc_textures.py"),
+                            "--coverage", str(folder)], capture_output=True, text=True)
+        out = r.stdout.splitlines()
+        k = next((i for i, l in enumerate(out) if l.startswith("uploads in captures")), None)
+        cov = out[k:] if k is not None else [f"coverage failed: {r.stderr.strip()[-300:]}"]
+
+    nbroken = len(broken) + len(nan_rows) + len(diffs)
+    rep = folder / "report.md"
+    with open(str(rep) + ".tmp", "w", encoding="utf-8") as f:
+        f.write(f"# Graphics audit: {folder.name}\n\n")
+        f.write(f"- captures: {len(caps)} GS, {len(vucaps)} VU1; scenes logged: {len(scenes)}\n")
+        f.write(f"- **BROKEN: {nbroken}** = lint zero-vertex {len(broken)} tri(s) in "
+                f"{len({s_ for s_, _ in broken})} cap(s), host-NaN VU1 {len(nan_rows)} cap(s), "
+                f"oracle DIFF {len(diffs)}\n")
+        f.write(f"- oracle: " + (f"{nmatch} MATCH, {len(diffs)} DIFF (details: oracle/report.md)" if graded
+                                 else "not graded (gfx_tour.ps1 -Oracle)") + "\n")
+        f.write(f"- normal lint (guard-band clamp fans, PCSX2 sends them too): {normal}\n")
+
+        f.write("\n## Scene timeline\n\n")
+        if scenes:
+            for st, txt in scenes:
+                f.write(f"- t={st} {txt}\n")
+        else:
+            f.write("none (no [scene] lines: run without PS2X_PAD_SCRIPT, or older build)\n")
+
+        f.write("\n## BROKEN: oracle DIFF (ours vs PCSX2 raster)\n\n")
+        for c in diffs:
+            f.write(f"- {c[0]} [{scene_at(_tick(c[0]))}] {' | '.join(c[2:])[:220]}\n")
+        if not diffs:
+            f.write("none\n" if graded else "not graded\n")
+
+        f.write("\n## BROKEN: zero-vertex triangles (vertex at raw (0,0)/top-left; the Krillin class)\n\n")
+        per = {}
+        for stem, fnd in broken:
+            per.setdefault(stem, []).append(fnd)
+        for stem, fs in per.items():
+            tb = sorted({x["tbp0"] for x in fs})
+            f.write(f"- {stem} [{scene_at(_tick(stem))}] {len(fs)} tri(s), tbp0 "
+                    f"{', '.join(f'{t:#x}' for t in tb[:8])}; first: {lint_line(stem, fs[0])}\n")
+        if not per:
+            f.write("none\n")
+
+        f.write("\n## BROKEN: host NaN (0x7FC00000/0xFFC00000) in VU1 memory (R5900 never makes these)\n\n")
+        for stem, lines in nan_rows:
+            f.write(f"- {stem} [{scene_at(_tick(stem))}]: {lines[-1]}\n")
+            for l in lines[:-1][:4]:
+                f.write(f"  - {l.strip()}\n")
+        if not nan_rows:
+            f.write("none\n" if vucaps else "no VU1 captures in this dir\n")
+
+        f.write("\n## Disc coverage (folders with pictures never uploaded = screens not reached)\n\n```\n")
+        f.write("\n".join(cov[:60]) + "\n```\n")
+    os.replace(str(rep) + ".tmp", rep)
+    print(f"BROKEN={nbroken} (lint {len(broken)}, nan caps {len(nan_rows)}, diff {len(diffs)}) -> {rep}")
+    return nbroken
 
 
 def main():
@@ -585,25 +763,29 @@ def main():
                     help="control: skip transfer T in OUR replay, ref = full replay; the tool must blame T")
     ap.add_argument("--oracle", action="store_true",
                     help="with a tour dir: grade every capture against PCSX2 GSRunner (sw) -> <dir>/oracle/report.md")
+    ap.add_argument("--dedupe", action="store_true", help="with --oracle: skip GSRunner for frames equal to the last graded one")
     ap.add_argument("--only", default="*", help="with --oracle: capture name glob, e.g. cap_t7095")
+    ap.add_argument("--audit", action="store_true",
+                    help="with a capture dir: oracle + BROKEN lint + host-NaN VU1 scan + scenes + coverage -> <dir>/report.md")
     ap.add_argument("--lint", action="store_true", help="with a tour dir or .gsr: list runaway/clamped triangles only (no GSRunner)")
     a = ap.parse_args()
 
+    if a.audit:
+        audit(a.dump)
+        return
     if not BENCH.exists():
         sys.exit(f"missing {BENCH} (build: build_scripts\\gs_bench.ps1 -Build)")
     dump = Path(a.dump)
     if a.lint:
         for gsr in ([dump] if not dump.is_dir() else sorted(dump.glob("*.gsr"))):
             for f in lint(gsr):
-                b = f["bbox"]
-                print(f"{gsr.stem} t={f['t']} prim={f['prim']} edge={f['edge']:.0f} clamp={int(f['clamp'])} "
-                      f"tbp0={f['tbp0']:#x} bbox=({b[0]:.0f},{b[1]:.0f})-({b[2]:.0f},{b[3]:.0f})")
+                print(lint_line(gsr.stem, f))
         return
     if dump.is_dir() and a.oracle:
         runner = find_gsrunner()
         if not runner or not runner.exists():
             sys.exit("no PCSX2 GSRunner: build F:\\PCSX2-src pcsx2-gsrunner, or set PS2X_GSRUNNER=<exe>")
-        oracle(dump, Path(a.out) if a.out else dump / "oracle", runner, a.thresh, a.only, a.selftest_skip)
+        oracle(dump, Path(a.out) if a.out else dump / "oracle", runner, a.thresh, a.only, a.selftest_skip, a.dedupe)
         return
     if dump.is_dir():
         tour(dump, Path(a.out) if a.out else dump / "frames")

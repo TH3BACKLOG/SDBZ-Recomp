@@ -8,6 +8,11 @@
 //     PS2X_VUCAP_AT=<s>[,<s>...]    start a capture this many seconds after the
 //                                   first vsync (default 0). Several values give
 //                                   several files, "_t<s>" added before the extension.
+//                                   A "t" prefix (t7770,t8085) means vsync TICKS
+//                                   instead of wall-clock seconds, the same tick
+//                                   PS2X_GSCAP uses, so both captures can be lined up
+//                                   and the window repeats run to run. One "t" item
+//                                   makes the whole list ticks.
 //     PS2X_VUCAP_FRAMES=<n>         vsyncs per capture (default 20)
 //     PS2X_VUCAP_FULLMEM=0|1        VU1 data memory in every RUNSTART (default 1)
 //
@@ -82,6 +87,7 @@ namespace vucap
         State s_state = State::Off;
         std::string s_basePath;
         std::vector<double> s_windows;
+        bool s_windowsAreTicks = false; // PS2X_VUCAP_AT=t<tick>,...
         size_t s_nextWindow = 0;
         uint32_t s_framesWanted = 20;
         bool s_fullMem = true;
@@ -241,7 +247,12 @@ namespace vucap
                 size_t comma = list.find(',', i);
                 if (comma == std::string::npos)
                     comma = list.size();
-                const std::string item = list.substr(i, comma - i);
+                std::string item = list.substr(i, comma - i);
+                if (!item.empty() && (item[0] == 't' || item[0] == 'T'))
+                {
+                    s_windowsAreTicks = true;
+                    item.erase(0, 1);
+                }
                 if (!item.empty())
                     s_windows.push_back(std::strtod(item.c_str(), nullptr));
                 i = comma + 1u;
@@ -263,7 +274,7 @@ namespace vucap
             s_t0 = std::chrono::steady_clock::now();
             s_state = State::Idle;
             std::cerr << "[vucap] ACTIVE path=" << s_basePath << " windows=" << s_windows.size()
-                      << " first_at=" << s_windows.front() << "s frames=" << s_framesWanted
+                      << " first_at=" << s_windows.front() << (s_windowsAreTicks ? " ticks" : "s") << " frames=" << s_framesWanted
                       << " fullmem=" << (s_fullMem ? 1 : 0) << std::endl;
         }
 
@@ -372,7 +383,7 @@ namespace vucap
         if (s_state == State::Idle && s_nextWindow < s_windows.size())
         {
             const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count();
-            if (t >= s_windows[s_nextWindow])
+            if ((s_windowsAreTicks ? static_cast<double>(tick) : t) >= s_windows[s_nextWindow])
             {
                 s_state = State::Armed;
                 g_hot.store(true, std::memory_order_relaxed);

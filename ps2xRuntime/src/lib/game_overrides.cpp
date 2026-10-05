@@ -75,6 +75,11 @@ extern std::atomic<int32_t> g_ps2xSema3LastSigCount;
 // segmented into frames.
 extern "C" uint64_t ps2x_vblank_ticks();
 
+// EE sqrt.s = sqrt(|x|) copies of three runner bodies (Kernel/FpuFixes/sqrt_abs_overrides.cpp).
+void sdbzSqrtAbs_mem_fill_z_192_0x2afed0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sdbzSqrtAbs_mem_fill_z_238_0x3107d0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+void sdbzSqrtAbs_mem_fill_z_241_0x313250(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
 // Phase C stack-bounds guard (Kernel/Syscalls/Thread.cpp), which owns the
 // per-tid stack ranges recorded at StartThread. Returns 1 when sp is outside
 // the running fiber's own stack and emits one bounded STACKOOB record. site is
@@ -1908,6 +1913,26 @@ namespace
                 if (!runtime.hasFunction(a))
                 {
                     runtime.registerFunction(a, rf.fn);
+                }
+            }
+        }
+
+        // Krillin's NaN bone matrices: EE sqrt.s of a negative operand is sqrt(|x|) on the
+        // R5900/PCSX2 but 0xFFC00000 through FPU_SQRT_S (header; fixing it rebuilds every
+        // runner TU). krillin2 TRAPVAL 10-04 caught these three sites making that NaN.
+        // Same generated code with only the sqrt changed, so it takes every word of the
+        // range: a thread resuming mid-body must land in the fixed copy too.
+        {
+            static constexpr RecoveredFn kSqrtAbsFns[] = {
+                {0x002AFED0u, 0x002B0040u, &sdbzSqrtAbs_mem_fill_z_192_0x2afed0},
+                {0x003107D0u, 0x003111A4u, &sdbzSqrtAbs_mem_fill_z_238_0x3107d0},
+                {0x00313250u, 0x00313484u, &sdbzSqrtAbs_mem_fill_z_241_0x313250},
+            };
+            for (const RecoveredFn &f : kSqrtAbsFns)
+            {
+                for (uint32_t a = f.addr; a < f.end; a += 4u)
+                {
+                    runtime.registerFunction(a, f.fn);
                 }
             }
         }

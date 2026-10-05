@@ -1,0 +1,64 @@
+# original.txt - walk-away Original-mode playthrough as Goku (every story stage, result + ending screen).
+# Run:  .\build_scripts\gfx_tour.ps1 -Name orig1 -Script build_scripts\sweeps\original.txt -Seconds 4800 -Every 90
+# No new build needed (uses poke / goto-if from the 10-03 runtime).
+#
+# Game Options bytes (VERIFIED twice: setters 0x33b590/0x33b670 + option strings 0x4d69e8, and the
+# community memory map agrees):
+#   0x5C7940 Difficulty 1=Easy 3=Normal 5=Hard 8=Very Hard   (also copied into both fighters live)
+#   0x5C7941 Damage 1..8                                     0x5C7942 Time 0=45s 1=60 2=80 3=99 4=none
+#   0x5C7943 Rounds 0=1 round 1=3 2=5                         0x5C7944 Stage Select 0=on 1=off
+# H: the fight reads these at fight start, so poking them at the main menu is enough.
+# H: Easy CPU + max damage + 1 round of 45 s -> button mashing wins most fights; a loss -> X = continue.
+# Health (10-04): VERIFIED from code: health = int at health_obj+12 (getter 0x1d2500, damage 0x1d25d0
+#   via fighter vtable 0x4e7fa0 slot 58 = 0x1d0400); health_obj = 0x38-byte heap alloc made in 0x1ce040,
+#   kept at fighter+6208. H: community P1 0x5b1a54 / P2 0x5b1a1c are those two objects (0x38 apart = fits).
+#   If P1/P2 are swapped, P1 dies in one hit -> captures show endless continues.
+# To play on the hardest setting instead: change the Difficulty poke to 8.
+
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+# Unlock everything (VERIFIED unlock1 10-04). See unlock_all.txt.
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+# Fast fights: Easy, max damage, 1 round, 45 s.
+poke 0x5C7940 1
+poke 0x5C7941 8
+poke 0x5C7942 0
+poke 0x5C7943 0
+log options poked: easy dmg8 1rd 45s
+wait ticks=120
+
+# Original (cursor starts on it, VERIFIED sweep1) -> character select -> Goku.
+press X hold=10 gap=50 until app=CAppSelectMain timeout=1200
+wait ticks=200
+press D hold=6 gap=30 until p1=1 timeout=600
+log on Goku
+wait ticks=30
+press X hold=10 gap=120 until app=CAppFightMain timeout=3000
+
+# Main loop: mash in fights; X also walks results, story text, continue and the world map.
+# One-hit kills: P2 health -> 1, only while a fight is up.
+# VERIFIED 0x1cb094: fighters = static array 0x5ADFB0 (2 x 0x1CD0); fighter1 = 0x5AFC80; health obj ptr at
+# fighter+6208 = 0x5B14C0; health int at obj+12. (orig1: fixed heap addr 0x5B1A1C swapped P1/P2 in 2 of 7
+# fights and missed Frieza.) H: fighter1 = P2; the log line 'old=' shows the health read (~250 = right).
+label loop
+repeat 2
+  press R hold=12 gap=2
+  press Q hold=4 gap=6
+  press Q hold=4 gap=6
+  press T hold=4 gap=6
+  press Q hold=4 gap=6
+  press T hold=4 gap=6
+end
+goto nopoke if app!=CAppFightMain
+poke [0x5B14C0]+12 1 w=4
+label nopoke
+press X hold=6 gap=20
+goto done if app=CAppMenuMain
+goto loop 900
+label done
+log original done
+wait ticks=300

@@ -18,6 +18,7 @@ Usage:
     python vucap_decode_kick.py capture.vucap --run 42          # only kicks from run 42
     python vucap_decode_kick.py capture.vucap --limit 0         # all kicks, all vertices
     python vucap_decode_kick.py capture.vucap --csv out.csv     # also write one row per vertex
+    python vucap_decode_kick.py capture.vucap --lint            # gfx_scene_diff --lint over the kicks
 """
 
 import argparse
@@ -145,13 +146,68 @@ def _apply_packed_register(st, reg_desc, lo, hi):
     return None  # PRIM (0x00) / TEX0 / CLAMP / NOP -- no vertex, safe to ignore
 
 
+def lint_capture(path, only_run=None):
+    """Same rule as gfx_scene_diff.py --lint, applied to VU1's own output: which runs (start pc)
+    sent clamped fans that reach the screen. corner = a vertex with x AND y both on the clamp."""
+    import collections
+    import gfx_scene_diff as g
+
+    recs, torn, _size = read_records(path)
+    if torn:
+        print(f"  WARNING: {torn}", file=sys.stderr)
+    tpc_of, blobs, kicks_per_tpc = {}, [], collections.Counter()
+    # PCSX2 logs one XGKICK as several KICKDATA chunks (GIF tag and data apart); ours as one.
+    # Join a run's chunks until endOfPacket or the next KICKSTART, or the lint sees no vertices.
+    open_kick = {}
+
+    def flush(run):
+        data = open_kick.pop(run, None)
+        if data and (only_run is None or run == only_run):
+            blobs.append((run, bytes(data)))
+            kicks_per_tpc[tpc_of.get(run, -1)] += 1
+
+    for rtype, payload in recs:
+        if rtype == 3:  # RUNSTART
+            run, tpc = struct.unpack_from("<2I", payload)
+            tpc_of[run] = tpc
+        elif rtype == 5:  # KICKSTART
+            flush(struct.unpack_from("<I", payload)[0])
+        elif rtype == 6:  # KICKDATA
+            run, _addr, sz, eop = struct.unpack_from("<4I", payload)
+            open_kick.setdefault(run, bytearray()).extend(payload[16:16 + sz])
+            if eop:
+                flush(run)
+    for run in list(open_kick):
+        flush(run)
+    found = g.lint_blobs(blobs)
+    clamp_vals = (0x4000, 0xBFFF)
+    by_tpc = collections.Counter()
+    for f in found:
+        tpc = tpc_of.get(f["t"], -1)
+        by_tpc[tpc] += 1
+        corner = any(x in clamp_vals and y in clamp_vals for x, y in f["raw"])
+        x0, y0, x1, y1 = f["bbox"]
+        print(f"run={f['t']} tpc={tpc:#05x} prim={f['prim']} edge={f['edge']:.0f} clamp={int(f['clamp'])} "
+              f"corner={int(corner)} tbp0={f['tbp0']:#x} bbox=({x0:.0f},{y0:.0f})-({x1:.0f},{y1:.0f}) "
+              f"raw={['%04x,%04x' % v for v in f['raw']]}")
+    print(f"\n{len(blobs)} kick(s) from {len(tpc_of)} run(s); {len(found)} flagged triangle(s)")
+    for tpc, n in sorted(by_tpc.items()):
+        print(f"  tpc {tpc:#05x}: {n} flagged in {kicks_per_tpc[tpc]} kicks")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("capture")
     ap.add_argument("--run", type=int, default=None, help="only decode KICKDATA from this run index")
     ap.add_argument("--limit", type=int, default=8, help="vertices to print per kick (0 = all)")
     ap.add_argument("--csv", default=None, help="write one row per vertex to this CSV path")
+    ap.add_argument("--lint", action="store_true",
+                    help="run gfx_scene_diff's stream lint (on-screen clamp / >1200 px triangles) over every "
+                         "XGKICK packet; prints the runs and start pcs that sent them")
     args = ap.parse_args()
+    if args.lint:
+        return lint_capture(args.capture, args.run)
 
     recs, torn, size = read_records(args.capture)
     if torn:
@@ -220,4 +276,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
