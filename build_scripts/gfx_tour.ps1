@@ -104,9 +104,16 @@ if (($Prune -or $Script) -and -not $KeepCaps -and $Oracle -and $Audit -and
     (Test-Path $rep) -and (Get-Item $rep).LastWriteTime -ge $startedAt -and
     -not (Select-String -Path $rep -Pattern 'oracle: not graded' -Quiet)) {
     $named = @{}
-    foreach ($r in @($rep, (Join-Path $dir 'oracle\report.md'))) {
-        if (Test-Path $r) {
-            foreach ($m in [regex]::Matches((Get-Content $r -Raw), '(cap|vu)_t\d+')) { $named[$m.Value] = $true }
+    # report.md names only BROKEN captures. oracle\report.md has a per-capture table listing
+    # EVERY capture (MATCH too) plus informational lint lines -- keep only its non-clean rows
+    # (orig2 10-05: matching every name there kept all 336 and pruned nothing).
+    foreach ($m in [regex]::Matches((Get-Content $rep -Raw), '(cap|vu)_t\d+')) { $named[$m.Value] = $true }
+    $orep = Join-Path $dir 'oracle\report.md'
+    if (Test-Path $orep) {
+        foreach ($line in Get-Content $orep) {
+            if ($line -match '^\|\s*((cap|vu)_t\d+)\s*\|\s*(\S+)' -and $Matches[3] -notin @('MATCH', 'SAME')) {
+                $named[$Matches[1]] = $true
+            }
         }
     }
     $gone = Get-ChildItem $dir -File | Where-Object {
