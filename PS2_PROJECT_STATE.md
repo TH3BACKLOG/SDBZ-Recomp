@@ -23863,3 +23863,10 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - Scene NAME sequence identical over all 49 shared scenes; scene ticks drift up to 65 between runs (host timing), so the old tick-exact compare was too strict (compare_sweeps.py now compares names, prints max drift).
 - Upload sets are NOT equal: 61 disc textures only in rt0, 122 only in rt4 (union 464 disc textures). Cause UNKNOWN (HYP: run-to-run nondeterminism, e.g. random opponent/stage; the control = a second rt0 or rt4 run, not done). Does not affect grading, helps coverage (union).
 - Decision: gfx_tour.ps1 -RasterThreads default is now 4 (use -RasterThreads 0 for the old behaviour).
+
+## 10-06 fighters2 RESULT (user started 11:24, 4 threads, ~20 vbl/s; graded 12:29)
+- 808 GS caps + 81 VU1, oracle 808 MATCH / 0 DIFF. Disc 1446/3367 pictures, 461/730 .pix (union with earlier runs is larger: run `--coverage gsdump/* --needs` from bash).
+- BROKEN 2 = zero-vertex, cap_t9967 (2 tris, prim=5, tbp0 0x2b20, bbox (-768,-801)-(129,11)), scene CAppFightMain p1=0x1c (fighter 28), fight 1 started t=9809, stage stg/s06 (uploads in the window: stg/s06 135, stg/sgmk20 6, dis/d00 3; NO ply folder uploads inside the window, so the opponent is unknown from this cap). Host-NaN VU1: 0 caps.
+- SAME first vertex bbox (-768,-801) as orig3 cap_t31114 (Goku p01 vs p22 on s07, tbp0 0x2a00). HYP: one shared producer (a vertex the VU1 program leaves at 0/garbage), not a per-fighter bug. Not yet shown: which fighter, PCSX2 control, why VUCAP host-NaN is 0.
+- Kept for follow-up: gsdump/fighters2/cap_t9967.gsr + .vram. helper: scratchpad capfolders.py (cap uploads -> disc folders).
+- fighters3 started 12:31 via gsdump/run_fighters3.ps1 (-Seconds 3600), console log gsdump/fighters3_console.txt. Launching from Start-Process: quote paths with spaces INSIDE the ArgumentList element ('"F:\SDBZ Recomp\x.ps1"'), else the child dies silently.
