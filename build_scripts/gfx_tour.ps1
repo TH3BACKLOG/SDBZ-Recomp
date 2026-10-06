@@ -31,7 +31,9 @@ param(
     [int]$MinFreeGB = 10,        # VU1 capture is skipped when F: has less free space than this
     [switch]$Prune,              # after a graded audit, delete captures the reports do not name (default with -Script)
     [switch]$KeepCaps,           # never prune
-    [switch]$NoLedger            # grade every capture even if gsdump\known_good says its uploads + scene were verified
+    [switch]$NoLedger,           # grade every capture even if gsdump\known_good says its uploads + scene were verified
+    [switch]$TexLog,             # PS2X_TEXHASH_LOG: hash EVERY texture upload of the run (default with -Script); exact disc coverage
+    [switch]$NoTexLog            # with -Script: do not log uploads (the log hashes every upload, ~100 transfers per fight tick)
 )
 $startedAt = Get-Date
 $root = 'F:\SDBZ Recomp'
@@ -54,6 +56,11 @@ if (-not $ReplayOnly) {
     } elseif (-not $Manual) {
         $set.PS2X_GS_RASTER_THREADS = '0'
         $set.PS2X_PAD_AUTOPRESS = '120'; $set.PS2X_PAD_AUTOPRESS_BTNS = $Buttons; $set.PS2X_PAD_AUTOPRESS_HOLD = '20'
+    }
+    if (($Script -or $TexLog) -and -not $NoTexLog) {
+        # Capture windows see ~5% of uploads; this log sees all of them (FNV-1a 64 per transfer). audit_disc_textures
+        # folds it into coverage_hashes.json ("fnv"), then this script deletes the (large) jsonl after a graded audit.
+        $set.PS2X_TEXHASH_LOG = "$dir\texhash.jsonl"
     }
     if ($VuCapEvery -gt 0 -and -not $VuCapTicks) {
         # Windows past the end of the run never fire; 400 covers any session length we use.
@@ -101,6 +108,12 @@ if ($Oracle) {
 if ($Audit) {
     python "$root\build_scripts\gfx_scene_diff.py" $dir --audit
     Write-Host "audit: $dir\report.md  (sheet: $dir\frames\sheet.png)"
+    # The distinct upload hashes are now in coverage_hashes.json; the raw log can be 100s of MB.
+    $tlog = Join-Path $dir 'texhash.jsonl'; $cj = Join-Path $dir 'coverage_hashes.json'
+    if ((Test-Path $tlog) -and -not $KeepCaps -and (Test-Path $cj) -and (Get-Item $cj).LastWriteTime -ge $startedAt) {
+        Write-Host ("texhash.jsonl {0:N0} MB folded into coverage_hashes.json, deleted" -f ((Get-Item $tlog).Length / 1MB))
+        Remove-Item $tlog -Confirm:$false
+    }
 }
 # Disk: a 4800 s sweep is ~5 GB of .gsr/.vram/.vucap, and a full F: froze orig3 mid-run (10-05).
 # Once a capture is graded clean, only its report line + sheet frame are worth keeping.

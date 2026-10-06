@@ -23818,3 +23818,9 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 - Learned: a self-test seed must be a draw that changes the final frame (cap_t31114 transfer 5689 changed nothing -> MATCH, not a failure). `seed.py`-style check: skip candidate, compare frames.
 - sweeps: `gen_fighters.py OUT --ids a,b --f2 N --name X` ; `fighters2.txt` (2,28,27,26) and `fighters3.txt` (12,4,23,9) generated with --f2 2.
 - Full prioritized plan: `C:\Users\mwlab\.claude\plans\dazzling-coalescing-pudding.md` (P0 done; P1 user runs fighters2/3 + vs1; P2 PS2X_TEXLOG upload log, user builds; P3 p22 zero-vertex, attract-Demo hang, Demo fountain DIFF; P4 stg/eff/trc/dis + models have no metric; P5 SPU2 audio).
+
+## 10-06 end: P2 EXACT COVERAGE needs no build
+- FOUND: `PS2X_TEXHASH_LOG` already exists in the runtime (FNV-1a 64 per upload). `gfx_tour.ps1 -Script` now sets it (`-NoTexLog` to disable); `audit_disc_textures.py` folds it into `coverage_hashes.json` ("fnv"), compares with disc `imgFnv` (cache `gsdump/known_good/disc_fnv.json`), `--texlog FILE` for extra logs. gfx_tour deletes the raw jsonl after the audit (~0.5 GB / 90 min).
+- VERIFIED: 142/142 distinct T8 hashes of the 10-02 log equal disc image FNVs; fold-in survives log deletion.
+- UNMEASURED: wall-speed cost of hashing every upload. Next run: compare watchdog vbl/s with fighters1 (~8); if it drops a lot use `-NoTexLog`.
+- Next runs unchanged: fighters2, fighters3, vs1 (their coverage will now be exact; re-judge p09/p22/p11 from fighters3/fighters1 reruns).

@@ -27,6 +27,35 @@ ROOT = r"F:\SDBZ Recomp\Super Dragon Ball Z ISO\Arcade Version\SDBZ ISO 2"
 IMG_TYPE = {1: "16bpp", 2: "24bpp", 3: "32bpp", 4: "T4", 5: "T8"}
 
 
+# FNV-1a 64 of a picture's image bytes = the h64 the runtime writes per host->local upload when
+# PS2X_TEXHASH_LOG is set (ps2_gs_gpu.cpp processImageData). Pure Python ~9 MB/s, so the result per
+# distinct image is cached (md5 -> fnv) in gsdump/known_good/disc_fnv.json.
+FNV_CACHE_PATH = os.path.join(r"F:\SDBZ Recomp", "gsdump", "known_good", "disc_fnv.json")
+_FNV, _FNV_NEW = {}, [0]
+
+
+def fnv1a64(b):
+    h = 1469598103934665603
+    for x in b:
+        h = ((h ^ x) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def load_fnv_cache():
+    if os.path.exists(FNV_CACHE_PATH):
+        with open(FNV_CACHE_PATH, encoding="utf-8") as f:
+            _FNV.update(json.load(f))
+
+
+def save_fnv_cache():
+    if _FNV_NEW[0]:
+        os.makedirs(os.path.dirname(FNV_CACHE_PATH), exist_ok=True)
+        with open(FNV_CACHE_PATH + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(_FNV, f)
+        os.replace(FNV_CACHE_PATH + ".tmp", FNV_CACHE_PATH)
+        _FNV_NEW[0] = 0
+
+
 def parse_tim2(d, base):
     """Yield dicts for each picture of a TIM2 starting at d[base:]."""
     if d[base:base + 4] != b"TIM2":
@@ -48,8 +77,13 @@ def parse_tim2(d, base):
             pass
         img = bytes(d[img_off:img_off + img_sz])
         blob = img + bytes(d[clut_off:clut_off + clut_sz])
+        im5 = hashlib.md5(img).hexdigest()
+        if im5 not in _FNV:
+            _FNV[im5] = "%016x" % fnv1a64(img)
+            _FNV_NEW[0] += 1
         yield {
-            "imgMd5": hashlib.md5(img).hexdigest(),
+            "imgMd5": im5,
+            "imgFnv": _FNV[im5],
             "imgHead": hashlib.md5(img[:1024]).hexdigest(),
             "w": w, "h": h, "mips": mips,
             "type": IMG_TYPE.get(img_t, f"?{img_t}"),
@@ -132,20 +166,42 @@ def gsr_uploads(path):
 COV_JSON = "coverage_hashes.json"
 
 
+def texlog_fnv(path):
+    """h64 of every COMPLETE upload (bytes == want) in a PS2X_TEXHASH_LOG jsonl."""
+    out = set()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"k":"T"' not in line:
+                continue
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            if j.get("bytes") == j.get("want"):
+                out.add(j["h64"])
+    return out
+
+
 def dir_hashes(d):
     """Upload hashes of one capture dir. gfx_tour prunes clean .gsr files after grading,
     so the sets are saved to <dir>/coverage_hashes.json and merged with whatever .gsr
     files are still there. The json only grows; gfx_tour wipes the dir on a rerun."""
     full, head, nup = set(), set(), 0
+    fnv = set()
     jp = os.path.join(d, COV_JSON)
     if os.path.exists(jp):
         with open(jp, encoding="utf-8") as f:
             j = json.load(f)
         full.update(j["full"])
         head.update(j["head"])
+        fnv.update(j.get("fnv", []))
         nup = j["uploads"]
+    # PS2X_TEXHASH_LOG (gfx_tour sets it): EVERY upload of the run, not only those inside capture windows.
+    tl = os.path.join(d, "texhash.jsonl")
+    if os.path.exists(tl):
+        fnv |= texlog_fnv(tl)
     gsrs = sorted(f for f in os.listdir(d) if f.endswith(".gsr"))
-    if gsrs:
+    if gsrs or fnv:
         fresh = 0
         for f in gsrs:
             for up in gsr_uploads(os.path.join(d, f)):
@@ -154,15 +210,15 @@ def dir_hashes(d):
                 head.add(hashlib.md5(up[:1024]).hexdigest())
         nup = max(nup, fresh)
         with open(jp + ".tmp", "w", encoding="utf-8") as f:
-            json.dump({"uploads": nup, "full": sorted(full), "head": sorted(head)}, f)
+            json.dump({"uploads": nup, "full": sorted(full), "head": sorted(head), "fnv": sorted(fnv)}, f)
         os.replace(jp + ".tmp", jp)
     if gsrs:
-        src = f"{len(gsrs)} .gsr (saved {COV_JSON})"
+        src = f"{len(gsrs)} .gsr + {len(fnv)} logged uploads (saved {COV_JSON})"
     elif full:
         src = COV_JSON
     else:
         src = "nothing (pruned before coverage was saved)"
-    return full, head, nup, src
+    return full, head, nup, src, fnv
 
 
 def needs_hint(folder):
@@ -181,26 +237,29 @@ def needs_hint(folder):
     return "menu/other screen"
 
 
-def coverage(pics, dirs, needs=False):
+def coverage(pics, dirs, needs=False, texlogs=()):
     """Which disc pictures were uploaded during the captured tour(s).
     Several dirs = the union over all of them (e.g. --coverage gsdump/*)."""
-    full, head = set(), set()
+    full, head, fnv = set(), set(), set()
     nup = 0
     dirs = [d for d in dirs if os.path.isdir(d)]
+    for tl in texlogs:
+        fnv |= texlog_fnv(tl)
     for d in dirs:
-        f_, h_, n_, src = dir_hashes(d)
+        f_, h_, n_, src, v_ = dir_hashes(d)
         full |= f_
         head |= h_
+        fnv |= v_
         nup += n_
         if len(dirs) > 1:
             print(f"  {os.path.basename(os.path.normpath(d)):<12} {len(f_):>5} distinct uploads  from {src}")
     seen_files = collections.defaultdict(lambda: [0, 0])
     for p in pics:
-        hit = p["imgMd5"] in full or p["imgHead"] in head
+        hit = p["imgMd5"] in full or p["imgHead"] in head or p["imgFnv"] in fnv
         seen_files[p["file"]][0] += 1
         seen_files[p["file"]][1] += hit
     hit_pics = sum(v[1] for v in seen_files.values())
-    print(f"uploads in captures: {nup} ({len(full)} distinct)")
+    print(f"uploads in captures: {nup} ({len(full)} distinct); logged complete uploads (TEXHASH): {len(fnv)} distinct")
     print(f"disc pictures uploaded at least once: {hit_pics}/{len(pics)}")
     touched = {k: v for k, v in seen_files.items() if v[1]}
     print(f".pix files touched: {len(touched)}/{len(seen_files)}")
@@ -230,10 +289,13 @@ def main():
     ap.add_argument("--other", action="store_true")
     ap.add_argument("--coverage", nargs="+", metavar="TOUR_DIR",
                     help="match IMAGE uploads in PS2X_GSCAP tour captures against the disc pictures")
+    ap.add_argument("--texlog", nargs="+", default=[], metavar="JSONL",
+                    help="with --coverage: extra PS2X_TEXHASH_LOG files (e.g. Logs/texhash.jsonl)")
     ap.add_argument("--needs", action="store_true",
                     help="with --coverage: list folders with 0 pictures reached and how a sweep reaches them")
     a = ap.parse_args()
 
+    load_fnv_cache()
     toc = arkd_toc.Toc(os.path.join(a.root, "INFO.DAT"))
     names = toc.all_names()
     if a.other:
@@ -262,6 +324,7 @@ def main():
                 pos = k + 4
             if found == 0:
                 bad.append((n, d[:8]))
+    save_fnv_cache()
     ok = [p for p in out if "err" not in p]
     print(f".pix files: {len({p['file'] for p in out})} with textures; {len(bad)} with none")
     print(f"pictures: {len(ok)}   unique content hashes: {len({p['md5'] for p in ok})}")
@@ -272,7 +335,7 @@ def main():
     for n, h in bad[:10]:
         print("  no TIM2:", n, h)
     if a.coverage:
-        coverage(ok, a.coverage, a.needs)
+        coverage(ok, a.coverage, a.needs, a.texlog)
     if a.json:
         with open(a.json + ".tmp", "w", encoding="utf-8") as f:
             json.dump(out, f)
