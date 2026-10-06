@@ -23884,3 +23884,13 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - HYP (untested): with pad 2 present the game is switched to the real PADMAN.IRX SIO2 path (ps2_pad.cpp ~l.956-983), which is first used here; scripted pad-1 presses (merged into g_ps2x_sio2_pad_buttons) do not reach the game or PADMAN polls are mis-timed (VBLANK OVERLAP). Pad 2 plumbing is the suspect, not the script grammar.
 - Consequence: no versus/stage sweep until pad 2 works. Stage coverage and the p22 opponent repro need another route (Original mode only has a random/fixed CPU opponent).
 - Options: (a) debug the SIO2 path (diff PCSX2 padman poll vs ours, why OVERLAP), needs a runtime build by the user; (b) workaround: drop `pad=2` from a versus script and test whether the SIO2 path is entered only by `usesPad2`; (c) skip versus, cover stages via Original-mode stage select (option byte 0x5C7944 already poked).
+
+## HANDOFF 10-06 (end of session)
+- DONE this session (all committed): IOP heap reuse fix VERIFIED (12 Demo cycles); MT sampler wrap fix VERIFIED (cap_t40924 MATCH); gfx_tour -RasterThreads default 4 (2.25x vbl/s, 486/486 MATCH); fighters2 + fighters3 run and graded (oracle 808 + 1084 MATCH, 0 DIFF); compare_sweeps compares scene names.
+- Coverage (union gsdump/*, `--coverage gsdump/* --needs`, bash): 2054/3367 disc pictures, 522/730 .pix touched. Still unreached: stg/s00 s12 se03 sgmk01/10/23/26/35/36/40/41, eff/e28 e30 (0 pictures), ply p09/p11/p22 only ~10-12% (HYP: upload metric limit; the TEXHASH log helps in fighters3 and later runs).
+- OPEN 1 (blocker for stages): versus.txt `pad=2` -> game stays on CAppWarning (see "vs1 RESULT"). HYP untested: pad 2 switches PADMAN to the SIO2 path where scripted pad-1 input is lost. Next steps: (b) run a copy of versus.txt without `pad=2`; (a) debug ps2_pad.cpp l.956-983 + padman VBLANK OVERLAP; (c) stages via Original-mode stage select (option byte 0x5C7944).
+- OPEN 2: zero-vertex lint fires on legit prim-5 corner fans (3 caps triaged). Proposed (NOT made): demote prim-5 `zero` findings with no host-NaN. PCSX2 control missing.
+- OPEN 3: rt0 vs rt4 upload sets differ (61 only rt0, 122 only rt4); control run with the same thread count not done.
+- OPEN 4: SPU2 audio audit AFTER graphics; ps2xIOP unit tests (off by default).
+- No game run is in progress. AFK grant (Startrek Reference) ended when the user returned. Nothing launched by the agent without ask.
+- Git: branch sync/upstream-2026-09-24; imgui.ini modified (UI noise, not committed); funcmap .bak files untracked (leave).
