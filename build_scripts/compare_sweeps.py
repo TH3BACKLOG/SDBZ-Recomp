@@ -55,12 +55,15 @@ def main():
                 print("  " + h)
     a, b = info
     n = min(len(a["scenes"]), len(b["scenes"]))
-    diff = next((i for i in range(n) if a["scenes"][i] != b["scenes"][i]), None)
-    print("== scene timelines")
+    diff = next((i for i in range(n) if a["scenes"][i][1] != b["scenes"][i][1]), None)
+    print("== scene timelines (scene names; the tick of a scene may drift by a few ticks between runs)")
+    m = n if diff is None else diff
+    drift = max((abs(a["scenes"][i][0] - b["scenes"][i][0]) for i in range(m)), default=0)
     if diff is None:
-        print(f"  identical over the first {n} scene changes")
+        print(f"  identical scene sequence over the first {n} scene changes; max tick drift {drift}")
     else:
         print(f"  first difference at scene #{diff}: {a['scenes'][diff]}  vs  {b['scenes'][diff]}")
+        print(f"  identical before it; max tick drift {drift}")
     for key in ("fnv", "full"):
         sa, sb = set(a["cov"].get(key, [])), set(b["cov"].get(key, []))
         print(f"== {key}: only in {a['dir'].name}: {len(sa - sb)}   only in {b['dir'].name}: {len(sb - sa)}   common: {len(sa & sb)}")

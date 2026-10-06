@@ -34,8 +34,8 @@ param(
     [switch]$NoLedger,           # grade every capture even if gsdump\known_good says its uploads + scene were verified
     [switch]$TexLog,             # PS2X_TEXHASH_LOG: hash EVERY texture upload of the run (default with -Script); exact disc coverage
     [switch]$NoTexLog,           # with -Script: do not log uploads (the log hashes every upload, ~100 transfers per fight tick)
-    [int]$RasterThreads = 0      # PS2X_GS_RASTER_THREADS for scripted/autopress runs: 0 = single-thread (default, 8 vbl/s in fights),
-                                 # 4 = what the game uses (~19-21 vbl/s). Unproven for captures: compare a run at 4 against 0 first.
+    [int]$RasterThreads = 4      # PS2X_GS_RASTER_THREADS for scripted/autopress runs: 4 = what the game uses (default, ~18 vbl/s in fights),
+                                 # 0 = single-thread (8 vbl/s). 10-06 A/B (rt0 vs rt4, fighters2): 217/217 vs 486/486 oracle MATCH, 0 BROKEN.
 )
 $startedAt = Get-Date
 $root = 'F:\SDBZ Recomp'
