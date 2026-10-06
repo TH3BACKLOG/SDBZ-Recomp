@@ -19,6 +19,7 @@ Verdict per region:
 Needs ps2x_gs_bench.exe built from the current gs_bench_main.cpp (STOP/SKIP/WATCH options).
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -249,18 +250,29 @@ def last_complete_frame(gsr, fbw):
     return fbp, clears[fbp][-1], len(clears[fbp])
 
 
-def tour(folder, out):
-    """Replay every PS2X_GSCAP_EVERY capture in a folder -> one frame each + a contact sheet."""
+def tour(folder, out, ledger_dir=None):
+    """Replay every PS2X_GSCAP_EVERY capture in a folder -> one frame each + a contact sheet.
+    ledger_dir = skip the render of captures the known-good ledger already covers (same rule as the
+    oracle: all uploads + scene known, lint clean; 1 in LEDGER_SAMPLE still drawn). The sheet is the
+    other big time sink of a sweep: it renders every capture once before the oracle renders it again."""
     global W, H
     caps = sorted(folder.glob("*.gsr"), key=lambda p: int(re.search(r"_t(\d+)$", p.stem).group(1)) if re.search(r"_t(\d+)$", p.stem) else 0)
     if not caps:
         sys.exit(f"no .gsr captures in {folder}")
     out.mkdir(parents=True, exist_ok=True)
+    ledger = Ledger(ledger_dir) if ledger_dir else None
+    scenes = read_scenes(folder) if ledger else []
+    nknown = 0
     frames, prev = [], None
     for gsr in caps:
         geo = display_geometry(gsr, out, gsr_regs(gsr))
         dfbp, fbw = (geo[0], geo[1]) if geo else (0x70, 8)
         W, H = (geo[2], geo[3]) if geo else (512, 448)
+        if ledger and not any(lint_broken(f) for f in lint(gsr)) \
+                and ledger.known(cap_uploads(gsr), scene_label_at(scenes, _tick(gsr.name))):
+            nknown += 1
+            print(f"  {gsr.stem}: known (ledger), not rendered")
+            continue
         lcf = last_complete_frame(gsr, fbw)
         fbp, stop, n = lcf if lcf else (dfbp, None, 0)
         bmp = out / "tour.bmp"
@@ -286,7 +298,7 @@ def tour(folder, out):
         dr.text((x + 3, y + 1), name, fill=(255, 255, 0))
     sheet_path = out / "sheet.png"
     sheet.save(sheet_path)
-    print(f"{len(caps)} capture(s), {len(frames)} distinct frame(s) -> {sheet_path}")
+    print(f"{len(caps)} capture(s), {len(frames)} distinct frame(s), {nknown} known (not rendered) -> {sheet_path}")
 
 
 # ---- oracle: PCSX2 GSRunner renders the same capture; no human judges any frame ----
@@ -504,12 +516,87 @@ def first_divergent(gsr, rect, rows, fbp, fbw, psm, work, runner, thresh, env, c
     return ts[hi]
 
 
-def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False):
+LEDGER_SAMPLE = 6  # every Nth ledger-known capture is graded anyway, so drift inside "known" scenes still shows
+
+
+def read_scenes(folder):
+    """[(tick, "app=.. vt=.. mode=N p1=0x..")] from <folder>/run_log.txt ([scene] lines of a PS2X_PAD_SCRIPT run)."""
+    scenes = []
+    log = Path(folder) / "run_log.txt"
+    if log.exists():
+        raw = log.read_bytes()
+        # launch_recomp -Log tees through PowerShell, which writes UTF-16 LE with a BOM.
+        enc = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8"
+        for line in raw.decode(enc, errors="replace").splitlines():
+            for m in SCENE_RE.finditer(line):  # other logs can share the line
+                scenes.append((int(m.group(1)), m.group(2)))
+    scenes.sort()
+    return scenes
+
+
+def scene_label_at(scenes, t):
+    lab = "unknown"
+    for st, txt in scenes:
+        if st > t:
+            break
+        lab = txt
+    return lab
+
+
+class Ledger:
+    """What earlier runs already proved: every disc/VRAM upload (md5) and scene label that appeared in a
+    capture graded MATCH against PCSX2. gfx_tour prunes graded captures, so without this a new run
+    re-grades screens that were verified days ago. A capture is KNOWN when ALL its uploads and its
+    scene label are in the ledger; the stream lint still runs on it, and 1 in LEDGER_SAMPLE is graded
+    anyway. The ledger only grows on MATCH (never on DIFF/ERROR/BROKEN). Texture/scene novelty does NOT
+    find Krillin-class bugs (known textures, bad geometry): that is the lint's job, on every capture."""
+
+    def __init__(self, path):
+        self.path = Path(path) / "ledger.json"
+        self.uploads, self.scenes, self.graded, self.skipped = set(), set(), 0, 0
+        if self.path.exists():
+            j = json.loads(self.path.read_text(encoding="utf-8"))
+            self.uploads, self.scenes = set(j["uploads"]), set(j["scenes"])
+            self.graded, self.skipped = j.get("graded", 0), j.get("skipped", 0)
+        self.known_seen = 0
+
+    def known(self, ups, scene):
+        if scene == "unknown" or scene not in self.scenes or not ups <= self.uploads:
+            return False
+        self.known_seen += 1
+        return self.known_seen % LEDGER_SAMPLE != 0
+
+    def add(self, ups, scene):
+        self.uploads |= ups
+        if scene != "unknown":
+            self.scenes.add(scene)
+        self.graded += 1
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"uploads": sorted(self.uploads), "scenes": sorted(self.scenes),
+                                   "graded": self.graded, "skipped": self.skipped}), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+
+def cap_uploads(gsr):
+    import hashlib
+    sys.path.insert(0, str(Path(__file__).parent))
+    import audit_disc_textures
+    return {hashlib.md5(u).hexdigest() for u in audit_disc_textures.gsr_uploads(gsr)}
+
+
+def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False, ledger_dir=None):
     """Every capture in a tour dir: our replay vs PCSX2 GSRunner at the same cut -> report.md.
     skip = seeded fault: drop that transfer from OUR replay only; the report must blame it.
     dedupe = skip GSRunner when our frame equals the last graded one (mean diff < 0.5): a long
-    sweep sits on the same screen for minutes. The stream lint still sees every capture."""
+    sweep sits on the same screen for minutes. The stream lint still sees every capture.
+    ledger_dir = also skip captures whose uploads + scene label an earlier run already graded MATCH
+    (row KNOWN, no render, no GSRunner); never combined with the seeded-fault self-test."""
     global W, H
+    ledger = Ledger(ledger_dir) if ledger_dir and skip is None else None
+    scenes = read_scenes(folder) if ledger else []
     caps = sorted(folder.glob(only + ".gsr"), key=lambda p: int(re.search(r"_t(\d+)$", p.stem).group(1)) if re.search(r"_t(\d+)$", p.stem) else 0)
     if not caps:
         sys.exit(f"no .gsr captures in {folder}")
@@ -517,7 +604,7 @@ def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False):
     work = out / "work"
     work.mkdir(exist_ok=True)
     lines, groups, lint_rows, offset_caps = [], {}, [], []
-    last = None  # (stem, frame) of the last capture GSRunner graded
+    last, last_ok = None, False  # (stem, frame) of the last capture GSRunner graded; was it a MATCH?
     for gsr in caps:
         regs = gsr_regs(gsr)
         geo = display_geometry(gsr, out, regs)
@@ -528,9 +615,17 @@ def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False):
         psm = (struct.unpack_from("<Q", regs, 0x90 if (pmode & 2 and not pmode & 1) else 0x70)[0] >> 15) & 0x1F
         lcf = last_complete_frame(gsr, fbw)
         fbp, stop, _ = lcf if lcf else (dfbp, None, 0)
-        for f in lint(gsr):
-            if stop is None or f["t"] < stop:
-                lint_rows.append((gsr.stem, f))
+        cap_lint = [f for f in lint(gsr) if stop is None or f["t"] < stop]
+        lint_rows.extend((gsr.stem, f) for f in cap_lint)
+        broken_here = any(lint_broken(f) for f in cap_lint)
+        ups, scene = None, None
+        if ledger:
+            ups, scene = cap_uploads(gsr), scene_label_at(scenes, _tick(gsr.name))
+            if not broken_here and ledger.known(ups, scene):
+                ledger.skipped += 1
+                lines.append(f"| {gsr.stem} | KNOWN | uploads + scene [{scene}] already graded MATCH (ledger; not re-graded) | |")
+                print(f"  {gsr.stem}: KNOWN [{scene}]")
+                continue
         bmp = work / "ours.bmp"
         if bmp.exists():
             bmp.unlink()
@@ -544,8 +639,10 @@ def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False):
                 and float(np.abs(last[1].astype(np.int16) - ours).mean()) < 0.5:
             lines.append(f"| {gsr.stem} | SAME | our frame = {last[0]} (not re-graded) | |")
             print(f"  {gsr.stem}: SAME as {last[0]}")
+            if ledger and last_ok and not broken_here:
+                ledger.add(ups, scene)
             continue
-        last = (gsr.stem, ours)
+        last, last_ok = (gsr.stem, ours), False
         ref = oracle_frame(gsr, fbp, fbw, psm, stop, work, runner)
         if ref is None:
             lines.append(f"| {gsr.stem} | ERROR | GSRunner gave no frame | |")
@@ -559,6 +656,9 @@ def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False):
         if not regions:
             lines.append(f"| {gsr.stem} | MATCH | mean diff {float(d.mean()):.2f} (exact {float(raw.mean()):.2f}, 1-px offset px {offpx:.1f}%) | |")
             print(f"  {gsr.stem}: MATCH")
+            last_ok = not broken_here
+            if ledger and last_ok:
+                ledger.add(ups, scene)
             continue
         gap = np.full((H, 4, 3), 255, np.uint8)
         heat = np.clip(d * 3, 0, 255).astype(np.uint8)
@@ -583,8 +683,13 @@ def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False):
             lines.append(f"| {gsr.stem} | DIFF | ({x},{y}) {w}x{h} {who}, diff {r['diff']:.0f} | {why[:180]} |")
         print(f"  {gsr.stem}: DIFF {len(regions)} region(s)")
     rep = out / "report.md"
+    if ledger:
+        ledger.save()
     with open(rep, "w", encoding="utf-8") as f:
         f.write(f"# Oracle report: {folder}\n\nOurs (ps2x_gs_bench) vs PCSX2 GSRunner (sw) at the last complete frame of each capture.\n\n")
+        if ledger:
+            f.write(f"Ledger {ledger.path}: {ledger.skipped} capture(s) KNOWN (skipped), ledger now {len(ledger.uploads)} uploads / "
+                    f"{len(ledger.scenes)} scenes. Lint ran on every capture.\n\n")
         f.write("## Distinct suspects (grouped by blamed draw state)\n\n")
         for key, hits in sorted(groups.items(), key=lambda kv: -len(kv[1])):
             caps_hit = sorted({s for s, _ in hits})
@@ -627,24 +732,10 @@ def audit(folder):
     vucaps = sorted(folder.glob("*.vucap"), key=lambda p: _tick(p.name))
 
     # Scene timeline from the run log (PS2X_PAD_SCRIPT runs log [scene] on every change).
-    scenes = []
-    log = folder / "run_log.txt"
-    if log.exists():
-        raw = log.read_bytes()
-        # launch_recomp -Log tees through PowerShell, which writes UTF-16 LE with a BOM.
-        enc = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8"
-        for line in raw.decode(enc, errors="replace").splitlines():
-            for m in SCENE_RE.finditer(line):  # other logs can share the line
-                scenes.append((int(m.group(1)), m.group(2)))
-    scenes.sort()
+    scenes = read_scenes(folder)
 
     def scene_at(t):
-        lab = "unknown"
-        for st, txt in scenes:
-            if st > t:
-                break
-            lab = txt
-        return lab
+        return scene_label_at(scenes, t)
 
     # 1. oracle (only when gfx_tour -Oracle / --oracle already graded this dir)
     orep = folder / "oracle" / "report.md"
@@ -653,7 +744,7 @@ def audit(folder):
         for line in orep.read_text(encoding="utf-8").splitlines():
             if line.startswith("| cap_") or line.startswith("| vu_"):
                 cells = [c.strip() for c in line.strip("|").split("|")]
-                if len(cells) >= 2 and cells[1] in ("MATCH", "SAME"):
+                if len(cells) >= 2 and cells[1] in ("MATCH", "SAME", "KNOWN"):
                     nmatch += 1
                 elif len(cells) >= 2 and cells[1] == "DIFF":
                     diffs.append(cells)
@@ -764,6 +855,9 @@ def main():
     ap.add_argument("--oracle", action="store_true",
                     help="with a tour dir: grade every capture against PCSX2 GSRunner (sw) -> <dir>/oracle/report.md")
     ap.add_argument("--dedupe", action="store_true", help="with --oracle: skip GSRunner for frames equal to the last graded one")
+    ap.add_argument("--ledger", metavar="DIR",
+                    help="with --oracle: known-good ledger dir (e.g. gsdump/known_good); captures whose uploads + scene "
+                         "an earlier run graded MATCH are marked KNOWN and not re-graded; the ledger grows on MATCH")
     ap.add_argument("--only", default="*", help="with --oracle: capture name glob, e.g. cap_t7095")
     ap.add_argument("--audit", action="store_true",
                     help="with a capture dir: oracle + BROKEN lint + host-NaN VU1 scan + scenes + coverage -> <dir>/report.md")
@@ -785,10 +879,10 @@ def main():
         runner = find_gsrunner()
         if not runner or not runner.exists():
             sys.exit("no PCSX2 GSRunner: build F:\\PCSX2-src pcsx2-gsrunner, or set PS2X_GSRUNNER=<exe>")
-        oracle(dump, Path(a.out) if a.out else dump / "oracle", runner, a.thresh, a.only, a.selftest_skip, a.dedupe)
+        oracle(dump, Path(a.out) if a.out else dump / "oracle", runner, a.thresh, a.only, a.selftest_skip, a.dedupe, a.ledger)
         return
     if dump.is_dir():
-        tour(dump, Path(a.out) if a.out else dump / "frames")
+        tour(dump, Path(a.out) if a.out else dump / "frames", a.ledger)
         return
     out =Path(a.out) if a.out else ROOT / "gsdump" / ("scene_" + re.sub(r"\W+", "_", dump.name.split(".gs")[0]))
     out.mkdir(parents=True, exist_ok=True)

@@ -30,7 +30,8 @@ param(
     [switch]$Dedupe,             # oracle skips GSRunner for frames equal to the last graded one
     [int]$MinFreeGB = 10,        # VU1 capture is skipped when F: has less free space than this
     [switch]$Prune,              # after a graded audit, delete captures the reports do not name (default with -Script)
-    [switch]$KeepCaps            # never prune
+    [switch]$KeepCaps,           # never prune
+    [switch]$NoLedger            # grade every capture even if gsdump\known_good says its uploads + scene were verified
 )
 $startedAt = Get-Date
 $root = 'F:\SDBZ Recomp'
@@ -79,12 +80,18 @@ if (-not $ReplayOnly) {
         foreach ($k in $set.Keys) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
     }
 }
-python "$root\build_scripts\gfx_scene_diff.py" $dir
+$targs = @("$root\build_scripts\gfx_scene_diff.py", $dir)
+# The sheet skips captures the known-good ledger covers (only when the oracle will grade them anyway).
+if ($Oracle -and -not $NoLedger) { $targs += @('--ledger', "$root\gsdump\known_good") }
+python @targs
 if ($Oracle) {
     # No human judges a frame: report.md lists every capture where we differ from PCSX2,
     # grouped by the blamed draw, plus runaway triangles; coverage names unreached screens.
     $oargs = @("$root\build_scripts\gfx_scene_diff.py", $dir, '--oracle')
     if ($Dedupe) { $oargs += '--dedupe' }
+    # Known-good ledger: uploads + scene already graded MATCH by an earlier run are not re-graded
+    # (rows KNOWN; lint still runs on every capture). -NoLedger forces a full regrade.
+    if (-not $NoLedger) { $oargs += @('--ledger', "$root\gsdump\known_good") }
     python @oargs
     if (-not $Audit) {
         python "$root\build_scripts\audit_disc_textures.py" --coverage $dir | Select-Object -Last 25
@@ -111,7 +118,7 @@ if (($Prune -or $Script) -and -not $KeepCaps -and $Oracle -and $Audit -and
     $orep = Join-Path $dir 'oracle\report.md'
     if (Test-Path $orep) {
         foreach ($line in Get-Content $orep) {
-            if ($line -match '^\|\s*((cap|vu)_t\d+)\s*\|\s*(\S+)' -and $Matches[3] -notin @('MATCH', 'SAME')) {
+            if ($line -match '^\|\s*((cap|vu)_t\d+)\s*\|\s*(\S+)' -and $Matches[3] -notin @('MATCH', 'SAME', 'KNOWN')) {
                 $named[$Matches[1]] = $true
             }
         }

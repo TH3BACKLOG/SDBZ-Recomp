@@ -165,7 +165,23 @@ def dir_hashes(d):
     return full, head, nup, src
 
 
-def coverage(pics, dirs):
+def needs_hint(folder):
+    """What a never-reached .pix folder is, and what a sweep must do to reach it.
+    ply/pNN = fighter NN (VERIFIED for p01 Goku, p04 Krillin; the rest is HYPOTHESIS: the
+    sweep scripts pick a fighter with `p1=<id>`, so the folder number should be that id)."""
+    leaf = folder.rsplit("/", 1)[-1]
+    if folder.startswith("ply/p") and leaf[1:].isdigit():
+        return f"fighter id {int(leaf[1:])}: sweep with p1={int(leaf[1:])} (select + fight)"
+    if folder.startswith("eff/"):
+        return "effect set (a special/ultimate of some fighter): fight with that fighter's moves"
+    if folder.startswith("dis"):
+        return "demo/cutscene pictures (attract Demo, story/event screens)"
+    if folder.startswith("stg/"):
+        return "stage assets: fight on that stage (Stage Select option)"
+    return "menu/other screen"
+
+
+def coverage(pics, dirs, needs=False):
     """Which disc pictures were uploaded during the captured tour(s).
     Several dirs = the union over all of them (e.g. --coverage gsdump/*)."""
     full, head = set(), set()
@@ -194,6 +210,17 @@ def coverage(pics, dirs):
     for folder, n in by_dir.most_common():
         if hit_dir[folder] < n:
             print(f"  {folder:<40} {n - hit_dir[folder]:>4}/{n} untouched")
+    if needs:
+        print("folders with < 50% of their pictures reached in any run -> how to reach:")
+        pic_by_dir = collections.Counter()
+        hit_pic_by_dir = collections.Counter()
+        for k, v in seen_files.items():
+            fd = k.rsplit("/", 1)[0] if "/" in k else "."
+            pic_by_dir[fd] += v[0]
+            hit_pic_by_dir[fd] += v[1]
+        for folder in sorted(pic_by_dir, key=lambda f: hit_pic_by_dir[f] / pic_by_dir[f]):
+            if hit_pic_by_dir[folder] * 2 < pic_by_dir[folder]:
+                print(f"  {folder:<14} {hit_pic_by_dir[folder]:>4}/{pic_by_dir[folder]:<4} pictures  {needs_hint(folder)}")
 
 
 def main():
@@ -203,6 +230,8 @@ def main():
     ap.add_argument("--other", action="store_true")
     ap.add_argument("--coverage", nargs="+", metavar="TOUR_DIR",
                     help="match IMAGE uploads in PS2X_GSCAP tour captures against the disc pictures")
+    ap.add_argument("--needs", action="store_true",
+                    help="with --coverage: list folders with 0 pictures reached and how a sweep reaches them")
     a = ap.parse_args()
 
     toc = arkd_toc.Toc(os.path.join(a.root, "INFO.DAT"))
@@ -243,7 +272,7 @@ def main():
     for n, h in bad[:10]:
         print("  no TIM2:", n, h)
     if a.coverage:
-        coverage(ok, a.coverage)
+        coverage(ok, a.coverage, a.needs)
     if a.json:
         with open(a.json + ".tmp", "w", encoding="utf-8") as f:
             json.dump(out, f)
