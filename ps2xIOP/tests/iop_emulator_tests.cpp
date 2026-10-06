@@ -893,6 +893,32 @@ namespace
 
 int main()
 {
+    // IOP heap must reuse freed blocks (10-06, orig3 attract-Demo hang): PS2RNA allocates 0x8D0, 0x18640,
+    // 0x8D0, 0x1840 and frees them on exit; a bump-from-high-water allocator walked past HeapLimit on the
+    // second init (alloc returned 0 -> the game's "E01112903 ps2rna_init_psj" infinite loop).
+    {
+        TestHost heapHost(0x20000u);
+        IopSubsystem heapIop(heapHost);
+        const uint32_t sizes[] = {0x8D0u, 0x18640u, 0x8D0u, 0x1840u};
+        uint32_t first[4] = {};
+        for (int cycle = 0; cycle < 40; ++cycle)
+        {
+            uint32_t got[4] = {};
+            for (int i = 0; i < 4; ++i)
+            {
+                got[i] = heapIop.allocateMemory(sizes[i], 64u);
+                if (!expect(got[i] != 0u, "IOP heap alloc failed after repeated free (leak)")) return 1;
+                if (cycle == 0)
+                    first[i] = got[i];
+            }
+            if (cycle > 0)
+                for (int i = 0; i < 4; ++i)
+                    if (!expect(got[i] == first[i], "IOP heap did not reuse the freed blocks")) return 1;
+            for (int i = 3; i >= 0; --i)
+                if (!expect(heapIop.freeMemory(got[i]), "IOP heap free of an owned block failed")) return 1;
+        }
+    }
+
     TestHost host(0x20000u);
     IopSubsystem iop(host);
 

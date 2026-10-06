@@ -23824,3 +23824,13 @@ residue: an unused duplicate `float fpuAcc;` at `ps2_runtime.h:63` that nothing 
 - VERIFIED: 142/142 distinct T8 hashes of the 10-02 log equal disc image FNVs; fold-in survives log deletion.
 - UNMEASURED: wall-speed cost of hashing every upload. Next run: compare watchdog vbl/s with fighters1 (~8); if it drops a lot use `-NoTexLog`.
 - Next runs unchanged: fighters2, fighters3, vs1 (their coverage will now be exact; re-judge p09/p22/p11 from fighters3/fighters1 reruns).
+
+## 10-06: ATTRACT-DEMO HANG = IOP HEAP LEAK (root cause VERIFIED statically + in the orig3 log; fix UNBUILT)
+- Log (orig3 run_log): watchdog `pc=0x136a10 ra=0x136a10`, gif/s=0, stuckSecs 3 -> 133 from t=4635 s to the end (134 watchdog lines); scene = attract CAppDemoMain p1=0x0c.
+- Disasm (mips_r5900_disassembler 0x136a00): `jal 0x120440` (printf) then `nop x5; beq zero,zero,0x136a10` = the game's own fatal-error trap. String at 0x4BBD80 = `PS2RNA: E01112903: Failed, sceSifAllocIopHeap(%d) in ps2rna_init_psj`. The log shows the same line (kputs) right before the stall.
+- Heap sequence (log [iop:iopheap]): 1st PS2RNA init allocs 0x8D0@0x1BEAC0, 0x18640@0x1BFC00, 0x8D0@0x1D8240, 0x1840@0x1D8B40; all four FREED (fno=2 -> 0). 2nd init: 0x8D0 -> 0x1DA380 (NOT the freed 0x1BEAC0), 0x18640 -> 0 (0x1DA380+0x18640 = 0x1F29C0 > HeapLimit 0x1F0000).
+- CAUSE: `IopMemory::allocate` (ps2xIOP/src/emulator/core/iop_memory.cpp) started its first-fit scan at `m_heapCursor` (a high-water mark that never goes down), so frees were never reused. Every Title->Demo cycle leaked ~0x1A000 bytes; the 2nd cycle exhausted the 0xD0000-byte heap.
+- FIX (edited, `cl /Zs` clean, NOT built, NOT run): scan from `HeapBase`. Test added: `ps2xIOP/tests/iop_emulator_tests.cpp` (40 cycles of the PS2RNA alloc/free pattern must return identical addresses, never 0).
+- RISK (HYP): IOP allocations after a free now land in low holes, so module/thread-stack addresses change versus the verified boot. Verify with a normal boot + the title idle loop.
+- VERIFY (user): `& "F:\SDBZ Recompuild.ps1" RelWithDebInfo` then run with `-Test`/ps2_iop_emulator_tests if enabled, then a boot left idle on the title for >= 3 attract-Demo cycles: expect repeated `PS2RNA: sceSifAllocIopHeap(99904) ret=0x...` lines and no `E01112903`. Not a PCSX2 repro: real IOP heaps do reuse freed blocks, so the real console cannot hit this.
+- LESSON: `[padscript]` kept pressing buttons through the hang (it thought app != Fight): a sweep needs a stall guard (see plan P3).

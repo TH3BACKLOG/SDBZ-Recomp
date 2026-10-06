@@ -307,7 +307,12 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // First fit from the heap BASE, not from the high-water mark: freed blocks below m_heapCursor must be
+        // reusable. Starting at the cursor leaked every free (10-06: PS2RNA init allocs 0x8D0/0x18640/0x8D0/0x1840,
+        // frees all four, the next init lands at 0x1DA380 and 0x18640 more passes HeapLimit 0x1F0000 -> ret 0 ->
+        // the game's own "E01112903 ... ps2rna_init_psj" trap, an infinite loop at 0x136A10: the attract-Demo
+        // hang after the second Title->Demo cycle, orig3 t=4635 s).
+        uint32_t candidate = alignUp(HeapBase, alignment);
         for (;;)
         {
             bool overlap = false;
