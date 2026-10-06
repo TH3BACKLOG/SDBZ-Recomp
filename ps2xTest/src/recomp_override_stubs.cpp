@@ -227,3 +227,41 @@ void table_entry_get_stride8_0x3a32f0(uint8_t *, R5900Context *, PS2Runtime *)
     ps2xTestGuestStub("table_entry_get_stride8_0x3a32f0");
 }
 
+
+// Callees of the 10-05 hole-recovery bodies in ps2xRuntime/src/lib/Kernel/recovered/ (sub_001C1C70, sub_002B6240,
+// sub_003BFA50, sub_003EB7F0, sub_003EBD00, sub_003F8820, sub_00426C60..): generated runner bodies, stubbed for the bench.
+
+void return_zero_z_48_0x1c1970(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("return_zero_z_48_0x1c1970");
+}
+
+void get_data_ptr_z_185_0x2b6200(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("get_data_ptr_z_185_0x2b6200");
+}
+
+void j_obj_detach_and_free_resources_2_0x3b7910(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("j_obj_detach_and_free_resources_2_0x3b7910");
+}
+
+void obj_ctor_init_k_clone_02_0x3eb6f0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_ctor_init_k_clone_02_0x3eb6f0");
+}
+
+void CAppFgtResDgnM_Ctor_0x3ebb60(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("CAppFgtResDgnM_Ctor_0x3ebb60");
+}
+
+void obj_ctor_init____0x3f4b70(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_ctor_init____0x3f4b70");
+}
+
+void rpc_dispatch_or_async_0x429d28(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("rpc_dispatch_or_async_0x429d28");
+}
