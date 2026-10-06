@@ -394,8 +394,14 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
 __forceinline uint32_t samplePoint(const Setup &S, int sampleU, int sampleV)
 {
     const GSTex0Reg &tex = S.tex;
-    sampleU = clampInt(sampleU, 0, S.texW - 1);
-    sampleV = clampInt(sampleV, 0, S.texH - 1);
+    // CLAMP_1/2 WMS/WMT (REPEAT / CLAMP / REGION_*), same as GSRasterizer::sampleTexture. This used to clamp
+    // unconditionally, so every REPEAT texture sampled the edge texel instead of wrapping (10-06: orig3 Demo
+    // fountain spray: bilinear neighbour u/v = -1 or 128 must wrap; threads=0 matched PCSX2, threads>=1 did not).
+    const auto &wrapReg = S.job->ctx.clamp;
+    sampleU = wrapTexCoord(sampleU, S.texW, static_cast<unsigned>(wrapReg.wms),
+                           static_cast<int>(wrapReg.minu), static_cast<int>(wrapReg.maxu));
+    sampleV = wrapTexCoord(sampleV, S.texH, static_cast<unsigned>(wrapReg.wmt),
+                           static_cast<int>(wrapReg.minv), static_cast<int>(wrapReg.maxv));
 
     u32 out = S.cache->read(S.vram, tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 
@@ -1125,12 +1131,6 @@ void submit(Job &job, const uint8_t *clutSrc, const void *owner)
 {
     Engine &e = engine();
     ++e.stJobs;
-    // DIAGNOSTIC (10-06): PS2X_GSMT_NOCACHE=1 drops every worker's texture page cache before each primitive.
-    // orig3 cap_t40924 renders a spray sprite differently with the MT path than with PS2X_GS_RASTER_THREADS=0
-    // (single-thread path = PCSX2); if NOCACHE makes MT equal ST, a VRAM write path misses a page-gen bump.
-    static const bool kNoTexCache = std::getenv("PS2X_GSMT_NOCACHE") != nullptr;
-    if (kNoTexCache)
-        g_epoch.fetch_add(1u, std::memory_order_release);
     if (job.vram != e.lastVram)
     {
         g_gsmtWaitReason = 1;
