@@ -33,7 +33,9 @@ param(
     [switch]$KeepCaps,           # never prune
     [switch]$NoLedger,           # grade every capture even if gsdump\known_good says its uploads + scene were verified
     [switch]$TexLog,             # PS2X_TEXHASH_LOG: hash EVERY texture upload of the run (default with -Script); exact disc coverage
-    [switch]$NoTexLog            # with -Script: do not log uploads (the log hashes every upload, ~100 transfers per fight tick)
+    [switch]$NoTexLog,           # with -Script: do not log uploads (the log hashes every upload, ~100 transfers per fight tick)
+    [int]$RasterThreads = 0      # PS2X_GS_RASTER_THREADS for scripted/autopress runs: 0 = single-thread (default, 8 vbl/s in fights),
+                                 # 4 = what the game uses (~19-21 vbl/s). Unproven for captures: compare a run at 4 against 0 first.
 )
 $startedAt = Get-Date
 $root = 'F:\SDBZ Recomp'
@@ -51,10 +53,10 @@ if (-not $ReplayOnly) {
         PS2X_GSCAP = "$From,$Frames,$dir\cap"; PS2X_GSCAP_EVERY = "$Every"
     }
     if ($Script) {
-        $set.PS2X_GS_RASTER_THREADS = '0'
+        $set.PS2X_GS_RASTER_THREADS = "$RasterThreads"
         $set.PS2X_PAD_SCRIPT = $Script
     } elseif (-not $Manual) {
-        $set.PS2X_GS_RASTER_THREADS = '0'
+        $set.PS2X_GS_RASTER_THREADS = "$RasterThreads"
         $set.PS2X_PAD_AUTOPRESS = '120'; $set.PS2X_PAD_AUTOPRESS_BTNS = $Buttons; $set.PS2X_PAD_AUTOPRESS_HOLD = '20'
     }
     if (($Script -or $TexLog) -and -not $NoTexLog) {
