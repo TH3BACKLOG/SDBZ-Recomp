@@ -1125,6 +1125,12 @@ void submit(Job &job, const uint8_t *clutSrc, const void *owner)
 {
     Engine &e = engine();
     ++e.stJobs;
+    // DIAGNOSTIC (10-06): PS2X_GSMT_NOCACHE=1 drops every worker's texture page cache before each primitive.
+    // orig3 cap_t40924 renders a spray sprite differently with the MT path than with PS2X_GS_RASTER_THREADS=0
+    // (single-thread path = PCSX2); if NOCACHE makes MT equal ST, a VRAM write path misses a page-gen bump.
+    static const bool kNoTexCache = std::getenv("PS2X_GSMT_NOCACHE") != nullptr;
+    if (kNoTexCache)
+        g_epoch.fetch_add(1u, std::memory_order_release);
     if (job.vram != e.lastVram)
     {
         g_gsmtWaitReason = 1;
