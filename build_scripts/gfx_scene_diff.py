@@ -23,6 +23,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -96,9 +97,11 @@ def display_geometry(dump, out, regs_bytes=None):
     return fbp, fbw, w, h
 
 
-def render(gsr, bmp, fbp, fbw, extra=None):
+def render(gsr, bmp, fbp, fbw, extra=None, w=None, h=None):
     # The bench hands fbp straight to GS::ReadVram, whose base is in BLOCKS; FRAME/DISPFB fbp is in pages (32 blocks).
-    env = {"PS2X_GSBENCH_BMP": f"{fbp * 32},{fbw},{W},{H},{bmp}", "PS2X_GS_RASTER_THREADS": "0"}
+    # w/h: explicit size so worker threads never read the W/H globals (default = the globals, as before).
+    w, h = (W if w is None else w), (H if h is None else h)
+    env = {"PS2X_GSBENCH_BMP": f"{fbp * 32},{fbw},{w},{h},{bmp}", "PS2X_GS_RASTER_THREADS": "0"}
     if extra:
         env.update(extra)
     rc, txt = run([str(BENCH), str(gsr), "1"], env)
@@ -233,16 +236,21 @@ def steps(gsr, rect, fbp, fbw, out, rows, limit):
     print(f"    {len(ts)} step frame(s) -> {sdir}")
 
 
-def last_complete_frame(gsr, fbw):
+def last_complete_frame(gsr, fbw, w=None, h=None):
     """A capture stops mid-frame. The newest finished frame is the one sitting in a buffer
     just before that buffer's last full-screen clear -> (fbp_pages, stop_transfer, clears)."""
-    rows, _ = blame(gsr, (0, 0, W, H), 0, fbw)
+    # Watch only a tiny rect at the screen centre: the bench lists a row per draw that touches the rect,
+    # and every full-screen clear (>= W-32 x H-48) covers the centre. The old whole-screen watch hashed
+    # the frame after every draw: 10-12 s per fight capture, ~4 h of a 700-capture grade (10-06); this is
+    # 0.3 s and returns the same (fbp, stop, clears).
+    w, h = (W if w is None else w), (H if h is None else h)
+    rows, _ = blame(gsr, (w // 2 - 4, h // 2 - 4, 8, 8), 0, fbw)
     clears = {}
     for r in rows:
         if r.get("nodraw") or r["tme"]:
             continue
         b = r["bbox"]
-        if b[2] - b[0] >= W - 32 and b[3] - b[1] >= H - 48:
+        if b[2] - b[0] >= w - 32 and b[3] - b[1] >= h - 48:
             clears.setdefault(int(r["fbp"], 16), []).append(r["t"])
     if not clears:
         return None
@@ -326,10 +334,12 @@ def gsr_transfers(gsr):
     return [raw[pa + idx[3 * i]: pa + idx[3 * i] + idx[3 * i + 1]] for i in range(count)]
 
 
-def oracle_frame(gsr, fbp, fbw, psm, stop, work, runner):
-    """PCSX2 SW renderer's view of buffer fbp after transfers [0, stop) -> RGB array, or None."""
+def oracle_frame(gsr, fbp, fbw, psm, stop, work, runner, w=None, h=None):
+    """PCSX2 SW renderer's view of buffer fbp after transfers [0, stop) -> RGB array, or None.
+    work must be private to the caller (parallel graders each get their own dir)."""
+    w, h = (W if w is None else w), (H if h is None else h)
     gs = work / "oracle.gs"
-    cmd = [sys.executable, str(PARSE), str(gsr), "--gsr-to-gs", str(gs), "--probe", f"{fbp},{fbw},{psm},{W},{H}"]
+    cmd = [sys.executable, str(PARSE), str(gsr), "--gsr-to-gs", str(gs), "--probe", f"{fbp},{fbw},{psm},{w},{h}"]
     if stop is not None:
         cmd += ["--stop", str(stop)]
     rc, txt = run(cmd)
@@ -350,10 +360,10 @@ def oracle_frame(gsr, fbp, fbw, psm, stop, work, runner):
         print(f"    GSRunner wrote no read-back dump (rc={rc}): {txt[-400:]}")
         return None
     img = np.asarray(load(hits[-1]))
-    if img.shape[0] < H or img.shape[1] < W:
-        print(f"    GSRunner rt0 is {img.shape[1]}x{img.shape[0]}, expected {W}x{H}")
+    if img.shape[0] < h or img.shape[1] < w:
+        print(f"    GSRunner rt0 is {img.shape[1]}x{img.shape[0]}, expected {w}x{h}")
         return None
-    return img[:H, :W].copy()
+    return img[:h, :w].copy()
 
 
 # GIF decode for the lint (PACKED / REGLIST / IMAGE carried across transfers like ps2_gs_gpu).
@@ -560,8 +570,13 @@ class Ledger:
             self.graded, self.skipped = j.get("graded", 0), j.get("skipped", 0)
         self.known_seen = 0
 
-    def known(self, ups, scene):
-        if scene == "unknown" or scene not in self.scenes or not ups <= self.uploads:
+    def covers(self, ups, scene, tu=(), ts=()):
+        """Pure test (no sampling counter). tu/ts = uploads/scenes of captures queued for grading in this
+        run that are assumed to MATCH until the GSRunner results come back."""
+        return scene != "unknown" and (scene in self.scenes or scene in ts)             and (ups <= self.uploads or all(u in self.uploads or u in tu for u in ups))
+
+    def known(self, ups, scene, tu=(), ts=()):
+        if not self.covers(ups, scene, tu, ts):
             return False
         self.known_seen += 1
         return self.known_seen % LEDGER_SAMPLE != 0
@@ -604,66 +619,124 @@ def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False, ledge
     work = out / "work"
     work.mkdir(exist_ok=True)
     lines, groups, lint_rows, offset_caps = [], {}, [], []
-    last, last_ok = None, False  # (stem, frame) of the last capture GSRunner graded; was it a MATCH?
-    for gsr in caps:
+    njobs = max(1, int(os.environ.get("PS2X_ORACLE_JOBS", "6")))
+    import struct
+    from concurrent.futures import ThreadPoolExecutor
+    import shutil
+
+    # ---- pass 1 (parallel): everything about one capture that needs no other capture ----
+    def prep(gsr):
         regs = gsr_regs(gsr)
         geo = display_geometry(gsr, out, regs)
         dfbp, fbw = (geo[0], geo[1]) if geo else (0x70, 8)
-        W, H = (geo[2], geo[3]) if geo else (512, 448)
-        import struct
+        w, h = (geo[2], geo[3]) if geo else (512, 448)
         pmode = struct.unpack_from("<Q", regs, 0)[0]
         psm = (struct.unpack_from("<Q", regs, 0x90 if (pmode & 2 and not pmode & 1) else 0x70)[0] >> 15) & 0x1F
-        lcf = last_complete_frame(gsr, fbw)
+        lcf = last_complete_frame(gsr, fbw, w, h)
         fbp, stop, _ = lcf if lcf else (dfbp, None, 0)
         cap_lint = [f for f in lint(gsr) if stop is None or f["t"] < stop]
-        lint_rows.extend((gsr.stem, f) for f in cap_lint)
-        broken_here = any(lint_broken(f) for f in cap_lint)
-        ups, scene = None, None
+        broken = any(lint_broken(f) for f in cap_lint)
+        ups = scene = None
         if ledger:
             ups, scene = cap_uploads(gsr), scene_label_at(scenes, _tick(gsr.name))
-            if not broken_here and ledger.known(ups, scene):
-                ledger.skipped += 1
-                lines.append(f"| {gsr.stem} | KNOWN | uploads + scene [{scene}] already graded MATCH (ledger; not re-graded) | |")
-                print(f"  {gsr.stem}: KNOWN [{scene}]")
-                continue
-        bmp = work / "ours.bmp"
+        p = dict(gsr=gsr, stem=gsr.stem, fbw=fbw, w=w, h=h, psm=psm, fbp=fbp, stop=stop, lint=cap_lint,
+                 broken=broken, ups=ups, scene=scene, ours=None)
+        # Ledger-covered captures (committed ledger alone) are not rendered unless the 1-in-N sample asks.
+        if not (ledger and not broken and ledger.covers(ups, scene)):
+            p["ours"] = render_ours(p)
+        return p
+
+    def render_ours(p):
+        bmp = work / f"ours_{p['stem']}.bmp"
         if bmp.exists():
             bmp.unlink()
-        env = {"PS2X_GSBENCH_STOP": str(stop)} if stop is not None else {}
+        env = {"PS2X_GSBENCH_STOP": str(p["stop"])} if p["stop"] is not None else {}
         env["PS2X_GS_RASTER_THREADS"] = ORACLE_RASTER_THREADS
         if skip is not None:
             env["PS2X_GSBENCH_SKIP"] = str(skip)
-        render(gsr, bmp, fbp, fbw, env)
-        ours = np.asarray(load(bmp))
+        render(p["gsr"], bmp, p["fbp"], p["fbw"], env, p["w"], p["h"])
+        ours = np.asarray(load(bmp)).copy()
+        bmp.unlink()
+        return ours
+
+    print(f"  pass 1: lint + replay {len(caps)} capture(s) on {njobs} worker(s)", flush=True)
+    with ThreadPoolExecutor(njobs) as ex:
+        preps = list(ex.map(prep, caps))
+    for p in preps:
+        lint_rows.extend((p["stem"], f) for f in p["lint"])
+
+    # ---- pass 2 (serial, cheap): decide per capture: KNOWN / SAME / needs GSRunner ----
+    # Captures queued for grading are assumed to MATCH for the ledger test of the later ones (tu/ts);
+    # a KNOWN row that leaned on such an assumption is graded after all if any job turns out not to MATCH.
+    tu, ts_ = set(), set()
+    items, jobs, last = [], [], None
+    for p in preps:
+        item = dict(p=p, kind=None)
+        items.append(item)
+        if ledger and not p["broken"] and ledger.known(p["ups"], p["scene"], tu, ts_):
+            ledger.skipped += 1
+            item.update(kind="known", via=not ledger.covers(p["ups"], p["scene"]))
+            continue
+        if p["ours"] is None:
+            p["ours"] = render_ours(p)
+        ours = p["ours"]
         if dedupe and last is not None and last[1].shape == ours.shape \
                 and float(np.abs(last[1].astype(np.int16) - ours).mean()) < 0.5:
-            lines.append(f"| {gsr.stem} | SAME | our frame = {last[0]} (not re-graded) | |")
-            print(f"  {gsr.stem}: SAME as {last[0]}")
-            if ledger and last_ok and not broken_here:
-                ledger.add(ups, scene)
-            continue
-        last, last_ok = (gsr.stem, ours), False
-        ref = oracle_frame(gsr, fbp, fbw, psm, stop, work, runner)
+            item.update(kind="same", base=last[0], basejob=last[2])
+            p["ours"] = None
+        else:
+            item.update(kind="job", job=len(jobs))
+            jobs.append(dict(p=p, ours=ours))
+            last = (p["stem"], ours, len(jobs) - 1)
+        if ledger and not p["broken"]:
+            tu |= p["ups"]
+            if p["scene"] != "unknown":
+                ts_.add(p["scene"])
+    print(f"  pass 2: {sum(i['kind'] == 'known' for i in items)} KNOWN, {sum(i['kind'] == 'same' for i in items)} SAME, "
+          f"{len(jobs)} to grade on PCSX2", flush=True)
+
+    # ---- pass 3 (parallel): PCSX2 GSRunner for every job, each in a private work dir ----
+    def grade(job):
+        p = job["p"]
+        wk = work / f"g_{p['stem']}"
+        wk.mkdir(exist_ok=True)
+        try:
+            return oracle_frame(p["gsr"], p["fbp"], p["fbw"], p["psm"], p["stop"], wk, runner, p["w"], p["h"])
+        finally:
+            shutil.rmtree(wk, ignore_errors=True)
+
+    def grade_all(js):
+        with ThreadPoolExecutor(njobs) as ex:
+            return list(ex.map(grade, js))
+
+    # ---- pass 4 (serial): compare, blame, ledger ----
+    results = {}   # stem -> (status, [report lines])
+    job_ok = {}
+
+    def finish(job, ref):
+        global W, H
+        p = job["p"]
+        stem, ours = p["stem"], job["ours"]
+        W, H = p["w"], p["h"]
+        fbp, fbw, psm, stop, gsr = p["fbp"], p["fbw"], p["psm"], p["stop"], p["gsr"]
         if ref is None:
-            lines.append(f"| {gsr.stem} | ERROR | GSRunner gave no frame | |")
-            continue
+            results[stem] = ("ERROR", [f"| {stem} | ERROR | GSRunner gave no frame | |"])
+            return False
         regions, d = find_regions(ours, ref, thresh, ORACLE_SHIFT)
         # Same art drawn about a pixel off: differs exactly but matches within +-1 px. Counted, not blamed.
         raw = pixel_diff(ours, ref)
         offpx = float(((raw > thresh) & (d <= thresh)).mean() * 100)
         if offpx >= 0.5:
-            offset_caps.append((gsr.stem, offpx))
+            offset_caps.append((stem, offpx))
         if not regions:
-            lines.append(f"| {gsr.stem} | MATCH | mean diff {float(d.mean()):.2f} (exact {float(raw.mean()):.2f}, 1-px offset px {offpx:.1f}%) | |")
-            print(f"  {gsr.stem}: MATCH")
-            last_ok = not broken_here
-            if ledger and last_ok:
-                ledger.add(ups, scene)
-            continue
+            results[stem] = ("MATCH", [f"| {stem} | MATCH | mean diff {float(d.mean()):.2f} (exact {float(raw.mean()):.2f}, 1-px offset px {offpx:.1f}%) | |"])
+            if ledger and not p["broken"]:
+                ledger.add(p["ups"], p["scene"])
+            return not p["broken"]
         gap = np.full((H, 4, 3), 255, np.uint8)
         heat = np.clip(d * 3, 0, 255).astype(np.uint8)
-        Image.fromarray(np.concatenate([ours, gap, ref, gap, np.stack([heat] * 3, axis=2)], axis=1)).save(out / f"{gsr.stem}.png")
-        cache = {}
+        Image.fromarray(np.concatenate([ours, gap, ref, gap, np.stack([heat] * 3, axis=2)], axis=1)).save(out / f"{stem}.png")
+        cache, out_lines = {}, []
         benv = {"PS2X_GSBENCH_SKIP": str(skip)} if skip is not None else {}
         benv["PS2X_GS_RASTER_THREADS"] = ORACLE_RASTER_THREADS
         for r in regions[:4]:
@@ -678,10 +751,47 @@ def oracle(folder, out, runner, thresh, only="*", skip=None, dedupe=False, ledge
                    f"ate={first['ate']} atst={first['atst']}") if first else "no divergent draw found"
             who = "ours darker" if r["ours_lum"] < r["ref_lum"] - 5 else ("ours brighter" if r["ours_lum"] > r["ref_lum"] + 5 else "different")
             x, y, w, h = r["rect"]
-            groups.setdefault(key, []).append((gsr.stem, first["tbp0"] if first else None))
+            groups.setdefault(key, []).append((stem, first["tbp0"] if first else None))
             why = f"first divergent draw: {describe(first)}" if first else verdict(rows)
-            lines.append(f"| {gsr.stem} | DIFF | ({x},{y}) {w}x{h} {who}, diff {r['diff']:.0f} | {why[:180]} |")
-        print(f"  {gsr.stem}: DIFF {len(regions)} region(s)")
+            out_lines.append(f"| {stem} | DIFF | ({x},{y}) {w}x{h} {who}, diff {r['diff']:.0f} | {why[:180]} |")
+        results[stem] = (f"DIFF {len(regions)} region(s)", out_lines)
+        return False
+
+    t_grade = time.time()
+    refs = grade_all(jobs)
+    print(f"  pass 3: {len(jobs)} GSRunner job(s) in {time.time() - t_grade:.0f}s", flush=True)
+    for i, (job, ref) in enumerate(zip(jobs, refs)):
+        job_ok[i] = finish(job, ref)
+        job["ours"] = None
+    if not all(job_ok.values()):
+        # A job did not MATCH: KNOWN rows that only held under the "queued jobs MATCH" assumption get graded now.
+        redo = [it for it in items if it["kind"] == "known" and it["via"]]
+        if redo:
+            print(f"  {len(redo)} KNOWN capture(s) relied on a capture that did not MATCH: grading them", flush=True)
+            extra = []
+            for it in redo:
+                p = it["p"]
+                if p["ours"] is None:
+                    p["ours"] = render_ours(p)
+                extra.append(dict(p=p, ours=p["ours"]))
+                it["kind"] = "regraded"
+                ledger.skipped -= 1
+            for job, ref in zip(extra, grade_all(extra)):
+                finish(job, ref)
+    for it in items:
+        p = it["p"]
+        if it["kind"] == "same":
+            lines.append(f"| {p['stem']} | SAME | our frame = {it['base']} (not re-graded) | |")
+            if ledger and job_ok.get(it["basejob"]) and not p["broken"]:
+                ledger.add(p["ups"], p["scene"])
+            print(f"  {p['stem']}: SAME as {it['base']}")
+        elif it["kind"] == "known":
+            lines.append(f"| {p['stem']} | KNOWN | uploads + scene [{p['scene']}] already graded MATCH (ledger; not re-graded) | |")
+            print(f"  {p['stem']}: KNOWN [{p['scene']}]")
+        else:
+            status, rl = results[p["stem"]]
+            lines.extend(rl)
+            print(f"  {p['stem']}: {status}")
     rep = out / "report.md"
     if ledger:
         ledger.save()
