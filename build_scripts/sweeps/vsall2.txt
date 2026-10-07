@@ -3,7 +3,7 @@
 # time - so counts are absolute), health frozen while both pads mash a seeded fuzz (H: random chords ->
 # specials/supers), then released so the fight ends; result menu D X -> select screen.
 # 10-07 vsall2 run 1: a fight is multi-round (2 WINS seen) and outlasted a 2500-tick wait; now P2 hp frozen at 1 after the fuzz
-# (rounds end fast) and the result menu gets 25 D X tries.
+# (hp 0 = instant KO each round; hp 1 did not shorten the fight: fuzz rarely lands a hit) and the result menu gets 25 D X tries.
 # VERIFIED vsall loop 1: select -> fight -> fuzz -> fight ends -> result menu -> select again (~5600 ticks/loop).
 # Run:  $env:PS2X_PAD2='1'
 #       .\build_scripts\gfx_tour.ps1 -Name vsall2 -Script build_scripts\sweeps\vsall2.txt -Seconds 3700 -Every 90
@@ -66,7 +66,7 @@ fuzz ticks=600 seed=100 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=101 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=102 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 0 left fight
@@ -112,7 +112,7 @@ fuzz ticks=600 seed=103 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=104 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=105 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 1 left fight
@@ -158,7 +158,7 @@ fuzz ticks=600 seed=106 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=107 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=108 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 2 left fight
@@ -204,7 +204,7 @@ fuzz ticks=600 seed=109 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=110 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=111 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 3 left fight
@@ -247,7 +247,7 @@ fuzz ticks=600 seed=112 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=113 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=114 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 4 left fight
@@ -293,7 +293,7 @@ fuzz ticks=600 seed=115 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=116 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=117 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 5 left fight
@@ -339,7 +339,7 @@ fuzz ticks=600 seed=118 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=119 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=120 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 6 left fight
@@ -385,7 +385,7 @@ fuzz ticks=600 seed=121 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=122 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=123 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 7 left fight
@@ -431,7 +431,7 @@ fuzz ticks=600 seed=124 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=125 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=126 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 8 left fight
@@ -477,7 +477,7 @@ fuzz ticks=600 seed=127 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=128 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=129 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 9 left fight
@@ -523,7 +523,7 @@ fuzz ticks=600 seed=130 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=131 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=132 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 10 left fight
@@ -569,7 +569,7 @@ fuzz ticks=600 seed=133 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=134 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=135 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 11 left fight
@@ -615,7 +615,7 @@ fuzz ticks=600 seed=136 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=137 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=138 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 12 left fight
@@ -658,7 +658,7 @@ fuzz ticks=600 seed=139 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=140 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=141 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 13 left fight
@@ -704,7 +704,7 @@ fuzz ticks=600 seed=142 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=143 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=144 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 14 left fight
@@ -750,7 +750,7 @@ fuzz ticks=600 seed=145 max=2 hold=2-8 gap=2-8
 fuzz ticks=500 seed=146 max=2 hold=2-8 gap=2-8 pad=2
 unfreeze
 freeze [0x5AF7F0]+12 250 w=4
-freeze [0x5B14C0]+12 1 w=4
+freeze [0x5B14C0]+12 0 w=4
 fuzz ticks=1500 seed=147 max=2 hold=2-8 gap=2-8 until app!=CAppFightMain
 unfreeze
 log loop 15 left fight
