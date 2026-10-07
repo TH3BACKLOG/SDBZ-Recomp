@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -325,6 +327,15 @@ namespace
 //   poke <addr> <value> [w=1|2|4]
 //   poke [<ptr>]+<off> <value> [w=..]   writes to word-at-<ptr> + <off> (heap objects;
 //                                       skipped + logged if that word is not a RAM pointer)
+//   freeze <addr> <value> [w=..]   like poke, but re-applied every frame until `unfreeze`
+//   freeze [<ptr>]+<off> <value>   (keeps health/ki topped up so a fuzzed fight does not end)
+//   unfreeze                       drops every freeze
+//   snap <name>                    dumps all EE RAM to $PS2X_SNAP_DIR/<name>.bin (max 48 per run);
+//                                  build_scripts/ramdiff.py finds the changing words (cursor/stage ids)
+//   fuzz ticks=<n> [seed=<n>] [pad=2] [btns=X+O+T+Q+R1+..] [hold=<a>-<b>] [gap=<a>-<b>] [max=<n>]
+//        [until <cond>]            seeded random button mashing for n ticks (default pool: every
+//                                  button except Start/Select/L3/R3; hold/gap in ticks, max = most
+//                                  buttons held at once); ends early when <cond> is met
 //   log <text>
 // Buttons: X O T Q(square) S(start) SEL U D L R L1 R1 L2 R2 L3 R3.
 // pad=2 presses on a second, scripted controller: port 1 is plugged in (SIO2 HLE
@@ -356,7 +367,7 @@ namespace
         constexpr uint32_t kDefaultTimeout = 3600u;
         constexpr int kSceneLogCap = 4000;
 
-        enum class Op { Wait, Press, Goto, Label, Poke, Log };
+        enum class Op { Wait, Press, Goto, Label, Poke, Log, Freeze, Unfreeze, Snap, Fuzz };
         enum class CondKind { None, App, NotApp, Mode, P1, Ticks };
 
         struct Cond
@@ -382,6 +393,8 @@ namespace
             uint32_t addr = 0, value = 0, width = 1;
             bool deref = false;
             uint32_t off = 0;
+            std::vector<uint16_t> pool; // fuzz: single-button masks
+            uint32_t holdLo = 2, holdHi = 8, gapLo = 2, gapHi = 8, seed = 1, maxBtn = 2;
         };
 
         struct Scene
@@ -519,6 +532,17 @@ namespace
                     return 0;
             }
             return m;
+        }
+
+        // "a-b" or "a" -> [lo, hi]
+        bool parseRange(const char *t, uint32_t &lo, uint32_t &hi)
+        {
+            char *end = nullptr;
+            lo = static_cast<uint32_t>(std::strtoul(t, &end, 0));
+            hi = lo;
+            if (*end == '-')
+                hi = static_cast<uint32_t>(std::strtoul(end + 1, &end, 0));
+            return *end == '\0' && hi >= lo;
         }
 
         bool parseCond(const std::string &kv, Cond &c)
@@ -662,9 +686,9 @@ namespace
                             return fail("goto takes [<times>] [if app=|app!=|mode=|p1=]");
                     }
                 }
-                else if (cmd == "poke" && tok.size() >= 3)
+                else if ((cmd == "poke" || cmd == "freeze") && tok.size() >= 3)
                 {
-                    s.op = Op::Poke;
+                    s.op = (cmd == "poke") ? Op::Poke : Op::Freeze;
                     const char *a = tok[1].c_str();
                     s.deref = (*a == '[');
                     char *end = nullptr;
@@ -692,6 +716,66 @@ namespace
                 }
                 else if (cmd == "log")
                     s.op = Op::Log;
+                else if (cmd == "unfreeze")
+                    s.op = Op::Unfreeze;
+                else if (cmd == "snap" && tok.size() == 2)
+                {
+                    s.op = Op::Snap;
+                    s.label = tok[1];
+                    for (char c : s.label)
+                        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-'))
+                            return fail("snap name must be [A-Za-z0-9_-]");
+                }
+                else if (cmd == "fuzz")
+                {
+                    s.op = Op::Fuzz;
+                    bool until = false;
+                    for (size_t k = 1; k < tok.size(); ++k)
+                    {
+                        const std::string &t = tok[k];
+                        if (t == "until")
+                            until = true;
+                        else if (t.rfind("ticks=", 0) == 0)
+                            s.timeout = static_cast<uint32_t>(std::strtoul(t.c_str() + 6, nullptr, 0));
+                        else if (t.rfind("seed=", 0) == 0)
+                            s.seed = static_cast<uint32_t>(std::strtoul(t.c_str() + 5, nullptr, 0));
+                        else if (t.rfind("max=", 0) == 0)
+                            s.maxBtn = static_cast<uint32_t>(std::max(1ul, std::strtoul(t.c_str() + 4, nullptr, 0)));
+                        else if (t == "pad=1" || t == "pad=2")
+                            s.pad = static_cast<uint32_t>(t[4] - '0');
+                        else if (t.rfind("hold=", 0) == 0)
+                        {
+                            if (!parseRange(t.c_str() + 5, s.holdLo, s.holdHi) || s.holdLo == 0)
+                                return fail("bad fuzz hold=a-b");
+                        }
+                        else if (t.rfind("gap=", 0) == 0)
+                        {
+                            if (!parseRange(t.c_str() + 4, s.gapLo, s.gapHi))
+                                return fail("bad fuzz gap=a-b");
+                        }
+                        else if (t.rfind("btns=", 0) == 0)
+                        {
+                            std::stringstream bs(t.substr(5));
+                            std::string b;
+                            while (std::getline(bs, b, '+'))
+                            {
+                                const uint16_t m = buttonMask(b);
+                                if (m == 0)
+                                    return fail("bad fuzz btns=");
+                                s.pool.push_back(m);
+                            }
+                        }
+                        else if (!until || !parseCond(t, s.cond))
+                            return fail("bad fuzz option");
+                    }
+                    if (s.timeout == 0)
+                        return fail("fuzz needs ticks=<n>");
+                    if (until && s.cond.kind == CondKind::None)
+                        return fail("until needs a condition");
+                    if (s.pool.empty())
+                        for (const char *bn : {"X", "O", "T", "Q", "R1", "R2", "L1", "L2", "U", "D", "L", "R"})
+                            s.pool.push_back(buttonMask(bn));
+                }
                 else
                     return fail("unknown step");
                 out.push_back(std::move(s));
@@ -718,6 +802,67 @@ namespace
             Scene last;
             bool haveLast = false;
             int sceneLogged = 0;
+            std::vector<Step> frozen;
+            int snapsTaken = 0;
+            uint64_t fzRng = 1, fzPhaseEnd = 0;
+            bool fzHolding = false;
+            uint16_t fzMask = 0;
+
+            uint32_t fzNext()
+            {
+                fzRng ^= fzRng >> 12;
+                fzRng ^= fzRng << 25;
+                fzRng ^= fzRng >> 27;
+                return static_cast<uint32_t>((fzRng * 0x2545F4914F6CDD1Dull) >> 32);
+            }
+
+            static uint32_t fzSpan(uint32_t lo, uint32_t hi, uint32_t r)
+            {
+                return lo + (hi > lo ? r % (hi - lo + 1u) : 0u);
+            }
+
+            // One poke / frozen poke. verbose = the one-shot log lines.
+            static void applyPoke(uint8_t *ram, const Step &s, uint64_t tick, bool verbose)
+            {
+                uint32_t dst = s.addr;
+                if (s.deref)
+                {
+                    const uint32_t ptr = r32(ram, s.addr);
+                    dst = ptr + s.off;
+                    if (ptr == 0u || !inRam(dst, s.width))
+                    {
+                        if (verbose)
+                            std::printf("[padscript] poke skipped: [0x%x]=0x%x not a RAM pointer tick=%llu\n",
+                                        s.addr, ptr, static_cast<unsigned long long>(tick));
+                        return;
+                    }
+                    if (verbose)
+                        std::printf("[padscript] poke [0x%x]=0x%x +0x%x -> 0x%x old=%d\n", s.addr, ptr, s.off,
+                                    dst, static_cast<int>(r32(ram, dst & ~3u)));
+                }
+                std::memcpy(ram + (dst & 0x1FFFFFFFu), &s.value, s.width); // little-endian low bytes
+            }
+
+            void takeSnap(const uint8_t *ram, const std::string &name, uint64_t tick)
+            {
+                if (snapsTaken >= 48)
+                {
+                    std::printf("[padscript] snap %s skipped: 48-per-run cap\n", name.c_str());
+                    return;
+                }
+                const char *d = std::getenv("PS2X_SNAP_DIR");
+                const std::filesystem::path dir = (d && *d) ? d : ".";
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                const std::filesystem::path file = dir / (name + ".bin");
+                std::ofstream o(file, std::ios::binary | std::ios::trunc);
+                o.write(reinterpret_cast<const char *>(ram), kRam);
+                o.close();
+                ++snapsTaken;
+                std::printf("[padscript] snap %s -> %s tick=%llu ok=%d\n", name.c_str(), file.string().c_str(),
+                            static_cast<unsigned long long>(tick), o.good() ? 1 : 0);
+                std::fflush(stdout);
+            }
 
             Engine()
             {
@@ -798,6 +943,8 @@ namespace
                 }
                 if (!active)
                     return 0;
+                for (const Step &fz : frozen)
+                    applyPoke(ram, fz, tick, false);
                 for (int guard = 0; guard < 64; ++guard) // instant steps run in one frame
                 {
                     if (pc >= steps.size())
@@ -821,6 +968,13 @@ namespace
                                         static_cast<unsigned long long>(tick), s.text.c_str());
                             std::fflush(stdout);
                         }
+                        if (s.op == Op::Fuzz)
+                        {
+                            fzRng = (static_cast<uint64_t>(s.seed) + 1u) * 0x9E3779B97F4A7C15ull;
+                            fzHolding = false;
+                            fzMask = 0;
+                            fzPhaseEnd = tick;
+                        }
                     }
                     const uint64_t elapsed = tick - stepStart;
                     switch (s.op)
@@ -830,25 +984,53 @@ namespace
                         next();
                         continue;
                     case Op::Poke:
-                    {
-                        uint32_t dst = s.addr;
-                        if (s.deref)
-                        {
-                            const uint32_t ptr = r32(ram, s.addr);
-                            dst = ptr + s.off;
-                            if (ptr == 0u || !inRam(dst, s.width))
-                            {
-                                std::printf("[padscript] poke skipped: [0x%x]=0x%x not a RAM pointer tick=%llu\n",
-                                            s.addr, ptr, static_cast<unsigned long long>(tick));
-                                next();
-                                continue;
-                            }
-                            std::printf("[padscript] poke [0x%x]=0x%x +0x%x -> 0x%x old=%d\n", s.addr, ptr, s.off,
-                                        dst, static_cast<int>(r32(ram, dst & ~3u)));
-                        }
-                        std::memcpy(ram + (dst & 0x1FFFFFFFu), &s.value, s.width); // little-endian low bytes
+                        applyPoke(ram, s, tick, true);
                         next();
                         continue;
+                    case Op::Freeze:
+                        applyPoke(ram, s, tick, true);
+                        frozen.push_back(s);
+                        next();
+                        continue;
+                    case Op::Unfreeze:
+                        frozen.clear();
+                        next();
+                        continue;
+                    case Op::Snap:
+                        takeSnap(ram, s.label, tick);
+                        next();
+                        continue;
+                    case Op::Fuzz:
+                    {
+                        if ((s.cond.kind != CondKind::None && condMet(s.cond, sc, elapsed)) || elapsed >= s.timeout)
+                        {
+                            next();
+                            continue;
+                        }
+                        if (tick >= fzPhaseEnd)
+                        {
+                            if (fzHolding)
+                            {
+                                fzHolding = false;
+                                fzMask = 0;
+                                fzPhaseEnd = tick + fzSpan(s.gapLo, s.gapHi, fzNext());
+                            }
+                            else
+                            {
+                                uint16_t m = 0;
+                                const uint32_t n = 1u + fzNext() % s.maxBtn;
+                                for (uint32_t k = 0; k < n; ++k)
+                                    m |= s.pool[fzNext() % s.pool.size()];
+                                if ((m & PAD_UP) && (m & PAD_DOWN))
+                                    m &= static_cast<uint16_t>(~PAD_DOWN);
+                                if ((m & PAD_LEFT) && (m & PAD_RIGHT))
+                                    m &= static_cast<uint16_t>(~PAD_RIGHT);
+                                fzMask = m;
+                                fzHolding = true;
+                                fzPhaseEnd = tick + fzSpan(s.holdLo, s.holdHi, fzNext());
+                            }
+                        }
+                        return static_cast<uint32_t>(fzMask) << (s.pad == 2u ? 16 : 0);
                     }
                     case Op::Goto:
                         if ((s.cond.kind == CondKind::None || condMet(s.cond, sc, 0u)) &&

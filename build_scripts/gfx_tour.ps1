@@ -55,6 +55,7 @@ if (-not $ReplayOnly) {
     if ($Script) {
         $set.PS2X_GS_RASTER_THREADS = "$RasterThreads"
         $set.PS2X_PAD_SCRIPT = $Script
+        $set.PS2X_SNAP_DIR = "$dir\snap"   # script op `snap <name>` -> RAM dumps for build_scripts\ramdiff.py
     } elseif (-not $Manual) {
         $set.PS2X_GS_RASTER_THREADS = "$RasterThreads"
         $set.PS2X_PAD_AUTOPRESS = '120'; $set.PS2X_PAD_AUTOPRESS_BTNS = $Buttons; $set.PS2X_PAD_AUTOPRESS_HOLD = '20'
