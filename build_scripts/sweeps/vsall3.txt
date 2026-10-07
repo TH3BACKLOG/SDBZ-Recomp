@@ -72,18 +72,38 @@ unfreeze
 log loop 4 left fight
 label result4
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu4 if app=CAppMenuMain
 goto charsel5 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel5 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu4 if app=CAppMenuMain
 goto result4 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu4
+
+# main menu -> Versus select, then the next loop
+label menu4
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 4 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok4 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu4 2
+label vs_ok4
+goto charsel5
 
 # ---- loop 5: P1 R x5, P2 R x3, stage R x16
 label charsel5
@@ -120,18 +140,38 @@ unfreeze
 log loop 5 left fight
 label result5
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu5 if app=CAppMenuMain
 goto charsel6 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel6 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu5 if app=CAppMenuMain
 goto result5 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu5
+
+# main menu -> Versus select, then the next loop
+label menu5
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 5 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok5 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu5 2
+label vs_ok5
+goto charsel6
 
 # ---- loop 6: P1 R x6, P2 R x6, stage R x2
 label charsel6
@@ -168,18 +208,38 @@ unfreeze
 log loop 6 left fight
 label result6
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu6 if app=CAppMenuMain
 goto charsel7 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel7 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu6 if app=CAppMenuMain
 goto result6 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu6
+
+# main menu -> Versus select, then the next loop
+label menu6
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 6 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok6 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu6 2
+label vs_ok6
+goto charsel7
 
 # ---- loop 7: P1 R x7, P2 R x9, stage R x5
 label charsel7
@@ -216,18 +276,38 @@ unfreeze
 log loop 7 left fight
 label result7
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu7 if app=CAppMenuMain
 goto charsel8 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel8 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu7 if app=CAppMenuMain
 goto result7 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu7
+
+# main menu -> Versus select, then the next loop
+label menu7
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 7 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok7 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu7 2
+label vs_ok7
+goto charsel8
 
 # ---- loop 8: P1 R x8, P2 R x12, stage R x8
 label charsel8
@@ -264,18 +344,38 @@ unfreeze
 log loop 8 left fight
 label result8
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu8 if app=CAppMenuMain
 goto charsel9 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel9 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu8 if app=CAppMenuMain
 goto result8 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu8
+
+# main menu -> Versus select, then the next loop
+label menu8
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 8 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok8 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu8 2
+label vs_ok8
+goto charsel9
 
 # ---- loop 9: P1 R x9, P2 R x2, stage R x11
 label charsel9
@@ -312,18 +412,38 @@ unfreeze
 log loop 9 left fight
 label result9
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu9 if app=CAppMenuMain
 goto charsel10 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel10 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu9 if app=CAppMenuMain
 goto result9 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu9
+
+# main menu -> Versus select, then the next loop
+label menu9
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 9 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok9 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu9 2
+label vs_ok9
+goto charsel10
 
 # ---- loop 10: P1 R x10, P2 R x5, stage R x14
 label charsel10
@@ -360,18 +480,38 @@ unfreeze
 log loop 10 left fight
 label result10
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu10 if app=CAppMenuMain
 goto charsel11 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel11 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu10 if app=CAppMenuMain
 goto result10 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu10
+
+# main menu -> Versus select, then the next loop
+label menu10
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 10 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok10 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu10 2
+label vs_ok10
+goto charsel11
 
 # ---- loop 11: P1 R x11, P2 R x8, stage R x17
 label charsel11
@@ -408,18 +548,38 @@ unfreeze
 log loop 11 left fight
 label result11
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu11 if app=CAppMenuMain
 goto charsel12 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel12 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu11 if app=CAppMenuMain
 goto result11 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu11
+
+# main menu -> Versus select, then the next loop
+label menu11
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 11 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok11 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu11 2
+label vs_ok11
+goto charsel12
 
 # ---- loop 12: P1 R x12, P2 R x11, stage R x3
 label charsel12
@@ -456,18 +616,38 @@ unfreeze
 log loop 12 left fight
 label result12
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu12 if app=CAppMenuMain
 goto charsel13 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel13 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu12 if app=CAppMenuMain
 goto result12 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu12
+
+# main menu -> Versus select, then the next loop
+label menu12
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 12 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok12 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu12 2
+label vs_ok12
+goto charsel13
 
 # ---- loop 13: P1 R x0, P2 R x1, stage R x6
 label charsel13
@@ -501,18 +681,38 @@ unfreeze
 log loop 13 left fight
 label result13
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu13 if app=CAppMenuMain
 goto charsel14 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel14 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu13 if app=CAppMenuMain
 goto result13 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu13
+
+# main menu -> Versus select, then the next loop
+label menu13
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 13 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok13 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu13 2
+label vs_ok13
+goto charsel14
 
 # ---- loop 14: P1 R x1, P2 R x4, stage R x9
 label charsel14
@@ -549,18 +749,38 @@ unfreeze
 log loop 14 left fight
 label result14
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu14 if app=CAppMenuMain
 goto charsel15 if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto charsel15 if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu14 if app=CAppMenuMain
 goto result14 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu14
+
+# main menu -> Versus select, then the next loop
+label menu14
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 14 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok14 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu14 2
+label vs_ok14
+goto charsel15
 
 # ---- loop 15: P1 R x2, P2 R x7, stage R x12
 label charsel15
@@ -597,18 +817,38 @@ unfreeze
 log loop 15 left fight
 label result15
 wait ticks=200
-goto menu if app=CAppMenuMain
+goto menu15 if app=CAppMenuMain
 goto done if app=CAppSelectMain
 press D hold=6 gap=30
 press X hold=10 gap=200
 goto done if app=CAppSelectMain
-goto menu if app=CAppMenuMain
+goto menu15 if app=CAppMenuMain
 goto result15 25
 log stuck after result - pause routine
 press S hold=10 gap=90
 press U hold=6 gap=30
 press X hold=10 gap=300
-goto menu
+goto menu15
+
+# main menu -> Versus select, then the next loop
+label menu15
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log loop 15 menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok15 if mode=3
+log NOT VERSUS - backing out
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu15 2
+label vs_ok15
+goto done
 
 label done
 log vsall2 finished all loops
