@@ -70,6 +70,11 @@ namespace
     constexpr uint32_t kIrqWaitPc = 0x00160200u;
     constexpr uint32_t kIrqResumePc = 0x00160210u;
     constexpr uint32_t kIntcHandlerPc = 0x00160220u;
+    constexpr uint32_t kIrqStackWaitPc = 0x00160230u;
+    constexpr uint32_t kIrqStackResumePc = 0x00160240u;
+    constexpr uint32_t kIrqStackHandlerPc = 0x00160250u;
+    constexpr uint32_t kIrqRegistrationSp = 0x001E0000u;
+    constexpr uint32_t kIrqRegistrationGuardAddr = kIrqRegistrationSp - 16u;
     constexpr uint32_t kISemaWaitPc = 0x00160300u;
     constexpr uint32_t kISemaResumePc = 0x00160310u;
     constexpr uint32_t kISemaDriverPc = 0x00160320u;
@@ -80,6 +85,9 @@ namespace
     constexpr uint32_t kTimer2WaitPc = 0x00160500u;
     constexpr uint32_t kTimer2ResumePc = 0x00160510u;
     constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
+    constexpr uint32_t kInvocationQueuePc = 0x00160530u;
+    constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
+    constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -101,6 +109,10 @@ namespace
     uint64_t g_vsyncTick = 0;
     uint64_t g_vsyncCsr = 0;
     std::atomic<bool> g_timer2Resumed{false};
+    uint32_t g_irqObservedSp = 0u;
+    uint32_t g_invocationQueueRuns = 0u;
+    uint32_t g_invocationQueueSp = 0u;
+    bool g_invocationQueueSpChanged = false;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -272,6 +284,43 @@ namespace
         g_dispatchTrace.push_back(3);
         g_resumedResult = getRegS32(*ctx, 2);
         g_timer2Resumed.store(true, std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerInvocationQueueHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t sp = getRegU32(ctx, 29);
+        if (g_invocationQueueSp == 0u)
+        {
+            g_invocationQueueSp = sp;
+        }
+        else if (g_invocationQueueSp != sp)
+        {
+            g_invocationQueueSpChanged = true;
+        }
+        ++g_invocationQueueRuns;
+        ctx->pc = 0u;
+    }
+
+    void schedulerQueueManyInvocations(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kInvocationCount = 96u;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        for (uint32_t i = 0u; i < kInvocationCount; ++i)
+        {
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::Interrupt;
+            invocation.tag = i;
+            invocation.context.pc = kInvocationQueueHandlerPc;
+            setRegU32(invocation.context, 31, 0u);
+            scheduler.queueInvocation(std::move(invocation));
+        }
+        ctx->pc = kInvocationQueueResumePc;
+    }
+
+    void schedulerInvocationQueueResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
         ctx->pc = 0u;
         runtime->requestStop();
     }

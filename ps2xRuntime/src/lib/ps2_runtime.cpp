@@ -1855,6 +1855,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
 
     m_cpuContext.pc = header.entry;
+    m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
 
     uint32_t maxLoadedRdramEnd = kGuestHeapDefaultBase;
     uint32_t moduleBase = std::numeric_limits<uint32_t>::max();
