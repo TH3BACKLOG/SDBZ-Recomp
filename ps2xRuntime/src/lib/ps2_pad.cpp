@@ -973,13 +973,24 @@ extern "C" void ps2x_pad_push_frame(uint8_t *rdram)
     }
     if (g_ps2x_sio2_pad_served.load(std::memory_order_relaxed) != 0u)
     {
+        // 10-07 (pad2a probe, VERIFIED in gsdump/pad2a/run_log.txt): with port 1 plugged in, PADMAN reaches
+        // command 0x42 and this handoff disabled the direct push, but PADMAN then logged 109x "VBLANK
+        // OVERLAP" and no input reached the game (CAppWarning never advanced; scripted X was seen by the
+        // host side as btns 0xbfff). Without port 1 the game ran on the direct push all along. So keep the
+        // direct push whenever pad 2 is present (or PS2X_PAD_KEEP_DIRECT=1) until the SIO2 completion path
+        // is fixed. HYP: PADMAN's transfer-done event never fires in the SIO2 HLE.
+        static const bool s_keepDirect = [] { const char *e = std::getenv("PS2X_PAD_KEEP_DIRECT"); return e && *e == '1'; }();
         static bool s_handoffLogged = false;
         if (!s_handoffLogged)
         {
             s_handoffLogged = true;
-            RUNTIME_LOG("[pad] PADMAN is serving SIO2 pad polls -- direct buffer push disabled\n");
+            if (s_pad2 || s_keepDirect)
+                RUNTIME_LOG("[pad] PADMAN is serving SIO2 pad polls -- direct buffer push KEPT (pad 2 present / PS2X_PAD_KEEP_DIRECT)\n");
+            else
+                RUNTIME_LOG("[pad] PADMAN is serving SIO2 pad polls -- direct buffer push disabled\n");
         }
-        return;
+        if (!s_pad2 && !s_keepDirect)
+            return;
     }
 
     for (int port = 0; port < kPadMaxPorts; ++port)
