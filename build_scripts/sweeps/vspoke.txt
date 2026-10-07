@@ -1,0 +1,74 @@
+# vspoke.txt - TEST: do the char-id words found by vsdisc/ramdiff steer the Versus fight?
+# VERIFIED (vsdisc 10-07): 0x5B4070/0x5B41A0 = P1 char id (1,12,22,2 as R moves, holds after confirm);
+#   0x5B41C0/0x5B42F0 = P2 char id; fighter struct +0x528 = char id: fighter0 0x5AE4D8 = 2, fighter1 0x5B01A8 = 22 in f0.
+#   (the select screen also writes 0x5B01A8 / 0x5AE4D8 live while a cursor moves.)
+# HYP: freezing 0x5B4070/0x5B41A0 (P1) and 0x5B41C0/0x5B42F0 (P2) at the select screen picks the fighters
+#   (P1=5, P2=9 here; an id outside the roster may crash = a result).
+# Read the result:  python build_scripts\ramdiff.py gsdump\vspoke\snap --at 0x5AE4D8 pk
+#                   python build_scripts\ramdiff.py gsdump\vspoke\snap --at 0x5B01A8 pk     (expect 5 and 9)
+# Run:  $env:PS2X_PAD2='1'
+#       .\build_scripts\gfx_tour.ps1 -Name vspoke -Script build_scripts\sweeps\vspoke.txt -Seconds 600 -Every 60
+# NOTE vsdisc finding: at the stage panel pad 1 X alone does NOT start the fight; pad 2 X does (both confirm).
+
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+poke 0x5C7942 0
+poke 0x5C7943 0
+poke 0x5C7944 0
+log unlock + 1 round 45s + stage select on
+wait ticks=120
+
+label menu
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok if mode=3
+log NOT VERSUS - backing out, trying pad 2 Start first
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu 2
+label vs_ok
+log in Versus char select
+
+wait ticks=200
+freeze 0x5B4070 5 w=4
+freeze 0x5B41A0 5 w=4
+wait ticks=60
+press X hold=10 gap=60
+log P1 confirmed (poked 5)
+wait ticks=200
+freeze 0x5B41C0 9 w=4
+freeze 0x5B42F0 9 w=4
+wait ticks=60
+press X hold=10 gap=90 pad=2
+log P2 confirmed (poked 9)
+wait ticks=120
+press X hold=10 gap=120
+log handicap done, stage panel
+wait ticks=100
+press R hold=6 gap=60
+wait ticks=40
+press X hold=10 gap=60
+press X hold=10 gap=60 pad=2 until app=CAppFightMain timeout=900
+wait ticks=300
+snap pk
+unfreeze
+freeze [0x5AF7F0]+12 250 w=4
+freeze [0x5B14C0]+12 250 w=4
+log fuzz 600 seed=2
+fuzz ticks=600 seed=2 max=2 hold=2-8 gap=2-8
+unfreeze
+log done
+wait ticks=300

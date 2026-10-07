@@ -58,8 +58,8 @@ log handicap done, stage panel
 wait ticks=100
 press R hold=6 gap=100
 log stage picked (H: cursor remembers its place, one R per loop = next stage)
-press X hold=10 gap=120 until app=CAppFightMain timeout=900
-press X hold=10 gap=120 pad=2 until app=CAppFightMain timeout=600
+press X hold=10 gap=60
+press X hold=10 gap=60 pad=2 until app=CAppFightMain timeout=900
 
 label mash
 repeat 2
