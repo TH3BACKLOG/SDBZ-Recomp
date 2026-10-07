@@ -7,7 +7,7 @@
 # H: result handling (versus2 'label result') works - versus2 was never run to a result menu.
 # Watch the log: [scene] p1=0x.. per loop shows whether P1 changes (cursor memory), [padscript] TIMEOUT = stuck.
 # Run:  $env:PS2X_PAD2='1'
-#       .uild_scripts\gfx_tour.ps1 -Name vsall -Script build_scripts\sweepssall.txt -Seconds 3600 -Every 90
+#       .\build_scripts\gfx_tour.ps1 -Name vsall -Script build_scripts\sweeps\vsall.txt -Seconds 3600 -Every 90
 
 wait app=CAppWarning timeout=900
 press X hold=10 gap=50 until app!=CAppWarning timeout=3000
