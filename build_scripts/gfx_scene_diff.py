@@ -379,8 +379,12 @@ def lint(gsr):
 
 def lint_broken(f):
     """zero (top-left/raw-0 vertex) is never normal; plain clamp fans and corner fans at
-    off-screen right/bottom are guard-band clipper output (PCSX2 sends them too)."""
-    return f.get("zero", False)
+    off-screen right/bottom are guard-band clipper output (PCSX2 sends them too).
+    10-07: a prim-5 (FAN) zero finding is demoted to normal lint. VERIFIED on every kept cap: the
+    Krillin class is prim 4 strips (48-72 tris per cap: krillin, sweep1), the 4 triage caps (orig3
+    t31114/t31204, fighters2 t9967, fighters3 t23477) are prim 5 with 2-6 tris, hub on screen, rim on the
+    clamp = a deliberate dark corner polygon (selftest-skip removed the corner wedge)."""
+    return f.get("zero", False) and f.get("prim") != 5
 
 
 def lint_line(stem, f):
