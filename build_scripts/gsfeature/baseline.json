@@ -162,5 +162,105 @@
  "blend_cs_cd_as_cd_colclamp0": [
   "MATCH",
   0
+ ],
+ "combo_fighter_t8_bilinear": [
+  "MATCH",
+  0
+ ],
+ "combo_fighter_ct32_nearest": [
+  "NEAR",
+  0
+ ],
+ "combo_fan_t4_bilinear": [
+  "DIFF",
+  2
+ ],
+ "combo_hud_sprite_stq": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_ct24_texa_blend": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_ct16_texa_aem_blend": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_ct16_texa_noaem_bilinear": [
+  "NEAR",
+  0
+ ],
+ "unseen_tfx_decal": [
+  "MATCH",
+  0
+ ],
+ "unseen_tfx_highlight2_blend": [
+  "DIFF",
+  2
+ ],
+ "unseen_tfx_modulate_tcc0_blend": [
+  "DIFF",
+  1
+ ],
+ "unseen_clamp_region_clamp_bilinear": [
+  "DIFF",
+  1
+ ],
+ "unseen_clamp_region_repeat_nearest": [
+  "MATCH",
+  0
+ ],
+ "unseen_fog_gouraud_tex": [
+  "DIFF",
+  2763
+ ],
+ "unseen_tex_t8h": [
+  "DIFF",
+  2774
+ ],
+ "unseen_tex_t4hl": [
+  "DIFF",
+  2599
+ ],
+ "unseen_tex_t4hh": [
+  "DIFF",
+  2554
+ ],
+ "unseen_clut_ct16_t8": [
+  "DIFF",
+  2774
+ ],
+ "unseen_clut_csm2_t8": [
+  "DIFF",
+  2774
+ ],
+ "unseen_fba_then_dst_alpha": [
+  "DIFF",
+  3
+ ],
+ "unseen_date_datm0": [
+  "DIFF",
+  3681
+ ],
+ "unseen_afail_zb_only": [
+  "DIFF",
+  2145
+ ],
+ "unseen_z24_gequal": [
+  "MATCH",
+  0
+ ],
+ "unseen_z16_gequal": [
+  "MATCH",
+  0
+ ],
+ "unseen_linestrip_gouraud": [
+  "DIFF",
+  694
+ ],
+ "unseen_scanmsk_even": [
+  "DIFF",
+  1397
  ]
 }

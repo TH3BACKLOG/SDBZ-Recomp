@@ -160,6 +160,8 @@ def draw(prim, verts, extra=()):
         if "uv" in v:
             u, vv = v["uv"]
             pairs.append((UV, (int(u * 16) & 0x3FFF) | ((int(vv * 16) & 0x3FFF) << 16)))
+        if "f" in v:
+            pairs.append((FOG, v["f"] << 56))
         pairs.append((XYZ2, xy(*v["xy"]) | (v.get("z", 0x1000) << 32)))
     return ad_packet(pairs)
 
@@ -306,6 +308,219 @@ def _(rng):
     vs = [{"xy": (0, 0), "st": (0.0, 0.0, 1.0)}, {"xy": (4, 0), "st": (1.0, 0.0, 1.0)},
           {"xy": (0, 4), "st": (0.0, 0.0, 1.0)}]
     return ups + [draw(P_TRI | (1 << 4), vs, regs)]
+
+
+# ---- census COMBOS (10-08c): single-feature cases hid the sprite + COLCLAMP bugs.
+# Top real combos: tristrip iip1 T8 CSM1 bilinear STQ CLAMP MODULATE tcc1 (vertex
+# colour != 128) + (Cs-Cd)*As+Cd + ATST GREATER 64 + ZTST GEQUAL Z32.
+A_MAIN = 0 | (1 << 2) | (0 << 4) | (1 << 6)                    # (Cs-Cd)*As+Cd
+T_FIGHTER = 1 | (6 << 1) | (64 << 4) | (1 << 16) | (2 << 17)   # ATST GREATER 64 KEEP, ZTST GEQUAL
+T_HUD = 1 | (7 << 1) | (0 << 4) | (1 << 16) | (1 << 17)        # ATST NOTEQUAL 0 KEEP, ZTST ALWAYS
+CLAMP_CLAMP = 1 | (1 << 2)
+
+
+def combo_bg():
+    return draw(P_SPRITE, [{"xy": (0, 0), "rgba": (40, 90, 200, 0x80), "z": 0},
+                           {"xy": (64, 64), "rgba": (40, 90, 200, 0x80), "z": 0}],
+                [(TEST_1, 0x30000), (ALPHA_1, 0)])
+
+
+def combo_strip(rng, psm, filt, z0, z1, ys=(4.1, 59.2)):
+    """Gouraud perspective tristrip ribbon, per-vertex z in z0..z1, uv overshoot -> CLAMP edges."""
+    vs = []
+    n = 8
+    for i in range(n):
+        x = 3.3 + 57.3 * i / (n - 1) + rng.random() * 0.9
+        y = ys[i % 2] + rng.random() * 0.9
+        q = 0.6 + rng.random()
+        u, v = (i / (n - 1)) * 1.1, (i % 2) * 1.05
+        vs.append({"xy": (x, y), "st": (u * q, v * q, q), "z": rng.randrange(z0, z1),
+                   "rgba": (rng.randrange(256), rng.randrange(256), rng.randrange(256), 0x80)})
+    regs = [(TEX0_1, tex0(psm, 4, 4)), (TEX1_1, (filt << 5) | (filt << 6)), (TEXFLUSH, 0),
+            (CLAMP_1, CLAMP_CLAMP), (ALPHA_1, A_MAIN), (TEST_1, T_FIGHTER)]
+    return draw(P_STRIP | (1 << 3) | (1 << 4) | (1 << 6), vs, regs)
+
+
+@case("combo_fighter_t8_bilinear", "SDBZ top combo: 2 overlapping gouraud T8 bilinear STQ CLAMP strips, blend, ATST>64, ZTST GEQUAL")
+def _(rng):
+    return tex_t8(rng) + [combo_bg(), combo_strip(rng, T8, 1, 0x1000, 0x8000),
+                          combo_strip(rng, T8, 1, 0x4000, 0xC000, ys=(30.5, 6.2))]
+
+
+@case("combo_fighter_ct32_nearest", "SDBZ CT32 nearest combo: gouraud STQ CLAMP strips, blend, ATST>64, ZTST GEQUAL")
+def _(rng):
+    return tex_ct32(rng) + [combo_bg(), combo_strip(rng, CT32, 0, 0x1000, 0x8000),
+                            combo_strip(rng, CT32, 0, 0x4000, 0xC000, ys=(30.5, 6.2))]
+
+
+@case("combo_fan_t4_bilinear", "SDBZ trifan tme1: gouraud T4 bilinear STQ fan, blend, ATST>64, ZTST GEQUAL")
+def _(rng):
+    import math
+    cx, cy = 31.4, 30.8
+    vs = [{"xy": (cx, cy), "st": (0.5, 0.5, 1.0), "z": 0x6000, "rgba": (200, 180, 160, 0x80)}]
+    for i in range(9):
+        a = i * 2 * math.pi / 8
+        q = 0.7 + rng.random() * 0.6
+        vs.append({"xy": (cx + 27 * math.cos(a) + rng.random(), cy + 27 * math.sin(a) + rng.random()),
+                   "st": ((0.5 + 0.55 * math.cos(a)) * q, (0.5 + 0.55 * math.sin(a)) * q, q),
+                   "z": rng.randrange(0x1000, 0x9000), "rgba": rnd_rgba(rng, 0x80)})
+    regs = [(TEX0_1, tex0(T4, 4, 4)), (TEX1_1, (1 << 5) | (1 << 6)), (TEXFLUSH, 0),
+            (CLAMP_1, CLAMP_CLAMP), (ALPHA_1, A_MAIN), (TEST_1, T_FIGHTER)]
+    return tex_t4(rng) + [combo_bg(), draw(P_FAN | (1 << 3) | (1 << 4) | (1 << 6), vs, regs)]
+
+
+@case("combo_hud_sprite_stq", "SDBZ HUD: STQ sprites T8 nearest CLAMP, vertex colour != 128, blend, ATST NOTEQUAL 0")
+def _(rng):
+    out = tex_t8(rng) + [combo_bg()]
+    regs = [(TEX0_1, tex0(T8, 4, 4)), (TEX1_1, 0), (TEXFLUSH, 0), (CLAMP_1, CLAMP_CLAMP),
+            (ALPHA_1, A_MAIN), (TEST_1, T_HUD)]
+    for x0, y0, x1, y1, s1, t1 in ((2.5, 3.0, 30.75, 20.25, 1.0, 1.0), (20.0, 15.5, 61.0, 50.0, 1.3, 0.8),
+                                   (5.0, 40.0, 13.0, 48.0, 0.5, 0.5)):
+        c = (rng.randrange(256), rng.randrange(256), rng.randrange(256), 0x80)
+        out.append(draw(P_SPRITE | (1 << 4) | (1 << 6), [
+            {"xy": (x0, y0), "st": (0.0, 0.0, 1.0), "rgba": c, "z": 0x100},
+            {"xy": (x1, y1), "st": (s1, t1, 1.0), "rgba": c, "z": 0x100}], regs))
+    return out
+
+
+# ---- UNSEEN features (10-08c): not in the census of reached scenes, but unreached
+# scenes (supers eff/, dis/ screens) may use them. A DIFF here = a likely missing/
+# wrong graphic we have not reached yet. The grade is RGB only, so alpha-only
+# features are made visible with blending / a second draw.
+FOG = 0x0A
+A_DST = 0 | (1 << 2) | (1 << 4) | (1 << 6)             # (Cs-Cd)*Ad+Cd: shows FRAME alpha
+ABE = 1 << 6
+
+
+def tex_ct24(rng, w=16, h=16, alpha=None):
+    return upload(TBP, 1, CT24, w, h, rand_bytes(rng, w * h * 3))
+
+
+def tex_ct16(rng, w=16, h=16, alpha=None):
+    px = bytearray(rand_bytes(rng, w * h * 2))
+    for i in range(0, len(px), 2 * 7):                  # some pure-black texels for AEM
+        px[i] = px[i + 1] = 0
+    return upload(TBP, 1, CT16, w, h, bytes(px))
+
+
+def tstrip(rng, ups, t0, filt=0, st=True, regs=(), pflags=0, uvscale=1.0, gouraud=False, fog=False, tw=4):
+    size = (1 << tw) * uvscale
+    quad = [((5.3, 4.1), (0, 0)), ((58.6, 9.4), (size, 0)), ((3.2, 57.7), (0, size)), ((55.9, 60.2), (size, size))]
+    vs = []
+    for (x, y), (u, v) in quad:
+        d = {"xy": (x, y), "rgba": rnd_rgba(rng, 0x80) if gouraud else (128, 128, 128, 128)}
+        if st:
+            q = 1.0 + 0.5 * rng.random()
+            d["st"] = (u / (1 << tw) * q, v / (1 << tw) * q, q)
+        else:
+            d["uv"] = (u, v)
+        if fog:
+            d["f"] = rng.randrange(256)
+        vs.append(d)
+    r = [(TEX0_1, t0), (TEX1_1, (filt << 5) | (filt << 6)), (TEXFLUSH, 0)] + list(regs)
+    pr = P_STRIP | (1 << 4) | ((0 if st else 1) << 8) | ((1 if gouraud else 0) << 3) | pflags
+    return ups + [combo_bg(), draw(pr, vs, r)]
+
+
+def unseen(name, desc, fn):
+    CASES[name] = (desc, fn)
+
+
+unseen("unseen_tex_ct24_texa_blend", "CT24 texture, TEXA TA0=0x30 -> alpha, blended (alpha visible)",
+       lambda rng: tstrip(rng, tex_ct24(rng), tex0(CT24, 4, 4), regs=[(TEXA, 0x30 | (0x70 << 32)), (ALPHA_1, A_MAIN)], pflags=ABE))
+unseen("unseen_tex_ct16_texa_aem_blend", "CT16 texture, TEXA AEM=1 TA0=0x20 TA1=0x70, black texels -> A=0, blended",
+       lambda rng: tstrip(rng, tex_ct16(rng), tex0(CT16, 4, 4), regs=[(TEXA, 0x20 | (1 << 15) | (0x70 << 32)), (ALPHA_1, A_MAIN)], pflags=ABE))
+unseen("unseen_tex_ct16_texa_noaem_bilinear", "CT16 texture, TEXA AEM=0, bilinear STQ, blended",
+       lambda rng: tstrip(rng, tex_ct16(rng), tex0(CT16, 4, 4), filt=1, regs=[(TEXA, 0x10 | (0x60 << 32)), (ALPHA_1, A_MAIN)], pflags=ABE))
+unseen("unseen_tfx_decal", "TFX DECAL tcc1 gouraud (vertex colour ignored)",
+       lambda rng: tstrip(rng, tex_t8(rng), tex0(T8, 4, 4, tfx=1), gouraud=True))
+unseen("unseen_tfx_highlight2_blend", "TFX HIGHLIGHT2 T8 gouraud, blended",
+       lambda rng: tstrip(rng, tex_t8(rng), tex0(T8, 4, 4, tfx=3), gouraud=True, regs=[(ALPHA_1, A_MAIN)], pflags=ABE))
+unseen("unseen_tfx_modulate_tcc0_blend", "TFX MODULATE TCC=0 (vertex alpha) gouraud T8 bilinear, blended",
+       lambda rng: tstrip(rng, tex_t8(rng), tex0(T8, 4, 4, tcc=0), filt=1, gouraud=True, regs=[(ALPHA_1, A_MAIN)], pflags=ABE))
+unseen("unseen_clamp_region_clamp_bilinear", "REGION_CLAMP u 2..12 v 3..11, T8 bilinear STQ, uv 1.3x",
+       lambda rng: tstrip(rng, tex_t8(rng), tex0(T8, 4, 4), filt=1, uvscale=1.3,
+                          regs=[(CLAMP_1, 2 | (2 << 2) | (2 << 4) | (12 << 14) | (3 << 24) | (11 << 34))]))
+unseen("unseen_clamp_region_repeat_nearest", "REGION_REPEAT umsk 7 ufix 8, vmsk 3 vfix 4, T8 nearest STQ, uv 2x",
+       lambda rng: tstrip(rng, tex_t8(rng), tex0(T8, 4, 4), uvscale=2.0,
+                          regs=[(CLAMP_1, 3 | (3 << 2) | (7 << 4) | (8 << 14) | (3 << 24) | (4 << 34))]))
+unseen("unseen_fog_gouraud_tex", "FGE fog per vertex, FOGCOL, gouraud T8 STQ",
+       lambda rng: tstrip(rng, tex_t8(rng), tex0(T8, 4, 4), gouraud=True, fog=True,
+                          regs=[(FOGCOL, 0x30 | (0xA0 << 8) | (0x50 << 16))], pflags=1 << 5))
+unseen("unseen_tex_t8h", "T8H texture (index in CT32 bits 24-31), nearest STQ",
+       lambda rng: tstrip(rng, upload(TBP, 1, T8H, 16, 16, rand_bytes(rng, 256)) + upload(CBP, 1, CT32, 16, 16, clut_ct32(rng, 256)),
+                          tex0(T8H, 4, 4)))
+unseen("unseen_tex_t4hl", "T4HL texture (index in CT32 bits 24-27), nearest STQ",
+       lambda rng: tstrip(rng, upload(TBP, 1, T4HL, 16, 16, rand_bytes(rng, 128)) + upload(CBP, 1, CT32, 8, 2, clut_ct32(rng, 16)),
+                          tex0(T4HL, 4, 4)))
+unseen("unseen_tex_t4hh", "T4HH texture (index in CT32 bits 28-31), nearest STQ",
+       lambda rng: tstrip(rng, upload(TBP, 1, T4HH, 16, 16, rand_bytes(rng, 128)) + upload(CBP, 1, CT32, 8, 2, clut_ct32(rng, 16)),
+                          tex0(T4HH, 4, 4)))
+unseen("unseen_clut_ct16_t8", "T8 texture with a CT16 CLUT (cpsm=CT16, CSM1)",
+       lambda rng: tstrip(rng, upload(TBP, 1, T8, 16, 16, rand_bytes(rng, 256)) + upload(CBP, 1, CT16, 16, 16, rand_bytes(rng, 512)),
+                          tex0(T8, 4, 4, cpsm=CT16)))
+unseen("unseen_clut_csm2_t8", "T8 texture with a CSM2 CLUT (linear, TEXCLUT cbw=4 cou=0 cov=2)",
+       lambda rng: tstrip(rng, upload(TBP, 1, T8, 16, 16, rand_bytes(rng, 256)) + upload(CBP, 4, CT32, 256, 4, clut_ct32(rng, 1024)),
+                          tex0(T8, 4, 4, csm=1), regs=[(TEXCLUT, 4 | (0 << 6) | (2 << 12))]))
+
+
+@case("unseen_fba_then_dst_alpha", "FBA=1 strip (alpha MSB forced), then a sprite blended by FRAME alpha (Ad)")
+def _(rng):
+    s = tstrip(rng, tex_t8(rng), tex0(T8, 4, 4), gouraud=True, regs=[(FBA_1, 1)])
+    cover = draw(P_SPRITE | ABE, [{"xy": (0, 0), "rgba": (250, 20, 30, 0x80)}, {"xy": (64, 64), "rgba": (250, 20, 30, 0x80)}],
+                 [(FBA_1, 0), (ALPHA_1, A_DST), (TEST_1, 0x30000)])
+    return s + [cover]
+
+
+@case("unseen_date_datm0", "DATE/DATM=0: gouraud strip writes alpha 0..0xFF, then a sprite drawn only where dest alpha MSB=0")
+def _(rng):
+    vs = []
+    for i in range(10):
+        vs.append({"xy": (2 + i * 6.7 + rng.random(), 4 + 52 * (i % 2) + rng.random()),
+                   "rgba": (rng.randrange(256), rng.randrange(256), rng.randrange(256), rng.choice((0, 0x40, 0xC0, 0xFF)))})
+    under = draw(P_STRIP | (1 << 3), vs, [(TEST_1, 0x30000)])
+    over = draw(P_SPRITE, [{"xy": (0, 0), "rgba": (255, 255, 0, 0x80)}, {"xy": (64, 64), "rgba": (255, 255, 0, 0x80)}],
+                [(TEST_1, 0x30000 | (1 << 14) | (0 << 15))])
+    return [combo_bg(), under, over]
+
+
+@case("unseen_afail_zb_only", "ATST NEVER AFAIL=ZB_ONLY writes z only: a later GEQUAL sprite is hidden where z was written")
+def _(rng):
+    vs = [{"xy": (2 + i * 6.7, 4 + 52 * (i % 2)), "rgba": (255, 0, 0, 0x80), "z": 0xF000} for i in range(10)]
+    zonly = draw(P_STRIP, vs, [(TEST_1, 1 | (0 << 1) | (2 << 12) | (1 << 16) | (1 << 17))])
+    back = draw(P_SPRITE, [{"xy": (0, 10), "rgba": (0, 255, 0, 0x80), "z": 0x8000},
+                           {"xy": (64, 50), "rgba": (0, 255, 0, 0x80), "z": 0x8000}],
+                [(TEST_1, (1 << 16) | (2 << 17))])
+    return [combo_bg(), zonly, back]
+
+
+def zfmt_case(zpsm, zmax):
+    def fn(rng):
+        regs = [(ZBUF_1, ZBP | (zpsm << 24)), (TEST_1, (1 << 16) | (2 << 17))]
+        a = [{"xy": (2 + i * 6.7 + rng.random(), 4 + 52 * (i % 2) + rng.random()), "rgba": rnd_rgba(rng, 0x80),
+              "z": rng.randrange(zmax // 4, zmax)} for i in range(10)]
+        b = [{"xy": (4 + 52 * (i % 2) + rng.random(), 2 + i * 6.7 + rng.random()), "rgba": rnd_rgba(rng, 0x80),
+              "z": rng.randrange(zmax // 4, zmax)} for i in range(10)]
+        clear = draw(P_SPRITE, [{"xy": (0, 0), "rgba": (0, 0, 0, 0), "z": 0}, {"xy": (64, 64), "rgba": (0, 0, 0, 0), "z": 0}],
+                     [(ZBUF_1, ZBP | (zpsm << 24)), (TEST_1, 0x30000)])
+        return [clear, draw(P_STRIP | (1 << 3), a, regs), draw(P_STRIP | (1 << 3), b, regs)]
+    return fn
+
+
+CASES["unseen_z24_gequal"] = ("Z24 buffer: two crossing gouraud strips, ZTST GEQUAL", zfmt_case(1, 1 << 24))
+CASES["unseen_z16_gequal"] = ("Z16 buffer: two crossing gouraud strips, ZTST GEQUAL", zfmt_case(2, 1 << 16))
+
+
+@case("unseen_linestrip_gouraud", "LINESTRIP gouraud zig-zag (no lines in the census)")
+def _(rng):
+    vs = [{"xy": (2 + i * 4.3 + rng.random(), 5 + 50 * (i % 2) + rng.random()), "rgba": rnd_rgba(rng, 0x80)} for i in range(14)]
+    return [combo_bg(), draw(2 | (1 << 3), vs, [(TEST_1, 0x30000)])]
+
+
+@case("unseen_scanmsk_even", "SCANMSK=2 (even lines masked) gouraud strip")
+def _(rng):
+    vs = [{"xy": (2 + i * 6.7 + rng.random(), 4 + 52 * (i % 2) + rng.random()), "rgba": rnd_rgba(rng, 0x80)} for i in range(10)]
+    return [combo_bg(), draw(P_STRIP | (1 << 3), vs, [(SCANMSK, 2), (TEST_1, 0x30000)])]
 
 
 @case("ztest_gequal","two overlapping strips, ZTST GEQUAL, near one drawn first")

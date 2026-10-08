@@ -24033,3 +24033,13 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - **Step 4 VU1:** unseen images (7603ba3c, af2cab1f, e2abe6df, 52626864, 1cb597ce, 1fe525a4 ...) run on the interpreter fallback (`[vu1recomp] not compiled`) = the PCSX2-verified path -> speed cost only.
 - **Gate:** `verify_fix.ps1` now runs `gs_feature_matrix.py --gate` after build (`-NoGsFeature` skips). baseline `build_scripts/gsfeature/baseline.json`. Gate VERIFIED: clean exit 0; `PS2X_GSBENCH_SKIP=1` seeded -> exit 1 naming 4 cases.
 - **Conclusion:** no missing-graphics bug left in the GS feature set SDBZ uses. Remaining: bilinear-STQ precision (match PCSX2 GSDrawScanline weights: read its source first), 1-texel UV rounding, untested-by-matrix unused features (T4HL/HH, TEX2, FBA, TEXA, CT16).
+
+### 10-08c — Protocol #1 (AFK loop): GS raster fixes found by the gsfeature matrix
+- Pushed `a2d829fd` (gsfeature tools) and `3d589902` (raster fixes). Both raster files changed (single-thread + MT).
+- Bilinear = PCSX2 GSDrawScanline: 16.16 coord - 0x8000, 4-bit weight, lerp16_4 horiz then vert. bilinear STQ 2300 px off -> <=22.
+- Nearest = floor(16.16 >> 16). Sprites: ceil coverage in 12.4 (was trunc: every sub-pixel sprite 1 px off), empty sprite draws nothing, FST UV not rounded to 1/16 texel. 9 sprite cases pixel-exact.
+- REAL BUG: COLCLAMP=0 dropped the blend result (`r &= 0xFF`). SDBZ captures always use COLCLAMP=1, so no visible impact so far.
+- Real captures vs PCSX2 (oracle regrade, Logs/gsfeature/oracle_after): tour/unlock1/tour2 282/282 MATCH; mean diff 0.026->0.005, 0.066->0.014, 0.179->0.070; 128 better, 0 worse.
+- ps2x_tests PS2GS: the suite crashed mid-run (raster jobs outlived the test's vram) -> now 60/68 with threads on. Left: T4HL/HH x3 and TEX2 (SDBZ never uses them), sceGsExec*/ResetGraph heap frees, SyncV.
+- Accepted residue: 1-22 px at exact texel boundaries on triangles (float barycentric vs PCSX2 SIMD lane stepping).
+- verify_fix PASS twice (bilinear_ltf, sprite_colclamp): build + gsfeature gate + 120 s boot.
