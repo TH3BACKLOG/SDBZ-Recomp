@@ -3,6 +3,7 @@
 #   .\build_scripts\conformance\conformance.ps1 -Gen -Build      # first time: generate, configure+build, run both, report
 #   .\build_scripts\conformance\conformance.ps1                  # rerun ours + report (PCSX2 output reused while the ELF is unchanged)
 #   .\build_scripts\conformance\conformance.ps1 -SeedSqrtBug     # control: our sqrt.s reads fs (the 09-26 bug) -> sqrt.s must FAIL
+#   .\build_scripts\conformance\conformance.ps1 -GameFixes       # the game's sqrt.s/vsqrt/vrsqrt override rewrite -> report_fixed.md
 #
 # Steps: gen_conformance.py (test ELF + ps2_recomp -> out\gen) -> build ps2x_conformance
 #        -> ours.bin -> run_pcsx2.py (pcsx2.bin) -> conformance_diff.py -> out\report.md
@@ -11,7 +12,8 @@ param(
     [switch]$Gen,          # regenerate the ELF + generated C++ (needs -Build afterwards)
     [switch]$Build,        # cmake configure if the target is new, then build ps2x_conformance
     [switch]$Pcsx2,        # force a fresh PCSX2 run
-    [switch]$SeedSqrtBug,  # seeded control run (rebuilds twice: seeded, then clean again)
+    [switch]$SeedSqrtBug,  # seeded control run (one rebuild; the next plain run rebuilds clean)
+    [switch]$GameFixes,    # gen_sqrt_abs_overrides.py rewrite applied (one rebuild; the next plain run rebuilds clean)
     [string]$Config = 'RelWithDebInfo'
 )
 $ErrorActionPreference = 'Stop'
@@ -20,10 +22,11 @@ $root = Split-Path -Parent (Split-Path -Parent $here)
 $out = Join-Path $here 'out'
 $exe = Join-Path $root "build\ps2xTest\$Config\ps2x_conformance.exe"
 $proj = Join-Path $root 'build\ps2xTest\ps2x_conformance.vcxproj'
+$variantFile = Join-Path $out 'exe_variant.txt'   # which generated code the exe was built from: clean / seeded / fixed
 
 function Invoke-Py { python @args; if ($LASTEXITCODE -ne 0) { throw "python $($args[0]) failed ($LASTEXITCODE)" } }
 
-function Build-Conformance {
+function Build-Conformance([string]$variant = 'clean') {
     $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
     if (-not (Test-Path $proj)) {
         # New target: re-run configure on the EXISTING build tree (keeps every cached option; no rebuild of the game).
@@ -36,7 +39,8 @@ function Build-Conformance {
     cmd /c "call `"$vs\Common7\Tools\VsDevCmd.bat`" -arch=amd64 >nul 2>&1 && `"$vs\MSBuild\Current\Bin\amd64\MSBuild.exe`" `"$proj`" /p:Configuration=$Config /p:Platform=x64 /m:4 /v:m /nologo" |
         Where-Object { $_ -match ' error |-> ' }
     if ($LASTEXITCODE -ne 0) { throw "ps2x_conformance build failed ($LASTEXITCODE)" }
-    'build OK in {0:N0} s' -f ((Get-Date) - $t0).TotalSeconds
+    Set-Content -Path $variantFile -Value $variant
+    'build OK in {0:N0} s ({1})' -f ((Get-Date) - $t0).TotalSeconds, $variant
 }
 
 function Run-Ours([string]$bin) {
@@ -59,19 +63,28 @@ function Ensure-Pcsx2 {
 
 if ($SeedSqrtBug) {
     Invoke-Py (Join-Path $here 'gen_conformance.py') --seed-bug sqrt
-    Build-Conformance
+    Build-Conformance 'seeded'
     Run-Ours (Join-Path $out 'ours_seeded.bin')
     Ensure-Pcsx2
     Invoke-Py (Join-Path $here 'conformance_diff.py') --dir $out --ours (Join-Path $out 'ours_seeded.bin') --report (Join-Path $out 'report_seeded.md')
     Select-String -Path (Join-Path $out 'report_seeded.md') -Pattern '^\| sqrt\.s ' | ForEach-Object { 'seeded control: ' + $_.Line }
-    Write-Host 'restoring the clean generated code + exe' -ForegroundColor DarkCyan
-    Invoke-Py (Join-Path $here 'gen_conformance.py')
-    Build-Conformance
-    return
+    return   # the next plain run sees exe_variant.txt != clean and regenerates + rebuilds
 }
 
-if ($Gen -or -not (Test-Path (Join-Path $out 'gen\conformance_fns.inc'))) { Invoke-Py (Join-Path $here 'gen_conformance.py') }
-if ($Build -or -not (Test-Path $exe)) { Build-Conformance }
+if ($GameFixes) {
+    Invoke-Py (Join-Path $here 'gen_conformance.py') --game-fixes
+    Build-Conformance 'fixed'
+    Run-Ours (Join-Path $out 'ours_fixed.bin')
+    Ensure-Pcsx2
+    Invoke-Py (Join-Path $here 'conformance_diff.py') --dir $out --ours (Join-Path $out 'ours_fixed.bin') --report (Join-Path $out 'report_fixed.md')
+    Select-String -Path (Join-Path $out 'report_fixed.md') -Pattern '^\| (sqrt\.s|vsqrt|vrsqrt) ' | ForEach-Object { 'game fixes: ' + $_.Line }
+    return   # the next plain run sees exe_variant.txt != clean and regenerates + rebuilds
+}
+
+$dirty = (Test-Path $variantFile) -and ((Get-Content $variantFile -Raw).Trim() -ne 'clean')
+if ($dirty) { Write-Host 'exe was built from seeded/fixed code: regenerating + rebuilding clean' -ForegroundColor DarkCyan }
+if ($Gen -or $dirty -or -not (Test-Path (Join-Path $out 'gen\conformance_fns.inc'))) { Invoke-Py (Join-Path $here 'gen_conformance.py') }
+if ($Build -or $dirty -or -not (Test-Path $exe)) { Build-Conformance }
 Run-Ours (Join-Path $out 'ours.bin')
 Ensure-Pcsx2
 Invoke-Py (Join-Path $here 'conformance_diff.py') --dir $out

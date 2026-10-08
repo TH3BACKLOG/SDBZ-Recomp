@@ -5,7 +5,7 @@
 ahead of time into ~4,520 C++ TUs under `ps2xRuntime/src/runner/`; a handwritten runtime
 (`ps2xRuntime/src/lib/`) supplies everything the hardware used to. There is no interpreter
 loop for EE code. The IOP *is* interpreted (real R3000, real `.IRX`).
-**Where we are (2026-10-08):** READ THE BOTTOM FIRST (newest notes are appended there; Parts 175 + the 10-08 reorg note are last). Active plan: offline PCSX2-driven graphics testing (GS dumps + VIF1->VU1 + EE opcode conformance), `C:/Users/mwlab/.claude/plans/sorted-foraging-kettle.md` -- Stage 0 in progress (0.1 DONE: PCSX2-src mods committed on local branch `sdbz-tools` `e7fca2861`, patch `third_party/pcsx2_patches/sdbz-tools.patch`). Repo root reorganized 10-08: map in `docs/REORG_2026-10-08.md`; new files always go in a matching folder.
+**Where we are (2026-10-08, end of session):** READ THE BOTTOM FIRST -- `HANDOFF 10-08` is the last section. Offline PCSX2-driven testing plan `C:/Users/mwlab/.claude/plans/sorted-foraging-kettle.md`: Stages 0/B/C DONE (A dropped). Revise plan 10-08 `C:/Users/mwlab/.claude/plans/zazzy-wiggling-anchor.md`: STANDING GRANT "automate everything" -- the agent builds + runs; one-command fix gate `build_scripts/verify_fix.ps1`. PCSX2-src mods on local branch `sdbz-tools`, patch `third_party/pcsx2_patches/sdbz-tools.patch`. Repo root reorganized 10-08: map in `docs/REORG_2026-10-08.md`; new files always go in a matching folder.
 **Older (2026-10-05):** READ ORDER: the newest Part at the TOP is Part 174 (10-03 gfx sweep); everything since (Parts 168b-170, 10-04/10-05 notes, HANDOFF 10-05) is APPENDED AT THE BOTTOM -- read the last ~80 lines first. Revised plan 10-05: `C:/Users/mwlab/.claude/plans/logical-forging-bunny.md`. Older summary (09-30, stale): fights run upright; VU1 recompiler + MT GS raster landed (unpushed). Open blocker: fast guest parks on the boot Auto-Save notice -- located to the CAppWarning memcard/notice gate `0x4076A0`; CORRECTED -- the gate was never the stall; the fast guest parks after CAppDemoMovie exits (t≈64, white screen), see Part 164 correction. Older history follows. The milestone ladder is the unit of progress. Rung 7 (character select) is REACHED
 -- 09-15 run, Goku's select model on screen (Part 117). Warped 3D: our VIF1 + VU1 match PCSX2 bit-exact
 on a replayed capture (Part 118). Smeared 3D FIXED 09-16 -- two GS bugs (Part 119); open: Ranking-screen
@@ -23990,3 +23990,31 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - 10-08 sqrt.s override BUILT (11:09) + boot run 120 s: `[sqrtabs] 72 sqrt.s bodies overridden (23502 slots)`, no errors, clean exit. Next: fight sweep to check graphics (Krillin et al.).
 - 10-08 Option 1 BUILT + committed/pushed `37d6c62d`. 120 s boot run 11:21: `[sqrtabs] 72 sqrt.s bodies overridden (23502 slots)`, no errors, clean exit. Krillin fight sweep `gsdump/krillin3` (PS2X_TRAPVAL=0xFFC00000) launched by agent under AFK grant, external window.
 - 10-08 krillin3 (option 1 build, agent-run under AFK grant): 6 Krillin fights t2113-47043, BROKEN 0 (523/523 oracle MATCH, 79 VU1 caps 0 host-NaN, zero-vertex 0), clean exit. TRAPVAL 0xFFC00000 256 hits (cap) = all integer: 33 boot copy 0x18e284/94, 132 @0x1a7560 + 91 @0x1a789c = lw/and/sw mask clear at +0xA0 in mem_fill_z_37_0x1a73d0. No float NaN producer seen (cap hit, so later ones unproven). Option 1 VERIFIED.
+- 10-08 vsqrt/vrsqrt(neg) fix WRITTEN, UNBUILT (uncommitted): `gen_sqrt_abs_overrides.py` now also rewrites VU0 vsqrt (Q = sqrt|ft|) and vrsqrt (Q = fs/sqrt|ft|, ft==0 -> +-FLT_MAX / +-0, per PCSX2 VUops.cpp _vuRSQRT) via fix_source(); 85 bodies (72 sqrt.s unchanged byte-for-byte + 13 VU), sites sqrt.s 108 / vsqrt 13 / vrsqrt 10 (all fs = vf0.w). Offline proof: `conformance.ps1 -GameFixes` applies the same fix_source to the test functions -> out/report_fixed.md (expect sqrt.s/vsqrt/vrsqrt FAIL -> FLAG: flags not modelled). cl /Zs EXIT=0 on game_overrides + 6 override TUs + 11 fixed conformance TUs + unity pair. Log now `[sqrtabs] 85 sqrt.s/vsqrt/vrsqrt bodies overridden`.
+- 10-08 user: "this process seems more time consuming". conformance.ps1 -GameFixes/-SeedSqrtBug now build ONCE (exe_variant.txt marks clean/seeded/fixed; the next plain run regenerates + rebuilds clean). User then asked for REVISE PLAN PROTOCOL.
+- 10-08 REVISE PROTOCOL done (plan `C:/Users/mwlab/.claude/plans/zazzy-wiggling-anchor.md`). User: "automate everything, simplify the process" = STANDING GRANT, agent builds + runs (no clean builds, x64dbg/commits still ask). New `build_scripts/verify_fix.ps1` = one-command fix gate (gen -> conformance -GameFixes -> build.ps1 RelWithDebInfo -> 120 s boot w/ -Expect lines -> optional -Sweep), summary in `Logs/verify/<name>/summary.md`. `gen_conformance.py` keeps mtimes of unchanged generated files (only changed unity batches recompile). ELF scan: 0 game words read VU MAC/STATUS/CLIP (cfc2 vi16-18), 0 mfsa, 1 mtsa -> the 42 FLAG classes + mtsa are unobservable; after vsqrt/vrsqrt the EE opcode layer has no open visible bug. Next bulk gfx work = unreached-scene coverage (supers eff/, dis/) via PCSX2 sweeps.
+- 10-08 vsqrt/vrsqrt fix VERIFIED by `verify_fix.ps1 -Name vsqrt` (agent-run, 4 min unattended): conformance 31 s, FAIL classes 4 -> 1 (sqrt.s/vsqrt/vrsqrt FAIL->FLAG; only mtsa left, unobservable), build 70 s, 120 s boot clean with `[sqrtabs] 85 sqrt.s/vsqrt/vrsqrt bodies overridden`. Control `-Expect '[sqrtabs] 999'` -> boot FAIL, exit 1 (gate can fail). Uncommitted.
+
+## HANDOFF 10-08 (end of session)
+**Done this session**
+- Stage B opcode conformance (`build_scripts/conformance/`, pushed `cfa78a5f`): our recompiled EE words vs PCSX2 on one test ELF; clean PASS 88 / FLAG 42 / FAIL 4.
+- sqrt.s(neg) -> sqrt|x| for all 72 runner bodies (pushed `37d6c62d`); krillin3 sweep 6 fights, 523/523 MATCH, BROKEN 0 (state `e5ad4832`).
+- vsqrt/vrsqrt(neg) per PCSX2 _vuSQRT/_vuRSQRT for 13 more bodies, same generator (`gen_sqrt_abs_overrides.py` fix_source); `verify_fix.ps1 -Name vsqrt` PASS (FAIL 4 -> 1, build, boot `[sqrtabs] 85 ...`). **UNCOMMITTED.**
+- Revise protocol: `verify_fix.ps1` (gen -> conformance -GameFixes -> build -> 120 s boot -Expect -> optional -Sweep; ~4 min; control run FAILs correctly). `gen_conformance.py` keeps mtimes of unchanged generated files. `-GameFixes`/`-SeedSqrtBug` build once (`out/exe_variant.txt`).
+
+**Uncommitted files:** `build_scripts/verify_fix.ps1` (new), `build_scripts/conformance/{conformance.ps1,gen_conformance.py,gen_sqrt_abs_overrides.py}`, `ps2xRuntime/src/lib/game_overrides.cpp`, this file. (`imgui.ini` stays uncommitted.) Generated overrides in `ps2xRuntime/src/lib/Kernel/FpuFixes/` are gitignored (re-run the generator after any runner regen).
+
+**Facts learned (verified)**
+- No SDBZ word reads VU0 MAC/STATUS/CLIP (cfc2 vi16-18 = 0) and none reads SA (mfsa = 0; mtsa = 1 at 0x17eb9c) -> the 42 FLAG classes + mtsa FAIL are unobservable. EE opcode layer has no open visible bug.
+- upstream/main 2c5fbb93 has the same vsqrt `std::max(0, ft)` bug (could report upstream).
+- PS2X_TRAPVAL=0xFFC00000 fills its 256 cap with integer mask stores before fights (0x18e284/94 boot copy, 0x1a7560/0x1a789c in 0x1a73d0) -> gate by address/time to see fight-time stores.
+
+**Next (pick one)**
+1. Commit + push the uncommitted fix + tooling.
+2. Bulk graphics: unreached-scene coverage (supers `eff/`, `dis/` screens) via PCSX2 sweeps (`gfx_tour.ps1 -Emu pcsx2`, `freeze` on ki), graded offline. Coverage 2121/3367.
+3. Lower: cvt.w.s >= 2^31 (338 words, bad data only); pmthi/pmfhi 32/64-bit mismatch (unused by SDBZ).
+
+**Learned patterns**
+- A fix that the conformance test can see -> prove it offline with `-GameFixes` first; the long sweep is only for fixes aimed at a known broken scene.
+- Regenerating every generated file resets mtimes -> MSBuild recompiles all; restore mtime on byte-identical files.
+- `'...' -f a, b` in a PowerShell array literal: the comma binds first -> format the value on its own line.

@@ -1924,8 +1924,9 @@ namespace
         // EE sqrt.s of a negative operand is sqrt(|x|) on the R5900/PCSX2 but 0xFFC00000
         // through FPU_SQRT_S (header; fixing it rebuilds every runner TU). krillin2 TRAPVAL
         // 10-04 caught three sites making Krillin's NaN bone matrices; the opcode conformance
-        // test 10-08 showed every negative input fails, so ALL 72 runner bodies with sqrt.s
-        // are overridden (108 sites). Same generated code with only the sqrt changed, so it
+        // test 10-08 showed every negative input fails, so ALL runner bodies with sqrt.s (72,
+        // 108 sites) or VU0 vsqrt/vrsqrt (13, 23 sites; ours gave Q = 0, PS2 uses |ft|) are
+        // overridden (gen_sqrt_abs_overrides.py). Same generated code with only the sqrt changed, so it
         // takes every word of the range: a thread resuming mid-body must land in the fixed
         // copy too. PS2X_SQRT_ABS=0 keeps the original bodies (A/B).
 #ifdef SDBZ_HAVE_SQRT_ABS_OVERRIDES
@@ -1938,7 +1939,7 @@ namespace
             const char *sqrtAbsEnv = std::getenv("PS2X_SQRT_ABS");
             if (sqrtAbsEnv != nullptr && sqrtAbsEnv[0] == '0')
             {
-                RUNTIME_LOG("[sqrtabs] DISABLED by PS2X_SQRT_ABS=0 - sqrt.s(neg) stays NaN");
+                RUNTIME_LOG("[sqrtabs] DISABLED by PS2X_SQRT_ABS=0 - sqrt.s(neg) stays NaN, vsqrt/vrsqrt(neg) Q = 0");
             }
             else
             {
@@ -1951,7 +1952,7 @@ namespace
                     }
                 }
                 RUNTIME_LOG("[sqrtabs] " << (sizeof(kSqrtAbsFns) / sizeof(kSqrtAbsFns[0]))
-                                         << " sqrt.s bodies overridden (" << slots << " slots)");
+                                         << " sqrt.s/vsqrt/vrsqrt bodies overridden (" << slots << " slots)");
             }
         }
 #endif

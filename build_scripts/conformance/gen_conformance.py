@@ -15,11 +15,13 @@ job table), PCSX2 runs main. conformance_diff.py compares the two output regions
     python gen_conformance.py                  -> out/ (elf, funcmap, toml, manifest) + ps2_recomp
     python gen_conformance.py --only sqrt.s,vaddx --vectors 4      (probe)
     python gen_conformance.py --seed-bug sqrt  (seeded control: our sqrt.s reads fs, like the 09-26 bug)
+    python gen_conformance.py --game-fixes     (apply gen_sqrt_abs_overrides.fix_source, as the game overrides do)
 """
 import argparse
 import collections
 import csv
 import json
+import os
 import random
 import re
 import struct
@@ -33,6 +35,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import conf_isa as I  # noqa: E402
 from mips_r5900_disassembler import load_elf, read_word  # noqa: E402
+import gen_sqrt_abs_overrides as SQ  # noqa: E402
 
 GAME_ELF = ROOT / "ELF" / "SLUS_214.42"
 FUNC_MAP = ROOT / "build_scripts" / "funcmap" / "sdbz_func_map_regen.csv"
@@ -414,6 +417,23 @@ def seed_sqrt_bug(manifest, gen):
     print(f"seeded control: {n} sqrt.s translation(s) now read fs")
 
 
+def apply_game_fixes(gen):
+    """The same rewrite the game's sqrt overrides get (gen_sqrt_abs_overrides.fix_source), so the
+    report shows whether that rewrite matches PCSX2."""
+    tot = collections.Counter()
+    for p in sorted(gen.glob("*.cpp")):
+        src = p.read_text()
+        if not any(k in src for k in SQ.NEEDLES):
+            continue
+        new, n = SQ.fix_source(src)
+        i = new.index("// Function: ")
+        p.write_text(new[:i] + "#include <cstring>\n" + SQ.FIX_DEFS + "\n" + new[i:])
+        tot.update(n)
+    if not tot:
+        sys.exit("--game-fixes: no sqrt.s / vsqrt / vrsqrt translation found (generated code changed?)")
+    print("game fixes applied: " + ", ".join(f"{k} {v}" for k, v in tot.items()))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=HERE / "out")
@@ -424,6 +444,7 @@ def main():
     ap.add_argument("--no-di", action="store_true", help="main does not disable interrupts")
     ap.add_argument("--no-recomp", action="store_true")
     ap.add_argument("--seed-bug", choices=["sqrt"])
+    ap.add_argument("--game-fixes", action="store_true", help="apply the game's sqrt override rewrite")
     ap.add_argument("--list", action="store_true", help="print the classes and exit")
     a = ap.parse_args()
     if a.list:
@@ -432,12 +453,27 @@ def main():
             print(f"{k:10} {classes[k]['groups']:3} {classes[k]['count']:7}  " + " | ".join(w["text"] for w in classes[k]["words"]))
         print("skipped:", dict(skipped.most_common()))
         return
+    gen_dir = a.out / "gen"
+    before = {f.name: (f.read_bytes(), f.stat().st_mtime_ns) for f in gen_dir.glob("*") if f.is_file()} if gen_dir.exists() else {}
     manifest, toml, gen = build(a)
     if not a.no_recomp:
         recompile(manifest, toml, gen)
         if a.seed_bug == "sqrt":
             seed_sqrt_bug(manifest, gen)
+        if a.game_fixes:
+            apply_game_fixes(gen)
         (a.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+        # recompile() rewrites every file: give byte-identical ones their old mtime back, so MSBuild
+        # recompiles only the unity batches whose files really changed (2-3 of 14 for a fix variant).
+        kept = changed = 0
+        for f in gen.glob("*"):
+            old = before.get(f.name)
+            if f.is_file() and old and f.read_bytes() == old[0]:
+                os.utime(f, ns=(old[1], old[1]))
+                kept += 1
+            elif f.is_file():
+                changed += 1
+        print(f"generated files: {changed} changed, {kept} unchanged (mtime kept)")
 
 
 if __name__ == "__main__":
