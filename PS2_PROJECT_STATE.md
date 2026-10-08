@@ -23999,10 +23999,10 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 **Done this session**
 - Stage B opcode conformance (`build_scripts/conformance/`, pushed `cfa78a5f`): our recompiled EE words vs PCSX2 on one test ELF; clean PASS 88 / FLAG 42 / FAIL 4.
 - sqrt.s(neg) -> sqrt|x| for all 72 runner bodies (pushed `37d6c62d`); krillin3 sweep 6 fights, 523/523 MATCH, BROKEN 0 (state `e5ad4832`).
-- vsqrt/vrsqrt(neg) per PCSX2 _vuSQRT/_vuRSQRT for 13 more bodies, same generator (`gen_sqrt_abs_overrides.py` fix_source); `verify_fix.ps1 -Name vsqrt` PASS (FAIL 4 -> 1, build, boot `[sqrtabs] 85 ...`). **UNCOMMITTED.**
+- vsqrt/vrsqrt(neg) per PCSX2 _vuSQRT/_vuRSQRT for 13 more bodies, same generator (`gen_sqrt_abs_overrides.py` fix_source); `verify_fix.ps1 -Name vsqrt` PASS (FAIL 4 -> 1, build, boot `[sqrtabs] 85 ...`). Pushed `3e98b297`.
 - Revise protocol: `verify_fix.ps1` (gen -> conformance -GameFixes -> build -> 120 s boot -Expect -> optional -Sweep; ~4 min; control run FAILs correctly). `gen_conformance.py` keeps mtimes of unchanged generated files. `-GameFixes`/`-SeedSqrtBug` build once (`out/exe_variant.txt`).
 
-**Uncommitted files:** `build_scripts/verify_fix.ps1` (new), `build_scripts/conformance/{conformance.ps1,gen_conformance.py,gen_sqrt_abs_overrides.py}`, `ps2xRuntime/src/lib/game_overrides.cpp`, this file. (`imgui.ini` stays uncommitted.) Generated overrides in `ps2xRuntime/src/lib/Kernel/FpuFixes/` are gitignored (re-run the generator after any runner regen).
+**Everything pushed** (`3e98b297`, branch `sync/upstream-2026-09-24`); only `imgui.ini` stays uncommitted. Generated overrides in `ps2xRuntime/src/lib/Kernel/FpuFixes/` are gitignored (re-run the generator after any runner regen).
 
 **Facts learned (verified)**
 - No SDBZ word reads VU0 MAC/STATUS/CLIP (cfc2 vi16-18 = 0) and none reads SA (mfsa = 0; mtsa = 1 at 0x17eb9c) -> the 42 FLAG classes + mtsa FAIL are unobservable. EE opcode layer has no open visible bug.
@@ -24010,9 +24010,8 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - PS2X_TRAPVAL=0xFFC00000 fills its 256 cap with integer mask stores before fights (0x18e284/94 boot copy, 0x1a7560/0x1a789c in 0x1a73d0) -> gate by address/time to see fight-time stores.
 
 **Next (pick one)**
-1. Commit + push the uncommitted fix + tooling.
-2. Bulk graphics: unreached-scene coverage (supers `eff/`, `dis/` screens) via PCSX2 sweeps (`gfx_tour.ps1 -Emu pcsx2`, `freeze` on ki), graded offline. Coverage 2121/3367.
-3. Lower: cvt.w.s >= 2^31 (338 words, bad data only); pmthi/pmfhi 32/64-bit mismatch (unused by SDBZ).
+1. Bulk graphics: unreached-scene coverage (supers `eff/`, `dis/` screens) via PCSX2 sweeps (`gfx_tour.ps1 -Emu pcsx2`, `freeze` on ki), graded offline. Coverage 2121/3367.
+2. Lower: cvt.w.s >= 2^31 (338 words, bad data only); pmthi/pmfhi 32/64-bit mismatch (unused by SDBZ).
 
 **Learned patterns**
 - A fix that the conformance test can see -> prove it offline with `-GameFixes` first; the long sweep is only for fixes aimed at a known broken scene.
