@@ -6,7 +6,7 @@ rasterizer replays PCSX2's GS stream and is compared with PCSX2's picture of the
 stream, and every differing region is blamed on a draw.
 
 Reference = PCSX2's SOFTWARE renderer on the same dump (GSRunner `-renderer sw -dump f`),
-the last frame of the displayed buffer: same frame, same size, no timing skew. The
+vs OUR replay stopped at the last complete frame (see sw_reference): same frame, same size. The
 screenshot PCSX2 saved next to the dump (cap_t<tick>.png) is only a fallback: it is the
 hardware render at window size, resized, and it is taken one frame BEFORE the dump starts,
 so fades and movies differ by a frame (pc_smoke 10-08: 9 false FLAGs in the intro movie,
@@ -23,6 +23,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import gfx_scene_diff as gsd  # noqa: E402  (read_scenes / scene_label_at)
@@ -38,47 +40,76 @@ def tick_of(path):
 
 
 def sw_reference(dump, out):
-    """PCSX2 software render of this dump's displayed buffer (last frame) -> png path, or None."""
+    """PCSX2 software render of this dump -> (ref png, --fbp, --stop, note), or (None, None, None, why).
+
+    A dump ends mid-frame. GSRunner only writes finished frames, but OUR full replay also draws the
+    unfinished one, and when it lands in the displayed buffer ours = old frame + half a new one
+    (pc_vsall3 10-08: 3 false FLAGs in fights; at frame ends ours matched PCSX2 to 0.65). So OUR side
+    stops at last_complete_frame() (same rule as the tour sheet), and the reference is the PCSX2 frame
+    of that buffer closest to it (frames of one buffer are 2 vsyncs apart, so a real raster bug still
+    differs from all of them)."""
     runner = gsd.find_gsrunner()
     geo = gsd.display_geometry(dump, out)
     if not runner or not runner.exists() or not geo:
-        return None
-    fbp = geo[0]
+        return None, None, None, "no GSRunner or no display regs"
+    dfbp, fbw, w, h = geo
+    gsr = gsd.prepare(dump, out)  # out/frame.gsr; gfx_scene_diff reuses it
+    lcf = gsd.last_complete_frame(gsr, fbw, w, h)
+    fbp, stop = (lcf[0], lcf[1]) if lcf else (dfbp, None)
     rt = out / "sw"
     rt.mkdir(exist_ok=True)
     for old in rt.glob("*"):
         old.unlink()
     rc, _ = gsd.run([str(runner), "-renderer", "sw", "-dump", "f", "-dumpdir", str(rt.resolve()), "-loop", "1",
                      "-surfaceless", "-noshadercache", "--", str(dump.resolve())], {"PCSX2_NOCONSOLE": "1"}, timeout=600)
-    # <draw>_f<frame>_fr-1_<FBP in blocks, hex>_<psm>.png ; keep the last frame of the displayed buffer
+    # <draw>_f<frame>_fr-1_<FBP in blocks, hex>_<psm>.png ; last draw file of each frame in that buffer
     want = f"_{fbp * 32:05x}_"
-    hits = [f for f in rt.glob("*_f*.png") if want in f.name]
-    hits.sort(key=lambda f: int(re.search(r"_f(\d+)_", f.name).group(1)))
-    ref = None
-    if hits:
+    last = {}
+    for f in rt.glob("*_f*.png"):
+        m = re.match(r"(\d+)_f(\d+)_", f.name)
+        if m and want in f.name and (int(m.group(2)) not in last or int(m.group(1)) > last[int(m.group(2))][0]):
+            last[int(m.group(2))] = (int(m.group(1)), f)
+    ref, note = None, "no SW frame for the buffer"
+    if last:
+        pick = max(last)
+        if stop is not None and len(last) > 1:
+            ours = out / "ours_lcf.bmp"
+            gsd.render(gsr, ours, fbp, fbw, {"PS2X_GSBENCH_STOP": str(stop)}, w, h)
+            o = np.asarray(gsd.load(ours), dtype=np.int16)
+            ours.unlink()
+
+            def dist(fr):
+                img = gsd.load(last[fr][1])
+                if img.size[0] < w or img.size[1] < h:
+                    return float("inf")
+                return float(np.abs(o - np.asarray(img.crop((0, 0, w, h)), dtype=np.int16)).mean())
+            pick = min(last, key=dist)
         ref = out / "pcsx2_sw.png"
-        hits[-1].replace(ref)
+        last[pick][1].replace(ref)
+        note = f"f{pick} of {len(last)}"
     for f in rt.glob("*"):
         f.unlink()
     rt.rmdir()
-    return ref
+    return ref, fbp, stop, note
 
 
 def grade(dump, out_root):
     stem = dump.name.split(".gs")[0]
     out = out_root / stem
     out.mkdir(parents=True, exist_ok=True)
-    ref = sw_reference(dump, out)
+    ref, fbp, stop, note = sw_reference(dump, out)
     cmd = [sys.executable, str(HERE / "gfx_scene_diff.py"), str(dump), "--out", str(out)]
     if ref:
-        cmd += ["--ref", str(ref)]
+        cmd += ["--ref", str(ref), "--fbp", hex(fbp)]
+        if stop is not None:
+            cmd += ["--stop", str(stop)]
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     text = proc.stdout + proc.stderr
     (out / "grade.txt").write_text(text, encoding="utf-8")
     for big in ("frame.gsr", "frame.vram", "regs.bin", "ours.bmp"):  # ~12 MB a capture, all rebuilt on a re-grade
         (out / big).unlink(missing_ok=True)
     res = {"stem": stem, "tick": tick_of(dump), "rc": proc.returncode, "mean": None, "regions": [], "out": out,
-           "ref": "sw" if ref else "png"}
+           "ref": f"sw {note}" if ref else "png"}
     cur = None
     for line in text.splitlines():
         m = MEAN_RE.match(line)
@@ -121,7 +152,8 @@ def main():
     counts = {k: sum(r["verdict"] == k for r in results) for k in ("MATCH", "FLAG", "ERROR")}
     lines = [f"# PCSX2 sweep grade: {folder.name}", "",
              f"{len(results)} dump(s): MATCH {counts['MATCH']}, FLAG {counts['FLAG']}, ERROR {counts['ERROR']}", "",
-             "Reference (ref column): sw = PCSX2's software renderer on the same dump (exact frame); png = PCSX2's",
+             "Reference (ref column): sw fN = PCSX2's software renderer on the same dump, frame N of the buffer, vs OUR",
+             "replay stopped at the last complete frame (the dump ends mid-frame); png = PCSX2's",
              "screenshot (fallback: hardware render, resized, one frame early). FLAG = a region where our replay is",
              "clearly darker (missing?) or brighter (extra?) than PCSX2.",
              "Per capture: `pcsx2_cmp/<capture>/compare.png` (ours | PCSX2 | diff) and `grade.txt`.", "",

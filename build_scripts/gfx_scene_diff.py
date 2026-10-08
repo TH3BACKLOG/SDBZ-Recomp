@@ -962,6 +962,8 @@ def main():
     ap.add_argument("--fbw", type=int, help="buffer width in 64px units (default: from DISPFB)")
     ap.add_argument("--size", help="WxH of the presented frame (default: from DISPLAY)")
     ap.add_argument("--rect", help="x,y,w,h extra region to blame (screen px)")
+    ap.add_argument("--stop", type=int, help="replay OUR side only up to this transfer (a dump ends mid-frame: "
+                                             "pass last_complete_frame()'s stop so the partial frame is not drawn)")
     ap.add_argument("--thresh", type=float, default=24.0, help="block mean-abs-diff to flag (default 24)")
     ap.add_argument("--top", type=int, default=4, help="regions to blame (default 4)")
     ap.add_argument("--selftest-skip", type=int, metavar="T",
@@ -1022,7 +1024,10 @@ def main():
     ours_bmp = out / "ours.bmp"
     print(f"[1] replay {dump.name}")
     skip = a.selftest_skip
-    render(gsr, ours_bmp, a.fbp, a.fbw, {"PS2X_GSBENCH_SKIP": str(skip)} if skip is not None else None)
+    env = {"PS2X_GSBENCH_SKIP": str(skip)} if skip is not None else {}
+    if a.stop is not None:
+        env["PS2X_GSBENCH_STOP"] = str(a.stop)
+    render(gsr, ours_bmp, a.fbp, a.fbw, env or None)
 
     if skip is not None:
         ref_bmp = out / "full.bmp"
@@ -1065,6 +1070,8 @@ def main():
             head += f"  diff={r['diff']:.0f} lum ours={r['ours_lum']:.0f} ref={r['ref_lum']:.0f} -> {who}"
         print("\n" + head)
         rows, _ = blame(gsr, rect, a.fbp, a.fbw)
+        if a.stop is not None:
+            rows = [q for q in rows if q["t"] < a.stop]  # draws past --stop are not in OUR frame
         print(f"    {verdict(rows)}")
         draws = [q for q in rows if not q.get("nodraw")]
         for q in draws[-6:]:
