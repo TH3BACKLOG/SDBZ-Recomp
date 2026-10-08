@@ -114,6 +114,37 @@ if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_gs_bench)
 endif()
 
+# Stage B opcode conformance (our side): the test functions ps2_recomp generated from
+# build_scripts/conformance/out/conformance.elf. Exists only after gen_conformance.py ran.
+set(PS2X_CONFORMANCE_GEN "${CMAKE_SOURCE_DIR}/build_scripts/conformance/out/gen")
+if(EXISTS "${PS2X_CONFORMANCE_GEN}/conformance_fns.inc")
+    file(GLOB PS2X_CONFORMANCE_SRCS CONFIGURE_DEPENDS "${PS2X_CONFORMANCE_GEN}/ct*.cpp")
+    add_executable(ps2x_conformance
+        src/conformance_main.cpp
+        src/recomp_override_stubs.cpp
+        $<TARGET_OBJECTS:ps2_test_function_table>
+        ${PS2X_CONFORMANCE_SRCS}
+    )
+    target_include_directories(ps2x_conformance PRIVATE
+        ${PS2X_CONFORMANCE_GEN}
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    )
+    target_link_libraries(ps2x_conformance PRIVATE
+        ps2_runtime
+        ps2_iop
+    )
+    # ~450 small generated files: batch them like the game runner's unity TUs.
+    set_target_properties(ps2x_conformance PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 32)
+    set_source_files_properties(src/conformance_main.cpp src/recomp_override_stubs.cpp
+        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    if(MSVC)
+        target_compile_options(ps2x_conformance PRIVATE /bigobj /MP)
+    endif()
+    if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+        ps2x_stage_ffmpeg_runtime_dlls(ps2x_conformance)
+    endif()
+endif()
+
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
 if(PRINT_GENERATED_CODE)
 

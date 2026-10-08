@@ -148,6 +148,11 @@ _ClaudeMemory/
 # build_scripts/* excluded above. Authored tools only; dumps/logs stay out.
 !build_scripts/*.py
 !build_scripts/*.ps1
+# Stage B opcode conformance: the tools are tracked; out/ (test ELF, generated C++, results) is not.
+!build_scripts/conformance/
+build_scripts/conformance/*
+!build_scripts/conformance/*.py
+!build_scripts/conformance/*.ps1
 
 # ghidra_scripts/ is swept up by `ghidra_*/`, so re-admit the dir explicitly.
 !ghidra_scripts/
