@@ -176,8 +176,17 @@ $vuRep = Join-Path $dir 'vu1_replay.txt'
 $vuCaps = @(Get-ChildItem $dir -File -Filter 'vu_t*.vucap')
 if ($Emu -eq 'pcsx2' -and $vuCaps.Count) {
     # PCSX2's VIF1 input through OUR VU1, compared with PCSX2's own XGKICK output (vu1_bench gate).
-    & "$root\build_scripts\vu1_bench.ps1" -Captures $vuCaps.FullName -Repeat 1 -NoHistory *>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $vuRep
-    "vu1 replay: $vuRep"
+    # A window with 0 VU1 runs (2D screens: warning, logos, movie) is EMPTY, not a failure -- vu1_bench
+    # gates it FAIL because "runs replayed 0" proves nothing; only runs>0 + mismatch is a real FAIL.
+    $vuOut = & "$root\build_scripts\vu1_bench.ps1" -Captures $vuCaps.FullName -Repeat 1 -NoHistory *>&1 | ForEach-Object { "$_" }
+    $vuOut | Set-Content -Path $vuRep
+    $vuLines = @($vuOut | Where-Object { $_ -match '^vu_t\d+\.vucap\s' })
+    $vuEmpty = @($vuLines | Where-Object { $_ -match '\sruns 0\s' }).Count
+    $vuFail = @($vuLines | Where-Object { $_ -match 'gate FAIL' -and $_ -notmatch '\sruns 0\s' })
+    $vuPass = @($vuLines | Where-Object { $_ -match 'gate PASS' }).Count
+    "vu1 replay: PASS {0}  FAIL {1}  EMPTY {2} (no VU1 work in the window) -> {3}" -f $vuPass, $vuFail.Count, $vuEmpty, $vuRep
+    $vuFail | ForEach-Object { "  $_" }
+    $global:LASTEXITCODE = [int]($vuFail.Count -gt 0)  # vu1_bench exits 1 on EMPTY windows too
 }
 # Disk: a 4800 s sweep is ~5 GB of .gsr/.vram/.vucap, and a full F: froze orig3 mid-run (10-05).
 # Once a capture is graded clean, only its report line + sheet frame are worth keeping.
@@ -190,7 +199,7 @@ if ($Emu -eq 'pcsx2' -and -not $KeepCaps -and (Test-Path $pcRep) -and (Get-Item 
     $keep = @{}
     foreach ($line in Get-Content $pcRep) { if ($line -match '^\|\s*(cap_t\d+)\s*\|.*\|\s*(FLAG|ERROR)\s*\|') { $keep[$Matches[1]] = $true } }
     if (Test-Path $rep) { foreach ($m in [regex]::Matches((Get-Content $rep -Raw), '(cap|vu)_t\d+')) { $keep[$m.Value] = $true } }
-    if (Test-Path $vuRep) { foreach ($line in Get-Content $vuRep) { if ($line -match '^(vu_t\d+)\.vucap\s.*gate FAIL') { $keep[$Matches[1]] = $true } } }
+    if (Test-Path $vuRep) { foreach ($line in Get-Content $vuRep) { if ($line -match '^(vu_t\d+)\.vucap\s.*runs [1-9]\d*\s+gate FAIL') { $keep[$Matches[1]] = $true } } }
     $gone = Get-ChildItem $dir -File | Where-Object {
         $_.Name -match '^((cap|vu)_t\d+)\.(gsr|vram|vucap|gs|gs\.zst|gs\.xz|png)$' -and -not $keep.ContainsKey($Matches[1]) }
     $bytes = ($gone | Measure-Object Length -Sum).Sum
@@ -207,7 +216,7 @@ if (($Prune -or $Script) -and -not $KeepCaps -and $Oracle -and $Audit -and $Emu 
     # (orig2 10-05: matching every name there kept all 336 and pruned nothing).
     foreach ($m in [regex]::Matches((Get-Content $rep -Raw), '(cap|vu)_t\d+')) { $named[$m.Value] = $true }
     if (Test-Path $vuRep) {
-        foreach ($line in Get-Content $vuRep) { if ($line -match '^(vu_t\d+)\.vucap\s.*gate FAIL') { $named[$Matches[1]] = $true } }
+        foreach ($line in Get-Content $vuRep) { if ($line -match '^(vu_t\d+)\.vucap\s.*runs [1-9]\d*\s+gate FAIL') { $named[$Matches[1]] = $true } }
     }
     $orep = Join-Path $dir 'oracle\report.md'
     if (Test-Path $orep) {

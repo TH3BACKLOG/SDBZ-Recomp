@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """pcsx2_grade.py -- grade the GS dumps of a PCSX2 sweep (gfx_tour.ps1 -Emu pcsx2).
 
-Each cap_t<tick>.gs.zst comes with the screenshot PCSX2 took of the same frame
-(cap_t<tick>.png). For every pair this runs gfx_scene_diff.py's single-dump mode:
-OUR rasterizer replays PCSX2's GS stream and is compared with PCSX2's own picture,
-and every differing region is blamed on a draw.
+For every cap_t<tick>.gs.zst this runs gfx_scene_diff.py's single-dump mode: OUR
+rasterizer replays PCSX2's GS stream and is compared with PCSX2's picture of the same
+stream, and every differing region is blamed on a draw.
 
-The screenshot is PCSX2's hardware render at window size, resized to the PS2 frame,
-so edges always differ a little (a matching fight: mean diff ~3.8, regions marked
-"different content" with lum within 5). Only regions where ours is clearly darker
-(missing) or brighter (extra) are FLAGGED.
+Reference = PCSX2's SOFTWARE renderer on the same dump (GSRunner `-renderer sw -dump f`),
+the last frame of the displayed buffer: same frame, same size, no timing skew. The
+screenshot PCSX2 saved next to the dump (cap_t<tick>.png) is only a fallback: it is the
+hardware render at window size, resized, and it is taken one frame BEFORE the dump starts,
+so fades and movies differ by a frame (pc_smoke 10-08: 9 false FLAGs in the intro movie,
+all gone against the GSRunner frame). Only regions where ours is clearly darker (missing)
+or brighter (extra) are FLAGGED.
 
     python build_scripts/pcsx2_grade.py gsdump/<name>            -> gsdump/<name>/pcsx2_report.md
     python build_scripts/pcsx2_grade.py gsdump/<name> --jobs 4
@@ -35,17 +37,48 @@ def tick_of(path):
     return int(m.group(1)) if m else -1
 
 
+def sw_reference(dump, out):
+    """PCSX2 software render of this dump's displayed buffer (last frame) -> png path, or None."""
+    runner = gsd.find_gsrunner()
+    geo = gsd.display_geometry(dump, out)
+    if not runner or not runner.exists() or not geo:
+        return None
+    fbp = geo[0]
+    rt = out / "sw"
+    rt.mkdir(exist_ok=True)
+    for old in rt.glob("*"):
+        old.unlink()
+    rc, _ = gsd.run([str(runner), "-renderer", "sw", "-dump", "f", "-dumpdir", str(rt.resolve()), "-loop", "1",
+                     "-surfaceless", "-noshadercache", "--", str(dump.resolve())], {"PCSX2_NOCONSOLE": "1"}, timeout=600)
+    # <draw>_f<frame>_fr-1_<FBP in blocks, hex>_<psm>.png ; keep the last frame of the displayed buffer
+    want = f"_{fbp * 32:05x}_"
+    hits = [f for f in rt.glob("*_f*.png") if want in f.name]
+    hits.sort(key=lambda f: int(re.search(r"_f(\d+)_", f.name).group(1)))
+    ref = None
+    if hits:
+        ref = out / "pcsx2_sw.png"
+        hits[-1].replace(ref)
+    for f in rt.glob("*"):
+        f.unlink()
+    rt.rmdir()
+    return ref
+
+
 def grade(dump, out_root):
     stem = dump.name.split(".gs")[0]
     out = out_root / stem
     out.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run([sys.executable, str(HERE / "gfx_scene_diff.py"), str(dump), "--out", str(out)],
-                          capture_output=True, text=True, errors="replace")
+    ref = sw_reference(dump, out)
+    cmd = [sys.executable, str(HERE / "gfx_scene_diff.py"), str(dump), "--out", str(out)]
+    if ref:
+        cmd += ["--ref", str(ref)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     text = proc.stdout + proc.stderr
     (out / "grade.txt").write_text(text, encoding="utf-8")
     for big in ("frame.gsr", "frame.vram", "regs.bin", "ours.bmp"):  # ~12 MB a capture, all rebuilt on a re-grade
         (out / big).unlink(missing_ok=True)
-    res = {"stem": stem, "tick": tick_of(dump), "rc": proc.returncode, "mean": None, "regions": [], "out": out}
+    res = {"stem": stem, "tick": tick_of(dump), "rc": proc.returncode, "mean": None, "regions": [], "out": out,
+           "ref": "sw" if ref else "png"}
     cur = None
     for line in text.splitlines():
         m = MEAN_RE.match(line)
@@ -78,9 +111,8 @@ def main():
     a = ap.parse_args()
     folder = a.folder
     dumps = sorted((p for p in folder.glob("cap_t*.gs*") if re.search(r"\.gs(\.zst|\.xz)?$", p.name)), key=tick_of)
-    dumps = [d for d in dumps if d.with_name(d.name.split(".gs")[0] + ".png").exists()]
     if not dumps:
-        sys.exit(f"no cap_t*.gs.zst + .png pairs in {folder}")
+        sys.exit(f"no cap_t*.gs.zst dumps in {folder}")
     scenes = gsd.read_scenes(folder)
     out_root = folder / "pcsx2_cmp"
     print(f"grading {len(dumps)} PCSX2 dump(s) on {a.jobs} worker(s) ...")
@@ -89,14 +121,15 @@ def main():
     counts = {k: sum(r["verdict"] == k for r in results) for k in ("MATCH", "FLAG", "ERROR")}
     lines = [f"# PCSX2 sweep grade: {folder.name}", "",
              f"{len(results)} dump(s): MATCH {counts['MATCH']}, FLAG {counts['FLAG']}, ERROR {counts['ERROR']}", "",
-             "Reference = PCSX2's own screenshot of the dumped frame (hardware render, resized). FLAG = a region where",
-             "our replay is clearly darker (missing?) or brighter (extra?) than PCSX2; edge-only differences are ignored.",
+             "Reference (ref column): sw = PCSX2's software renderer on the same dump (exact frame); png = PCSX2's",
+             "screenshot (fallback: hardware render, resized, one frame early). FLAG = a region where our replay is",
+             "clearly darker (missing?) or brighter (extra?) than PCSX2.",
              "Per capture: `pcsx2_cmp/<capture>/compare.png` (ours | PCSX2 | diff) and `grade.txt`.", "",
-             "| capture | scene | verdict | mean diff | regions | flagged |", "|---|---|---|---|---|---|"]
+             "| capture | scene | verdict | ref | mean diff | regions | flagged |", "|---|---|---|---|---|---|---|"]
     for r in results:
         scene = gsd.scene_label_at(scenes, r["tick"]) if scenes else "unknown"
         mean = f"{r['mean']:.2f}" if r["mean"] is not None else "-"
-        lines.append(f"| {r['stem']} | {scene} | {r['verdict']} | {mean} | {len(r['regions'])} | {len(r['flagged'])} |")
+        lines.append(f"| {r['stem']} | {scene} | {r['verdict']} | {r['ref']} | {mean} | {len(r['regions'])} | {len(r['flagged'])} |")
     for r in results:
         if r["verdict"] == "MATCH":
             continue

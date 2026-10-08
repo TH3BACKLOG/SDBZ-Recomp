@@ -22,7 +22,8 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'pcsx2_build_log.txt'
 $t0 = Get-Date
 & $msbuild $proj '/p:SolutionDir=F:\PCSX2-src\' '/p:Configuration=Release AVX2' '/p:Platform=x64' "/m:$Jobs" '/v:m' '/nologo' `
-    "/flp:LogFile=$log;Verbosity=normal" | Select-String -Pattern 'error|warning C|->' | ForEach-Object { $_.Line }
+    "/flp:LogFile=$log;Verbosity=normal" | Select-String -Pattern 'error|warning C|->' |
+    Where-Object { $_.Line -notmatch 'warning C4996: .*compressEvent' } | ForEach-Object { $_.Line }  # Qt 7 deprecation spam (~100 lines a build)
 $rc = $LASTEXITCODE
 '{0} in {1:N0} s (exit {2}); log: {3}' -f $(if ($rc -eq 0) { 'BUILD OK' } else { 'BUILD FAILED' }), ((Get-Date) - $t0).TotalSeconds, $rc, $log
 exit $rc
