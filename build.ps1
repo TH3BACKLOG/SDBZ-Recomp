@@ -170,8 +170,10 @@ if ($Clean -and -not $Full) {
 
 $done     = 0
 $start    = Get-Date
-$errorLog = "$root\build_errors.txt"
-$buildLog = "$root\build_log.txt"
+# Logs live in Logs\build\ (10-08 reorg), not the repo root.
+New-Item -ItemType Directory -Force -Path "$root\Logs\build" | Out-Null
+$errorLog = "$root\Logs\build\build_errors.txt"
+$buildLog = "$root\Logs\build\build_log.txt"
 
 # Show errors from the previous build before clearing
 if (Test-Path $errorLog) {

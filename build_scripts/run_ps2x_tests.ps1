@@ -8,6 +8,10 @@
 # Example: .\build_scripts\run_ps2x_tests.ps1 -Config RelWithDebInfo -TimeoutSec 300
 #
 # Output: Logs\tests\ps2x_tests_<stamp>\<suite>.txt  + summary.txt (one line per suite).
+# Suites run from the repo root (GSDumpReplay reads gsdump/frame.gsr relative to it).
+# The runtime writes run_probe.jsonl into the cwd, so the game's root copy is set aside
+# first and restored at the end; each suite's probe file is kept as <suite>.probe.jsonl.
+# EMPTY = suite registered 0 tests. CRASH(-1073741819) = access violation.
 # Note: the filter is a substring match, so suite "Scheduler" also re-runs every
 # Scheduler* suite. Its line in the summary covers all of them.
 param(
@@ -27,13 +31,17 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $exeTime = (Get-Item -LiteralPath $exe).LastWriteTime
 $summary = New-Object System.Collections.Generic.List[string]
 $summary.Add("exe: $exe ($exeTime)  timeout: $TimeoutSec s")
-$summary.Add(('{0,-30} {1,-8} {2,6} {3,6} {4,6}' -f 'suite', 'result', 'tests', 'passed', 'secs'))
+$summary.Add(('{0,-30} {1,-18} {2,6} {3,6} {4,6}' -f 'suite', 'result', 'tests', 'passed', 'secs'))
 
+$probe = Join-Path $repo 'run_probe.jsonl'
+$probeSaved = Join-Path $outDir 'run_probe.root_saved.jsonl'
+if (Test-Path -LiteralPath $probe) { Move-Item -LiteralPath $probe -Destination $probeSaved }
+try {
 foreach ($s in $suites) {
     $log = Join-Path $outDir (($s -replace '[^A-Za-z0-9_]', '_') + '.txt')
     $err = "$log.stderr"
     $sw  = [Diagnostics.Stopwatch]::StartNew()
-    $p   = Start-Process -FilePath $exe -ArgumentList "`"$s`"" -NoNewWindow -PassThru `
+    $p   = Start-Process -FilePath $exe -ArgumentList "`"$s`"" -NoNewWindow -PassThru -WorkingDirectory $repo `
                -RedirectStandardOutput $log -RedirectStandardError $err
     $done = $p.WaitForExit($TimeoutSec * 1000)
     if (-not $done) { try { $p.Kill($true) } catch {} ; $p.WaitForExit() }
@@ -42,14 +50,19 @@ foreach ($s in $suites) {
         Add-Content -LiteralPath $log -Value "`n--- stderr ---"; Get-Content -LiteralPath $err | Add-Content -LiteralPath $log
     }
     Remove-Item -LiteralPath $err -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $probe) { Move-Item -Force -LiteralPath $probe -Destination ([IO.Path]::ChangeExtension($log, '.probe.jsonl')) }
     $text   = Get-Content -LiteralPath $log -Raw
     $total  = if ($text -match 'Total Tests:\s*(\d+)') { [int]$Matches[1] } else { -1 }
     $passed = if ($text -match 'Passed:\s*(\d+)')      { [int]$Matches[1] } else { -1 }
     $result = if (-not $done) { 'TIMEOUT' }
               elseif ($total -lt 0) { "CRASH($($p.ExitCode))" }
+              elseif ($total -eq 0) { 'EMPTY' }
               elseif ($passed -eq $total) { 'PASS' } else { 'FAIL' }
-    $line = '{0,-30} {1,-8} {2,6} {3,6} {4,6:N0}' -f $s, $result, $total, $passed, $sw.Elapsed.TotalSeconds
+    $line = '{0,-30} {1,-18} {2,6} {3,6} {4,6:N0}' -f $s, $result, $total, $passed, $sw.Elapsed.TotalSeconds
     $summary.Add($line); Write-Host $line
+}
+} finally {
+    if (Test-Path -LiteralPath $probeSaved) { Move-Item -Force -LiteralPath $probeSaved -Destination $probe }
 }
 $summaryPath = Join-Path $outDir 'summary.txt'
 [IO.File]::WriteAllLines($summaryPath, $summary)

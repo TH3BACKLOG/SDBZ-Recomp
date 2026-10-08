@@ -23950,3 +23950,13 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - Moved: logs → `Logs/{build,tests,sweeps,runs,run_logs}`; analysis → `analysis/`; notes → `docs/`; tool installs → `tools/`; downloads → `installers/`; captures → `dumps/`; scratch recompiles → `recomp_scratch/` (toml paths fixed).
 - Tracked moves (git mv, uncommitted): `HANDOFF_NOTE.md` → `docs/handoffs/`, `sofdec_oracle*.csv` → `analysis/sofdec/`, `arkd_grep.ps1` + `run_watchdog.ps1` → `build_scripts/`.
 - Next: offline PCSX2 testing plan (`C:\Users\mwlab\.claude\plans\sorted-foraging-kettle.md`), Stage 0.
+
+## 10-08 — Stage 0 done: ps2x_tests BASELINE (Debug exe built 10-08 02:2x, post-merge `da33bca0`)
+- Runner: `build_scripts/run_ps2x_tests.ps1` (one process per suite, 120 s timeout). Logs: `Logs/tests/ps2x_tests_2026-10-08_0226/`.
+- 49 suites: 28 PASS, 6 EMPTY (0 tests: FiberAlloc, FiberPtr, ParkWindow, Protocol, Race, SemaDelete), 7 FAIL, 5 CRASH, 0 TIMEOUT.
+- FAIL: CodeGenerator 63/64 (backward BEQ preemption-policy check), PS2Memory 51/53 (SPR_FROM/SPR_TO MADR/SADR), PS2Recompiler 38/39 (ghidra map vs fallback starts), PS2RuntimeIO 11/14 (sceMcEnd, sceMcGetDir, +1), PS2SifRpc 9/10 (SifInitRpc resets IOP), PS2VU1 34/40 (WAITP/RNG, FMAC lane stall, LOI, LQ/SQ, upper ADD mask, upper/lower collision), SchedulerRpcLoopPark 0/1.
+- CRASH: PS2GS + Observability + RuntimeExpansion = access violation (0xC0000005) after several [Failed]; RuntimeInterrupt + RuntimeKernel = abort (EeScheduler.cpp:4089 executor-thread assert).
+- ⚠ Graphics-relevant FAILs before the PS2GS crash: FBA CT32, HIGHLIGHT/HIGHLIGHT2, T4 CSM1 CLUT, T4 triangle atlas, T4HL/T4HH planes, FST sprite edges; Observability CLUT-cache CSM1 T4. HYPOTHESIS (unchecked): stale test expectations vs real raster bugs.
+- This is the reference: a new failure after Stage B/C changes = ours; these = pre-existing.
+- Side fixes: `build.ps1` now writes `Logs/build/build_log.txt` + `build_errors.txt` (was repo root). The baseline run overwrote the root `run_probe.jsonl` (game copy from 10-03 only in the user's backup); the runner now sets it aside and restores it.
+- Next: Stage A (user plays PCSX2 to 3 scenes: one super/special, one known-good fight, one menu).
