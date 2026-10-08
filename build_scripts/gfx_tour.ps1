@@ -93,6 +93,9 @@ if (-not $ReplayOnly) {
         $set.PS2X_VUCAP_FRAMES = "$VuCapFrames"
     }
     if ($Emu -eq 'pcsx2') {
+        # PCSX2 VuCapture counts the vsync it starts on as frame 1 (VuCapture.cpp OnVSync: Begin, then
+        # --framesLeft), so frames=1 closes the file in the same call with 0 runs (pc_discover2 10-08: 25/25 empty).
+        if ($VuCapTicks) { $set.PS2X_VUCAP_FRAMES = "$($VuCapFrames + 1)" }
         $set.PS2X_PCSX2_LOG = "$dir\run_log.txt"   # [scene] lines land where -Audit looks for them
         $set.PS2X_PCSX2_RUN_TICKS = "$(if ($Ticks) { $Ticks } else { $Seconds * 60 })"
         if ($Script) { $set.PS2X_PCSX2_EXIT_ON_END = '1' }
@@ -186,6 +189,10 @@ if ($Emu -eq 'pcsx2' -and $vuCaps.Count) {
     $vuPass = @($vuLines | Where-Object { $_ -match 'gate PASS' }).Count
     "vu1 replay: PASS {0}  FAIL {1}  EMPTY {2} (no VU1 work in the window) -> {3}" -f $vuPass, $vuFail.Count, $vuEmpty, $vuRep
     $vuFail | ForEach-Object { "  $_" }
+    if ($vuPass + $vuFail.Count -eq 0) {
+        # Menus and select screens do run VU1 (pilot menu.vucap: 18k+ runs), so all-empty = broken capture.
+        Write-Warning "every VU1 window is EMPTY: the capture recorded nothing, this is not a pass"
+    }
     $global:LASTEXITCODE = [int]($vuFail.Count -gt 0)  # vu1_bench exits 1 on EMPTY windows too
 }
 # Disk: a 4800 s sweep is ~5 GB of .gsr/.vram/.vucap, and a full F: froze orig3 mid-run (10-05).
