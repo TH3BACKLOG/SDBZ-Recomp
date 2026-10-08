@@ -23,7 +23,9 @@ param(
     # interpreter side by side; full state, memory, packets and cycle counts
     # compared). Any mismatch fails the gate.
     [switch]$Verify,
-    [string]$Config = 'RelWithDebInfo'
+    [string]$Config = 'RelWithDebInfo',
+    # Do not append to logs\vucap\bench_history.csv (sweep captures are a correctness check, not a speed sample).
+    [switch]$NoHistory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -91,6 +93,7 @@ try {
             if (-not $vpass) { $allPass = $false; $pass = $false }
         }
 
+        if ($NoHistory) { continue }
         if (-not (Test-Path $history)) { 'date,commit,label,capture,repeat,median_ms,min_ms,max_ms,ns_per_cycle,runs,gate' | Set-Content $history }
         '{0},{1}{2},{3},{4},{5},{6:F1},{7:F1},{8:F1},{9:F3},{10},{11}' -f (Get-Date -Format s), $commit, $dirty, $Label,
             (Split-Path $capPath -Leaf), $Repeat, $median, $sorted[0], $sorted[-1], $ns, $runs, $(if ($pass) { 'PASS' } else { 'FAIL' }) |

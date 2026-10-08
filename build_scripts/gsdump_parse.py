@@ -530,8 +530,10 @@ def emit_gs(gsr_path, out_path, template=TEMPLATE_DUMP, stop=None, probe=None):
             f.write(regs)
             f.write(struct.pack("<BB", PACKET_VSYNC, 0))
 
-        for path, data in transfers:
-            if all_zero or (path == 0 and len(data) > 16384):
+        # Transfer 0 is the synthetic register-restore packet (--init-state), not PCSX2 PATH1
+        # data: sent as Path1Old it crashed GSRunner on PCSX2-origin .gsr (0xFEFEFEFE, 10-08).
+        for i, (path, data) in enumerate(transfers):
+            if all_zero or (path == 0 and len(data) > 16384) or i == 0:
                 path = GS_PATH3
             transfer(path, data)
         if probe is not None:
