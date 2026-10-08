@@ -98,6 +98,8 @@ def main():
             import os
             import time
             first, last = args.fullmem if args.fullmem else (1, 0)
+            # PCSX2 opens the file itself and does not create folders.
+            os.makedirs(os.path.dirname(os.path.abspath(args.vucap)), exist_ok=True)
             srv.send({"cmd": "vucap", "path": os.path.abspath(args.vucap),
                       "frames": args.frames, "fullmem_from": first, "fullmem_to": last})
             print(f"vucap requested -> {os.path.abspath(args.vucap)} ({args.frames} frames)")
@@ -113,7 +115,12 @@ def main():
                 # Only a state reached after armed/capturing belongs to this request.
                 if st["state"] in ("armed", "capturing"):
                     started = True
-                if (started and st["state"] in ("done", "idle")) or st["state"] == "error" \
+                # "error" can be stale too (10-08: a failed open of the previous path
+                # ended the wait for the NEXT request at once). Trust it only once this
+                # request has started, or when the message names this request's path.
+                ours_failed = st["state"] == "error" and (
+                    started or os.path.abspath(args.vucap) in (st["error"] or ""))
+                if (started and st["state"] in ("done", "idle")) or ours_failed \
                         or (not started and polls > 30):
                     if st["error"]:
                         print(f"  error: {st['error']}")
