@@ -24017,3 +24017,19 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - A fix that the conformance test can see -> prove it offline with `-GameFixes` first; the long sweep is only for fixes aimed at a known broken scene.
 - Regenerating every generated file resets mtimes -> MSBuild recompiles all; restore mtime on byte-identical files.
 - `'...' -f a, b` in a PowerShell array literal: the comma binds first -> format the value on its own line.
+
+## 10-08b — Revise plan: find missing graphics by FEATURE, not SCENE
+- Upstream check: `upstream/main` 2c5fbb93 is ancestor of HEAD -> current.
+- Plan `C:/Users/mwlab/.claude/plans/fluttering-twirling-pebble.md` APPROVED. Steps: (1) triage the ~20 failing PS2GS + 6 PS2VU1 ps2x_tests (threads on/off -> RACE vs REAL); (2) `build_scripts/gsfeature/` GS feature matrix vs PCSX2 GSRunner SW; (3) census of features SDBZ uses from existing dumps; (4) count unseen VU1 microprograms; (5) targeted sweep only if needed.
+
+### 10-08b RESULTS (plan steps 1-4 done, no game run, ~1 h total)
+- **Step 1 (ps2x_tests triage):** PS2GS with `PS2X_GS_THREAD=0 PS2X_GS_RASTER_THREADS=0` runs all 68 tests (no crash), 9 FAIL. With threads ON it segfaults after `T4 CSM1` and 5 more fail (FBA, FST sprite edges, HIGHLIGHT/2, T4 CSM1) = threads-only = HYPOTHESIS harness drain race (game unaffected: real dumps match PCSX2). PS2VU1 6 FAIL both ways = all pipeline-latency checks ("result should stay hidden until cycle 4"), not math.
+- **Step 3 census** (`build_scripts/gsfeature/gs_feature_census.py`, 616 captures, 1 min): SDBZ draws with tristrip/trifan/sprite; T8 + T4 (CT32 CSM1 CLUT) + CT32; MODULATE tcc1 only; bilinear or nearest; 3 blend eqs; ATST GREATER64/NOTEQUAL0/ALWAYS, AFAIL KEEP only; ZTST GEQUAL/ALWAYS/GREATER; frame CT32 only. NEVER seen: T4HL/T4HH, T8H(rare 1404), PABE, TEX2, FBA, fog, DTHE, HIGHLIGHT, TCC0, DATE.
+  - Census bug fixed on the way: GIF packets span dump transfers; gsdump_draws.process_packet assumes a tag per transfer -> fake PSMs. Census uses a resumable per-path parser (GifPath).
+- **Step 2 matrix** (`build_scripts/gsfeature/gs_feature_matrix.py`, 30 synthetic cases, 75 s, ours vs PCSX2 GSRunner SW): MATCH = fans (incl. the exact ps2x_tests fan quad), strips, 4 blend eqs, all ATST/AFAIL incl. FB_ONLY/RGB_ONLY, ZTST, PABE, bilinear UV (NEAR). Control (skip draw) DIFF = tool not blind.
+  - => ps2x_tests fan, AFAIL x2, PABE fails are TEST bugs (fan test reads swizzled VRAM linearly).
+  - DIFF 1: **bilinear + STQ, every PSM**: ~2300/2774 px off by <=20 levels (uniform noise, visually same). Weight precision on the STQ path. SDBZ's main path (10M draws). Fidelity, not missing art.
+  - DIFF 2: nearest/UV: exactly 1 px at (41,11) in every UV case = one texel boundary rounding.
+- **Step 4 VU1:** unseen images (7603ba3c, af2cab1f, e2abe6df, 52626864, 1cb597ce, 1fe525a4 ...) run on the interpreter fallback (`[vu1recomp] not compiled`) = the PCSX2-verified path -> speed cost only.
+- **Gate:** `verify_fix.ps1` now runs `gs_feature_matrix.py --gate` after build (`-NoGsFeature` skips). baseline `build_scripts/gsfeature/baseline.json`. Gate VERIFIED: clean exit 0; `PS2X_GSBENCH_SKIP=1` seeded -> exit 1 naming 4 cases.
+- **Conclusion:** no missing-graphics bug left in the GS feature set SDBZ uses. Remaining: bilinear-STQ precision (match PCSX2 GSDrawScanline weights: read its source first), 1-texel UV rounding, untested-by-matrix unused features (T4HL/HH, TEX2, FBA, TEXA, CT16).

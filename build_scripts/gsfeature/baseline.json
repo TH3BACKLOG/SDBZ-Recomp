@@ -1,0 +1,122 @@
+{
+ "fan_quad_subpixel": [
+  "MATCH",
+  0
+ ],
+ "fan_ngon_gouraud": [
+  "MATCH",
+  0
+ ],
+ "strip_gouraud_subpixel": [
+  "MATCH",
+  0
+ ],
+ "tex_t4_nearest_stq": [
+  "MATCH",
+  0
+ ],
+ "tex_t4_nearest_uv": [
+  "DIFF",
+  1
+ ],
+ "tex_t4_bilinear_stq": [
+  "DIFF",
+  517
+ ],
+ "tex_t4_bilinear_uv": [
+  "NEAR",
+  0
+ ],
+ "tex_t8_nearest_stq": [
+  "DIFF",
+  3
+ ],
+ "tex_t8_nearest_uv": [
+  "DIFF",
+  1
+ ],
+ "tex_t8_bilinear_stq": [
+  "DIFF",
+  541
+ ],
+ "tex_t8_bilinear_uv": [
+  "DIFF",
+  1
+ ],
+ "tex_ct32_nearest_stq": [
+  "DIFF",
+  1
+ ],
+ "tex_ct32_nearest_uv": [
+  "DIFF",
+  1
+ ],
+ "tex_ct32_bilinear_stq": [
+  "DIFF",
+  425
+ ],
+ "tex_ct32_bilinear_uv": [
+  "NEAR",
+  0
+ ],
+ "tex_t8_bilinear_stq_clamp": [
+  "DIFF",
+  331
+ ],
+ "tex_t8_bilinear_stq_repeat_wrap": [
+  "DIFF",
+  505
+ ],
+ "blend_cs_cd_as_cd": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_cs_as_cs": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_0_as_cd": [
+  "MATCH",
+  0
+ ],
+ "blend_fix": [
+  "MATCH",
+  0
+ ],
+ "atest_greater64_keep": [
+  "MATCH",
+  0
+ ],
+ "atest_notequal0_keep": [
+  "MATCH",
+  0
+ ],
+ "atest_afail_fb_only": [
+  "MATCH",
+  0
+ ],
+ "atest_afail_rgb_only": [
+  "MATCH",
+  0
+ ],
+ "ztest_gequal": [
+  "MATCH",
+  0
+ ],
+ "pabe": [
+  "MATCH",
+  0
+ ],
+ "tfx_highlight": [
+  "DIFF",
+  221
+ ],
+ "tfx_modulate_tcc0": [
+  "DIFF",
+  1
+ ],
+ "control_skip_draw": [
+  "DIFF",
+  1751
+ ]
+}

@@ -211,3 +211,8 @@ build_scripts/logs/
 build_scripts/data/
 analysis/*
 !analysis/sofdec/
+# GS feature matrix + census (feature-not-scene plan 10-08b): tools + baseline tracked; results go to Logs/gsfeature/.
+!build_scripts/gsfeature/
+build_scripts/gsfeature/*
+!build_scripts/gsfeature/*.py
+!build_scripts/gsfeature/baseline.json

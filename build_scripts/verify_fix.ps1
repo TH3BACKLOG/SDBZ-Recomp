@@ -8,6 +8,8 @@
 #   conformance  conformance\conformance.ps1 -GameFixes            FAIL classes must drop vs report.md, no new FAIL
 #                                                                  (-NoConformance for fixes the opcode test cannot see)
 #   build        build.ps1 RelWithDebInfo                          exit 0
+#   gsfeature    gsfeature\gs_feature_matrix.py --gate              no GS feature case worse than baseline.json
+#                                                                  (~75 s, synthetic draws vs PCSX2 SW; -NoGsFeature skips)
 #   boot         launch_recomp.ps1, -BootSeconds (same flags as gfx_tour.ps1)
 #                every -Expect line present, '[run] exiting loop', no exception/FATAL/missing-target
 #   sweep        gfx_tour.ps1 -Script <Sweep>                      BROKEN=0 in its report.md (-Sweep only)
@@ -16,6 +18,7 @@ param(
     [string[]]$Expect = @(),
     [switch]$Gen,
     [switch]$NoConformance,
+    [switch]$NoGsFeature,
     [int]$BootSeconds = 120,
     [string]$Sweep,
     [int]$SweepSeconds = 2400
@@ -96,6 +99,16 @@ Step 'build' {
         throw "build.ps1 exit $code $first"
     }
     'RelWithDebInfo OK'
+}
+
+if (-not $NoGsFeature) {
+    Step 'gsfeature' {
+        $o = python (Join-Path $root 'build_scripts\gsfeature\gs_feature_matrix.py') --gate 2>&1
+        $code = $LASTEXITCODE
+        $gate = ($o | Select-String -Pattern '^GATE (PASS|FAIL).*' | Select-Object -Last 1)
+        if ($code -ne 0) { throw $(if ($gate) { $gate.Line } else { "gs_feature_matrix exit $code" }) }
+        $gate.Line
+    }
 }
 
 Step 'boot' {
