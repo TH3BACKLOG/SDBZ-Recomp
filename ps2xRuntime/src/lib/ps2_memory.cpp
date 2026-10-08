@@ -1853,19 +1853,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
 
                 const uint32_t chBit = (channelBase == 0x1000D000u) ? 8u : 9u;
-                uint32_t dstat = m_ioRegisters.count(0x1000E010u) ? m_ioRegisters[0x1000E010u] : 0u;
-                dstat |= (1u << chBit);
-                const uint32_t st = dstat & 0x3FFu;
-                const uint32_t mk = (dstat >> 16) & 0x3FFu;
-                if ((st & mk) != 0u)
-                    dstat |= (1u << 31);
-                else
-                    dstat &= ~(1u << 31);
-                m_ioRegisters[0x1000E010u] = dstat;
+                {
+                    static std::atomic<uint32_t> s_logged{0u};
+                    if ((s_logged.fetch_or(1u << chBit) & (1u << chBit)) == 0u)
+                        std::fprintf(stderr, "[sprdma] first %s transfer: qwc=%u madr=0x%x sadr=0x%x\n",
+                                     chBit == 8u ? "fromSPR(ch8)" : "toSPR(ch9)", spQwc,
+                                     m_ioRegisters[channelBase + 0x10], sadr);
+                }
 
-                // Signal completion: clear the STR (start) bit and the quadword count.
-                m_ioRegisters[channelBase + 0x00] = value & ~0x100u;
+                // Completion like upstream's tryProcessScratchpadDma (shadowed by this
+                // block): MADR/SADR advance past the transfer, QWC=0, then
+                // completeDmacChannel clears STR, raises D_STAT and queues the cause,
+                // so a DMAC handler the guest enabled (EnableDmac) runs. This block
+                // used to skip the advance and the queue (ps2x_tests PS2Memory SPR).
+                m_ioRegisters[channelBase + 0x10] = (m_ioRegisters[channelBase + 0x10] + spQwc * 16u) & 0x7FFFFFF0u;
+                m_ioRegisters[channelBase + 0x80] = (sadr + spQwc * 16u) & 0x3FF0u;
+                m_ioRegisters[channelBase + 0x00] = value;
                 m_ioRegisters[channelBase + 0x20] = 0u;
+                completeDmacChannel(channelBase, chBit);
                 return true;
             }
 

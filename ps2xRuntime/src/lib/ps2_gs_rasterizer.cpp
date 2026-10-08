@@ -1733,6 +1733,175 @@ namespace
         return x0 <= x1 && y0 <= y1;
     }
 
+    // PCSX2-exact triangle texture coordinates: GSRasterizer::DrawTriangle (plane
+    // gradients from the y-sorted vertices, each section anchored at its own start
+    // vertex) + GSDrawScanline AVX2 (8 lanes: lane j of a group = scan + dscan*(j-skip),
+    // later groups add dscan*8; FST / constant-q prims step in integers after a per-row
+    // truncation, with the bilinear half-texel taken off the vertices). Barycentric
+    // weights picked a different texel at exact texel boundaries (gsfeature tex_*
+    // residue; ATST flips in combo_fan_t4_bilinear). u/v out: 16.16, -0x8000 applied
+    // when linear (what the samplers' fixed path expects).
+    struct TriTexInterp
+    {
+        bool fixedMode = false, ltf = false, flatTop = false;
+        float x[3] = {}, y[3] = {}, a[3][3] = {};
+        float dscan[3] = {}, dedge[3] = {};
+        int anchorFlat = 0, splitRow = 0;
+        int rowY = INT32_MIN, base = 0, group = 0;
+        float lanesF[8][3] = {}, stepF[3] = {};
+        int lanesI[8][2] = {}, stepI[2] = {};
+
+        static int cvtt(float f) { return (f > -2147483648.0f && f < 2147483648.0f) ? static_cast<int>(f) : INT32_MIN; }
+
+        bool setup(const GSVertex &v0, const GSVertex &v1, const GSVertex &v2, float ofx, float ofy,
+                   bool fst, int tw, int th, bool linear)
+        {
+            static const uint8_t kYSort[8][3] = {{0, 1, 2}, {1, 0, 2}, {0, 0, 0}, {1, 2, 0},
+                                                  {0, 2, 1}, {0, 0, 0}, {2, 0, 1}, {2, 1, 0}};
+            const GSVertex *in[3] = {&v0, &v1, &v2};
+            const bool qEq = !fst && v0.q == v1.q && v1.q == v2.q;
+            fixedMode = fst || qEq;
+            ltf = linear;
+            const float W = static_cast<float>(0x10000 << tw), H = static_cast<float>(0x10000 << th);
+            float px[3], py[3], at[3][3];
+            for (int i = 0; i < 3; ++i)
+            {
+                const GSVertex &v = *in[i];
+                px[i] = v.x - ofx;
+                py[i] = v.y - ofy;
+                if (fst)
+                {
+                    at[i][0] = static_cast<float>(static_cast<int>(v.u) << 12);
+                    at[i][1] = static_cast<float>(static_cast<int>(v.v) << 12);
+                    at[i][2] = 1.0f;
+                }
+                else if (qEq && v.q != 1.0f) // PCSX2 q_div: (st / q) * size
+                {
+                    at[i][0] = (v.s / v.q) * W;
+                    at[i][1] = (v.t / v.q) * H;
+                    at[i][2] = 1.0f;
+                }
+                else
+                {
+                    at[i][0] = v.s * W;
+                    at[i][1] = v.t * H;
+                    at[i][2] = v.q;
+                }
+                if (fixedMode && linear)
+                {
+                    at[i][0] -= 32768.0f;
+                    at[i][1] -= 32768.0f;
+                }
+            }
+            const int m1s = (py[0] > py[1] ? 1 : 0) | (py[0] > py[2] ? 2 : 0) | (py[1] > py[2] ? 4 : 0);
+            for (int i = 0; i < 3; ++i)
+            {
+                const int k = kYSort[m1s][i];
+                x[i] = px[k];
+                y[i] = py[k];
+                a[i][0] = at[k][0];
+                a[i][1] = at[k][1];
+                a[i][2] = at[k][2];
+            }
+            const int m1 = (y[0] == y[1] ? 1 : 0) | (y[0] == y[2] ? 2 : 0) | (y[1] == y[2] ? 4 : 0);
+            if (m1 == 7)
+                return false;
+            const float dv0x = x[1] - x[0], dv0y = y[1] - y[0], dv1x = x[2] - x[0], dv1y = y[2] - y[0];
+            const float cross = dv0y * dv1x - dv0x * dv1y;
+            if (cross == 0.0f)
+                return false;
+            const int m2 = std::signbit(cross) ? 1 : 0;
+            const float c0 = dv0x / cross, c1 = dv0y / cross, c2 = dv1x / cross, c3 = dv1y / cross;
+            for (int k = 0; k < 3; ++k)
+            {
+                const float d0 = a[1][k] - a[0][k], d1 = a[2][k] - a[0][k];
+                dscan[k] = d1 * c1 - d0 * c3;
+                dedge[k] = d0 * c2 - d1 * c0;
+            }
+            flatTop = (m1 & 1) != 0;
+            anchorFlat = 1 - m2;
+            splitRow = static_cast<int>(std::ceil(y[1]));
+            rowY = INT32_MIN;
+            return true;
+        }
+
+        // First covered pixel of row `row` (PCSX2's l.x: ceil(left edge) clipped to the scissor).
+        void beginRow(int row, int left)
+        {
+            const int anc = flatTop ? anchorFlat : (row < splitRow ? 0 : 1);
+            const float dy = static_cast<float>(row) - y[anc];
+            const float prestep = static_cast<float>(left) - x[anc];
+            const int skip = left & 7;
+            rowY = row;
+            base = left - skip;
+            group = 0;
+            for (int k = 0; k < 3; ++k)
+            {
+                const float scan = (a[anc][k] + dedge[k] * dy) + dscan[k] * prestep;
+                if (fixedMode && k < 2)
+                {
+                    const int vt = cvtt(scan);
+                    for (int j = 0; j < 8; ++j)
+                        lanesI[j][k] = static_cast<int>(static_cast<uint32_t>(vt) +
+                                                        static_cast<uint32_t>(cvtt(dscan[k] * static_cast<float>(j - skip))));
+                    stepI[k] = cvtt(dscan[k] * 8.0f);
+                }
+                else
+                {
+                    for (int j = 0; j < 8; ++j)
+                        lanesF[j][k] = scan + dscan[k] * static_cast<float>(j - skip);
+                    stepF[k] = dscan[k] * 8.0f;
+                }
+            }
+        }
+
+        void at(int px, int &u, int &v)
+        {
+            const int g = (px - base) >> 3;
+            while (group < g)
+            {
+                for (int j = 0; j < 8; ++j)
+                {
+                    if (fixedMode)
+                    {
+                        lanesI[j][0] = static_cast<int>(static_cast<uint32_t>(lanesI[j][0]) + static_cast<uint32_t>(stepI[0]));
+                        lanesI[j][1] = static_cast<int>(static_cast<uint32_t>(lanesI[j][1]) + static_cast<uint32_t>(stepI[1]));
+                    }
+                    else
+                    {
+                        lanesF[j][0] += stepF[0];
+                        lanesF[j][1] += stepF[1];
+                        lanesF[j][2] += stepF[2];
+                    }
+                }
+                ++group;
+            }
+            const int j = (px - base) & 7;
+            if (fixedMode)
+            {
+                u = lanesI[j][0];
+                v = lanesI[j][1];
+                return;
+            }
+            u = cvtt(lanesF[j][0] / lanesF[j][2]);
+            v = cvtt(lanesF[j][1] / lanesF[j][2]);
+            if (ltf)
+            {
+                u = static_cast<int>(static_cast<uint32_t>(u) - 0x8000u);
+                v = static_cast<int>(static_cast<uint32_t>(v) - 0x8000u);
+            }
+        }
+    };
+
+    // drawTriangle hands sampleTexture a ready 16.16 coordinate through this (the
+    // member's signature lives in a header).
+    struct FixedUv
+    {
+        bool on = false;
+        int u = 0, v = 0;
+    };
+    thread_local FixedUv t_fixedUv;
+
     uint32_t bilinearFilter(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, int fu, int fv)
     {
         uint32_t out = 0;
@@ -2995,6 +3164,16 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         return 0xFFFF00FFu;
     };
 
+    if (t_fixedUv.on) // drawTriangle's PCSX2-exact 16.16 coordinate (TriTexInterp)
+    {
+        const int fu = t_fixedUv.u, fv = t_fixedUv.v;
+        if (!tex1UsesLinearFilter(ctx.tex1.data))
+            return samplePoint(fu >> 16, fv >> 16);
+        return bilinearFilter(samplePoint(fu >> 16, fv >> 16), samplePoint((fu >> 16) + 1, fv >> 16),
+                              samplePoint(fu >> 16, (fv >> 16) + 1), samplePoint((fu >> 16) + 1, (fv >> 16) + 1),
+                              (fu & 0xFFFF) >> 12, (fv & 0xFFFF) >> 12);
+    }
+
     if (!tex1UsesLinearFilter(ctx.tex1.data))
     {
         return samplePoint(texFixed16(texUf) >> 16, texFixed16(texVf) >> 16); // PCSX2: 16.16 >> 16 (floor)
@@ -3582,10 +3761,18 @@ void GSRasterizer::drawTriangle(GS *gs)
 
     const float invArea = 1.0f / static_cast<float>(area2);
 
+    TriTexInterp triTex;
+    const bool triTexOn = prim.tme &&
+                          triTex.setup(v0, v1, v2, static_cast<float>(ctx.xyoffset.ofx) / 16.0f,
+                                       static_cast<float>(ctx.xyoffset.ofy) / 16.0f, prim.fst != 0,
+                                       static_cast<int>(ctx.tex0.tw), static_cast<int>(ctx.tex0.th),
+                                       tex1UsesLinearFilter(ctx.tex1.data));
+
     for (int y = minY; y <= maxY; ++y)
     {
         const int64_t py = static_cast<int64_t>(y) * 16;
         const int64_t px0 = static_cast<int64_t>(minX) * 16;
+        bool rowStarted = false;
         int64_t e[3];
         for (int i = 0; i < 3; ++i)
         {
@@ -3646,7 +3833,18 @@ void GSRasterizer::drawTriangle(GS *gs)
                     iv = 0;
                 }
 
+                if (triTexOn)
+                {
+                    if (!rowStarted)
+                    {
+                        triTex.beginRow(y, x);
+                        rowStarted = true;
+                    }
+                    t_fixedUv.on = true;
+                    triTex.at(x, t_fixedUv.u, t_fixedUv.v);
+                }
                 uint32_t texel = sampleTexture(gs, is, it, iq, iu, iv);
+                t_fixedUv.on = false;
 
                 ps2diag_fbstat::t_lastTexel = texel;
 

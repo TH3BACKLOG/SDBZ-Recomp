@@ -16,15 +16,15 @@
   0
  ],
  "tex_t4_nearest_uv": [
-  "DIFF",
-  1
+  "MATCH",
+  0
  ],
  "tex_t4_bilinear_stq": [
   "NEAR",
   0
  ],
  "tex_t4_bilinear_uv": [
-  "NEAR",
+  "MATCH",
   0
  ],
  "tex_t8_nearest_stq": [
@@ -32,31 +32,31 @@
   3
  ],
  "tex_t8_nearest_uv": [
-  "DIFF",
-  1
+  "MATCH",
+  0
  ],
  "tex_t8_bilinear_stq": [
   "DIFF",
   2
  ],
  "tex_t8_bilinear_uv": [
-  "DIFF",
-  1
+  "MATCH",
+  0
  ],
  "tex_ct32_nearest_stq": [
   "DIFF",
   1
  ],
  "tex_ct32_nearest_uv": [
-  "DIFF",
-  1
+  "MATCH",
+  0
  ],
  "tex_ct32_bilinear_stq": [
   "DIFF",
   4
  ],
  "tex_ct32_bilinear_uv": [
-  "NEAR",
+  "MATCH",
   0
  ],
  "tex_t8_bilinear_stq_clamp": [
@@ -112,8 +112,8 @@
   2
  ],
  "tfx_modulate_tcc0": [
-  "DIFF",
-  1
+  "MATCH",
+  0
  ],
  "control_skip_draw": [
   "DIFF",
@@ -376,6 +376,10 @@
   0
  ],
  "unseen3_alias_t8h_t4hl_ct32": [
+  "MATCH",
+  0
+ ],
+ "tex1_t4_2texel_tri_bilinear": [
   "MATCH",
   0
  ]

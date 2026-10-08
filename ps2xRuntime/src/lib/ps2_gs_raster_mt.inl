@@ -463,6 +463,16 @@ __forceinline uint32_t samplePoint(const Setup &S, int sampleU, int sampleV)
 
 uint32_t sampleTexel(const Setup &S, float texUf, float texVf);
 
+// A ready 16.16 coordinate (TriTexInterp; -0x8000 already applied when linear).
+__forceinline uint32_t sampleTexelFixed(const Setup &S, int fu, int fv)
+{
+    if (!S.linear)
+        return samplePoint(S, fu >> 16, fv >> 16);
+    return bilinearFilter(samplePoint(S, fu >> 16, fv >> 16), samplePoint(S, (fu >> 16) + 1, fv >> 16),
+                          samplePoint(S, fu >> 16, (fv >> 16) + 1), samplePoint(S, (fu >> 16) + 1, (fv >> 16) + 1),
+                          (fu & 0xFFFF) >> 12, (fv & 0xFFFF) >> 12);
+}
+
 __forceinline uint32_t sampleTexture(const Setup &S, float s, float t, float q, uint16_t u, uint16_t v)
 {
     float texUf, texVf;
@@ -660,12 +670,20 @@ void drawTriangle(const Setup &S)
         return;
 
     const float invArea = 1.0f / static_cast<float>(area2);
+
+    // PCSX2-exact texture coordinates (TriTexInterp in ps2_gs_rasterizer.cpp).
+    TriTexInterp triTex;
+    const bool triTexOn = prim.tme &&
+                          triTex.setup(v0, v1, v2, static_cast<float>(ctx.xyoffset.ofx) / 16.0f,
+                                       static_cast<float>(ctx.xyoffset.ofy) / 16.0f, prim.fst != 0,
+                                       static_cast<int>(ctx.tex0.tw), static_cast<int>(ctx.tex0.th), S.linear);
     const auto &tex = ctx.tex0;
 
     for (int y = S.firstRow(minY); y <= maxY; y += S.rowN)
     {
         const int64_t py = static_cast<int64_t>(y) * 16;
         const int64_t px0 = static_cast<int64_t>(minX) * 16;
+        bool rowStarted = false;
         int64_t e[3];
         for (int i = 0; i < 3; ++i)
         {
@@ -720,7 +738,20 @@ void drawTriangle(const Setup &S)
                     iv = 0;
                 }
 
-                uint32_t texel = sampleTexture(S, is, it, iq, iu, iv);
+                uint32_t texel;
+                if (triTexOn)
+                {
+                    if (!rowStarted)
+                    {
+                        triTex.beginRow(y, x);
+                        rowStarted = true;
+                    }
+                    int fu, fv;
+                    triTex.at(x, fu, fv);
+                    texel = sampleTexelFixed(S, fu, fv);
+                }
+                else
+                    texel = sampleTexture(S, is, it, iq, iu, iv);
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
                 uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
