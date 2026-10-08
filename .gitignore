@@ -188,3 +188,21 @@ cheatengine-mcp/
 x64dbg/
 __pycache__/
 imgui.ini
+
+# Folder reorg 2026-10-08 (move log: docs/REORG_2026-10-08.md). Local-only homes
+# for tools, installers, art, game files, dumps and old backups -- never tracked.
+installers/
+art/
+game_files/
+dumps/
+archive/
+recomp_scratch/
+docs/important_text_files/
+docs/session_summaries/
+docs/solutions_log/
+docs/claude_memory_old/
+build_scripts/funcmap/_bak/
+build_scripts/logs/
+build_scripts/data/
+analysis/*
+!analysis/sofdec/

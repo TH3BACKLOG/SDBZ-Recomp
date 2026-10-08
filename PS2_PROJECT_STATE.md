@@ -23943,3 +23943,9 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - Next, in order: (1) find the ki word (snap at known ki, ramdiff) and freeze it full -> supers/eff/; (2) list the untouched `dis/d01-d03` pictures and find the screen that uploads them; (3) D remainder (stg/s00 s03 se03 sgmk*) by more stage-list positions; (4) E SPU2 audio.
 - Still open: `ps2x_tests` after the merge, boot/`idle_demo` run, PCSX2 control for the prim-5 fan scene, PADMAN/SIO2 completion root cause (`VBLANK OVERLAP`, harmless), MT-raster vs single-thread DIFF (orig3 Demo).
 - Not committed on purpose: `imgui.ini`, `sdbz_func_map_merged.csv.*.bak`. The sweep generator is `build_scripts/gen_versus_sweep.py`: `python build_scripts/gen_versus_sweep.py 16 <start> <name>` writes `sweeps/<name>.txt` (needs `sweeps/versus2.txt` for the boot prefix).
+## 10-08 — Folder reorg (house cleaning, no build)
+- New rule: every new file goes in a matching folder, never the root. Map + move log: `docs/REORG_2026-10-08.md` (101 moves).
+- Root keeps only build/source, recompiler input (`config.toml`, `ELF/`, ISO folder), runtime sinks (`mc0/`, `mc1/`, `imgui.ini`, `run_log.txt`, `run_probe.jsonl`), and fixed-path tooling (`launch_recomp.ps1`, `build_scripts/`, `gsdump/`, `PCSX2/`, `x64dbg/`).
+- Moved: logs → `Logs/{build,tests,sweeps,runs,run_logs}`; analysis → `analysis/`; notes → `docs/`; tool installs → `tools/`; downloads → `installers/`; captures → `dumps/`; scratch recompiles → `recomp_scratch/` (toml paths fixed).
+- Tracked moves (git mv, uncommitted): `HANDOFF_NOTE.md` → `docs/handoffs/`, `sofdec_oracle*.csv` → `analysis/sofdec/`, `arkd_grep.ps1` + `run_watchdog.ps1` → `build_scripts/`.
+- Next: offline PCSX2 testing plan (`C:\Users\mwlab\.claude\plans\sorted-foraging-kettle.md`), Stage 0.
