@@ -20,8 +20,8 @@
   1
  ],
  "tex_t4_bilinear_stq": [
-  "DIFF",
-  517
+  "NEAR",
+  0
  ],
  "tex_t4_bilinear_uv": [
   "NEAR",
@@ -37,7 +37,7 @@
  ],
  "tex_t8_bilinear_stq": [
   "DIFF",
-  541
+  2
  ],
  "tex_t8_bilinear_uv": [
   "DIFF",
@@ -53,7 +53,7 @@
  ],
  "tex_ct32_bilinear_stq": [
   "DIFF",
-  425
+  4
  ],
  "tex_ct32_bilinear_uv": [
   "NEAR",
@@ -61,11 +61,11 @@
  ],
  "tex_t8_bilinear_stq_clamp": [
   "DIFF",
-  331
+  2
  ],
  "tex_t8_bilinear_stq_repeat_wrap": [
   "DIFF",
-  505
+  12
  ],
  "blend_cs_cd_as_cd": [
   "MATCH",
@@ -109,7 +109,7 @@
  ],
  "tfx_highlight": [
   "DIFF",
-  221
+  2
  ],
  "tfx_modulate_tcc0": [
   "DIFF",
@@ -118,5 +118,49 @@
  "control_skip_draw": [
   "DIFF",
   1751
+ ],
+ "sprite_t4_nearest_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t4_bilinear_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_nearest_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_bilinear_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_ct32_nearest_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_ct32_bilinear_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_nearest_uv_1to1": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_bilinear_uv_halftexel": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_bilinear_stq": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_0_as_cd_colclamp0": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_cd_as_cd_colclamp0": [
+  "MATCH",
+  0
  ]
 }

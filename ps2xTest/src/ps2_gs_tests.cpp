@@ -8,6 +8,7 @@
 #include "Stubs/GS.h"
 
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +17,17 @@
 #include <array>
 
 using namespace ps2_syscalls;
+
+// MT raster drain (ps2_gs_raster_mt.inl). A test that draws and then reads VRAM
+// directly must call it first: the raster workers draw asynchronously.
+void ps2xGsRasterFlush();
+
+// Declared after `GS gs` (so destroyed before it and before the test's vram): the
+// raster workers may still hold queued jobs that write that vram.
+struct RasterDrainOnExit
+{
+    ~RasterDrainOnExit() { ps2xGsRasterFlush(); }
+};
 
 namespace
 {
@@ -107,6 +119,7 @@ namespace
 
     void writePSMT4Texel(std::vector<uint8_t> &vram, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint8_t index)
     {
+        ps2xGsRasterFlush(); // direct VRAM access: drain queued raster jobs first
         const uint32_t nibbleAddr = GSMem::LookupPixelAddressP4(tbp, tbw, x, y);
         const uint32_t byteOff = nibbleAddr >> 1;
         uint8_t &packed = vram[byteOff];
@@ -162,6 +175,7 @@ namespace
 
     void writeReferencePSMT4Texel(std::vector<uint8_t> &vram, uint32_t tbp, uint32_t tbw, uint32_t x, uint32_t y, uint8_t index)
     {
+        ps2xGsRasterFlush(); // direct VRAM access: drain queued raster jobs first
         const uint32_t nibbleAddr = referenceAddrPSMT4(tbp, tbw, x, y);
         const uint32_t byteOff = nibbleAddr >> 1;
         uint8_t &packed = vram[byteOff];
@@ -247,7 +261,9 @@ namespace
                                     uint32_t y,
                                     uint32_t pixel)
     {
+        ps2xGsRasterFlush(); // direct VRAM access: drain queued raster jobs first
         const uint32_t off = referenceAddrPSMCT32(fbp, (fbw != 0u) ? fbw : 1u, x, y);
+        ps2xGsRasterFlush();
         std::memcpy(vram.data() + off, &pixel, sizeof(pixel));
     }
 
@@ -257,8 +273,10 @@ namespace
                                        uint32_t x,
                                        uint32_t y)
     {
+        ps2xGsRasterFlush(); // direct VRAM access: drain queued raster jobs first
         const uint32_t off = referenceAddrPSMCT32(fbp, (fbw != 0u) ? fbw : 1u, x, y);
         uint32_t pixel = 0u;
+        ps2xGsRasterFlush();
         std::memcpy(&pixel, vram.data() + off, sizeof(pixel));
         return pixel;
     }
@@ -739,6 +757,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kCtx0Color = 0x11223344u;
             constexpr uint32_t kCtx1Sentinel = 0xAABBCCDDu;
@@ -768,6 +787,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             gs.writeRegister(GS_REG_FRAME_1, (1ull << 16)); // FBW=1, PSMCT32, FBP=0
             gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
@@ -777,6 +797,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT) | (1ull << 6));
 
             const uint32_t dstWhite = 0xFFFFFFFFu;
+            ps2xGsRasterFlush();
             std::memcpy(vram.data(), &dstWhite, sizeof(dstWhite));
 
             gs.writeRegister(GS_REG_PABE, 0ull);
@@ -784,10 +805,13 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t blendedPixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&blendedPixel, vram.data(), sizeof(blendedPixel));
+            if (blendedPixel != 0x013F3F3Fu) std::printf("  [pabe] blendedPixel=0x%08X\n", blendedPixel);
             t.Equals(blendedPixel, 0x013F3F3Fu,
                      "without PABE, low-alpha fullscreen copies should still apply ALPHA blending");
 
+            ps2xGsRasterFlush();
             std::memcpy(vram.data(), &dstWhite, sizeof(dstWhite));
 
             gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT) | (1ull << 6));
@@ -796,10 +820,12 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t pabeBypassedPixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pabeBypassedPixel, vram.data(), sizeof(pabeBypassedPixel));
             t.Equals(pabeBypassedPixel, 0x01000000u,
                      "with PABE enabled, low-alpha source pixels should bypass ALPHA blending and overwrite the destination");
 
+            ps2xGsRasterFlush();
             std::memcpy(vram.data(), &dstWhite, sizeof(dstWhite));
 
             gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT) | (1ull << 6));
@@ -808,7 +834,9 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t highAlphaPixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&highAlphaPixel, vram.data(), sizeof(highAlphaPixel));
+            if (highAlphaPixel != 0x803F3F3Fu) std::printf("  [pabe] highAlphaPixel=0x%08X\n", highAlphaPixel);
             t.Equals(highAlphaPixel, 0x803F3F3Fu,
                      "with PABE enabled, high-alpha source pixels should still use the configured ALPHA blend");
         });
@@ -818,6 +846,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             gs.writeRegister(GS_REG_FRAME_1, (1ull << 16));
             gs.writeRegister(GS_REG_ZBUF_1, (1ull) << 32);
@@ -830,10 +859,12 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t pixelWithoutFba = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixelWithoutFba, vram.data(), sizeof(pixelWithoutFba));
             t.Equals(pixelWithoutFba, 0x01112233u,
                      "without FBA, CT32 writes should preserve the source alpha byte");
 
+            ps2xGsRasterFlush();
             std::memset(vram.data(), 0, sizeof(uint32_t));
 
             gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_POINT));
@@ -842,6 +873,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, 0ull);
 
             uint32_t pixelWithFba = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixelWithFba, vram.data(), sizeof(pixelWithFba));
             t.Equals(pixelWithFba, 0x81112233u,
                      "with FBA enabled, CT32 writes should force the framebuffer alpha high bit");
@@ -852,6 +884,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint64_t kFrame1 =
                 (0ull << 0) |
@@ -908,10 +941,12 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_2, kTex0_2);
             gs.writeRegister(GS_REG_PRIM, kCopyPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            // 1x1 px sprite: v1 at (1,1) px, UV +1 texel. A zero-size sprite draws nothing
+            // (PCSX2 DrawSprite rempty); the old raster drew 1 px and this test relied on it.
             gs.writeRegister(GS_REG_UV, kUvRow1);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, kUvRow1);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (32ull << 16)));
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
@@ -923,6 +958,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint64_t kFrame =
@@ -1000,6 +1036,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint64_t kFrame2 =
                 150ull |
@@ -1092,11 +1129,13 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kDisplayPixel = 0x00332211u;
             constexpr uint32_t kSourcePixel = 0x00665544u;
             constexpr uint32_t kUpdatedSourcePixel = 0x00998877u;
             writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 0u, kDisplayPixel);
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + 0u, &kSourcePixel, sizeof(kSourcePixel));
 
             constexpr uint64_t kFrame2 =
@@ -1190,6 +1229,7 @@ void register_ps2_gs_tests()
             t.Equals(static_cast<uint32_t>(latchedFrame[3]), 0xFFu,
                      "latched host presentation should normalize framebuffer alpha for host upload");
 
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + 0u, &kUpdatedSourcePixel, sizeof(kUpdatedSourcePixel));
 
             std::vector<uint8_t> staleFrame;
@@ -1226,6 +1266,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTopLeft = 0xFF332211u;
             constexpr uint32_t kTopRight = 0xFF665544u;
@@ -1280,11 +1321,13 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kSourceTbp0 = 64u;
             constexpr uint32_t kSourcePixelRow1 = 0x00665544u;
             constexpr uint32_t kDisplayPixelRow1 = 0x00CCBBAAu;
             const uint32_t swizzledSourceOff = GSMem::LookupPixelAddressCT32(kSourceTbp0, 10u, 0u, 1u) * 4;
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + swizzledSourceOff, &kSourcePixelRow1, sizeof(kSourcePixelRow1));
             writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 1u, kDisplayPixelRow1);
 
@@ -1393,6 +1436,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kRow1Pixel =
                 0x44u |
@@ -1407,6 +1451,7 @@ void register_ps2_gs_tests()
             constexpr size_t kHostRow1Off = 640u * 4u;
 
             writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 1u, kRow1Pixel);
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + (150u * 8192u) + kHostRow1Off, &kLinearGarbageRow1, sizeof(kLinearGarbageRow1));
 
             gs.latchHostPresentationFrame();
@@ -1457,6 +1502,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kCircuit1Pixel =
                 200u |
@@ -1470,6 +1516,7 @@ void register_ps2_gs_tests()
                 (255u << 24);
 
             writeReferenceFramePSMCT32Pixel(vram, 150u, 10u, 0u, 0u, kCircuit1Pixel);
+            ps2xGsRasterFlush();
             std::memcpy(vram.data(), &kCircuit2Pixel, sizeof(kCircuit2Pixel));
 
             gs.latchHostPresentationFrame();
@@ -1519,6 +1566,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kPixel =
                 0x22u |
@@ -1559,6 +1607,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kLastRowPixel =
                 0x12u |
@@ -1606,6 +1655,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kLine0 = 0x000000FFu;
             constexpr uint32_t kLine1 = 0x0000FF00u;
@@ -1655,6 +1705,7 @@ void register_ps2_gs_tests()
             GSRegisters regs{};
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             std::vector<uint8_t> packet;
             appendU64(packet, makeGifTag(2u, GIF_FMT_PACKED, 1u, true));
@@ -1679,6 +1730,7 @@ void register_ps2_gs_tests()
             GSRegisters regs{};
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+            RasterDrainOnExit rasterDrain;
 
             std::vector<uint8_t> packet;
             appendU64(packet, makeGifTag(2u, GIF_FMT_PACKED, 1u, true));
@@ -1818,9 +1870,11 @@ void register_ps2_gs_tests()
                 std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
                 GS gs;
                 gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                RasterDrainOnExit rasterDrain;
 
                 writeReferencePSMT4Texel(vram, kTexTbp, 8u, sample.x, sample.y, sample.index);
                 const uint32_t clutOff = referenceAddrPSMCT32(kClutCbp, 1u, sample.index, 0u);
+                ps2xGsRasterFlush();
                 std::memcpy(vram.data() + clutOff, &sample.color, sizeof(sample.color));
 
                 gs.writeRegister(GS_REG_FRAME_1, kFrame);
@@ -1885,6 +1939,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |
@@ -1937,6 +1992,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |
@@ -1993,6 +2049,7 @@ void register_ps2_gs_tests()
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t signalValue = (0xFFFFFFFFull << 32) | 0x11223344ull;
             gs.writeRegister(GS_REG_SIGNAL, signalValue);
@@ -2015,6 +2072,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             // Setup for host->local transfer to DBP=0, DBW=1, PSMCT32, rect 2x2.
             const uint64_t bitblt =
@@ -2070,6 +2128,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |
@@ -2131,6 +2190,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             for (uint32_t x = 0; x < 4u; ++x)
             {
@@ -2183,6 +2243,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |      // SBP
@@ -2226,6 +2287,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |      // SBP
@@ -2266,6 +2328,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             // 4x2 PSMCT32 = 8 texels = 32 bytes = 2 qwords.
             const uint64_t bitblt =
@@ -2345,6 +2408,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |
@@ -2407,6 +2471,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |
@@ -2472,6 +2537,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             const uint64_t bitblt =
                 (static_cast<uint64_t>(0u) << 0) |
@@ -2520,6 +2586,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexWidth = 128u;
             constexpr uint32_t kTexHeight = 64u;
@@ -2628,6 +2695,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kSrcBp = 64u;
             constexpr uint32_t kDstBp = 96u;
@@ -2703,6 +2771,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint32_t kClutCbp = 128u;
@@ -2737,7 +2806,9 @@ void register_ps2_gs_tests()
             // resolves to row 1, column 0 after the CSM1 swizzle.
             const uint32_t wrongClutOff = GSMem::LookupPixelAddressCT32(kClutCbp, 1u, 8u, 0u) * 4;
             const uint32_t expectedClutOff = GSMem::LookupPixelAddressCT32(kClutCbp, 1u, 0u, 1u) * 4;
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + wrongClutOff, &kWrongColor, sizeof(kWrongColor));
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + expectedClutOff, &kExpectedColor, sizeof(kExpectedColor));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -2749,12 +2820,16 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            // 1x1 px sprite: v1 at (1,1) px, UV +1 texel. A zero-size sprite draws nothing
+            // (PCSX2 DrawSprite rempty); the old raster drew 1 px and this test relied on it.
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16)));
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
+            ps2xGsRasterFlush();
 
             uint32_t pixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "T4 CSM1 lookup should follow Veronica's swizzled CLUT row layout for logical index 8");
@@ -2765,6 +2840,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint32_t kClutCbp = 128u;
@@ -2832,12 +2908,16 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_1, kTex0);
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            // 1x1 px sprite: v1 at (1,1) px, UV +1 texel. A zero-size sprite draws nothing
+            // (PCSX2 DrawSprite rempty); the old raster drew 1 px and this test relied on it.
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16)));
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
+            ps2xGsRasterFlush();
 
             uint32_t pixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "T8 CSM1 CLUT sampling should read CT32-uploaded palette entries through GS swizzled addressing");
@@ -2848,6 +2928,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint32_t kWrongClutCbp = 128u;
@@ -2887,7 +2968,9 @@ void register_ps2_gs_tests()
 
             const uint32_t wrongClutOff = GSMem::LookupPixelAddressCT32(kWrongClutCbp, 1u, 8u, 0u) * 4;
             const uint32_t expectedClutOff = GSMem::LookupPixelAddressCT32(kExpectedClutCbp, 1u, 8u, 0u) * 4;
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + wrongClutOff, &kWrongColor, sizeof(kWrongColor));
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + expectedClutOff, &kExpectedColor, sizeof(kExpectedColor));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -2906,6 +2989,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16));
 
             uint32_t pixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, kExpectedColor,
                      "TEX2 should override the active CLUT base and format state without requiring a new TEX0 write");
@@ -2916,6 +3000,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint64_t kFrameReg =
@@ -2993,6 +3078,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint64_t kFrameReg =
@@ -3029,6 +3115,7 @@ void register_ps2_gs_tests()
                 (0x44u << 24);
 
             const uint32_t texOff = GSMem::LookupPixelAddressCT32(kTexTbp, 1u, 0u, 0u) * 4;
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + texOff, &kTexturePixel, sizeof(kTexturePixel));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3055,6 +3142,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint64_t kFrameReg =
@@ -3091,6 +3179,7 @@ void register_ps2_gs_tests()
                 (0x30u << 24);
 
             const uint32_t texOff = GSMem::LookupPixelAddressCT32(kTexTbp, 1u, 0u, 0u) * 4;
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + texOff, &kTexturePixel, sizeof(kTexturePixel));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3117,6 +3206,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint64_t kFrameReg =
@@ -3153,6 +3243,7 @@ void register_ps2_gs_tests()
                 (0x10u << 24);
 
             const uint32_t texOff = GSMem::LookupPixelAddressCT32(kTexTbp, 1u, 0u, 0u) * 4;
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + texOff, &kTexturePixel, sizeof(kTexturePixel));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrameReg);
@@ -3176,11 +3267,12 @@ void register_ps2_gs_tests()
 
         tc.Run("GS TEX1 linear filter blends T4 STQ triangle samples", [](TestCase &t)
         {
-            auto renderSamplePixel = [](uint64_t tex1Reg) -> uint32_t
+            auto renderSamplePixel = [](uint64_t tex1Reg, uint32_t px) -> uint32_t
             {
                 std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
                 GS gs;
                 gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                RasterDrainOnExit rasterDrain;
 
                 constexpr uint32_t kTexTbp = 64u;
                 constexpr uint32_t kClutCbp = 128u;
@@ -3215,7 +3307,9 @@ void register_ps2_gs_tests()
 
                 writePSMT4Texel(vram, kTexTbp, 1u, 0u, 0u, 0u);
                 writePSMT4Texel(vram, kTexTbp, 1u, 1u, 0u, 1u);
+                ps2xGsRasterFlush();
                 std::memcpy(vram.data() + kClutCbp * 256u + 0u * 4u, &kBlack, sizeof(kBlack));
+                ps2xGsRasterFlush();
                 std::memcpy(vram.data() + kClutCbp * 256u + 1u * 4u, &kWhite, sizeof(kWhite));
 
                 auto packFloat = [](float value) -> uint32_t
@@ -3248,22 +3342,25 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
 
-                return readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                return readReferencePSMCT32Pixel(vram, 0u, 1u, px, 1u);
             };
 
             constexpr uint64_t kTex1Linear =
                 (1ull << 5) |
                 (1ull << 6);
 
-            const uint32_t nearestPixel = renderSamplePixel(0ull);
-            const uint32_t linearPixel = renderSamplePixel(kTex1Linear);
+            // s = x/4 over a 2-texel T4 row. Pixel 1: u = 0.5 = texel 0's centre, so
+            // bilinear weight 0 (PCSX2: u - 0.5, 4-bit weight) -- no blend there.
+            // Pixel 2: u = 1.0, weight 8/16 between texel 0 and 1 -> ~0x7F.
+            const uint32_t nearestPixel = renderSamplePixel(0ull, 1u);
+            const uint32_t linearPixel = renderSamplePixel(kTex1Linear, 2u);
 
             t.Equals(nearestPixel, 0x80000000u,
                      "point sampling should keep the sampled STQ triangle pixel on texel 0");
 
             const uint8_t linearR = static_cast<uint8_t>(linearPixel & 0xFFu);
             const uint8_t linearA = static_cast<uint8_t>((linearPixel >> 24) & 0xFFu);
-            t.IsTrue(linearR > 0x10u && linearR < 0x70u,
+            t.IsTrue(linearR > 0x60u && linearR < 0xA0u,
                      "linear filtering should blend the STQ triangle sample between black and white T4 texels");
             t.Equals(linearA, static_cast<uint8_t>(0x80u),
                      "linear filtering should preserve the shared opaque alpha from the CLUT entries");
@@ -3274,6 +3371,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint64_t kFrame =
                 (0ull << 0) |
@@ -3307,8 +3405,10 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
+            ps2xGsRasterFlush();
 
             uint32_t pixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, 0x00563412u,
                      "AFAIL=FB_ONLY should still update the framebuffer when the alpha test fails");
@@ -3319,6 +3419,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint64_t kFrame =
                 (0ull << 0) |
@@ -3346,6 +3447,7 @@ void register_ps2_gs_tests()
                 (0x3F800000ull << 32); // q = 1.0f
             constexpr uint32_t kExisting = 0xAB030201u;
 
+            ps2xGsRasterFlush();
             std::memcpy(vram.data(), &kExisting, sizeof(kExisting));
 
             gs.writeRegister(GS_REG_FRAME_1, kFrame);
@@ -3355,8 +3457,10 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
+            ps2xGsRasterFlush();
 
             uint32_t pixel = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, 0xAB563412u,
                      "AFAIL=RGB_ONLY should update RGB while preserving destination alpha");
@@ -3367,6 +3471,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint64_t kFrame =
                 (0ull << 0) |
@@ -3403,6 +3508,7 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(420u, 102u));
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(420u, 420u));
             gs.writeRegister(GS_REG_XYZF2, makeXyzf(102u, 420u));
+            ps2xGsRasterFlush();
 
             bool sawFilledRow = false;
             for (uint32_t y = 6u; y <= 26u; ++y)
@@ -3411,9 +3517,7 @@ void register_ps2_gs_tests()
                 int last = -1;
                 for (uint32_t x = 6u; x <= 26u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, static_cast<uint32_t>(y));
                     if ((pixel & 0x00FFFFFFu) != 0u)
                     {
                         if (first < 0)
@@ -3432,9 +3536,7 @@ void register_ps2_gs_tests()
                 sawFilledRow = true;
                 for (int x = first; x <= last; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, 0u, 1u, x, static_cast<uint32_t>(y));
                     if ((pixel & 0x00FFFFFFu) == 0u)
                     {
                         t.Fail("triangle fan quad should not leave interior holes within a covered row");
@@ -3769,6 +3871,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kDbp = 64u;
             constexpr uint32_t kDbw = 1u;
@@ -3843,6 +3946,7 @@ void register_ps2_gs_tests()
                 {
                     const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp, kDbw, x, y);
                     uint32_t word = 0u;
+                    ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
 
                     const uint8_t expectedA = indexA(x, y);
@@ -3908,6 +4012,7 @@ void register_ps2_gs_tests()
                 {
                     const uint32_t off = GSMem::LookupPixelAddressCT32(kDbpT8H, kDbwT8H, x, y);
                     uint32_t word = 0u;
+                    ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
 
                     const uint8_t expected = byteT8H(x, y);
@@ -4001,6 +4106,7 @@ void register_ps2_gs_tests()
                 {
                     const uint32_t off = GSMem::LookupPixelAddressCT32(kDbpMix, kDbwMix, x, y);
                     uint32_t word = 0u;
+                    ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
 
                     const uint8_t gotLow = static_cast<uint8_t>((word >> 24) & 0xFu);
@@ -4021,6 +4127,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kTexTbp = 64u;
             constexpr uint32_t kClutCbpA = 128u;
@@ -4032,6 +4139,7 @@ void register_ps2_gs_tests()
             const uint32_t sharedWordOff = GSMem::LookupPixelAddressCT32(kTexTbp, 1u, 0u, 0u);
             const uint32_t sharedWord =
                 (static_cast<uint32_t>(kIndexB) << 28) | (static_cast<uint32_t>(kIndexA) << 24);
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + sharedWordOff, &sharedWord, sizeof(sharedWord));
 
             constexpr uint32_t kExpectedColorA = 0x800000FFu; // RGBA = (255,0,0,128)
@@ -4041,7 +4149,9 @@ void register_ps2_gs_tests()
             // Place each plane's expected color at its own CLUT's entry for the sampled index.
             const uint32_t clutAOff = GSMem::LookupPixelAddressCT32(kClutCbpA, 1u, kIndexA, 0u);
             const uint32_t clutBOff = GSMem::LookupPixelAddressCT32(kClutCbpB, 1u, kIndexB, 0u);
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + clutAOff, &kExpectedColorA, sizeof(kExpectedColorA));
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + clutBOff, &kExpectedColorB, sizeof(kExpectedColorB));
 
             // Seed distractor entries at the *other* plane's index in each CLUT so that a
@@ -4049,7 +4159,9 @@ void register_ps2_gs_tests()
             // resolve to a non-matching color instead of accidentally matching by coincidence.
             const uint32_t clutADistractorOff = GSMem::LookupPixelAddressCT32(kClutCbpA, 1u, kIndexB, 0u);
             const uint32_t clutBDistractorOff = GSMem::LookupPixelAddressCT32(kClutCbpB, 1u, kIndexA, 0u);
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + clutADistractorOff, &kDistractorColor, sizeof(kDistractorColor));
+            ps2xGsRasterFlush();
             std::memcpy(vram.data() + clutBDistractorOff, &kDistractorColor, sizeof(kDistractorColor));
 
             constexpr uint64_t kFrameReg =
@@ -4082,12 +4194,15 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_1, kTex0HL);
             gs.writeRegister(GS_REG_PRIM, kPrim);
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            // 1x1 px sprite: v1 at (1,1) px, UV +1 texel. A zero-size sprite draws nothing
+            // (PCSX2 DrawSprite rempty); the old raster drew 1 px and this test relied on it.
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16)));
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixelHL = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
             t.Equals(pixelHL, kExpectedColorA,
                      "T4HL sampling should resolve through its own CLUT plane, unaffected by the co-resident T4HH nibble");
@@ -4104,12 +4219,15 @@ void register_ps2_gs_tests()
                 (static_cast<uint64_t>(GS_PSM_CT32) << 51);
 
             gs.writeRegister(GS_REG_TEX0_1, kTex0HH);
+            // 1x1 px sprite: v1 at (1,1) px, UV +1 texel. A zero-size sprite draws nothing
+            // (PCSX2 DrawSprite rempty); the old raster drew 1 px and this test relied on it.
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull | (16ull << 16)));
+            gs.writeRegister(GS_REG_XYZ2, (16ull | (16ull << 16)));
 
             uint32_t pixelHH = 0u;
+            ps2xGsRasterFlush();
             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));
             t.Equals(pixelHH, kExpectedColorB,
                      "T4HH sampling should resolve through its own CLUT plane, unaffected by the co-resident T4HL nibble");
@@ -4120,6 +4238,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            RasterDrainOnExit rasterDrain;
 
             constexpr uint32_t kDbw = 1u;
             constexpr uint32_t kRrw = 8u;
@@ -4182,6 +4301,7 @@ void register_ps2_gs_tests()
                 {
                     const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp1, kDbw, x, y);
                     uint32_t word = 0u;
+                    ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
                     if (((word >> 24) & 0xFu) != indexPattern1(x, y))
                         pattern1Ok = false;
@@ -4226,6 +4346,7 @@ void register_ps2_gs_tests()
                 {
                     const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp2, kDbw, x, y);
                     uint32_t word = 0u;
+                    ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
                     if (((word >> 24) & 0xFu) != indexPattern2(x, y))
                         pattern2Ok = false;

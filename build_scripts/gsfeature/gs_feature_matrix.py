@@ -22,6 +22,7 @@ Gate (verify_fix.ps1): --gate exits 1 when a case is worse than baseline.json
 """
 import argparse
 import json
+import os
 import random
 import struct
 import sys
@@ -222,7 +223,45 @@ for _psm, _fn in (("t4", tex_t4), ("t8", tex_t8), ("ct32", tex_ct32)):
                 f"{_psm.upper()} CLUT/texture, {_fname}, {'STQ' if _st else 'UV'}, REPEAT", _mk())
 
 
-@case("tex_t8_bilinear_stq_clamp", "T8 bilinear STQ, CLAMP, uv overshoot 1.3x (edge texels)")
+def sprite(rng, tex_fn, filt, x0, y0, x1, y1, u0, v0, u1, v1, use_st=False, tw=4):
+    """Textured SPRITE (census: SDBZ draws 2D/UI with sprites). UV in texels."""
+    ups = tex_fn(rng, 1 << tw, 1 << tw, None)
+    p = {tex_t4: T4, tex_t8: T8, tex_ct32: CT32}[tex_fn]
+    regs = [(TEX0_1, tex0(p, tw, tw)), (TEX1_1, (filt << 5) | (filt << 6)), (TEXFLUSH, 0), (CLAMP_1, 0)]
+    vs = []
+    for (x, y), (u, v) in (((x0, y0), (u0, v0)), ((x1, y1), (u1, v1))):
+        d = {"xy": (x, y), "rgba": (128, 128, 128, 128)}
+        if use_st:
+            d["st"] = (u / (1 << tw), v / (1 << tw), 1.0)
+        else:
+            d["uv"] = (u, v)
+        vs.append(d)
+    return ups + [draw(P_SPRITE | (1 << 4) | ((0 if use_st else 1) << 8), vs, regs)]
+
+
+for _psm, _fn in (("t4", tex_t4), ("t8", tex_t8), ("ct32", tex_ct32)):
+    for _filt, _fname in ((0, "nearest"), (1, "bilinear")):
+        CASES[f"sprite_{_psm}_{_fname}_uv_scaled"] = (
+            f"SPRITE {_psm.upper()} {_fname} UV, 16x16 texels -> ~55x57 px at subpixel corners",
+            (lambda fn, f: lambda rng: sprite(rng, fn, f, 4.5, 3.25, 59.75, 60.5, 0, 0, 16, 16))(_fn, _filt))
+
+
+@case("sprite_t8_nearest_uv_1to1", "SPRITE T8 nearest UV 1:1 (UI glyph blit), 16x16 at (8,8)")
+def _(rng):
+    return sprite(rng, tex_t8, 0, 8, 8, 24, 24, 0, 0, 16, 16)
+
+
+@case("sprite_t8_bilinear_uv_halftexel", "SPRITE T8 bilinear UV 1:1 with +0.5 texel offset (common 2D idiom)")
+def _(rng):
+    return sprite(rng, tex_t8, 1, 8, 8, 40, 40, 0.5, 0.5, 32.5, 32.5)
+
+
+@case("sprite_t8_bilinear_stq", "SPRITE T8 bilinear STQ (q=1), 16x16 -> ~55x57 px")
+def _(rng):
+    return sprite(rng, tex_t8, 1, 4.5, 3.25, 59.75, 60.5, 0, 0, 16, 16, use_st=True)
+
+
+@case("tex_t8_bilinear_stq_clamp","T8 bilinear STQ, CLAMP, uv overshoot 1.3x (edge texels)")
 def _(rng):
     return textured(rng, tex_t8, "strip", 1, True, extra_regs=[(CLAMP_1, 1 | (1 << 2))], uvscale=1.3)
 
@@ -232,12 +271,12 @@ def _(rng):
     return textured(rng, tex_t8, "strip", 1, True, extra_regs=[(CLAMP_1, 0)], uvscale=2.5)
 
 
-def blend_case(alpha_reg, test=0x30000, abe=True):
+def blend_case(alpha_reg, test=0x30000, abe=True, colclamp=1):
     def fn(rng):
         bg = draw(P_SPRITE, [{"xy": (0, 0), "rgba": (40, 90, 200, 0x40)}, {"xy": (64, 64), "rgba": (40, 90, 200, 0x40)}])
         vs = [{"xy": (4.5, 3.25), "rgba": rnd_rgba(rng)}, {"xy": (60.25, 10.5), "rgba": rnd_rgba(rng)},
               {"xy": (8.75, 60.5), "rgba": rnd_rgba(rng)}, {"xy": (59.5, 58.75), "rgba": rnd_rgba(rng)}]
-        return [bg, draw(P_STRIP | (1 << 3) | ((1 if abe else 0) << 6), vs, [(ALPHA_1, alpha_reg), (TEST_1, test)])]
+        return [bg, draw(P_STRIP | (1 << 3) | ((1 if abe else 0) << 6), vs, [(ALPHA_1, alpha_reg), (TEST_1, test), (COLCLAMP, colclamp)])]
     return fn
 
 
@@ -246,6 +285,10 @@ CASES["blend_cs_cd_as_cd"] = ("ALPHA (Cs-Cd)*As+Cd (SDBZ main)", blend_case(0 | 
 CASES["blend_cs_cs_as_cs"] = ("ALPHA (Cs-Cs)*As+Cs", blend_case(0 | (0 << 2) | (0 << 4) | (0 << 6)))
 CASES["blend_cs_0_as_cd"] = ("ALPHA (Cs-0)*As+Cd additive", blend_case(0 | (2 << 2) | (0 << 4) | (1 << 6)))
 CASES["blend_fix"] = ("ALPHA (Cs-Cd)*FIX+Cd, FIX=0x60", blend_case(0 | (1 << 2) | (2 << 4) | (1 << 6) | (0x60 << 32)))
+# COLCLAMP=0 wraps (& 0xFF); our raster used to DROP the blend result there (ps2x_tests PABE caught it)
+CASES["blend_cs_0_as_cd_colclamp0"] = ("ALPHA (Cs-0)*As+Cd additive, COLCLAMP=0 (overflow wraps)",
+                                      blend_case(0 | (2 << 2) | (0 << 4) | (1 << 6), colclamp=0))
+CASES["blend_cs_cd_as_cd_colclamp0"] = ("ALPHA (Cs-Cd)*As+Cd, COLCLAMP=0", blend_case(0 | (1 << 2) | (0 << 4) | (1 << 6), colclamp=0))
 # SDBZ alpha tests (census): GREATER 64 KEEP, NOTEQUAL 0 KEEP
 CASES["atest_greater64_keep"] = ("ATE GREATER ref 64 AFAIL KEEP", blend_case(0 | (1 << 2) | (1 << 6), 1 | (6 << 1) | (64 << 4) | 0x30000))
 CASES["atest_notequal0_keep"] = ("ATE NOTEQUAL ref 0 AFAIL KEEP", blend_case(0 | (1 << 2) | (1 << 6), 1 | (7 << 1) | (0 << 4) | 0x30000))
@@ -254,7 +297,18 @@ CASES["atest_afail_fb_only"] = ("ATE GEQUAL 0x80 AFAIL FB_ONLY", blend_case(0, 1
 CASES["atest_afail_rgb_only"] = ("ATE GEQUAL 0x80 AFAIL RGB_ONLY", blend_case(0, 1 | (5 << 1) | (0x80 << 4) | (3 << 12) | 0x30000, abe=False))
 
 
-@case("ztest_gequal", "two overlapping strips, ZTST GEQUAL, near one drawn first")
+@case("tex1_t4_2texel_tri_bilinear", "ps2x_tests 'TEX1 linear T4 STQ' draw: 2x1 T4 black|white, tri s 0..1 over 4 px")
+def _(rng):
+    # texel 0 -> CLUT 0 black, texel 1 -> CLUT 1 white (low nibble = texel 0)
+    clut = bytes((0, 0, 0, 0x80, 255, 255, 255, 0x80)) + bytes(14 * 4)
+    ups = upload(TBP, 1, T4, 2, 1, bytes((0x10,))) + upload(CBP, 1, CT32, 8, 2, clut)
+    regs = [(TEX0_1, tex0(T4, 1, 0)), (TEX1_1, (1 << 5) | (1 << 6)), (TEXFLUSH, 0), (CLAMP_1, 0)]
+    vs = [{"xy": (0, 0), "st": (0.0, 0.0, 1.0)}, {"xy": (4, 0), "st": (1.0, 0.0, 1.0)},
+          {"xy": (0, 4), "st": (0.0, 0.0, 1.0)}]
+    return ups + [draw(P_TRI | (1 << 4), vs, regs)]
+
+
+@case("ztest_gequal","two overlapping strips, ZTST GEQUAL, near one drawn first")
 def _(rng):
     a = [{"xy": (4, 4), "rgba": (255, 0, 0, 128), "z": 0x8000}, {"xy": (50, 6), "rgba": (255, 0, 0, 128), "z": 0x8000},
          {"xy": (6, 50), "rgba": (255, 0, 0, 128), "z": 0x8000}]
@@ -373,7 +427,12 @@ def main():
 
     # Gate: a case may not get worse than the saved baseline (known DIFFs stay allowed).
     if a.save_baseline:
-        BASELINE.write_text(json.dumps({r[0]: [r[1], r[4]] for r in rows}, indent=1), encoding="utf-8")
+        # merge, so --only X --save-baseline keeps every other case's entry
+        merged = json.loads(BASELINE.read_text(encoding="utf-8")) if BASELINE.exists() else {}
+        merged.update({r[0]: [r[1], r[4]] for r in rows})
+        tmp = BASELINE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(merged, indent=1), encoding="utf-8")
+        os.replace(tmp, BASELINE)
         print(f"baseline saved: {BASELINE}")
     if a.gate:
         if not BASELINE.exists():

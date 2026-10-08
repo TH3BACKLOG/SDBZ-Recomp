@@ -1507,15 +1507,67 @@ namespace
         return mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
     }
 
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+    // drawSprite sets this around sampleTexture: the coordinate it passes is
+    // s/t (texel / size, q = 1) even when PRIM.FST=1 (sampleTexture's
+    // signature is in a header, so no extra parameter).
+    thread_local bool t_sampleAsStq = false;
+
+    // Texel coordinate -> 16.16 fixed, as PCSX2 GSDrawScanline does it
+    // (VectorI(s / q): cvttps truncates; out of range / NaN -> INT32_MIN).
+    int texFixed16(float texF)
     {
-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        // Inline round-half-away-from-zero instead of a CRT lround call per
-        // channel. Exact vs lround for v >= 0 (the double add can't round);
-        // v < 0 clamps to 0 either way.
-        const float v = top + (bottom - top) * fy;
-        return clampU8(static_cast<int>(static_cast<double>(v) + 0.5));
+        const float f = texF * 65536.0f;
+        return (f > -2147483648.0f && f < 2147483648.0f) ? static_cast<int>(f) : INT32_MIN;
+    }
+
+    // PCSX2 GSDrawScanline LTF (gsfeature matrix tex_*_bilinear_stq DIFF'd up to
+    // 20 levels with float weights): coordinate 16.16 minus 0x8000, weight = top
+    // 4 bits of the fraction, lerp16_4 = a + ((b - a) * f >> 4) (arithmetic
+    // shift), horizontal (c00->c10) then vertical. c10 = (u1,v0), c01 = (u0,v1).
+    struct BilinearTap
+    {
+        int u0, v0, fu, fv;
+    };
+
+    BilinearTap bilinearTap(float texUf, float texVf)
+    {
+        const int u = texFixed16(texUf) - 0x8000;
+        const int v = texFixed16(texVf) - 0x8000;
+        return {u >> 16, v >> 16, (u & 0xFFFF) >> 12, (v & 0xFFFF) >> 12};
+    }
+
+    // PCSX2 DrawSprite coverage: per axis ceil(min) <= x < ceil(max), done in the
+    // GS's 12.4 fixed point (XYOFFSET keeps its fraction). Truncating instead
+    // shifted every sub-pixel sprite by one pixel (gsfeature sprite_*_scaled).
+    // Inclusive bounds out; false = empty (PCSX2 draws nothing; old code drew 1 px).
+    bool spriteCoverage(float ax, float ay, float bx, float by, int64_t ofx16, int64_t ofy16,
+                        int &x0, int &y0, int &x1, int &y1)
+    {
+        auto ceil16 = [](int64_t v) { return static_cast<int>((v + 15) >> 4); }; // >> floors negatives
+        const int64_t X0 = static_cast<int64_t>(std::lround(ax * 16.0f)) - ofx16;
+        const int64_t Y0 = static_cast<int64_t>(std::lround(ay * 16.0f)) - ofy16;
+        const int64_t X1 = static_cast<int64_t>(std::lround(bx * 16.0f)) - ofx16;
+        const int64_t Y1 = static_cast<int64_t>(std::lround(by * 16.0f)) - ofy16;
+        x0 = ceil16(std::min(X0, X1));
+        y0 = ceil16(std::min(Y0, Y1));
+        x1 = ceil16(std::max(X0, X1)) - 1;
+        y1 = ceil16(std::max(Y0, Y1)) - 1;
+        return x0 <= x1 && y0 <= y1;
+    }
+
+    uint32_t bilinearFilter(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, int fu, int fv)
+    {
+        uint32_t out = 0;
+        for (int sh = 0; sh < 32; sh += 8)
+        {
+            const int a00 = static_cast<int>((c00 >> sh) & 0xFFu), a10 = static_cast<int>((c10 >> sh) & 0xFFu);
+            const int a01 = static_cast<int>((c01 >> sh) & 0xFFu), a11 = static_cast<int>((c11 >> sh) & 0xFFu);
+            const int top = a00 + (((a10 - a00) * fu) >> 4);
+            const int bottom = a01 + (((a11 - a01) * fu) >> 4);
+            const int c = top + (((bottom - top) * fv) >> 4);
+            out |= static_cast<uint32_t>(c & 0xFF) << sh;
+        }
+        return out;
     }
 }
 
@@ -2106,9 +2158,10 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
             }
             else
             {
-                r &= 0xFF;
-                g &= 0xFF;
-                b &= 0xFF;
+                // COLCLAMP=0 wraps (PCSX2); `r &= 0xFF` dropped the blend result.
+                r = static_cast<uint8_t>(br & 0xFF);
+                g = static_cast<uint8_t>(bg & 0xFF);
+                b = static_cast<uint8_t>(bb & 0xFF);
             }
         }
     }
@@ -2609,7 +2662,7 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
     int texH = 1 << tex.th;
 
     float texUf, texVf;
-    if (prim.fst)
+    if (prim.fst && !t_sampleAsStq)
     {
         texUf = static_cast<float>(u) / 16.0f;
         texVf = static_cast<float>(v) / 16.0f;
@@ -2761,48 +2814,13 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
 
     if (!tex1UsesLinearFilter(ctx.tex1.data))
     {
-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        return samplePoint(texFixed16(texUf) >> 16, texFixed16(texVf) >> 16); // PCSX2: 16.16 >> 16 (floor)
     }
 
-    const float sampleU = texUf - 0.5f;
-    const float sampleV = texVf - 0.5f;
-    const int u0 = static_cast<int>(std::floor(sampleU));
-    const int v0 = static_cast<int>(std::floor(sampleV));
-    const int u1 = u0 + 1;
-    const int v1 = v0 + 1;
-    const float fx = sampleU - static_cast<float>(u0);
-    const float fy = sampleV - static_cast<float>(v0);
-
-    const uint32_t c00 = samplePoint(u0, v0);
-    const uint32_t c10 = samplePoint(u1, v0);
-    const uint32_t c01 = samplePoint(u0, v1);
-    const uint32_t c11 = samplePoint(u1, v1);
-
-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
-                                  static_cast<uint8_t>(c10 & 0xFFu),
-                                  static_cast<uint8_t>(c01 & 0xFFu),
-                                  static_cast<uint8_t>(c11 & 0xFFu),
-                                  fx, fy);
-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
-                                  fx, fy);
-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
-                                  fx, fy);
-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
-                                  fx, fy);
-
-    return static_cast<uint32_t>(r) |
-           (static_cast<uint32_t>(g) << 8) |
-           (static_cast<uint32_t>(b) << 16) |
-           (static_cast<uint32_t>(a) << 24);
+    const BilinearTap tap = bilinearTap(texUf, texVf);
+    return bilinearFilter(samplePoint(tap.u0, tap.v0), samplePoint(tap.u0 + 1, tap.v0),
+                          samplePoint(tap.u0, tap.v0 + 1), samplePoint(tap.u0 + 1, tap.v0 + 1),
+                          tap.fu, tap.fv);
 }
 
 void GSRasterizer::drawSprite(GS *gs)
@@ -2813,26 +2831,14 @@ void GSRasterizer::drawSprite(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
     u32 z1 = static_cast<u32>(v1.z);
 
-    if (x0 > x1)
-        std::swap(x0, x1);
-    if (y0 > y1)
-        std::swap(y0, y1);
-
-    const int unclippedX0 = x0;
-    const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
-    const int unclippedX1 = unclippedX0 + spanX - 1;
-    const int unclippedY1 = unclippedY0 + spanY - 1;
+    int unclippedX0, unclippedY0, unclippedX1, unclippedY1;
+    if (!spriteCoverage(v0.x, v0.y, v1.x, v1.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy,
+                        unclippedX0, unclippedY0, unclippedX1, unclippedY1))
+        return;
+    const int spanX = unclippedX1 - unclippedX0 + 1; // read by the [uvspan]/[boxtex] probes
+    const int spanY = unclippedY1 - unclippedY0 + 1;
 
     // If the sprite rectangle is fully outside scissor, nothing should render.
     // SCISSOR fields are unsigned 64-bit bitfields: compare as int, or a sprite
@@ -3158,22 +3164,16 @@ void GSRasterizer::drawSprite(GS *gs)
             for (int x = drawX0; x <= drawX1; ++x)
             {
                 float texUf = u0f + (static_cast<float>(x) - vx0) * duDx;
-                uint32_t texel = 0xFFFF00FFu;
-                if (prim.fst)
-                {
-                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
-                    const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = sampleTexture(gs, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
-                }
-                else
-                {
-                    texel = sampleTexture(gs,
-                                          texUf / static_cast<float>(texW),
-                                          texVf / static_cast<float>(texH),
-                                          1.0f, 0u, 0u);
-                }
+                // FST and STQ alike: PCSX2 steps sprite U/V in 16.16 texels.
+                // Rounding FST to 1/16 texel here broke scaled sprites
+                // (gsfeature sprite_*_uv_scaled). t_sampleAsStq makes
+                // sampleTexture take the s/t branch even when PRIM.FST=1.
+                t_sampleAsStq = true;
+                const uint32_t texel = sampleTexture(gs,
+                                                     texUf / static_cast<float>(texW),
+                                                     texVf / static_cast<float>(texH),
+                                                     1.0f, 0u, 0u);
+                t_sampleAsStq = false;
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
