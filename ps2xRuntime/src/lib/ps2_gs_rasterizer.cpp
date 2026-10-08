@@ -2071,8 +2071,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
     {
         const GSVertex &v = gs->m_vtxQueue[0];
         const auto &ctx = gs->activeContext();
-        int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
-        int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
+        // PCSX2 DrawPoint: p = int(v - offset + 0.5) (truncating).
+        int px = static_cast<int>(v.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f + 0.5f);
+        int py = static_cast<int>(v.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f + 0.5f);
         uint8_t pr = v.r, pg = v.g, pb = v.b;
         if (gs->m_registers.prim.fge)
             applyFog(gs->m_registers.fogcol.data, v.fog << 7, pr, pg, pb);

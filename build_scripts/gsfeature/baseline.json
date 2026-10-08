@@ -266,5 +266,73 @@
  "unseen_tex2_clut_switch": [
   "DIFF",
   2
+ ],
+ "unseen2_blend_cd_cs_as_cs": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_0_cs_fix_cd": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_cs_cd_ad_cs": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_cd_0_as_0": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_cs_0_fix_0": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_never_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_less_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_lequal_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_equal_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_ztest_never_and_greater": [
+  "MATCH",
+  0
+ ],
+ "unseen2_fbmsk_partial": [
+  "MATCH",
+  0
+ ],
+ "unseen2_zmsk": [
+  "MATCH",
+  0
+ ],
+ "unseen2_context2": [
+  "NEAR",
+  0
+ ],
+ "unseen2_prmode": [
+  "MATCH",
+  0
+ ],
+ "unseen2_points": [
+  "MATCH",
+  0
+ ],
+ "unseen2_line_list_flat": [
+  "MATCH",
+  0
+ ],
+ "unseen2_local_to_local_copy": [
+  "MATCH",
+  0
  ]
 }

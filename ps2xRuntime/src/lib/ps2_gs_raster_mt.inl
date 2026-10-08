@@ -806,8 +806,9 @@ void runJob(const Job &j, TexCache &cache, int n, int idx)
     case GS_PRIM_POINT:
     {
         const GSVertex &v = j.v[0];
-        int px = static_cast<int>(v.x) - (j.ctx.xyoffset.ofx >> 4);
-        int py = static_cast<int>(v.y) - (j.ctx.xyoffset.ofy >> 4);
+        // PCSX2 DrawPoint: p = int(v - offset + 0.5) (truncating).
+        int px = static_cast<int>(v.x - static_cast<float>(j.ctx.xyoffset.ofx) / 16.0f + 0.5f);
+        int py = static_cast<int>(v.y - static_cast<float>(j.ctx.xyoffset.ofy) / 16.0f + 0.5f);
         uint8_t pr = v.r, pg = v.g, pb = v.b;
         if (S.fge)
             applyFog(S.fogcol, v.fog << 7, pr, pg, pb);

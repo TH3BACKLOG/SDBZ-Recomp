@@ -1707,6 +1707,7 @@ void GS::reset()
     m_debugNextSeq = 1;
     m_debugFrameIndex = 0;
     m_debugLastVsyncTick = UINT64_MAX;
+    m_registers.prmodecont.data = 1; // GS reset value (AC=1: PRIM sets the attributes)
 }
 
 GSContext &GS::activeContext()
@@ -5320,7 +5321,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     {
     case GS_REG_PRIM:
     {
-        m_registers.prim.data = value;
+        // PRMODECONT.AC=0: PRIM only sets the primitive type, the attributes
+        // come from PRMODE (PCSX2 ApplyPRIM; gsfeature unseen2_prmode).
+        if (m_registers.prmodecont.data & 1u)
+            m_registers.prim.data = value;
+        else
+            m_registers.prim.data = (m_registers.prim.data & ~7ull) | (value & 7ull);
         m_vtxCount = 0;
         m_vtxIndex = 0;
         break;
@@ -5536,6 +5542,8 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     case GS_REG_PRMODE:
         m_registers.prmode.data = value;
+        if ((m_registers.prmodecont.data & 1u) == 0u) // PCSX2: ignored while AC=1
+            m_registers.prim.data = (value & ~7ull) | (m_registers.prim.data & 7ull);
         break;
     case GS_REG_TEXCLUT:
         m_registers.texclut.data = value;

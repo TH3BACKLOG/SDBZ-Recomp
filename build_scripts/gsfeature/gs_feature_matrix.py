@@ -536,6 +536,110 @@ def _(rng):
     return ups + a + [b]
 
 
+# ---- UNSEEN batch 2 (10-08c): more equations/methods/state an unreached scene may use.
+TEX0_2, CLAMP_2, TEX1_2, XYOFFSET_2, PRMODE = 0x07, 0x09, 0x15, 0x19, 0x1B
+SCISSOR_2, ALPHA_2, TEST_2, FBA_2, FRAME_2, ZBUF_2 = 0x41, 0x43, 0x48, 0x4B, 0x4D, 0x4F
+P_POINT, P_LINE = 0, 1
+
+
+def gstrip(rng, n=10, a=None, z=None):
+    """Gouraud ribbon covering most of the frame (random vertex alpha unless a is given)."""
+    return [{"xy": (2 + i * 6.7 + rng.random(), 4 + 52 * (i % 2) + rng.random()),
+             "rgba": rnd_rgba(rng, a) if a is not None else (rng.randrange(256), rng.randrange(256),
+                                                             rng.randrange(256), rng.randrange(256)),
+             "z": z if z is not None else rng.randrange(0x1000, 0xF000)} for i in range(n)]
+
+
+def eq_case(a, b, c, d, fix=0x50):
+    def fn(rng):
+        return [combo_bg(), draw(P_STRIP | (1 << 3) | ABE, gstrip(rng), [(ALPHA_1, a | (b << 2) | (c << 4) | (d << 6) | (fix << 32)),
+                                                                    (TEST_1, 0x30000)])]
+    return fn
+
+
+for _n, _abcd in (("cd_cs_as_cs", (1, 0, 0, 0)), ("0_cs_fix_cd", (2, 0, 2, 1)), ("cs_cd_ad_cs", (0, 1, 1, 0)),
+                  ("cd_0_as_0", (1, 2, 0, 2)), ("cs_0_fix_0", (0, 2, 2, 2))):
+    CASES["unseen2_blend_" + _n] = (f"ALPHA A/B/C/D = {_abcd} (not in the census)", eq_case(*_abcd))
+
+for _n, _m in (("never", 0), ("less", 2), ("lequal", 3), ("equal", 4)):
+    CASES["unseen2_atest_" + _n + "_keep"] = (f"ATST method {_n} ref 0x60 AFAIL KEEP, random vertex alpha",
+                                             (lambda m: lambda rng: [combo_bg(), draw(P_STRIP | (1 << 3), gstrip(rng),
+                                              [(TEST_1, 1 | (m << 1) | (0x60 << 4) | 0x30000)])])(_m))
+
+
+@case("unseen2_ztest_never_and_greater", "ZTST NEVER strip (draws nothing), then ZTST GREATER strip over a z ramp")
+def _(rng):
+    ramp = draw(P_STRIP | (1 << 3), gstrip(rng, a=0x80), [(TEST_1, (1 << 16) | (1 << 17))])
+    never = draw(P_STRIP, gstrip(rng, a=0x80, z=0xFFFF), [(TEST_1, (1 << 16) | (0 << 17))])
+    greater = draw(P_STRIP | (1 << 3), gstrip(rng, a=0x80, z=0x8000), [(TEST_1, (1 << 16) | (3 << 17))])
+    return [combo_bg(), ramp, never, greater]
+
+
+@case("unseen2_fbmsk_partial", "FRAME.FBMSK=0x00FF00FF: only G and A written by a gouraud strip")
+def _(rng):
+    return [combo_bg(), draw(P_STRIP | (1 << 3), gstrip(rng),
+                             [(FRAME_1, FBP | (1 << 16) | (CT32 << 24) | (0x00FF00FF << 32)), (TEST_1, 0x30000)]),
+            draw(P_SPRITE, [{"xy": (0, 0), "rgba": (0, 0, 0, 0)}, {"xy": (0, 0), "rgba": (0, 0, 0, 0)}],
+                 [(FRAME_1, FBP | (1 << 16) | (CT32 << 24))])]
+
+
+@case("unseen2_zmsk", "ZBUF.ZMSK=1 strip (z not written), then a GEQUAL strip that would be hidden if it were")
+def _(rng):
+    clear = draw(P_SPRITE, [{"xy": (0, 0), "rgba": (40, 90, 200, 0x80), "z": 0}, {"xy": (64, 64), "rgba": (40, 90, 200, 0x80), "z": 0}],
+                 [(TEST_1, 0x30000)])
+    near = draw(P_STRIP | (1 << 3), gstrip(rng, a=0x80, z=0xF000), [(ZBUF_1, ZBP | (1 << 32)), (TEST_1, 0x30000)])
+    far = draw(P_SPRITE, [{"xy": (0, 12), "rgba": (0, 255, 0, 0x80), "z": 0x100}, {"xy": (64, 52), "rgba": (0, 255, 0, 0x80), "z": 0x100}],
+               [(ZBUF_1, ZBP), (TEST_1, (1 << 16) | (2 << 17))])
+    return [clear, near, far]
+
+
+@case("unseen2_context2", "PRIM.CTXT=1: every draw state from the *_2 registers (T8 bilinear STQ, blend, ATST)")
+def _(rng):
+    regs = [(FRAME_2, FBP | (1 << 16) | (CT32 << 24)), (ZBUF_2, ZBP), (XYOFFSET_2, 0),
+            (SCISSOR_2, 0 | (63 << 16) | (0 << 32) | (63 << 48)), (TEST_2, 1 | (6 << 1) | (0x20 << 4) | 0x30000),
+            (ALPHA_2, A_MAIN), (FBA_2, 0), (CLAMP_2, CLAMP_CLAMP), (TEX0_2, tex0(T8, 4, 4)), (TEX1_2, (1 << 5) | (1 << 6)),
+            (TEXFLUSH, 0),
+            # context 1 deliberately different: if CTXT is ignored the strip lands nowhere / unfiltered
+            (FRAME_1, (FBP + 4) | (1 << 16) | (CT32 << 24)), (TEX1_1, 0)]
+    vs = []
+    for i in range(8):
+        q = 0.7 + rng.random() * 0.6
+        vs.append({"xy": (3 + i * 8.3 + rng.random(), 5 + 52 * (i % 2) + rng.random()),
+                   "st": ((i // 2) / 3.2 * q, (i % 2) * q, q), "rgba": rnd_rgba(rng, 0x80)})
+    return tex_t8(rng) + [combo_bg(), draw(P_STRIP | (1 << 3) | (1 << 4) | ABE | (1 << 9), vs, regs)]
+
+
+@case("unseen2_prmode", "PRMODECONT=0: IIP/TME/ABE come from PRMODE, not PRIM (PRIM says flat untextured)")
+def _(rng):
+    prmode = (1 << 3) | ABE          # gouraud + blend from PRMODE
+    return [combo_bg(), draw(P_STRIP, gstrip(rng), [(PRMODECONT, 0), (PRMODE, prmode), (ALPHA_1, A_MAIN), (TEST_1, 0x30000)]),
+            draw(P_SPRITE, [{"xy": (0, 0), "rgba": (0, 0, 0, 0)}, {"xy": (0, 0), "rgba": (0, 0, 0, 0)}], [(PRMODECONT, 1)])]
+
+
+@case("unseen2_points", "POINT list, subpixel positions, flat colours")
+def _(rng):
+    vs = [{"xy": (rng.random() * 62 + 0.5, rng.random() * 62 + 0.5), "rgba": rnd_rgba(rng, 0x80)} for _ in range(200)]
+    return [combo_bg(), draw(P_POINT, vs, [(TEST_1, 0x30000)])]
+
+
+@case("unseen2_line_list_flat", "LINE list (not strip), flat, steep + shallow + reversed directions")
+def _(rng):
+    vs = []
+    for _ in range(12):
+        vs.append({"xy": (rng.random() * 63, rng.random() * 63), "rgba": rnd_rgba(rng, 0x80)})
+        vs.append({"xy": (rng.random() * 63, rng.random() * 63), "rgba": rnd_rgba(rng, 0x80)})
+    return [combo_bg(), draw(P_LINE, vs, [(TEST_1, 0x30000)])]
+
+
+@case("unseen2_local_to_local_copy", "TRXDIR=2 local->local copy of a drawn 24x20 rect to (36,30) (screen-effect copies)")
+def _(rng):
+    art = draw(P_STRIP | (1 << 3), gstrip(rng, a=0x80), [(TEST_1, 0x30000)])
+    bb = (FBP * 32) | (1 << 16) | (CT32 << 24) | ((FBP * 32) << 32) | (1 << 48) | (CT32 << 56)
+    copy = ad_packet([(BITBLTBUF, bb), (TRXPOS, 4 | (6 << 16) | (36 << 32) | (30 << 48)),
+                      (TRXREG, 24 | (20 << 32)), (TRXDIR, 2)])
+    return [combo_bg(), art, copy]
+
+
 @case("ztest_gequal","two overlapping strips, ZTST GEQUAL, near one drawn first")
 def _(rng):
     a = [{"xy": (4, 4), "rgba": (255, 0, 0, 128), "z": 0x8000}, {"xy": (50, 6), "rgba": (255, 0, 0, 128), "z": 0x8000},
