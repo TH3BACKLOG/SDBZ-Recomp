@@ -3944,7 +3944,7 @@ void register_ps2_gs_tests()
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
                 {
-                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp, kDbw, x, y);
+                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp, kDbw, x, y) * 4u; // pixel index -> byte offset (CT32)
                     uint32_t word = 0u;
                     ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
@@ -4010,7 +4010,7 @@ void register_ps2_gs_tests()
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
                 {
-                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbpT8H, kDbwT8H, x, y);
+                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbpT8H, kDbwT8H, x, y) * 4u; // pixel index -> byte offset (CT32)
                     uint32_t word = 0u;
                     ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
@@ -4104,7 +4104,7 @@ void register_ps2_gs_tests()
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
                 {
-                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbpMix, kDbwMix, x, y);
+                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbpMix, kDbwMix, x, y) * 4u; // pixel index -> byte offset (CT32)
                     uint32_t word = 0u;
                     ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
@@ -4136,7 +4136,7 @@ void register_ps2_gs_tests()
             constexpr uint8_t kIndexB = 0u; // T4HH plane index at the sampled texel; must differ from kIndexA
 
             // Shared CT32 word at texel (0,0): T4HL nibble occupies bits 24-27, T4HH bits 28-31.
-            const uint32_t sharedWordOff = GSMem::LookupPixelAddressCT32(kTexTbp, 1u, 0u, 0u);
+            const uint32_t sharedWordOff = GSMem::LookupPixelAddressCT32(kTexTbp, 1u, 0u, 0u) * 4u; // pixel index -> byte offset (CT32)
             const uint32_t sharedWord =
                 (static_cast<uint32_t>(kIndexB) << 28) | (static_cast<uint32_t>(kIndexA) << 24);
             ps2xGsRasterFlush();
@@ -4147,8 +4147,8 @@ void register_ps2_gs_tests()
             constexpr uint32_t kDistractorColor = 0x800000AAu;
 
             // Place each plane's expected color at its own CLUT's entry for the sampled index.
-            const uint32_t clutAOff = GSMem::LookupPixelAddressCT32(kClutCbpA, 1u, kIndexA, 0u);
-            const uint32_t clutBOff = GSMem::LookupPixelAddressCT32(kClutCbpB, 1u, kIndexB, 0u);
+            const uint32_t clutAOff = GSMem::LookupPixelAddressCT32(kClutCbpA, 1u, kIndexA, 0u) * 4u; // pixel index -> byte offset (CT32)
+            const uint32_t clutBOff = GSMem::LookupPixelAddressCT32(kClutCbpB, 1u, kIndexB, 0u) * 4u; // pixel index -> byte offset (CT32)
             ps2xGsRasterFlush();
             std::memcpy(vram.data() + clutAOff, &kExpectedColorA, sizeof(kExpectedColorA));
             ps2xGsRasterFlush();
@@ -4157,8 +4157,8 @@ void register_ps2_gs_tests()
             // Seed distractor entries at the *other* plane's index in each CLUT so that a
             // cross-plane nibble read (a bug reading the wrong plane, or the wrong CLUT) would
             // resolve to a non-matching color instead of accidentally matching by coincidence.
-            const uint32_t clutADistractorOff = GSMem::LookupPixelAddressCT32(kClutCbpA, 1u, kIndexB, 0u);
-            const uint32_t clutBDistractorOff = GSMem::LookupPixelAddressCT32(kClutCbpB, 1u, kIndexA, 0u);
+            const uint32_t clutADistractorOff = GSMem::LookupPixelAddressCT32(kClutCbpA, 1u, kIndexB, 0u) * 4u; // pixel index -> byte offset (CT32)
+            const uint32_t clutBDistractorOff = GSMem::LookupPixelAddressCT32(kClutCbpB, 1u, kIndexA, 0u) * 4u; // pixel index -> byte offset (CT32)
             ps2xGsRasterFlush();
             std::memcpy(vram.data() + clutADistractorOff, &kDistractorColor, sizeof(kDistractorColor));
             ps2xGsRasterFlush();
@@ -4299,7 +4299,7 @@ void register_ps2_gs_tests()
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
                 {
-                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp1, kDbw, x, y);
+                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp1, kDbw, x, y) * 4u; // pixel index -> byte offset (CT32)
                     uint32_t word = 0u;
                     ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));
@@ -4344,7 +4344,7 @@ void register_ps2_gs_tests()
             {
                 for (uint32_t x = 0; x < kRrw; ++x)
                 {
-                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp2, kDbw, x, y);
+                    const uint32_t off = GSMem::LookupPixelAddressCT32(kDbp2, kDbw, x, y) * 4u; // pixel index -> byte offset (CT32)
                     uint32_t word = 0u;
                     ps2xGsRasterFlush();
                     std::memcpy(&word, vram.data() + off, sizeof(word));

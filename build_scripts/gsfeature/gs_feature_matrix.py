@@ -711,6 +711,44 @@ def _(rng):
     return tstrip(rng, ups, tex0(CT32, 4, 4), regs=[(MIPTBP1_1, TBP1 | (1 << 14)), (TEX1_1, tex1)])
 
 
+@case("unseen3_t4hl_t4hh_shared_plane", "T4HL and T4HH uploaded to the SAME words (RMW), each sampled through its own CLUT")
+def _(rng):
+    CBPB = CBP + 0x40
+    ups = upload(TBP, 1, T4HL, 16, 16, rand_bytes(rng, 128)) + upload(TBP, 1, T4HH, 16, 16, rand_bytes(rng, 128)) +         upload(CBP, 1, CT32, 8, 2, clut_ct32(rng, 16, 0x80)) + upload(CBPB, 1, CT32, 8, 2, clut_ct32(rng, 16, 0x80))
+    thh = tex0(T4HH, 4, 4) & ~(0x3FFF << 37) | (CBPB << 37)
+    top = [{"xy": (2.3 + i * 6.7, 3.1 + 26 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    bot = [{"xy": (2.3 + i * 6.7, 33.4 + 27 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    return ups + [combo_bg(),
+                  draw(P_STRIP | (1 << 4) | (1 << 8), top, [(TEX0_1, tex0(T4HL, 4, 4)), (TEXFLUSH, 0)]),
+                  draw(P_STRIP | (1 << 4) | (1 << 8), bot, [(TEX0_1, thh), (TEXFLUSH, 0)])]
+
+
+@case("unseen3_upload_oversized_then_next", "T8 upload with excess IMAGE data past TRXREG, then a 2nd upload; both sampled")
+def _(rng):
+    TBP2 = TBP + 0x80
+    first = upload(TBP, 1, T8, 16, 16, rand_bytes(rng, 256 + 64))     # 64 bytes too many
+    second = upload(TBP2, 1, T8, 16, 16, rand_bytes(rng, 256))
+    clut = upload(CBP, 1, CT32, 16, 16, clut_ct32(rng, 256, 0x80))
+    top = [{"xy": (2.3 + i * 6.7, 3.1 + 26 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    bot = [{"xy": (2.3 + i * 6.7, 33.4 + 27 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    t2 = tex0(T8, 4, 4) & ~0x3FFF | TBP2
+    return first + second + clut + [combo_bg(),
+                  draw(P_STRIP | (1 << 4) | (1 << 8), top, [(TEX0_1, tex0(T8, 4, 4)), (TEXFLUSH, 0)]),
+                  draw(P_STRIP | (1 << 4) | (1 << 8), bot, [(TEX0_1, t2), (TEXFLUSH, 0)])]
+
+
+@case("unseen3_alias_t8h_t4hl_ct32", "T8H upload, T4HL over it, CT32 frame draw under both; read back as T8H and as T4HH")
+def _(rng):
+    CBPB = CBP + 0x40
+    ups = upload(TBP, 1, CT32, 16, 16, clut_ct32(rng, 256, 0x80)) + upload(TBP, 1, T8H, 16, 16, rand_bytes(rng, 256)) +         upload(TBP, 1, T4HL, 16, 16, rand_bytes(rng, 128)) +         upload(CBP, 1, CT32, 16, 16, clut_ct32(rng, 256, 0x80)) + upload(CBPB, 1, CT32, 8, 2, clut_ct32(rng, 16, 0x80))
+    thh = tex0(T4HH, 4, 4) & ~(0x3FFF << 37) | (CBPB << 37)
+    top = [{"xy": (2.3 + i * 6.7, 3.1 + 26 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    bot = [{"xy": (2.3 + i * 6.7, 33.4 + 27 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    return ups + [combo_bg(),
+                  draw(P_STRIP | (1 << 4) | (1 << 8), top, [(TEX0_1, tex0(T8H, 4, 4)), (TEXFLUSH, 0)]),
+                  draw(P_STRIP | (1 << 4) | (1 << 8), bot, [(TEX0_1, thh), (TEXFLUSH, 0)])]
+
+
 @case("ztest_gequal","two overlapping strips, ZTST GEQUAL, near one drawn first")
 def _(rng):
     a = [{"xy": (4, 4), "rgba": (255, 0, 0, 128), "z": 0x8000}, {"xy": (50, 6), "rgba": (255, 0, 0, 128), "z": 0x8000},

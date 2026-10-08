@@ -366,5 +366,17 @@
  "unseen3_mipmap_fixed_lod1": [
   "DIFF",
   2774
+ ],
+ "unseen3_t4hl_t4hh_shared_plane": [
+  "MATCH",
+  0
+ ],
+ "unseen3_upload_oversized_then_next": [
+  "MATCH",
+  0
+ ],
+ "unseen3_alias_t8h_t4hl_ct32": [
+  "MATCH",
+  0
  ]
 }
