@@ -640,6 +640,77 @@ def _(rng):
     return [combo_bg(), art, copy]
 
 
+# ---- UNSEEN batch 3 (10-08c): palette slots, 16/24-bit frames, dithering, CT16S, Z16S, mipmaps.
+DIMX, MIPTBP1_1 = 0x44, 0x34
+CT16S, Z16S = 0x0A, 0x0A
+FBP16 = 4                         # a second 64x64 buffer (pages) for the 16-bit frame cases
+
+
+def copy16_to_frame(fbp16_block, psm16):
+    """1:1 nearest UV sprite: the 16-bit buffer as a texture -> the CT32 frame (sprite path is exact)."""
+    t0 = (fbp16_block | (1 << 14) | (psm16 << 20) | (6 << 26) | (6 << 30) | (1 << 34) | (1 << 35))  # DECAL tcc1 64x64
+    return draw(P_SPRITE | (1 << 4) | (1 << 8), [{"xy": (0, 0), "uv": (0, 0)}, {"xy": (64, 64), "uv": (64, 64)}],
+                [(FRAME_1, FBP | (1 << 16) | (CT32 << 24)), (TEX0_1, t0), (TEX1_1, 0), (TEXFLUSH, 0), (CLAMP_1, 0),
+                 (TEXA, 0x80 | (0x80 << 32)), (TEST_1, 0x30000), (DTHE, 0)])
+
+
+@case("unseen3_t4_csa_slots", "T4 CSM1: CLUT A at CSA 0, CLUT B at CSA 5 (cld=1), draw CSA 5 then CSA 0 with cld=0")
+def _(rng):
+    CBPB = CBP + 0x40
+    ups = upload(TBP, 1, T4, 16, 16, rand_bytes(rng, 128)) + upload(CBP, 1, CT32, 8, 2, clut_ct32(rng, 16, 0x80)) + \
+        upload(CBPB, 1, CT32, 8, 2, clut_ct32(rng, 16, 0x80))
+    load_a = ad_packet([(TEX0_1, tex0(T4, 4, 4, csa=0, cld=1))])
+    tb = tex0(T4, 4, 4, csa=5, cld=1) & ~(0x3FFF << 37) | (CBPB << 37)
+    top = [{"xy": (2.3 + i * 6.7, 3.1 + 26 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    bot = [{"xy": (2.3 + i * 6.7, 33.4 + 27 * (i % 2)), "uv": (i * 1.7, (i % 2) * 15.3)} for i in range(10)]
+    b = draw(P_STRIP | (1 << 4) | (1 << 8), top, [(TEX0_1, tb), (TEXFLUSH, 0)])
+    a = draw(P_STRIP | (1 << 4) | (1 << 8), bot, [(TEX0_1, tex0(T4, 4, 4, csa=0, cld=0)), (TEXFLUSH, 0)])
+    return ups + [combo_bg(), load_a, b, a]
+
+
+def frame16_case(psm16, dither):
+    def fn(rng):
+        regs = [(FRAME_1, FBP16 | (1 << 16) | (psm16 << 24)), (TEST_1, 0x30000), (DTHE, 1 if dither else 0),
+                (DIMX, sum(((rng.randrange(8)) << (4 * i)) for i in range(16)))]
+        clear = draw(P_SPRITE, [{"xy": (0, 0), "rgba": (40, 90, 200, 0x80)}, {"xy": (64, 64), "rgba": (40, 90, 200, 0x80)}],
+                     [(FRAME_1, FBP16 | (1 << 16) | (psm16 << 24)), (TEST_1, 0x30000), (DTHE, 0)])
+        return [clear, draw(P_STRIP | (1 << 3), gstrip(rng, a=0x80), regs), copy16_to_frame(FBP16 * 32, psm16)]
+    return fn
+
+
+CASES["unseen3_frame_ct16"] = ("CT16 frame, gouraud strip (5551 quantise), copied to CT32 by a 1:1 sprite", frame16_case(CT16, False))
+CASES["unseen3_frame_ct16_dither"] = ("CT16 frame + DTHE=1 random DIMX, gouraud strip, copied to CT32", frame16_case(CT16, True))
+CASES["unseen3_frame_ct16s_dither"] = ("CT16S frame + DTHE=1 random DIMX, gouraud strip, copied to CT32", frame16_case(CT16S, True))
+
+
+@case("unseen3_frame_ct24_blend_ad", "CT24 frame: gouraud strip, then a sprite blended by dest alpha (CT24 has none)")
+def _(rng):
+    f24 = [(FRAME_1, FBP | (1 << 16) | (CT24 << 24))]
+    s = draw(P_STRIP | (1 << 3), gstrip(rng), f24 + [(TEST_1, 0x30000)])
+    cover = draw(P_SPRITE | ABE, [{"xy": (0, 0), "rgba": (250, 20, 30, 0x80)}, {"xy": (64, 64), "rgba": (250, 20, 30, 0x80)}],
+                 f24 + [(ALPHA_1, A_DST), (TEST_1, 0x30000)])
+    return [combo_bg(), s, cover]
+
+
+@case("unseen3_tex_ct16s", "CT16S texture, nearest STQ, TEXA TA0=0x40 TA1=0x80")
+def _(rng):
+    return tstrip(rng, upload(TBP, 1, CT16S, 16, 16, rand_bytes(rng, 512)), tex0(CT16S, 4, 4),
+                  regs=[(TEXA, 0x40 | (0x80 << 32))])
+
+
+@case("unseen3_z16s_gequal", "Z16S buffer: two crossing gouraud strips, ZTST GEQUAL")
+def _(rng):
+    return zfmt_case(Z16S, 1 << 16)(rng)
+
+
+@case("unseen3_mipmap_fixed_lod1", "TEX1 MXL=1 LCM=1 K=1.0 (fixed LOD 1), MMIN nearest-mip-nearest: samples MIPTBP1 level")
+def _(rng):
+    TBP1 = TBP + 0x80
+    ups = upload(TBP, 1, CT32, 16, 16, clut_ct32(rng, 256, 0x80)) + upload(TBP1, 1, CT32, 8, 8, clut_ct32(rng, 64, 0x80))
+    tex1 = 1 | (1 << 2) | (0 << 5) | (2 << 6) | (16 << 32)        # LCM=1 MXL=1 MMAG=nearest MMIN=2 K=16 (1.0)
+    return tstrip(rng, ups, tex0(CT32, 4, 4), regs=[(MIPTBP1_1, TBP1 | (1 << 14)), (TEX1_1, tex1)])
+
+
 @case("ztest_gequal","two overlapping strips, ZTST GEQUAL, near one drawn first")
 def _(rng):
     a = [{"xy": (4, 4), "rgba": (255, 0, 0, 128), "z": 0x8000}, {"xy": (50, 6), "rgba": (255, 0, 0, 128), "z": 0x8000},
@@ -724,18 +795,27 @@ def main():
         work.mkdir(exist_ok=True)
         gsr = work / "case.gsr"
         n = write_gsr(gsr, fn(random.Random(f"{a.seed}:{name}")))
-        extra = {"PS2X_GSBENCH_SKIP": str(n - 1)} if name.startswith("control_") else None
-        bmp = work / "ours.bmp"
-        if bmp.exists():
-            bmp.unlink()
-        S.render(gsr, bmp, FBP, 1, extra=extra, w=W, h=H)
-        ours = np.asarray(Image.open(bmp).convert("RGB"))[:H, :W]
+        extra = {"PS2X_GSBENCH_SKIP": str(n - 1)} if name.startswith("control_") else {}
+        # Both of our rasterizers: threads=0 is the single-thread path (S.render's default),
+        # threads=4 the MT path the game runs by default. Both must match PCSX2.
+        renders = {}
+        for tag, threads in (("st", "0"), ("mt", "4")):
+            bmp = work / f"ours_{tag}.bmp"
+            if bmp.exists():
+                bmp.unlink()
+            S.render(gsr, bmp, FBP, 1, extra=dict(extra, PS2X_GS_RASTER_THREADS=threads), w=W, h=H)
+            renders[tag] = np.asarray(Image.open(bmp).convert("RGB"))[:H, :W]
         ref = S.oracle_frame(gsr, FBP, 1, CT32, None, work, runner, w=W, h=H)
         if ref is None:
             rows.append((name, "NOREF", 0, 0, 0, desc))
             print(f"{name:34s} NOREF")
             continue
-        verdict, mx, n2, n8, d = grade(ours, ref)
+        graded = {t: grade(r, ref) for t, r in renders.items()}
+        worst = max(graded, key=lambda t: (RANK.get(graded[t][0], 9), graded[t][3]))
+        ours = renders[worst]
+        verdict, mx, n2, n8, d = graded[worst]
+        if (graded["st"][0], graded["st"][3]) != (graded["mt"][0], graded["mt"][3]):
+            desc = f"[st {graded['st'][0]}/{graded['st'][3]} mt {graded['mt'][0]}/{graded['mt'][3]}] " + desc
         lit = int((ref.max(axis=2) > 0).sum())
         if lit == 0:
             verdict = "EMPTY"

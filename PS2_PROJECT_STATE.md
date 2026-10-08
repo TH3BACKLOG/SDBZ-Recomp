@@ -24050,3 +24050,6 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
   lines = PCSX2 DDA + diamond exit (was Bresenham from truncated ends). TEX2 CLUT switch already matched.
 - Left (minor): FBA case 3 px (frame alpha > 0x80 at 3 isolated px, cause unknown); T4HL/HH + TEX2 ps2x_tests fail on test-side
   raw-VRAM checks while the same path matches PCSX2 in the matrix.
+- `eede20ac`: PRMODECONT.AC=0 semantics (PRIM type only, PRMODE attrs; reset AC=1; SDBZ writes AC=1 itself) + PCSX2 point rounding. Batch 2 (blend eqs, ATST methods, ZTST, FBMSK, ZMSK, ctx2, points, line list, local->local copy) all MATCH.
+- ⚠ The matrix/oracle used to grade ONLY the single-thread raster (gfx_scene_diff.render forces PS2X_GS_RASTER_THREADS=0); the game runs MT. Now the matrix renders both (st+mt, worst counts) and gfx_scene_diff honours PS2X_GSDIFF_RASTER_THREADS. MT == ST on all 85 cases and on 461/461 real captures.
+- Batch 3: DIMX/DTHE register writes were DROPPED (case break;) -> stored; dithering implemented (16-bit frames, PCSX2 WriteFrame); CT24 frame C=Ad = 1.0. T4 CSA slots, Z16S MATCH. Mipmaps NOT implemented (SDBZ: MXL=0 in all 616 captures) - known DIFF case.

@@ -334,5 +334,37 @@
  "unseen2_local_to_local_copy": [
   "MATCH",
   0
+ ],
+ "unseen3_t4_csa_slots": [
+  "MATCH",
+  0
+ ],
+ "unseen3_frame_ct16": [
+  "NEAR",
+  0
+ ],
+ "unseen3_frame_ct16_dither": [
+  "NEAR",
+  0
+ ],
+ "unseen3_frame_ct16s_dither": [
+  "NEAR",
+  0
+ ],
+ "unseen3_frame_ct24_blend_ad": [
+  "MATCH",
+  0
+ ],
+ "unseen3_tex_ct16s": [
+  "DIFF",
+  1
+ ],
+ "unseen3_z16s_gequal": [
+  "MATCH",
+  0
+ ],
+ "unseen3_mipmap_fixed_lod1": [
+  "DIFF",
+  2774
  ]
 }

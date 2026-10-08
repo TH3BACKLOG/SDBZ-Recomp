@@ -5657,8 +5657,11 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_FOGCOL:
         m_registers.fogcol.data = value;
         break;
-    case GS_REG_DIMX:
+    case GS_REG_DIMX: // used by the raster's dithering (16-bit frames); were dropped
+        m_registers.dimx.data = value;
+        break;
     case GS_REG_DTHE:
+        m_registers.dthe.data = value;
         break;
     case GS_REG_COLCLAMP:
         m_registers.colclamp.data = value;

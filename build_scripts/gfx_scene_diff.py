@@ -101,7 +101,9 @@ def render(gsr, bmp, fbp, fbw, extra=None, w=None, h=None):
     # The bench hands fbp straight to GS::ReadVram, whose base is in BLOCKS; FRAME/DISPFB fbp is in pages (32 blocks).
     # w/h: explicit size so worker threads never read the W/H globals (default = the globals, as before).
     w, h = (W if w is None else w), (H if h is None else h)
-    env = {"PS2X_GSBENCH_BMP": f"{fbp * 32},{fbw},{w},{h},{bmp}", "PS2X_GS_RASTER_THREADS": "0"}
+    # PS2X_GSDIFF_RASTER_THREADS=4 grades the MT rasterizer (the game's default path); default 0 = single-thread.
+    env = {"PS2X_GSBENCH_BMP": f"{fbp * 32},{fbw},{w},{h},{bmp}",
+           "PS2X_GS_RASTER_THREADS": os.environ.get("PS2X_GSDIFF_RASTER_THREADS", "0")}
     if extra:
         env.update(extra)
     rc, txt = run([str(BENCH), str(gsr), "1"], env)

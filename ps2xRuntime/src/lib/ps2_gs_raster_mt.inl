@@ -50,6 +50,8 @@ struct Job
     GSTexaReg texa;
     uint64_t fogcol;
     uint64_t scanmsk;
+    uint64_t dthe;
+    uint64_t dimx;
     uint8_t *vram;
     const uint8_t *clut;
 };
@@ -233,8 +235,8 @@ struct Setup
     RasterReadFn frd, zrd;
     RasterWriteFn fwr, zwr;
     u32 fbp, fbw, fpsm, fmsk, zbp, zpsm;
-    bool fb16, zmsk, abe, pabe, clamp, fbaOr, fge;
-    uint64_t test, fogcol, scanmsk;
+    bool fb16, zmsk, abe, pabe, clamp, fbaOr, fge, dither;
+    uint64_t test, fogcol, scanmsk, dimx;
     uint32_t ztst;
     int sx0, sx1, sy0, sy1;
     uint8_t asel, bsel, csel, dsel, afix;
@@ -265,6 +267,7 @@ struct Setup
         zwr = g_rasterVram.write[zpsm & 0x3Fu];
         fb16 = GSInternal::bitsPerPixel(static_cast<uint8_t>(fpsm)) == 16;
         zmsk = ctx.zbuf.zmsk;
+        dither = (j.dthe & 1u) != 0u && fb16; // PCSX2: 16-bit frames only
         abe = j.prim.abe;
         pabe = j.pabe.pabe;
         clamp = j.colclamp.clamp;
@@ -273,6 +276,7 @@ struct Setup
         fge = j.prim.fge;
         fogcol = j.fogcol;
         scanmsk = j.scanmsk;
+        dimx = j.dimx;
         ztst = static_cast<uint32_t>((ctx.test.data >> 17) & 3);
         sx0 = static_cast<int>(ctx.scissor.x0);
         sx1 = static_cast<int>(ctx.scissor.x1);
@@ -350,6 +354,7 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
     if (date && failsDestAlphaTest(S.test, S.fpsm, fbrgba))
         return;
 
+    int ir = r, ig = g, ib = b; // unclamped until finishColour (blend, then dither)
     if (S.abe)
     {
         uint8_t dr = fbrgba & 0xFF;
@@ -367,28 +372,16 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
                     return cd;
                 return 0;
             };
-            int cAlpha = (S.csel == 0) ? a : (S.csel == 1) ? da
+            // CT24 has no alpha: C=Ad multiplies by 1.0 (PCSX2 skips the modulate).
+            int cAlpha = (S.csel == 0) ? a : (S.csel == 1) ? (S.fpsm == GS_PSM_CT24 ? 128 : da)
                                                              : S.afix;
 
-            int br = ((pickRGB(S.asel, r, dr) - pickRGB(S.bsel, r, dr)) * cAlpha >> 7) + pickRGB(S.dsel, r, dr);
-            int bg = ((pickRGB(S.asel, g, dg) - pickRGB(S.bsel, g, dg)) * cAlpha >> 7) + pickRGB(S.dsel, g, dg);
-            int bb = ((pickRGB(S.asel, b, db) - pickRGB(S.bsel, b, db)) * cAlpha >> 7) + pickRGB(S.dsel, b, db);
-
-            if (S.clamp)
-            {
-                r = clampU8(br);
-                g = clampU8(bg);
-                b = clampU8(bb);
-            }
-            else
-            {
-                // COLCLAMP=0 wraps (PCSX2); the old code dropped the blend result.
-                r = static_cast<uint8_t>(br & 0xFF);
-                g = static_cast<uint8_t>(bg & 0xFF);
-                b = static_cast<uint8_t>(bb & 0xFF);
-            }
+            ir = ((pickRGB(S.asel, r, dr) - pickRGB(S.bsel, r, dr)) * cAlpha >> 7) + pickRGB(S.dsel, r, dr);
+            ig = ((pickRGB(S.asel, g, dg) - pickRGB(S.bsel, g, dg)) * cAlpha >> 7) + pickRGB(S.dsel, g, dg);
+            ib = ((pickRGB(S.asel, b, db) - pickRGB(S.bsel, b, db)) * cAlpha >> 7) + pickRGB(S.dsel, b, db);
         }
     }
+    finishColour(S.dither, S.dimx, S.clamp, x, y, ir, ig, ib, r, g, b);
 
     if (!alphaTest.preserveDestinationAlpha && S.fbaOr)
         a = static_cast<uint8_t>(a | 0x80u);

@@ -1475,6 +1475,34 @@ namespace
         return static_cast<int>(f * 128.0f);
     }
 
+    // PCSX2 WriteFrame: DTHE adds DIMX[y&3][x&3] (signed 3 bits) to RGB of a
+    // 16-bit frame after blending, then COLCLAMP saturates or wraps. Dithering
+    // was not implemented (gsfeature unseen3_frame_ct16_dither).
+    void finishColour(bool dither, uint64_t dimx, bool clamp, int x, int y, int ir, int ig, int ib,
+                      uint8_t &r, uint8_t &g, uint8_t &b)
+    {
+        if (dither)
+        {
+            const int v = static_cast<int>((dimx >> (4 * (((y & 3) << 2) | (x & 3)))) & 7u);
+            const int dm = v >= 4 ? v - 8 : v;
+            ir += dm;
+            ig += dm;
+            ib += dm;
+        }
+        if (clamp)
+        {
+            r = clampU8(ir);
+            g = clampU8(ig);
+            b = clampU8(ib);
+        }
+        else
+        {
+            r = static_cast<uint8_t>(ir & 0xFF);
+            g = static_cast<uint8_t>(ig & 0xFF);
+            b = static_cast<uint8_t>(ib & 0xFF);
+        }
+    }
+
     // PCSX2 GSRasterizer::DrawEdgeLine (non-AA): DDA on the major axis, the
     // "diamond exit" rule for the first/last pixel, and a fixed-point decision
     // value for the minor axis. plot(x, y, t), t = 0..1 along v0->v1 for the
@@ -1792,6 +1820,8 @@ void GSRasterizer::drawPrimitive(GS *gs)
         job.pabe = gs->m_registers.pabe;
         job.colclamp = gs->m_registers.colclamp;
         job.fogcol = gs->m_registers.fogcol.data;
+        job.dthe = gs->m_registers.dthe.data;
+        job.dimx = gs->m_registers.dimx.data;
         job.scanmsk = gs->m_registers.scanmsk.data;
         job.texa = gs->m_registers.texa;
         job.vram = gs->m_vram;
@@ -2281,6 +2311,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     if (ps2diag_fbstat::t_redPixel)
         ps2diag_fbstat::g_trDstRgb.store(fbrgba & 0x00FFFFFFu, std::memory_order_relaxed);
 
+    int ir = r, ig = g, ib = b; // unclamped until finishColour (blend, then dither)
     if (prim.abe)
     {
         uint8_t dr = fbrgba & 0xFF;
@@ -2305,28 +2336,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
                     return cd;
                 return 0;
             };
-            int cAlpha = (csel == 0) ? a : (csel == 1) ? da
+            // CT24 has no alpha: C=Ad multiplies by 1.0 (PCSX2 skips the modulate).
+            int cAlpha = (csel == 0) ? a : (csel == 1) ? (fpsm == GS_PSM_CT24 ? 128 : da)
                                                        : fix;
 
-            int br = ((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr);
-            int bg = ((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg);
-            int bb = ((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db);
-
-            if (colclamp.clamp)
-            {
-                r = clampU8(br);
-                g = clampU8(bg);
-                b = clampU8(bb);
-            }
-            else
-            {
-                // COLCLAMP=0 wraps (PCSX2); `r &= 0xFF` dropped the blend result.
-                r = static_cast<uint8_t>(br & 0xFF);
-                g = static_cast<uint8_t>(bg & 0xFF);
-                b = static_cast<uint8_t>(bb & 0xFF);
-            }
+            ir = ((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr);
+            ig = ((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg);
+            ib = ((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db);
         }
     }
+    finishColour((gs->m_registers.dthe.data & 1u) != 0u && bitsPerPixel(fpsm) == 16, gs->m_registers.dimx.data,
+                 colclamp.clamp, x, y, ir, ig, ib, r, g, b);
 
     u32 fbmask = frame.fbmsk;
     bool zmask = zbuf.zmsk;
