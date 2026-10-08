@@ -535,17 +535,18 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 int ftf = (instr >> 23) & 0x3;
                 const float num = vuNormalizeOperand(m_state.vf[vfS][fsf]);
                 const float radicand = vuNormalizeOperand(m_state.vf[vfT][ftf]);
-                const float den = std::sqrt(std::fabs(radicand));
+                // PCSX2 _vuRSQRT: ft == 0 sets D; fs != 0 -> +-MAX, fs == 0 -> +-0 and
+                // also I (was +-MAX with I only), the sign is sign(fs) ^ sign(ft) incl. -0.
                 uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
                 float result = 0.0f;
-                if (den != 0.0f)
-                    result = num / den;
+                if (radicand != 0.0f)
+                    result = num / std::sqrt(std::fabs(radicand));
                 else
                 {
-                    statusDi = num == 0.0f ? 0x10u : 0x20u;
-                    result = std::signbit(num)
-                                 ? -std::numeric_limits<float>::max()
-                                 : std::numeric_limits<float>::max();
+                    const bool neg = std::signbit(num) != std::signbit(radicand);
+                    statusDi = num != 0.0f ? 0x20u : 0x30u;
+                    result = num != 0.0f ? (neg ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max())
+                                         : (neg ? -0.0f : 0.0f);
                 }
                 uint32_t ignoredFlags = 0u;
                 result = normalizeResult(result, ignoredFlags);

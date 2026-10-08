@@ -985,11 +985,12 @@ class Gen:
             W("            r.queueQ(std::sqrt(std::fabs(val)), 7u, val < 0.0f ? 0x10u : 0u);")
         elif sp == 0x3A:  # RSQRT
             W("            const float num = N(vf[%d][%d]), rad = N(vf[%d][%d]);" % (vfS, fsf, vfT, ftf))
-            W("            const float den = std::sqrt(std::fabs(rad));")
+            # PCSX2 _vuRSQRT (mirrors ps2_vu1_lower.cpp): rad == 0 -> D; num == 0 too -> +-0 and D|I
             W("            uint32_t di = rad < 0.0f ? 0x10u : 0u; float res = 0.0f;")
-            W("            if (den != 0.0f) res = num / den;")
-            W("            else { di = num == 0.0f ? 0x10u : 0x20u;")
-            W("                res = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max(); }")
+            W("            if (rad != 0.0f) res = num / std::sqrt(std::fabs(rad));")
+            W("            else { const bool neg = std::signbit(num) != std::signbit(rad); di = num != 0.0f ? 0x20u : 0x30u;")
+            W("                res = num != 0.0f ? (neg ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max())")
+            W("                                  : (neg ? -0.0f : 0.0f); }")
             W("            r.queueQ(res, 13u, di);")
         elif sp in (0x3B, 0x7B):  # WAITQ / WAITP
             pass
