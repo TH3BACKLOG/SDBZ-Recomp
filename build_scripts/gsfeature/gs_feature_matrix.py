@@ -523,6 +523,19 @@ def _(rng):
     return [combo_bg(), draw(P_STRIP | (1 << 3), vs, [(SCANMSK, 2), (TEST_1, 0x30000)])]
 
 
+@case("unseen_tex2_clut_switch", "TEX2 switches CBP to a second CLUT (cld=1) without a TEX0 write; 2 strips")
+def _(rng):
+    CBP2 = CBP + 0x40
+    ups = upload(TBP, 1, T8, 16, 16, rand_bytes(rng, 256)) + upload(CBP, 1, CT32, 16, 16, clut_ct32(rng, 256)) +         upload(CBP2, 1, CT32, 16, 16, clut_ct32(rng, 256))
+    t0 = tex0(T8, 4, 4)
+    tex2 = (T8 << 20) | (CBP2 << 37) | (CT32 << 51) | (1 << 61)
+    a = tstrip(rng, [], t0)
+    vs = [{"xy": (2.3 + i * 6.7, 34.3 + 25.6 * (i % 2)), "st": ((i // 2) / 4.1, (i % 2) * 0.97, 1.0), "rgba": (128, 128, 128, 128)}
+          for i in range(10)]
+    b = draw(P_STRIP | (1 << 4), vs, [(TEX2_1, tex2), (TEXFLUSH, 0)])
+    return ups + a + [b]
+
+
 @case("ztest_gequal","two overlapping strips, ZTST GEQUAL, near one drawn first")
 def _(rng):
     a = [{"xy": (4, 4), "rgba": (255, 0, 0, 128), "z": 0x8000}, {"xy": (50, 6), "rgba": (255, 0, 0, 128), "z": 0x8000},

@@ -1347,6 +1347,33 @@ namespace
         return (texel & 0x00FFFFFFu) | (static_cast<uint32_t>(a) << 24);
     }
 
+    // Palette index from a T8/T4 texel read. T8H/T4HL/T4HH alias CT32 words (the
+    // page cache returns the whole word): index = bits 24-31 / 24-27 / 28-31.
+    // The old code used the low byte for all of them (gsfeature unseen_tex_t8h/t4hl/t4hh).
+    uint8_t paletteIndex(uint32_t psm, uint32_t out)
+    {
+        switch (psm)
+        {
+        case GS_PSM_T8H:
+            return static_cast<uint8_t>(out >> 24);
+        case GS_PSM_T4HL:
+            return static_cast<uint8_t>((out >> 24) & 0xFu);
+        case GS_PSM_T4HH:
+            return static_cast<uint8_t>(out >> 28);
+        default:
+            return static_cast<uint8_t>(out);
+        }
+    }
+
+    // Raw CLUT cache entry -> 8888. CT16/CT16S entries widen 5551 and take their
+    // alpha from TEXA (PCSX2 GSClut Expand16); they used to go out raw.
+    uint32_t clutEntryToRgba(const GSTexaReg &texa, uint32_t cpsm, uint32_t raw)
+    {
+        if (cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S)
+            return applyTexa(texa, GS_PSM_CT16, Rgba5551ToRgba8888(static_cast<u16>(raw)));
+        return raw;
+    }
+
     std::atomic<uint32_t> s_debugPrimitiveCount{0};
     std::atomic<uint32_t> s_debugPixelCount{0};
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
@@ -1386,25 +1413,148 @@ namespace
     {
         bool writeFramebuffer;
         bool preserveDestinationAlpha;
+        bool writeZ;
     };
 
     AlphaTestResult classifyAlphaTest(uint64_t testReg, uint8_t alpha)
     {
         const bool pass = passesAlphaTest(testReg, alpha);
         if (pass)
-            return {true, false};
+            return {true, false, true};
 
-        // TEST.AFAIL controls what happens when the alpha comparison fails.
+        // TEST.AFAIL controls what happens when the alpha comparison fails
+        // (PCSX2 TestAlpha). FB_ONLY and RGB_ONLY used to write Z too, and
+        // ZB_ONLY wrote nothing (gsfeature unseen_afail_zb_only).
         switch (static_cast<uint8_t>((testReg >> 12) & 0x3u))
         {
         case 1: // FB_ONLY
-            return {true, false};
-        case 3: // RGB_ONLY
-            return {true, true};
-        case 0: // KEEP
+            return {true, false, false};
         case 2: // ZB_ONLY
+            return {false, false, true};
+        case 3: // RGB_ONLY
+            return {true, true, false};
+        case 0: // KEEP
         default:
-            return {false, false};
+            return {false, false, false};
+        }
+    }
+
+    // TEST.DATE: PCSX2 TestDestAlpha. Only 32- and 16-bit frames (CT24 has no
+    // alpha); `dstRgba` is the frame pixel widened to 8888 (16-bit A -> 0x80).
+    bool failsDestAlphaTest(uint64_t testReg, uint32_t fpsm, uint32_t dstRgba)
+    {
+        if (((testReg >> 14) & 1u) == 0u || fpsm == GS_PSM_CT24)
+            return false;
+        const bool msb = (dstRgba & 0x80000000u) != 0u;
+        const bool datm = ((testReg >> 15) & 1u) != 0u;
+        return msb != datm;
+    }
+
+    // SCANMSK 2 = skip even lines, 3 = skip odd lines (PCSX2 GSRasterizer).
+    bool scanMasked(uint64_t scanmsk, int y)
+    {
+        return (scanmsk & 2u) != 0u && static_cast<uint64_t>(y & 1) == (scanmsk & 1u);
+    }
+
+    // PRIM.FGE fog, PCSX2 GSDrawScanline: f16 = F << 7 (interpolated, truncated),
+    // c = fogcol + ((c - fogcol) * 2 * f16 >> 16) (lerp16<0> = mul16hs, floors).
+    void applyFog(uint64_t fogcol, int f16, uint8_t &r, uint8_t &g, uint8_t &b)
+    {
+        auto ch = [&](uint8_t c, int sh)
+        {
+            const int fc = static_cast<int>((fogcol >> sh) & 0xFFu);
+            return static_cast<uint8_t>(fc + ((((static_cast<int>(c) - fc) * 2) * f16) >> 16));
+        };
+        r = ch(r, 0);
+        g = ch(g, 8);
+        b = ch(b, 16);
+    }
+
+    int fogF16(float f)
+    {
+        return static_cast<int>(f * 128.0f);
+    }
+
+    // PCSX2 GSRasterizer::DrawEdgeLine (non-AA): DDA on the major axis, the
+    // "diamond exit" rule for the first/last pixel, and a fixed-point decision
+    // value for the minor axis. plot(x, y, t), t = 0..1 along v0->v1 for the
+    // attributes. x/y are pixel coordinates with XYOFFSET already removed.
+    // Replaces a Bresenham walk from truncated endpoints (gsfeature
+    // unseen_linestrip_gouraud: ~700 px off).
+    template <typename Plot>
+    void walkLinePcsx2(float x0, float y0, float x1, float y1, Plot &&plot)
+    {
+        const float dxF = x1 - x0;
+        const float dyF = y1 - y0;
+        if (dxF == 0.0f && dyF == 0.0f)
+            return;
+        const bool stepX = std::fabs(dxF) >= std::fabs(dyF);
+        const bool posX = dxF >= 0.0f;
+        const bool posY = dyF >= 0.0f;
+        const int dxi = posX ? 1 : -1;
+        const int dyi = posY ? 1 : -1;
+
+        float rx0 = std::floor(x0 + 0.5f), ry0 = std::floor(y0 + 0.5f);
+        float rx1 = std::floor(x1 + 0.5f), ry1 = std::floor(y1 + 0.5f);
+
+        auto testEndpoint = [&](float dx, float dy) -> bool
+        {
+            const float dist = std::fabs(dx) + std::fabs(dy);
+            if (dist < 0.5f)
+                return false;
+            if (stepX)
+                return (posX ? (dx > 0.0f) : (dx < 0.0f)) && (dist > 0.5f || dy >= 0.0f);
+            return (posY ? (dy > 0.0f) : (dy < 0.0f)) && (dist > 0.5f || dx >= 0.0f);
+        };
+        if (testEndpoint(x0 - rx0, y0 - ry0)) // first pixel not covered
+        {
+            rx0 += stepX ? static_cast<float>(dxi) : 0.0f;
+            ry0 += stepX ? 0.0f : static_cast<float>(dyi);
+        }
+        if (!testEndpoint(x1 - rx1, y1 - ry1)) // last pixel not covered
+        {
+            rx1 -= stepX ? static_cast<float>(dxi) : 0.0f;
+            ry1 -= stepX ? 0.0f : static_cast<float>(dyi);
+        }
+        if ((stepX ? (dxi * (rx1 - rx0)) : (dyi * (ry1 - ry0))) < 0.0f)
+            return;
+
+        const int rxi1 = static_cast<int>(rx1), ryi1 = static_cast<int>(ry1);
+        const float major = std::fabs(stepX ? dxF : dyF);
+        const bool posD = stepX ? posY : posX;
+        const int scaleD = static_cast<int>(2 * 16 * 16 * major);
+        const int dD = static_cast<int>(2 * 16 * 16 * (stepX ? dyF : dxF));
+        int D = static_cast<int>(scaleD * (stepX ? (y0 - ry0) : (x0 - rx0)));
+        int xi = static_cast<int>(rx0), yi = static_cast<int>(ry0);
+
+        const float prestep = stepX ? dxi * (rx0 - x0) : dyi * (ry0 - y0);
+        float along = prestep; // distance from v0 on the major axis
+        D += static_cast<int>(dD * prestep);
+        auto stepDependent = [&](int sign)
+        {
+            D -= scaleD * sign;
+            (stepX ? yi : xi) += sign;
+        };
+        while (D >= scaleD / 2)
+            stepDependent(1);
+        while (D < -scaleD / 2)
+            stepDependent(-1);
+
+        for (;;)
+        {
+            plot(xi, yi, along / major);
+            if (stepX ? (xi == rxi1) : (yi == ryi1))
+                break;
+            along += 1.0f;
+            D += dD;
+            (stepX ? xi : yi) += stepX ? dxi : dyi;
+            if (posD)
+            {
+                if (D >= scaleD / 2)
+                    stepDependent(1);
+            }
+            else if (D < -scaleD / 2)
+                stepDependent(-1);
         }
     }
 
@@ -1641,6 +1791,8 @@ void GSRasterizer::drawPrimitive(GS *gs)
         job.prim = prim;
         job.pabe = gs->m_registers.pabe;
         job.colclamp = gs->m_registers.colclamp;
+        job.fogcol = gs->m_registers.fogcol.data;
+        job.scanmsk = gs->m_registers.scanmsk.data;
         job.texa = gs->m_registers.texa;
         job.vram = gs->m_vram;
         job.clut = nullptr;
@@ -1921,7 +2073,10 @@ void GSRasterizer::drawPrimitive(GS *gs)
         const auto &ctx = gs->activeContext();
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        writePixel(gs, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a);
+        uint8_t pr = v.r, pg = v.g, pb = v.b;
+        if (gs->m_registers.prim.fge)
+            applyFog(gs->m_registers.fogcol.data, v.fog << 7, pr, pg, pb);
+        writePixel(gs, px, py, static_cast<u32>(v.z), pr, pg, pb, v.a);
         break;
     }
     default:
@@ -2049,9 +2204,12 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
+    if (scanMasked(gs->m_registers.scanmsk.data, y))
+        return;
+
     const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test.data, a);
 
-    if (!alphaTest.writeFramebuffer)
+    if (!alphaTest.writeFramebuffer && !alphaTest.writeZ)
     {
         if (ps2diag_fbstat::t_redPixel)
             ps2diag_fbstat::g_trKillAte.fetch_add(1, std::memory_order_relaxed);
@@ -2074,7 +2232,8 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
 
     // small optimization, avoid reading the framebuffer for simple draws
     // TODO: only one address lookup for rmw
-    const bool frmw = (ctx.frame.fbmsk != 0) || alphaBlendEnabled || destinationAlpha;
+    const bool dateOn = ((ctx.test.data >> 14) & 1u) != 0u;
+    const bool frmw = (ctx.frame.fbmsk != 0) || alphaBlendEnabled || destinationAlpha || dateOn;
 
     u32 fbrgba = 0;
     if (frmw)
@@ -2115,6 +2274,8 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
             ps2diag_fbstat::g_gfZ.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    if (dateOn && failsDestAlphaTest(ctx.test.data, fpsm, fbrgba))
+        return;
 
     if (ps2diag_fbstat::t_redPixel)
         ps2diag_fbstat::g_trDstRgb.store(fbrgba & 0x00FFFFFFu, std::memory_order_relaxed);
@@ -2641,9 +2802,10 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
-    rasterWriteVram(gs->m_vram, fpsm, fbp, fbw, x, y, pixel);
+    if (alphaTest.writeFramebuffer)
+        rasterWriteVram(gs->m_vram, fpsm, fbp, fbw, x, y, pixel);
 
-    if (!zmask)
+    if (!zmask && alphaTest.writeZ)
     {
         rasterWriteVram(gs->m_vram, zpsm, zbp, fbw, x, y, z);
     }
@@ -2706,8 +2868,8 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
             // bookkeeping -- several locked RMWs per texel, 4x under bilinear.
             // Skip it entirely when the diag gate is off.
             if (!diagOn)
-                return applyTexa(texa, tex.psm,
-                                 gs->ReadClutCache(tex.cpsm, static_cast<u8>(out), tex.csa));
+                return clutEntryToRgba(texa, tex.cpsm,
+                                       gs->ReadClutCache(tex.cpsm, paletteIndex(tex.psm, out), tex.csa));
 
             // [boxtex] -- Stage 5.11 run 22. Every paletted format, not just
             // T8: if suspect #16 is live the box may be arriving as T4, and
@@ -2789,8 +2951,8 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
             }
 
             const u32 texelOut =
-                applyTexa(texa, tex.psm,
-                          gs->ReadClutCache(tex.cpsm, static_cast<u8>(out), tex.csa));
+                clutEntryToRgba(texa, tex.cpsm,
+                                gs->ReadClutCache(tex.cpsm, paletteIndex(tex.psm, out), tex.csa));
 
             // (3) THE CLUT LOOKUP, measured on the sampler's own result --
             // this is the value the pixel loop receives, not a host-side
@@ -3188,7 +3350,10 @@ void GSRasterizer::drawSprite(GS *gs)
                     ps2diag_fbstat::g_bxTexel.store(texel, std::memory_order_relaxed);
 
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                writePixel(gs, x, y, z1, color.r, color.g, color.b, color.a);
+                uint8_t fr = color.r, fg = color.g, fb = color.b;
+                if (prim.fge) // PCSX2: a sprite's fog is v1's
+                    applyFog(gs->m_registers.fogcol.data, v1.fog << 7, fr, fg, fb);
+                writePixel(gs, x, y, z1, fr, fg, fb, color.a);
             }
         }
 
@@ -3198,6 +3363,8 @@ void GSRasterizer::drawSprite(GS *gs)
     }
     else
     {
+        if (prim.fge) // PCSX2: a sprite's fog is v1's
+            applyFog(gs->m_registers.fogcol.data, v1.fog << 7, r, g, b);
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
                 writePixel(gs, x, y, z1, r, g, b, a);
@@ -3480,6 +3647,8 @@ void GSRasterizer::drawTriangle(GS *gs)
                 a = color.a;
             }
 
+            if (prim.fge)
+                applyFog(gs->m_registers.fogcol.data, fogF16(v0.fog * w0 + v1.fog * w1 + v2.fog * w2), r, g, b);
             writePixel(gs, x, y, static_cast<u32>(z + 0.5), r, g, b, a);
         }
     }
@@ -3493,28 +3662,11 @@ void GSRasterizer::drawLine(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    const float ofxF = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+    const float ofyF = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
 
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
-
-    int dx = std::abs(x1 - x0);
-    int dy = -std::abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-
-    int totalSteps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-    if (totalSteps == 0)
-        totalSteps = 1;
-    int step = 0;
-
-    for (;;)
+    walkLinePcsx2(v0.x - ofxF, v0.y - ofyF, v1.x - ofxF, v1.y - ofyF, [&](int x0, int y0, float t)
     {
-        float t = static_cast<float>(step) / static_cast<float>(totalSteps);
         uint8_t r, g, b, a;
         if (prim.iip)
         {
@@ -3533,22 +3685,8 @@ void GSRasterizer::drawLine(GS *gs)
 
         double z = (v0.z + (v1.z - v0.z) * t);
 
+        if (prim.fge)
+            applyFog(gs->m_registers.fogcol.data, fogF16(v0.fog + (v1.fog - v0.fog) * t), r, g, b);
         writePixel(gs, x0, y0, static_cast<u32>(z), r, g, b, a);
-
-        if (x0 == x1 && y0 == y1)
-            break;
-
-        int e2 = 2 * err;
-        if (e2 >= dy)
-        {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
-        }
-        ++step;
-    }
+    });
 }

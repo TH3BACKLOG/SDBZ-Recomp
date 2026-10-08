@@ -213,39 +213,39 @@
  ],
  "unseen_fog_gouraud_tex": [
   "DIFF",
-  2763
+  1
  ],
  "unseen_tex_t8h": [
-  "DIFF",
-  2774
+  "MATCH",
+  0
  ],
  "unseen_tex_t4hl": [
-  "DIFF",
-  2599
+  "MATCH",
+  0
  ],
  "unseen_tex_t4hh": [
   "DIFF",
-  2554
+  1
  ],
  "unseen_clut_ct16_t8": [
   "DIFF",
-  2774
+  1
  ],
  "unseen_clut_csm2_t8": [
-  "DIFF",
-  2774
+  "MATCH",
+  0
  ],
  "unseen_fba_then_dst_alpha": [
   "DIFF",
   3
  ],
  "unseen_date_datm0": [
-  "DIFF",
-  3681
+  "MATCH",
+  0
  ],
  "unseen_afail_zb_only": [
-  "DIFF",
-  2145
+  "MATCH",
+  0
  ],
  "unseen_z24_gequal": [
   "MATCH",
@@ -256,11 +256,15 @@
   0
  ],
  "unseen_linestrip_gouraud": [
-  "DIFF",
-  694
+  "MATCH",
+  0
  ],
  "unseen_scanmsk_even": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex2_clut_switch": [
   "DIFF",
-  1397
+  2
  ]
 }

@@ -48,6 +48,8 @@ struct Job
     GSPabeReg pabe;
     GSColClampReg colclamp;
     GSTexaReg texa;
+    uint64_t fogcol;
+    uint64_t scanmsk;
     uint8_t *vram;
     const uint8_t *clut;
 };
@@ -231,8 +233,8 @@ struct Setup
     RasterReadFn frd, zrd;
     RasterWriteFn fwr, zwr;
     u32 fbp, fbw, fpsm, fmsk, zbp, zpsm;
-    bool fb16, zmsk, abe, pabe, clamp, fbaOr;
-    uint64_t test;
+    bool fb16, zmsk, abe, pabe, clamp, fbaOr, fge;
+    uint64_t test, fogcol, scanmsk;
     uint32_t ztst;
     int sx0, sx1, sy0, sy1;
     uint8_t asel, bsel, csel, dsel, afix;
@@ -268,6 +270,9 @@ struct Setup
         clamp = j.colclamp.clamp;
         fbaOr = (ctx.fba.data & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24;
         test = ctx.test.data;
+        fge = j.prim.fge;
+        fogcol = j.fogcol;
+        scanmsk = j.scanmsk;
         ztst = static_cast<uint32_t>((ctx.test.data >> 17) & 3);
         sx0 = static_cast<int>(ctx.scissor.x0);
         sx1 = static_cast<int>(ctx.scissor.x1);
@@ -305,13 +310,16 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
 {
     if (x < S.sx0 || x > S.sx1 || y < S.sy0 || y > S.sy1)
         return;
+    if (scanMasked(S.scanmsk, y))
+        return;
 
     const AlphaTestResult alphaTest = classifyAlphaTest(S.test, a);
-    if (!alphaTest.writeFramebuffer)
+    if (!alphaTest.writeFramebuffer && !alphaTest.writeZ)
         return;
 
     uint8_t *vram = S.vram;
-    const bool frmw = (S.fmsk != 0) || S.abe || alphaTest.preserveDestinationAlpha;
+    const bool date = ((S.test >> 14) & 1u) != 0u;
+    const bool frmw = (S.fmsk != 0) || S.abe || alphaTest.preserveDestinationAlpha || date;
 
     u32 fbrgba = 0;
     if (frmw)
@@ -338,6 +346,8 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
         break;
     }
     if (!zpass)
+        return;
+    if (date && failsDestAlphaTest(S.test, S.fpsm, fbrgba))
         return;
 
     if (S.abe)
@@ -391,8 +401,9 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
     if (S.fb16)
         pixel = Rgba8888ToRgba5551(pixel);
 
-    S.fwr(vram, S.fbp, S.fbw, x, y, pixel);
-    if (!S.zmsk)
+    if (alphaTest.writeFramebuffer)
+        S.fwr(vram, S.fbp, S.fbw, x, y, pixel);
+    if (!S.zmsk && alphaTest.writeZ)
         S.zwr(vram, S.zbp, S.fbw, x, y, z);
 }
 
@@ -431,7 +442,7 @@ __forceinline uint32_t samplePoint(const Setup &S, int sampleU, int sampleV)
     {
         // GS::ReadClutCache on the job's CLUT snapshot (offsets masked to
         // the 1 KB cache; the old code read past it for csa > 15 on T8).
-        const u8 index = static_cast<u8>(out);
+        const u8 index = paletteIndex(tex.psm, out);
         const u32 csa = tex.csa;
         u32 clutVal = 0;
         switch (static_cast<u32>(tex.cpsm))
@@ -451,7 +462,7 @@ __forceinline uint32_t samplePoint(const Setup &S, int sampleU, int sampleV)
         default:
             break;
         }
-        return applyTexa(S.texa, tex.psm, clutVal);
+        return clutEntryToRgba(S.texa, tex.cpsm, clutVal);
     }
     }
     return 0xFFFF00FFu;
@@ -581,12 +592,17 @@ void drawSprite(const Setup &S)
                 uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
 
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                writePixel(S, x, y, z1, color.r, color.g, color.b, color.a);
+                uint8_t fr = color.r, fg = color.g, fb = color.b;
+                if (S.fge) // PCSX2: a sprite's fog is v1's
+                    applyFog(S.fogcol, v1.fog << 7, fr, fg, fb);
+                writePixel(S, x, y, z1, fr, fg, fb, color.a);
             }
         }
     }
     else
     {
+        if (S.fge)
+            applyFog(S.fogcol, v1.fog << 7, r, g, b);
         for (int y = S.firstRow(drawY0); y <= drawY1; y += S.rowN)
             for (int x = drawX0; x <= drawX1; ++x)
                 writePixel(S, x, y, z1, r, g, b, a);
@@ -724,6 +740,8 @@ void drawTriangle(const Setup &S)
                 a = color.a;
             }
 
+            if (S.fge)
+                applyFog(S.fogcol, fogF16(v0.fog * w0 + v1.fog * w1 + v2.fog * w2), r, g, b);
             writePixel(S, x, y, static_cast<u32>(z + 0.5), r, g, b, a);
         }
     }
@@ -738,65 +756,33 @@ void drawLine(const Setup &S)
     const GSVertex &v1 = j.v[1];
     const auto &ctx = j.ctx;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
-
-    int dx = std::abs(x1 - x0);
-    int dy = -std::abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-
-    int totalSteps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-    if (totalSteps == 0)
-        totalSteps = 1;
-    int step = 0;
-
-    for (;;)
+    // PCSX2 line walk (walkLinePcsx2 in ps2_gs_rasterizer.cpp).
+    const float ofxF = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+    const float ofyF = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+    walkLinePcsx2(v0.x - ofxF, v0.y - ofyF, v1.x - ofxF, v1.y - ofyF, [&](int x0, int y0, float t)
     {
-        if (S.ownsRow(y0))
+        if (!S.ownsRow(y0))
+            return;
+        uint8_t r, g, b, a;
+        if (prim.iip)
         {
-            float t = static_cast<float>(step) / static_cast<float>(totalSteps);
-            uint8_t r, g, b, a;
-            if (prim.iip)
-            {
-                r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * t));
-                g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * t));
-                b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * t));
-                a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * t));
-            }
-            else
-            {
-                r = v1.r;
-                g = v1.g;
-                b = v1.b;
-                a = v1.a;
-            }
-            double z = (v0.z + (v1.z - v0.z) * t);
-            writePixel(S, x0, y0, static_cast<u32>(z), r, g, b, a);
+            r = clampU8(static_cast<int>(v0.r + (v1.r - v0.r) * t));
+            g = clampU8(static_cast<int>(v0.g + (v1.g - v0.g) * t));
+            b = clampU8(static_cast<int>(v0.b + (v1.b - v0.b) * t));
+            a = clampU8(static_cast<int>(v0.a + (v1.a - v0.a) * t));
         }
-
-        if (x0 == x1 && y0 == y1)
-            break;
-
-        int e2 = 2 * err;
-        if (e2 >= dy)
+        else
         {
-            err += dy;
-            x0 += sx;
+            r = v1.r;
+            g = v1.g;
+            b = v1.b;
+            a = v1.a;
         }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
-        }
-        ++step;
-    }
+        double z = (v0.z + (v1.z - v0.z) * t);
+        if (S.fge)
+            applyFog(S.fogcol, fogF16(v0.fog + (v1.fog - v0.fog) * t), r, g, b);
+        writePixel(S, x0, y0, static_cast<u32>(z), r, g, b, a);
+    });
 }
 
 void runJob(const Job &j, TexCache &cache, int n, int idx)
@@ -822,8 +808,11 @@ void runJob(const Job &j, TexCache &cache, int n, int idx)
         const GSVertex &v = j.v[0];
         int px = static_cast<int>(v.x) - (j.ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (j.ctx.xyoffset.ofy >> 4);
+        uint8_t pr = v.r, pg = v.g, pb = v.b;
+        if (S.fge)
+            applyFog(S.fogcol, v.fog << 7, pr, pg, pb);
         if (S.ownsRow(py))
-            writePixel(S, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a);
+            writePixel(S, px, py, static_cast<u32>(v.z), pr, pg, pb, v.a);
         break;
     }
     default:

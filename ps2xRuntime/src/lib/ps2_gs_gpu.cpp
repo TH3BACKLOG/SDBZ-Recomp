@@ -7337,8 +7337,24 @@ void GS::ReloadClutCache(u32 psm, u32 cpsm, u32 cbp, u8 csm, u8 csa, u8 cld)
         ReloadClutCacheCSM1(psm, cpsm, cbp, csa);
         break;
     case 1:
-        ReloadClutCacheCSM2(psm, cbp);
+    {
+        // CSM2, PCSX2 GSClut::WriteCLUT*_CSM2: entry i at (COU*16 + i, COV) of a
+        // CBW-wide buffer in the CLUT's own format, stored from CSA*16 (CT32:
+        // CSA & 15). ReloadClutCacheCSM2 always read CT16 and used COU*256
+        // (gsfeature unseen_clut_csm2_t8); its signature has no cpsm/csa.
+        const auto texclut = m_registers.texclut;
+        const u32 entries = 1u << GSMem::BitsPerPixel(static_cast<GSMem::PixelStorageMode>(psm));
+        const bool clut32 = cpsm == GS_PSM_CT32 || cpsm == GS_PSM_CT24;
+        const u32 bpp = clut32 ? 4u : 2u;
+        u32 cache_addr = ((clut32 ? (csa & 15u) : csa) * 16u) * bpp;
+        for (u32 i = 0; i < entries; ++i, cache_addr += bpp)
+        {
+            const u32 value = ReadVram(clut32 ? GS_PSM_CT32 : cpsm, cbp, texclut.cbw,
+                                       static_cast<u32>(texclut.cou) * 16u + i, texclut.cov);
+            memcpy(&m_clut_cache[cache_addr & 0x3FF], &value, bpp);
+        }
         break;
+    }
     default:
         break;
     }

@@ -24043,3 +24043,10 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - ps2x_tests PS2GS: the suite crashed mid-run (raster jobs outlived the test's vram) -> now 60/68 with threads on. Left: T4HL/HH x3 and TEX2 (SDBZ never uses them), sceGsExec*/ResetGraph heap frees, SyncV.
 - Accepted residue: 1-22 px at exact texel boundaries on triangles (float barycentric vs PCSX2 SIMD lane stepping).
 - verify_fix PASS twice (bilinear_ltf, sprite_colclamp): build + gsfeature gate + 120 s boot.
+- Combo cases (census top combos: fighter T8 bilinear strips, CT32, trifan T4, HUD STQ sprites): all MATCH/NEAR. The fan's 2 dropped px = bilinear residue flipping ATST GREATER 64 (MATCH with ATST off).
+- UNSEEN-feature cases (no reached scene uses them) found 9 real raster bugs, all fixed in both raster files vs PCSX2:
+  DATE ignored; AFAIL ZB_ONLY wrote no Z (FB_ONLY/RGB_ONLY wrote Z); SCANMSK ignored; fog never applied (FGE);
+  T8H/T4HL/T4HH used the low byte as the index; CT16 CLUT entries not widened (5551 + TEXA); CSM2 CLUT read CT16 at COU*256;
+  lines = PCSX2 DDA + diamond exit (was Bresenham from truncated ends). TEX2 CLUT switch already matched.
+- Left (minor): FBA case 3 px (frame alpha > 0x80 at 3 isolated px, cause unknown); T4HL/HH + TEX2 ps2x_tests fail on test-side
+  raw-VRAM checks while the same path matches PCSX2 in the matrix.
