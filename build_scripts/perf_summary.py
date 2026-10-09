@@ -10,6 +10,13 @@ pasting the log. Encoding-safe (reuses analyze_run.read_text_any).
   python build_scripts/perf_summary.py A.txt B.txt         # side by side
 
 Also prints the last [gsraster-wait] / [cputime] record for context.
+
+  python build_scripts/perf_summary.py --fight [LOG]       # real-fight report
+
+--fight: only seconds whose [budget] vu1Us/vbl >= --vu1-min (5000 = fight-level
+VU1 load, menus drop out), median/p10/p90 vbl/s, [budget] medians, per-thread
+CPU and the GameThread [hostprof] leaf + owner rows. Pair with
+`launch_recomp.ps1 -PerfFight`, which calls this at the end of the run.
 """
 import argparse
 import os
@@ -69,14 +76,93 @@ def summarize(path, lo, hi):
     return out
 
 
+def _pct(sorted_vals, p):
+    # Nearest-rank percentile on an already sorted list.
+    i = max(0, min(len(sorted_vals) - 1, int(round(p / 100.0 * (len(sorted_vals) - 1)))))
+    return sorted_vals[i]
+
+
+HP_THREAD = re.compile(r"^\[hostprof\]\s+tid (\d+)\s+([\d.]+)s\s+(.+)$")
+HP_SECTION = re.compile(r"-- tid \d+ \(([^)]+)\)")
+HP_LEAF = re.compile(r"^\[hostprof\]\s+([\d.]+)%\s+([\d.]+)s\s+(.+)$")
+HP_OWNER = re.compile(r"^\[hostprof\]\s+owner\s+([\d.]+)%\s+(.+)$")
+
+
+def fight(path, vu1_min, thread, top):
+    if not os.path.exists(path):
+        print("log not found: %s" % path)
+        return 1
+    text = read_text_any(path)
+    rows = []
+    for bt, bv, rest in BD.findall(text):
+        m = re.search(r"vu1Us/vbl=(\d+)", rest)
+        if m and int(m.group(1)) >= vu1_min:
+            row = {"t": int(bt), "vbl": int(bv)}
+            for k in BUDGET_KEYS:
+                mk = re.search(re.escape(k) + r"=(\d+)", rest)
+                if mk:
+                    row[k] = int(mk.group(1))
+            rows.append(row)
+    print("== %s  --fight (vu1Us/vbl >= %d)" % (path, vu1_min))
+    if not rows:
+        print("   NO fight seconds -- the run never reached a fight; do not read this as 0 vbl/s.")
+        return 1
+    v = sorted(r["vbl"] for r in rows)
+    print("   fight seconds=%d (t=%d..%d)  vbl/s median=%.1f p10=%d p90=%d mean=%.1f min=%d max=%d"
+          % (len(v), rows[0]["t"], rows[-1]["t"], statistics.median(v), _pct(v, 10), _pct(v, 90),
+             statistics.mean(v), v[0], v[-1]))
+    print("   [budget] medians: " + "  ".join(
+        "%s=%d" % (k, statistics.median([r[k] for r in rows if k in r]))
+        for k in BUDGET_KEYS if any(k in r for r in rows)))
+    # [hostprof]: records can be glued onto other output, so cut at each tag.
+    next_tag = re.compile(r"\[[A-Za-z][\w:.-]*\]")
+    hp = []
+    for r in re.findall(r"\[hostprof\][^\r\n]*", text):
+        m = next_tag.search(r, 10)
+        hp.append(r[:m.start()] if m else r)
+    threads = [m.groups() for m in (HP_THREAD.match(r.rstrip()) for r in hp) if m]
+    if threads:
+        print("   thread CPU: " + "  ".join("%s=%ss" % (n, s) for _, s, n in threads[:7]))
+    sect, leaves, owners = None, [], []
+    for r in hp:
+        r = r.rstrip()
+        ms = HP_SECTION.search(r)
+        if ms:
+            sect = ms.group(1)
+            continue
+        if sect != thread:
+            continue
+        ml, mo = HP_LEAF.match(r), HP_OWNER.match(r)
+        if ml:
+            leaves.append(ml.groups())
+        elif mo:
+            owners.append(mo.groups())
+    if owners:
+        print("   %s owners: %s" % (thread, "  ".join("%s %s%%" % (o.split("!")[-1], p) for p, o in owners[:8])))
+    for p, s, name in leaves[:top]:
+        print("     %5s%%  %7ss  %s" % (p, s, name[:110]))
+    if not leaves:
+        print("   (no [hostprof] %s section -- was -HostProfile on and did the report land before the stop?)" % thread)
+    gs = re.findall(r"\[gsthread\] submits=[^\r\n]*", text)
+    if gs:
+        print("   last " + gs[-1][:260])
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="*", default=[DEFAULT_LOG])
+    ap.add_argument("--fight", action="store_true", help="real-fight report (see module doc)")
+    ap.add_argument("--vu1-min", type=int, default=5000, help="--fight: min vu1Us/vbl for a fight second")
+    ap.add_argument("--thread", default="GameThread", help="--fight: [hostprof] thread section to list")
+    ap.add_argument("--top", type=int, default=20, help="--fight: leaf rows to print")
     ap.add_argument("--from", dest="lo", type=int, default=80)
     ap.add_argument("--to", dest="hi", type=int, default=240)
     ap.add_argument("--hostprof", action="store_true",
                     help="print only the [hostprof] report lines (startswith filter)")
     a = ap.parse_args()
+    if a.fight:
+        return max(fight(p, a.vu1_min, a.thread, a.top) for p in a.logs)
     if a.hostprof:
         for p in a.logs:
             for ln in read_text_any(p).splitlines():

@@ -29,6 +29,12 @@ param(
     # pause menu), quantum 3000, DIAG off. Reaches a live fight at t~140..205, so
     # pair with -RunSeconds 206 and PS2X_PROFILE_START=145 for a profile.
     [switch]$Fight,
+    # REAL-fight perf measurement in one command (-Fight is the attract demo).
+    # Pad script perf_fight.txt starts an Original-mode fight; implies
+    # -NoDebugger -HostProfile, RunSeconds 320, RelWithDebInfo exe (unless -Exe
+    # given), then prints `perf_summary.py --fight` (median vbl/s over seconds
+    # with fight-level VU1 load).
+    [switch]$PerfFight,
     # Arm the DR0 hardware watchpoint on the rpc_call saved-$ra slot. Off by
     # default since 2026-07-28 -- it costs ~20% of the run's CPU. Turn it on
     # only when hunting a memory writer, never during a perf measurement.
@@ -95,6 +101,25 @@ if ($Repeat -gt 1) {
     if (Test-Path -LiteralPath $analyzer) { & python $analyzer --runs }
     else { Write-Warning "analyze_run.py not found at $analyzer" }
     return
+}
+
+# --- -PerfFight preset ----------------------------------------------------------
+# Every setting a real-fight measurement needs, so none is forgotten by hand.
+# AUTOPRESS must be CLEARED: it fights the pad script and lands in the attract demo.
+if ($PerfFight) {
+    if (-not $PSBoundParameters.ContainsKey('Exe')) {
+        $Exe = "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+    }
+    if ($RunSeconds -le 0) { $RunSeconds = 320 }
+    $NoDebugger = [switch]$true
+    $HostProfile = [switch]$true
+    Remove-Item Env:PS2X_PAD_AUTOPRESS* -ErrorAction SilentlyContinue
+    $env:PS2X_DIAG = '0'
+    $env:PS2X_DET_VBLANK_QUANTUM = '3000'
+    $env:PS2X_PAD_SCRIPT = Join-Path (Split-Path -Parent $PSCommandPath) 'build_scripts\sweeps\perf_fight.txt'
+    $env:PS2X_PROFILE_GATE = '1'
+    $env:PS2X_PROFILE_START = '0'
+    Write-Host "[launch_recomp] -PerfFight: perf_fight.txt pad script, ${RunSeconds}s, quantum 3000, DIAG=0, profile gate on, exe=$Exe" -ForegroundColor Cyan
 }
 
 # --- Tracers -----------------------------------------------------------------
@@ -701,5 +726,11 @@ if (Test-Path $Log) {
         Write-Host '  ############################################################' -ForegroundColor Red
     } else {
         Write-Host "[validity] run passes the validity gate (SREG mirrored$(if ($Watch) { ', watches armed' }), no capped probes)." -ForegroundColor Green
+    }
+
+    if ($PerfFight) {
+        Write-Host ''
+        $summary = Join-Path (Split-Path -Parent $PSCommandPath) 'build_scripts\perf_summary.py'
+        & python $summary --fight $Log
     }
 }
