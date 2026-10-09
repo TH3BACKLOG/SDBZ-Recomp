@@ -2,7 +2,7 @@
 #   pwsh -NoProfile -File "F:\SDBZ Recomp\build_scripts\play.ps1"
 # Thin wrapper over launch_recomp.ps1: DIAG off (the default there is ON and costs
 # ~10%), no debugger shm, boot script (play_boot.txt) to the main menu, no auto-stop, determinism ON (never det=0),
-# vblank quantum 3000 (the value fights are verified at). Log still goes to
+# vblank quantum 3000 (the value fights are verified at), VU1 on its own thread (-NoVuThread to disable). Log still goes to
 # run_log.txt, so [scene]/[texmiss]-style evidence from your play is kept.
 param(
     [string]$Exe = "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe",
@@ -22,17 +22,22 @@ param(
     # Keys: arrows/WASD, X/Space = Cross, C = Circle, Z = Square, V = Triangle,
     # Q/E = L1/R1, Shift = L2/R2, Enter = Start, Tab = Select (keyboard only when no
     # gamepad is plugged in).
-    [switch]$NoAuto
+    [switch]$NoAuto,
+    # VU1 + VIF1 + GIF submission run on their own thread (PS2X_VU1_THREAD=1, P5b):
+    # the EE thread no longer waits for VU1 microprograms. Default ON here (measured
+    # 37 -> 41 vbl/s in a fight); -NoVuThread runs them inline on the EE thread.
+    [switch]$NoVuThread
 )
 
 $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 
 # Env persists across runs in one shell: clear anything a test run left behind.
 foreach ($v in 'PS2X_PAD_AUTOPRESS', 'PS2X_PAD_AUTOPRESS_BTNS', 'PS2X_PAD_AUTOPRESS_HOLD', 'PS2X_PAD_AUTOPRESS_SECS',
-               'PS2X_PAD_SCRIPT', 'PS2X_VUCAP', 'PS2X_GSCAP', 'PS2X_HWWATCH', 'PS2X_TEXMISS_LOG') {
+               'PS2X_PAD_SCRIPT', 'PS2X_VUCAP', 'PS2X_GSCAP', 'PS2X_HWWATCH', 'PS2X_TEXMISS_LOG', 'PS2X_VU1_THREAD') {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
 $env:PS2X_DIAG = '0'
+if (-not $NoVuThread) { $env:PS2X_VU1_THREAD = '1' }
 if (-not $NoAuto) {
     $env:PS2X_PAD_SCRIPT = Join-Path $root 'build_scripts\sweeps\play_boot.txt'
 }
@@ -46,7 +51,7 @@ if ($Texmiss) {
     Write-Host "[play] texmiss log -> $($env:PS2X_TEXMISS_LOG)" -ForegroundColor Cyan
 }
 
-Write-Host "[play] DIAG=0 quantum=$Quantum nearest=$(-not $Bilinear) auto-boot=$(if ($NoAuto) { 'off' } else { 'on' })  (close the window to stop)" -ForegroundColor Cyan
+Write-Host "[play] DIAG=0 quantum=$Quantum nearest=$(-not $Bilinear) auto-boot=$(if ($NoAuto) { 'off' } else { 'on' }) vu-thread=$(-not $NoVuThread)  (close the window to stop)" -ForegroundColor Cyan
 
 $args2 = @{ Exe = $Exe; NoDebugger = $true; RunSeconds = $RunSeconds }
 if ($HostProfile) { $args2['HostProfile'] = $true }
