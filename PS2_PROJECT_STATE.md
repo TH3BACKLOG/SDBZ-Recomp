@@ -269,6 +269,28 @@ Replaces "which probe fired" as the unit of progress. Each rung needs an asserta
 Expect **new** blockers at rung 5 (pad input, save data, audio). That is the point: they are
 reached only because the earlier rungs now hold.
 
+## Part 176 (2026-10-08) -- feature-not-scene: GS matrix vs PCSX2 found + fixed ~25 raster bugs (Protocol #1 AFK loop)
+
+Commits `a2d829fd` .. `38ab953c` (branch sync/upstream-2026-09-24, pushed). Details: the 10-08b/10-08c notes at the END of this file.
+
+- Tools: `build_scripts/gsfeature/gs_feature_census.py` (features SDBZ draws with), `gs_feature_matrix.py` (96 synthetic cases, ours ST+MT vs PCSX2 GSRunner SW, `--gate` vs `baseline.json`, gated in `verify_fix.ps1`), `build_scripts/vu1_mpg_scan.py` (VU1 microprogram census), `gfx_scene_diff.py` honours `PS2X_GSDIFF_RASTER_THREADS=4`.
+- Fixed (both raster files): bilinear 4-bit weights; sprite ceil coverage + FST UV; COLCLAMP=0 blend; DATE; AFAIL Z writes; SCANMSK; fog; T8H/T4HL/T4HH index; CT16 + CSM2 CLUTs; lines (PCSX2 DDA); points; PRMODECONT/PRMODE; DIMX/DTHE stored + dithering; CT24 C=Ad; PCSX2-exact triangle UV interpolation. VU1 RSQRT 0/0. SPR DMA completion. Tests: raster drain/RAII crash fix, CT32 pixel-index offsets.
+- Result: real captures 461/461 MATCH, closer to PCSX2 (krillin mean 0.0193 -> 0.0153), 0 worse, ST == MT. PS2GS 61/68, PS2Memory 53/53.
+
+**Learned patterns**
+- One-feature-at-a-time synthetic cases hide bugs: base registers fixed COLCLAMP=1 (hid the dropped blend) and no textured-sprite case existed (hid coverage + UV bugs). Fix with census COMBO cases + an "unseen features" batch.
+- `gfx_scene_diff.render` forced `PS2X_GS_RASTER_THREADS=0`, so every oracle grade only checked the single-thread raster. Grade both (the matrix now does).
+- A register `case X: break;` in `GS::writeRegister` silently drops state (DIMX/DTHE). Grep the write switch before blaming the raster.
+- A boot with no pad input sits on the Warning screen forever: set `PS2X_PAD_AUTOPRESS=120` for any run that must pass it (FMV, menus).
+- ps2x_tests that read VRAM right after a draw need `ps2xGsRasterFlush()` (MT raster is async); `GSMem::Lookup*` return pixel INDICES, not byte offsets.
+
+**Handoff -- next**
+1. Small: `unseen_fba_then_dst_alpha` 3 px where our FRAME alpha = 0xFF vs PCSX2 0x80 (probe in Logs/gsfeature/matrix/fba_probe).
+2. Varying-Q STQ residue (1-22 boundary px): PCSX2 samples ~0.001 px up-left; source not found (time-boxed).
+3. 32 never-run VU1 programs (shader table 0x43BD50) need real VIF1 input to verify vs PCSX2.
+4. Backlog E: SPU2 audio (plan with the user first). Mipmaps unimplemented (unused by SDBZ).
+5. Build/verify: `.uild_scriptserify_fix.ps1 -Name <x> -NoConformance` (RelWithDebInfo build + 96-case gate + 120 s boot); matrix alone: `python build_scripts/gsfeature/gs_feature_matrix.py --gate`.
+
 ## Part 174 (2026-10-03) -- revise protocol: unattended "find all missing graphics" sweep
 
 - Plan: `harmonic-tickling-castle.md` (3rd revise). User launches ONE command and walks away; target = every screen/mode. Memory: `project_auto_gfx_sweep`.
