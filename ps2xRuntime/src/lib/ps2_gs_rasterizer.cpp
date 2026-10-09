@@ -1681,8 +1681,9 @@ namespace
     bool tex1UsesLinearFilter(uint64_t tex1)
     {
         // 10-09: PS2X_GS_NEAREST=1 forces point sampling everywhere (both
-        // rasterisers go through here): speed over fidelity, for manual play
-        // (build_scripts/play.ps1). Off by default; the oracle gates never set it.
+        // rasterisers go through here): for manual play. Off in the library
+        // (gs_bench / oracle gates stay exact); ps2EntryRunner's main() sets it
+        // to 1 when unset and no capture var is present, so =0 means bilinear.
         static const bool forceNearest = []
         {
             const char *e = std::getenv("PS2X_GS_NEAREST");

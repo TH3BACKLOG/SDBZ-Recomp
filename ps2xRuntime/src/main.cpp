@@ -171,6 +171,20 @@ int main(int argc, char *argv[])
 #endif
     setupTerminateLogger();
 
+#if defined(_WIN32)
+    // Texture interpolation off by default for interactive play (point sampling,
+    // see tex1UsesLinearFilter). Graded runs keep the PCSX2-exact bilinear path:
+    // a capture run (PS2X_GSCAP / PS2X_VUCAP) or an explicit PS2X_GS_NEAREST
+    // (=0 forces bilinear) is left alone.
+    if (!std::getenv("PS2X_GS_NEAREST") && !std::getenv("PS2X_GSCAP") && !std::getenv("PS2X_VUCAP"))
+        _putenv_s("PS2X_GS_NEAREST", "1");
+    {
+        const char *nearest = std::getenv("PS2X_GS_NEAREST");
+        std::cerr << "[gs] texture sampling: " << ((nearest && *nearest == '1') ? "nearest (interpolation off)" : "PS2-exact bilinear")
+                  << " (PS2X_GS_NEAREST=" << (nearest ? nearest : "unset") << ")" << std::endl;
+    }
+#endif
+
     try
     {
         std::filesystem::path pathObj = getExecutablePath(argc, argv);

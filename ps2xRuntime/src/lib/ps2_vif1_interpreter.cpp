@@ -720,7 +720,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
                 ps2diag_gifpath::g_curSite.store(directHl ? 8u : 2u, std::memory_order_relaxed);
-                ps2diag_gifpath::g_curSrc.store(dsSrcAt(pos), std::memory_order_relaxed);
+                // Only the [drawpath] capture ring reads g_curSrc; resolveSrc scans a
+                // 1024-entry ring (~1% of the fight game thread), so not with diag off.
+                ps2diag_gifpath::g_curSrc.store(ps2_diag::enabled() ? dsSrcAt(pos) : 0xFFFFFFFFu,
+                                                std::memory_order_relaxed);
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
                 ps2diag_gifpath::g_curSite.store(0u, std::memory_order_relaxed);
                 ps2diag_gifpath::g_curSrc.store(0xFFFFFFFFu, std::memory_order_relaxed);

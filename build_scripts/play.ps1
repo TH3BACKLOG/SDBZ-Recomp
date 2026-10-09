@@ -26,7 +26,8 @@ foreach ($v in 'PS2X_PAD_AUTOPRESS', 'PS2X_PAD_AUTOPRESS_BTNS', 'PS2X_PAD_AUTOPR
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
 $env:PS2X_DIAG = '0'
-if ($Bilinear) { Remove-Item Env:PS2X_GS_NEAREST -ErrorAction SilentlyContinue } else { $env:PS2X_GS_NEAREST = '1' }
+# ps2EntryRunner defaults an UNSET value to 1, so -Bilinear must say 0 explicitly.
+$env:PS2X_GS_NEAREST = if ($Bilinear) { '0' } else { '1' }
 $env:PS2X_DET_VBLANK_QUANTUM = "$Quantum"
 
 if ($Texmiss) {

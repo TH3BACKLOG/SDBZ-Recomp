@@ -425,6 +425,31 @@ namespace
         return nreg == 0u ? 16u : nreg;
     }
 
+    // 10-09 perf: DMA chain gather buffers (chainBuf -> PendingTransfer::chainData)
+    // are reused. A fresh vector per chain grew by reallocation and was freed
+    // back to the OS when the transfer was done: ~4-8% of the fight game thread
+    // in memcpy, page faults and NtFreeVirtualMemory. Per thread, as the queues.
+    thread_local std::vector<std::vector<uint8_t>> t_chainBufPool;
+
+    std::vector<uint8_t> takeChainBuf()
+    {
+        if (t_chainBufPool.empty())
+            return {};
+        std::vector<uint8_t> buf = std::move(t_chainBufPool.back());
+        t_chainBufPool.pop_back();
+        buf.clear();
+        return buf;
+    }
+
+    // Call right before the queue is cleared; every packet in it was consumed.
+    template <typename Queue>
+    void recycleChainBufs(Queue &queue)
+    {
+        for (auto &p : queue)
+            if (p.chainData.capacity() != 0u && t_chainBufPool.size() < 8u)
+                t_chainBufPool.push_back(std::move(p.chainData));
+    }
+
 }
 
 // Helpers for GS VRAM addressing (PSMCT32 path).
@@ -1924,9 +1949,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuf();
 
-                    auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                    auto appendData =[&](uint32_t srcAddr, uint32_t qwCount)
                     {
                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
                         uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
@@ -2390,6 +2415,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBufs(m_pendingGifTransfers);
     m_pendingGifTransfers.clear();
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
@@ -2448,6 +2474,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBufs(m_pendingVif0Transfers);
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -2506,6 +2533,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    recycleChainBufs(m_pendingVif1Transfers);
     m_pendingVif1Transfers.clear();
 
     if (m_gifArbiter)

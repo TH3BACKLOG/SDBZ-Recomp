@@ -518,6 +518,16 @@ class Gen:
                           if p.is_branch() and (p.lo.viRead & 0xFFFE)}
         self.find_dead_flags()
         self.find_pending()
+        # VF/ACC scoreboard entries some emit_stall term reads. Stamps of any
+        # other VF/ACC key are dead stores (~800 per program vs ~20 reads),
+        # so markPairWrites skips them. VI stamps with latency > 1 stay:
+        # finish() reads viR.
+        self.stall_read_keys = set()
+        for pc, p in self.pairs.items():
+            pend = self.pending_in.get(pc)
+            for k in self.stall_keys(p):
+                if pend is None or k in pend:
+                    self.stall_read_keys.add(k)
 
     @staticmethod
     def pushes_fmac_flags(p):
@@ -1153,6 +1163,12 @@ class Gen:
 
         # markPairWrites
         for key, lat in self.pair_stamps(p):
+            if key[0] != "vi" and key not in self.stall_read_keys:
+                continue
+            # ready = cyc + 1 is <= cyc at every later read (the ++r.cyc
+            # below runs before any stall check, goto stop or goto done).
+            if lat <= 1:
+                continue
             if key[0] == "vf":
                 W("        r.vfR[%d][%d] = r.cyc + %du;" % (key[1], key[2], lat))
             elif key[0] == "vi":

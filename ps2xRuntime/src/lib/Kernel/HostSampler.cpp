@@ -61,6 +61,7 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -77,9 +78,11 @@ struct ThreadSamples
     uint64_t totalWeight = 0;
     std::unordered_map<uint64_t, uint64_t> byRip;
     // 10-09: samples whose RIP is outside the game exe (CRT memcpy, ntdll waits...)
-    // keyed by {leaf RIP, nearest return address into the game exe on the stack}.
-    // Answers "who calls memcpy / who sleeps", which the flat histogram cannot.
-    std::map<std::pair<uint64_t, uint64_t>, uint64_t> byCaller;
+    // keyed by {leaf RIP, nearest return address into the game exe on the stack,
+    // the next one after it}. Answers "who calls memcpy / who sleeps", which the
+    // flat histogram cannot. The second caller names the code behind an
+    // out-of-line std:: helper (std::copy, vector::assign).
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> byCaller;
 };
 
 struct TrackedThread
@@ -91,6 +94,7 @@ struct TrackedThread
 
 std::atomic<bool> g_stop{false};
 std::atomic<bool> g_reported{false};
+std::atomic<bool> g_gateOpen{true};
 std::thread g_thread;
 
 std::unordered_map<DWORD, ThreadSamples> g_samples;
@@ -109,18 +113,20 @@ void initExeRange()
 // Nearest 8-byte stack slot (within the bytes copied from RSP) holding a return
 // address into the game exe: the bytes before it must end a CALL (E8 rel32 or an
 // FF /2 form). Heuristic: stale slots can fool it, but the aggregate is fine.
-uint64_t gameCallerFromStack(const uint64_t *slots, size_t count)
+// Index of the first slot at or after `from` that looks like a return address
+// into the game exe, or `count`.
+size_t gameCallerFromStack(const uint64_t *slots, size_t count, size_t from = 0)
 {
-    for (size_t i = 0; i < count; ++i)
+    for (size_t i = from; i < count; ++i)
     {
         const uint64_t v = slots[i];
         if (v < g_exeLo + 8 || v >= g_exeHi)
             continue;
         const uint8_t *c = reinterpret_cast<const uint8_t *>(v);
         if (c[-5] == 0xE8 || c[-6] == 0xFF || c[-2] == 0xFF || c[-3] == 0xFF || c[-4] == 0xFF)
-            return v;
+            return i;
     }
-    return 0;
+    return count;
 }
 
 uint64_t threadCpu100ns(HANDLE h)
@@ -438,36 +444,45 @@ void report(double windowSec)
                 return moduleOf(proc, a) + "!" + n;
             };
             std::unordered_map<uint64_t, std::string> leafCache, callerCache;
+            auto callerName = [&](uint64_t a) -> const std::string & {
+                auto ci = callerCache.find(a);
+                if (ci == callerCache.end())
+                {
+                    std::string n = collapse(a);
+                    IMAGEHLP_LINE64 line{};
+                    line.SizeOfStruct = sizeof(line);
+                    DWORD d = 0;
+                    if (SymGetLineFromAddr64(proc, a, &d, &line) && line.FileName)
+                    {
+                        const char *slash = std::strrchr(line.FileName, '\\');
+                        char lb[160];
+                        std::snprintf(lb, sizeof(lb), " (%s:%lu)", slash ? slash + 1 : line.FileName,
+                                      static_cast<unsigned long>(line.LineNumber));
+                        n += lb;
+                    }
+                    ci = callerCache.emplace(a, n).first;
+                }
+                return ci->second;
+            };
             size_t resolvedPairs = 0;
             for (const auto &kv : ts.byCaller)
             {
+                const uint64_t leaf = std::get<0>(kv.first);
+                const uint64_t c1 = std::get<1>(kv.first);
+                const uint64_t c2 = std::get<2>(kv.first);
                 callerTotal += kv.second;
                 if (++resolvedPairs > kMaxResolve)
                     continue;
-                auto li = leafCache.find(kv.first.first);
+                auto li = leafCache.find(leaf);
                 if (li == leafCache.end())
-                    li = leafCache.emplace(kv.first.first, collapse(kv.first.first)).first;
+                    li = leafCache.emplace(leaf, collapse(leaf)).first;
                 std::string caller = "(no game frame in top 768 bytes)";
-                if (kv.first.second)
+                if (c1)
                 {
-                    auto ci = callerCache.find(kv.first.second);
-                    if (ci == callerCache.end())
-                    {
-                        std::string n = collapse(kv.first.second);
-                        IMAGEHLP_LINE64 line{};
-                        line.SizeOfStruct = sizeof(line);
-                        DWORD d = 0;
-                        if (SymGetLineFromAddr64(proc, kv.first.second, &d, &line) && line.FileName)
-                        {
-                            const char *slash = std::strrchr(line.FileName, '\\');
-                            char lb[160];
-                            std::snprintf(lb, sizeof(lb), " (%s:%lu)", slash ? slash + 1 : line.FileName,
-                                          static_cast<unsigned long>(line.LineNumber));
-                            n += lb;
-                        }
-                        ci = callerCache.emplace(kv.first.second, n).first;
-                    }
-                    caller = ci->second;
+                    caller = callerName(c1);
+                    // An out-of-line std:: helper says nothing; name its caller too.
+                    if (c2 && caller.find("!std::") != std::string::npos)
+                        caller += "  <-  " + callerName(c2);
                 }
                 byPair[li->second + "  <-  " + caller] += kv.second;
             }
@@ -512,6 +527,11 @@ void samplerMain(int intervalMs, double reportAfterSec)
     double startSec = 0.0;
     if (const char *st = std::getenv("PS2X_PROFILE_START"))
         startSec = (std::max)(0.0, std::atof(st));
+    // PS2X_PROFILE_GATE=1: also discard samples while the runtime has the gate
+    // closed (ps2x_host_sampler_gate; the [budget] line closes it on seconds
+    // with little VU1 work), so a fight profile skips the menus in between.
+    const char *gateEnv = std::getenv("PS2X_PROFILE_GATE");
+    const bool useGate = gateEnv && *gateEnv && *gateEnv != '0';
 
     while (!g_stop.load(std::memory_order_relaxed))
     {
@@ -567,12 +587,19 @@ void samplerMain(int intervalMs, double reportAfterSec)
             if (startSec > 0.0 &&
                 std::chrono::duration<double>(now - started).count() < startSec)
                 continue;
+            if (useGate && !g_gateOpen.load(std::memory_order_relaxed))
+                continue;
 
             ThreadSamples &s = g_samples[kv.first];
             s.totalWeight += delta;
             s.byRip[ctx.Rip] += delta;
             if (stackCount)
-                s.byCaller[{ctx.Rip, gameCallerFromStack(stackSlots, stackCount)}] += delta;
+            {
+                const size_t c1 = gameCallerFromStack(stackSlots, stackCount);
+                const size_t c2 = c1 < stackCount ? gameCallerFromStack(stackSlots, stackCount, c1 + 1) : stackCount;
+                s.byCaller[{ctx.Rip, c1 < stackCount ? stackSlots[c1] : 0u,
+                            c2 < stackCount ? stackSlots[c2] : 0u}] += delta;
+            }
         }
 
         const double elapsed =
@@ -619,6 +646,11 @@ extern "C" void ps2x_host_sampler_start(void)
     g_thread = std::thread(samplerMain, intervalMs, reportAfter);
 }
 
+extern "C" void ps2x_host_sampler_gate(int open)
+{
+    g_gateOpen.store(open != 0, std::memory_order_relaxed);
+}
+
 extern "C" void ps2x_host_sampler_stop(void)
 {
     if (!g_thread.joinable())
@@ -632,6 +664,7 @@ extern "C" void ps2x_host_sampler_stop(void)
 #else // !_WIN32
 
 extern "C" void ps2x_host_sampler_start(void) {}
+extern "C" void ps2x_host_sampler_gate(int) {}
 extern "C" void ps2x_host_sampler_stop(void) {}
 
 #endif

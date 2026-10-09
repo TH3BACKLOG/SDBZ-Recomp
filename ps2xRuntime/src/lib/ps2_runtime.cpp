@@ -58,6 +58,7 @@ namespace ps2_stubs
 // rather than in a header because a header change forces all ~30,000 runner TUs
 // to recompile. No-ops unless PS2X_PROFILE is set.
 extern "C" void ps2x_host_sampler_start(void);
+extern "C" void ps2x_host_sampler_gate(int open);
 extern "C" void ps2x_host_sampler_stop(void);
 
 // Detached host-side FMV player (src/lib/Kernel/Fmv/FmvHost.cpp). Declared here
@@ -6807,6 +6808,9 @@ void PS2Runtime::run()
                         const uint64_t nv = dVbl != 0 ? dVbl : 1;
                         const uint64_t xferTotal = dx[0] + dx[1] + dx[2] + dx[3] + dx[4];
                         const uint64_t rastPx = dr[0] + dr[1] + dr[2] + dr[3] + dr[4] + dr[5];
+                        // Fight seconds spend 8-30 ms/vbl in VU1, menus ~0: this
+                        // opens the PS2X_PROFILE_GATE sample filter.
+                        ps2x_host_sampler_gate(dv[0] / 1000 / nv >= 5000u ? 1 : 0);
                         std::cerr << "[budget] t=" << (t + 1) << " vbl/s=" << dVbl
                                   << " xfer/s=" << xferTotal << " (exit/resched/pushInv/pushSeq/block="
                                   << dx[0] << "/" << dx[1] << "/" << dx[2] << "/" << dx[3] << "/" << dx[4] << ")"

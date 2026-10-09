@@ -328,8 +328,10 @@ namespace ps2x::iop::spu2
             v.flags = 0;
             v.haveBlock = false;
             v.nextA = ((v.ssa & 0xFFFF8u) | 1u) & kAddrMask;
-            if (!v.loopMode)
-                v.loopStart = v.ssa & 0xFFFF8u;
+            // PCSX2 V_Voice::Start (spu2sys.cpp:216): KON clears LoopMode, so a loop-start flag in the new
+            // sample's blocks sets LSA again; an LSAX write earlier must not pin the loop point forever.
+            v.loopMode = false;
+            v.loopStart = v.ssa & 0xFFFF8u;
             v.prev1 = v.prev2 = 0;
             v.wr = v.rd = 0;
             v.outx = 0;
@@ -518,6 +520,8 @@ namespace ps2x::iop::spu2
 
     void writeReg(uint32_t off, uint16_t value)
     {
+        if (off >= kSize) // IopMemory forwards the whole 64 KB window; do not mirror it onto live registers
+            return;
         off &= 0x7FEu;
         if (!g.gaussReady)
             buildGauss();
@@ -627,6 +631,8 @@ namespace ps2x::iop::spu2
 
     bool readLive(uint32_t off, uint16_t *value)
     {
+        if (off >= kSize)
+            return false;
         off &= 0x7FEu;
         if (off >= 0x760u)
             return false;

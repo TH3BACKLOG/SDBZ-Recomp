@@ -61,6 +61,7 @@ if (-not $ReplayOnly) {
     Get-ChildItem $dir -File -Recurse | Remove-Item -Confirm:$false
     $set = @{
         PS2X_DIAG = '0'; PS2X_DET_VBLANK_QUANTUM = '3000'
+        PS2X_GS_NEAREST = '0'   # graded captures stay PCSX2-exact (ps2EntryRunner defaults unset to 1)
         PS2X_GSCAP = "$From,$Frames,$dir\cap"; PS2X_GSCAP_EVERY = "$Every"
     }
     if ($Script) {

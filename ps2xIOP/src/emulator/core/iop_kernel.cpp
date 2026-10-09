@@ -730,15 +730,14 @@ namespace ps2x::iop::detail
             }
         }
 
+        // One pass (10-09 perf: this walk was ~4% of the fight game thread):
+        // waking a Delay thread before testing it gives the same pick as the
+        // old wake-all-then-select passes.
+        IopThread *next = nullptr;
         for (auto &[id, thread] : m_threads)
         {
             if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
                 thread.state = IopThreadState::Ready;
-        }
-
-        IopThread *next = nullptr;
-        for (auto &[id, thread] : m_threads)
-        {
             if (thread.state != IopThreadState::Ready)
                 continue;
             if (next == nullptr || thread.priority < next->priority ||
