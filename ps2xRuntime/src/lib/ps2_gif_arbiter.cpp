@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <intrin.h>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -177,6 +178,27 @@ std::atomic<uint64_t> g_presenterYieldNs{0};
 extern std::atomic<uint64_t> g_gsmtWaitDoneNs; // ps2_gs_rasterizer.cpp
 extern std::atomic<uint64_t> g_gsmtWaitDoneCalls;
 extern std::atomic<uint64_t> g_gsmtWaitByReason[16][2];
+extern std::atomic<uint64_t> g_gsmtBusyTsc[16];
+extern std::atomic<uint64_t> g_gsmtJobs[16];
+extern std::atomic<uint64_t> g_gsmtSubmitTsc;
+extern std::atomic<uint64_t> g_gsmtSubmitCalls;
+// TSC ticks -> ms (calibrated once, 2 ms spin).
+static double gsmtTicksToMs(uint64_t ticks)
+{
+    static const double msPerTick = []
+    {
+        using clock = std::chrono::steady_clock;
+        const auto c0 = clock::now();
+        const uint64_t t0 = __rdtsc();
+        while (clock::now() - c0 < std::chrono::milliseconds(2))
+        {
+        }
+        const uint64_t t1 = __rdtsc();
+        const double ms = std::chrono::duration<double, std::milli>(clock::now() - c0).count();
+        return t1 > t0 ? ms / static_cast<double>(t1 - t0) : 0.0;
+    }();
+    return static_cast<double>(ticks) * msPerTick;
+}
 namespace
 {
 
@@ -282,6 +304,15 @@ struct GsThread
                     (unsigned long long)syncs[1], (unsigned long long)syncs[2],
                     (unsigned long long)syncs[3], (unsigned long long)syncs[4], (unsigned long long)syncs[5],
                     (unsigned long long)syncs[0]);
+        std::printf("[gsmt] submitCalls=%llu submitMs=%.1f", (unsigned long long)g_gsmtSubmitCalls.load(std::memory_order_relaxed),
+                    gsmtTicksToMs(g_gsmtSubmitTsc.load(std::memory_order_relaxed)));
+        for (int i = 0; i < 16; ++i)
+        {
+            const uint64_t j = g_gsmtJobs[i].load(std::memory_order_relaxed);
+            if (j)
+                std::printf(" w%d=%llu/%.1fms", i, (unsigned long long)j, gsmtTicksToMs(g_gsmtBusyTsc[i].load(std::memory_order_relaxed)));
+        }
+        std::printf("\n");
         std::printf("[gsraster-wait]");
         for (int r = 0; r < 16; ++r)
         {

@@ -2037,6 +2037,104 @@ void GS::refreshDisplaySnapshot()
     snapshotVRAM();
 }
 
+static bool latchCheckOn()
+{
+    static const bool on = []
+    {
+        const char *e = std::getenv("PS2X_LATCH_CHECK");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+// PS2X_LATCH_CHECK=1: the page-wise copy (fast) against the per-pixel reference.
+static void latchCheckCompare(const std::vector<uint8_t> &fast, const std::vector<uint8_t> &ref,
+                              uint32_t width, uint32_t height, uint32_t psm)
+{
+    if (fast.empty())
+        return;
+    static std::atomic<uint64_t> frames{0}, bad{0};
+    uint64_t badPx = 0;
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+            if (std::memcmp(&fast[(y * 640u + x) * 4u], &ref[(y * 640u + x) * 4u], 4) != 0)
+                ++badPx;
+    const uint64_t n = frames.fetch_add(1) + 1;
+    if (badPx)
+        bad.fetch_add(1);
+    if (badPx || (n % 600) == 0)
+        std::printf("[latchcheck] copies=%llu badCopies=%llu psm=0x%x w=%u h=%u badPx=%llu\n",(unsigned long long)n,
+                    (unsigned long long)bad.load(), psm, width, height, (unsigned long long)badPx);
+}
+
+// 10-09 P6: read a frame rect out of swizzled VRAM a page at a time instead of one
+// address lookup per pixel (the display latch was ~4 ms per frame on the GS thread
+// with the raster workers idle). Same page/block layout as the per-pixel readers
+// (ReadPixelCT32 / CT16 / CT16S): page = (y / pageH) * bw + x / 64, 32 blocks a page.
+// Returns false (output untouched) when a page lies past the end of VRAM; the
+// caller then takes the per-pixel path, which wraps.
+static bool copyRectPagewise(const uint8_t *vram, size_t vramSize, uint32_t psm, uint32_t base, uint32_t bw,
+                             uint32_t ox, uint32_t oy, uint32_t w, uint32_t h, uint8_t *out, uint32_t outPitch,
+                             bool preserveAlpha)
+{
+    const bool is32 = (psm == GS_PSM_CT32 || psm == GS_PSM_CT24);
+    const uint32_t pageH = is32 ? 32u : 64u;
+    const uint32_t bpp = is32 ? 4u : 2u;
+    const uint32_t pitch = 64u * bpp;
+    if (w == 0u || h == 0u)
+        return true;
+    const uint32_t px0 = ox / 64u, px1 = (ox + w - 1u) / 64u;
+    const uint32_t py0 = oy / pageH, py1 = (oy + h - 1u) / pageH;
+    const uint64_t lastBlock = static_cast<uint64_t>(base) + (static_cast<uint64_t>(py1) * bw + px1) * 32u + 31u;
+    if ((lastBlock + 1u) * 256u > vramSize)
+        return false;
+
+    alignas(64) uint8_t page[64u * 64u * 4u];
+    for (uint32_t py = py0; py <= py1; ++py)
+    {
+        for (uint32_t px = px0; px <= px1; ++px)
+        {
+            const uint32_t blk = base + (py * bw + px) * 32u;
+            if (is32)
+                GSMem::ReadPageToLinearBufferCT32(page, pitch, vram, blk);
+            else if (psm == GS_PSM_CT16S)
+                GSMem::ReadPageToLinearBufferCT16S(page, pitch, vram, blk);
+            else
+                GSMem::ReadPageToLinearBufferCT16(page, pitch, vram, blk);
+
+            const uint32_t x0 = std::max(ox, px * 64u), x1 = std::min(ox + w, px * 64u + 64u);
+            const uint32_t y0 = std::max(oy, py * pageH), y1 = std::min(oy + h, py * pageH + pageH);
+            for (uint32_t y = y0; y < y1; ++y)
+            {
+                const uint8_t *src = page + (y - py * pageH) * pitch + (x0 - px * 64u) * bpp;
+                uint8_t *dst = out + (y - oy) * outPitch + (x0 - ox) * 4u;
+                const uint32_t n = x1 - x0;
+                if (is32)
+                {
+                    std::memcpy(dst, src, static_cast<size_t>(n) * 4u);
+                    if (!preserveAlpha || psm == GS_PSM_CT24)
+                        for (uint32_t i = 0; i < n; ++i)
+                            dst[i * 4u + 3u] = 0xFFu;
+                }
+                else
+                {
+                    for (uint32_t i = 0; i < n; ++i)
+                    {
+                        uint16_t c;
+                        std::memcpy(&c, src + i * 2u, 2);
+                        const uint32_t r = c & 31u, g = (c >> 5) & 31u, b = (c >> 10) & 31u;
+                        dst[i * 4u + 0u] = static_cast<uint8_t>((r << 3) | (r >> 2));
+                        dst[i * 4u + 1u] = static_cast<uint8_t>((g << 3) | (g >> 2));
+                        dst[i * 4u + 2u] = static_cast<uint8_t>((b << 3) | (b >> 2));
+                        dst[i * 4u + 3u] = preserveAlpha ? ((c & 0x8000u) ? 0x80u : 0x00u) : 255u;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                                      uint32_t width,
                                      uint32_t height,
@@ -2072,6 +2170,15 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
         const uint32_t srcPixelBytes = (frame.psm == GS_PSM_CT24) ? 3u : 4u;
         if (useLocalMemoryLayout)
         {
+            std::vector<uint8_t> fastCopy;
+            if (width <= kHostFrameWidth && height <= kHostFrameHeight &&
+                copyRectPagewise(m_vram, m_vramSize, frame.psm, basePtr, fbwBlocks, sourceOriginX, sourceOriginY,
+                                 width, height, outPixels.data(), kHostFrameWidth * 4u, preserveAlpha))
+            {
+                if (!latchCheckOn())
+                    return true;
+                fastCopy = outPixels; // PS2X_LATCH_CHECK=1: also run the per-pixel path and compare
+            }
             for (uint32_t y = 0; y < height; ++y)
             {
                 uint8_t *dstRow = outPixels.data() + (y * kHostFrameWidth * 4u);
@@ -2098,6 +2205,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                     dstRow[x * 4u + 3u] = a;
                 }
             }
+            latchCheckCompare(fastCopy, outPixels, width, height, frame.psm);
             return true;
         }
 
@@ -2129,6 +2237,15 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     {
         if (useLocalMemoryLayout)
         {
+            std::vector<uint8_t> fastCopy;
+            if (width <= kHostFrameWidth && height <= kHostFrameHeight &&
+                copyRectPagewise(m_vram, m_vramSize, frame.psm, basePtr, fbwBlocks, sourceOriginX, sourceOriginY,
+                                 width, height, outPixels.data(), kHostFrameWidth * 4u, preserveAlpha))
+            {
+                if (!latchCheckOn())
+                    return true;
+                fastCopy = outPixels; // PS2X_LATCH_CHECK=1: also run the per-pixel path and compare
+            }
             for (uint32_t y = 0; y < height; ++y)
             {
                 const uint32_t dstOff = y * kHostFrameWidth * 4u;
@@ -2149,6 +2266,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                     dst[x * 4u + 3u] = preserveAlpha ? ((c & 0x8000u) ? 0x80u : 0x00u) : 255u;
                 }
             }
+            latchCheckCompare(fastCopy, outPixels, width, height, frame.psm);
             return true;
         }
 

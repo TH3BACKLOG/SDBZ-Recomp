@@ -17,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <intrin.h>
 #include "ThreadNaming.h"
 
 using namespace GSInternal;
@@ -1976,6 +1977,12 @@ std::atomic<uint64_t> g_gsmtWaitDoneCalls{0};
 // (set by the ps2_gs_gpu.cpp caller), 0 unknown.
 std::atomic<uint64_t> g_gsmtWaitByReason[16][2];
 int g_gsmtWaitReason = 0;
+// 10-09 P6 stats: TSC ticks each raster worker spends in runJob / the upload
+// barrier (idle spinning excluded), and ticks the producer spends in submit().
+std::atomic<uint64_t> g_gsmtBusyTsc[16];
+std::atomic<uint64_t> g_gsmtJobs[16];
+std::atomic<uint64_t> g_gsmtSubmitTsc{0};
+std::atomic<uint64_t> g_gsmtSubmitCalls{0};
 
 // 10-09 60fps P0: raster workload classes per worker, summed by
 // ps2x_budget_raster() for the [budget] line. Every worker owns distinct rows,

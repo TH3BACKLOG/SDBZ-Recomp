@@ -31,8 +31,24 @@
 //   out. Probes need the old path, so PS2X_DIAG=1 keeps it.
 //
 //   PS2X_GS_RASTER_THREADS=N  workers (default 4, 0 = old single-thread path)
+//   PS2X_GS_RASTER_BAND=B     rows per ownership band (default 1 = one-row
+//                             interleave). Worker w owns the rows y with
+//                             (y / B) % N == w. 10-09 P6: B=8 is exact (gs_bench
+//                             hash, matrix) but gave no measurable speedup (bench
+//                             flat; live fights confounded by content), so it
+//                             stays off by default.
 namespace gsmt
 {
+inline int rasterBand()
+{
+    static const int band = []
+    {
+        const char *e = std::getenv("PS2X_GS_RASTER_BAND");
+        int b = (e && *e) ? std::atoi(e) : 1;
+        return b < 1 ? 1 : (b > 256 ? 256 : b);
+    }();
+    return band;
+}
 constexpr uint32_t kVramBlocks = 0x4000u; // 4 MB / 256-byte blocks
 constexpr uint32_t kVramPages = kVramBlocks / 32u;
 constexpr uint32_t kMaxWorkers = 16u;
@@ -54,6 +70,9 @@ struct Job
     uint64_t dimx;
     uint8_t *vram;
     const uint8_t *clut;
+    // Loose row range the primitive can touch (producer's scissor-clamped bbox);
+    // a worker owning none of these rows skips the job.
+    int rowLo = 0, rowHi = 0x7fffffff;
     // Deferred host->local upload (10-09): when set, this "job" is not a
     // primitive. Every worker stops at it; the last to arrive calls
     // upApply(upCtx) (which writes VRAM and frees upCtx) and bumps the pages it
@@ -241,6 +260,7 @@ struct Setup
     TexCache *cache;
     int rowN;   // workers
     int rowIdx; // this worker
+    int band;   // rows per ownership band
 
     RasterReadFn frd, zrd;
     RasterWriteFn fwr, zwr;
@@ -264,6 +284,7 @@ struct Setup
         cache = &c;
         rowN = n;
         rowIdx = idx;
+        band = rasterBand();
         const GSContext &ctx = j.ctx;
         fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
         fbw = std::max<u32>(ctx.frame.fbw, 1u);
@@ -309,13 +330,27 @@ struct Setup
     // First row >= y0 this worker owns (y0 >= 0).
     int firstRow(int y0) const
     {
-        const int r = y0 % rowN;
-        return y0 + ((rowIdx - r + rowN) % rowN);
+        if (rowN <= 1)
+            return y0;
+        const int b = y0 / band;
+        const int cur = b % rowN;
+        if (cur == rowIdx)
+            return y0;
+        return (b + ((rowIdx - cur + rowN) % rowN)) * band;
+    }
+
+    // The row after y that this worker owns.
+    int nextRow(int y) const
+    {
+        ++y;
+        if (rowN <= 1 || (y % band) != 0)
+            return y;
+        return y + (rowN - 1) * band; // band done: skip the other workers' bands
     }
 
     bool ownsRow(int y) const
     {
-        return y >= 0 && (y % rowN) == rowIdx;
+        return y >= 0 && ((y / band) % rowN) == rowIdx;
     }
 };
 
@@ -587,7 +622,7 @@ void drawSprite(const Setup &S)
         const float duDx = (spanXf != 0.0f) ? (u1f - u0f) / spanXf : 0.0f;
         const float dvDy = (spanYf != 0.0f) ? (v1f - v0f) / spanYf : 0.0f;
 
-        for (int y = S.firstRow(drawY0); y <= drawY1; y += S.rowN)
+        for (int y = S.firstRow(drawY0); y <= drawY1; y = S.nextRow(y))
         {
             budgetRasterSpan(S.rowIdx, true, true, S.linear, S.abe, S.ztst >= 2, drawX1 - drawX0 + 1);
             float texVf = v0f + (static_cast<float>(y) - vy0) * dvDy;
@@ -617,7 +652,7 @@ void drawSprite(const Setup &S)
     {
         if (S.fge)
             applyFog(S.fogcol, v1.fog << 7, r, g, b);
-        for (int y = S.firstRow(drawY0); y <= drawY1; y += S.rowN)
+        for (int y = S.firstRow(drawY0); y <= drawY1; y = S.nextRow(y))
         {
             budgetRasterSpan(S.rowIdx, true, false, false, S.abe, S.ztst >= 2, drawX1 - drawX0 + 1);
             for (int x = drawX0; x <= drawX1; ++x)
@@ -693,7 +728,7 @@ void drawTriangle(const Setup &S)
                                        static_cast<int>(ctx.tex0.tw), static_cast<int>(ctx.tex0.th), S.linear);
     const auto &tex = ctx.tex0;
 
-    for (int y = S.firstRow(minY); y <= maxY; y += S.rowN)
+    for (int y = S.firstRow(minY); y <= maxY; y = S.nextRow(y))
     {
         const int64_t py = static_cast<int64_t>(y) * 16;
         const int64_t px0 = static_cast<int64_t>(minX) * 16;
@@ -828,20 +863,41 @@ void drawLine(const Setup &S)
 
 void runJob(const Job &j, TexCache &cache, int n, int idx)
 {
+    if (idx == 0)
+    {
+        if (j.prim.prim == GS_PRIM_SPRITE)
+            ++g_budgetRaster[0].v[7];
+        else if (j.prim.prim == GS_PRIM_TRIANGLE || j.prim.prim == GS_PRIM_TRISTRIP || j.prim.prim == GS_PRIM_TRIFAN)
+            ++g_budgetRaster[0].v[6];
+    }
+    if (n > 1)
+    {
+        // Skip a job that touches none of this worker's bands, before any setup.
+        const int band = rasterBand();
+        const int b0 = j.rowLo / band, b1 = j.rowHi / band;
+        if (b1 - b0 + 1 < n)
+        {
+            bool mine = false;
+            for (int b = b0; b <= b1; ++b)
+                if (b % n == idx)
+                {
+                    mine = true;
+                    break;
+                }
+            if (!mine)
+                return;
+        }
+    }
     Setup S;
     S.init(j, cache, n, idx);
     switch (j.prim.prim)
     {
     case GS_PRIM_SPRITE:
-        if (idx == 0)
-            ++g_budgetRaster[0].v[7];
         drawSprite(S);
         break;
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
-        if (idx == 0)
-            ++g_budgetRaster[0].v[6];
         drawTriangle(S);
         break;
     case GS_PRIM_LINE:
@@ -1151,16 +1207,22 @@ struct Engine
                     spins = 0;
                 }
             }
+            uint64_t busy = 0;
+            const uint64_t first = r;
             while (r < avail)
             {
                 const Job &job = ring[r & (kRingSize - 1u)];
+                const uint64_t t0 = __rdtsc();
                 if (job.upApply)
                     uploadBarrier(job, r);
                 else
                     runJob(job, *cache, n, idx);
+                busy += __rdtsc() - t0;
                 ++r;
                 done[idx].v.store(r, std::memory_order_release);
             }
+            g_gsmtBusyTsc[idx].fetch_add(busy, std::memory_order_relaxed);
+            g_gsmtJobs[idx].fetch_add(r - first, std::memory_order_relaxed);
         }
     }
 };
@@ -1212,8 +1274,19 @@ inline bool active()
 
 // Queue one primitive (called by GSRasterizer::drawPrimitive on the GS
 // thread). clutSrc is GS::m_clut_cache, owner the GS object.
+struct SubmitTimer
+{
+    const uint64_t t0 = __rdtsc();
+    ~SubmitTimer()
+    {
+        g_gsmtSubmitTsc.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        g_gsmtSubmitCalls.fetch_add(1u, std::memory_order_relaxed);
+    }
+};
+
 void submit(Job &job, const uint8_t *clutSrc, const void *owner)
 {
+    SubmitTimer submitTimer;
     Engine &e = engine();
     ++e.stJobs;
     if (job.vram != e.lastVram)
@@ -1266,6 +1339,9 @@ void submit(Job &job, const uint8_t *clutSrc, const void *owner)
     const uint32_t bx1 = clampF(std::ceil(maxX - ofx) + 1.0f, sx0, sx1);
     const uint32_t by0 = clampF(std::floor(minY - ofy) - 1.0f, sy0, sy1);
     const uint32_t by1 = clampF(std::ceil(maxY - ofy) + 1.0f, sy0, sy1);
+
+    job.rowLo = static_cast<int>(by0);
+    job.rowHi = static_cast<int>(by1);
 
     Range wr[4];
     int nwr = 0;
