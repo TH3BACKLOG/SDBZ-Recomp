@@ -54,6 +54,16 @@ struct Job
     uint64_t dimx;
     uint8_t *vram;
     const uint8_t *clut;
+    // Deferred host->local upload (10-09): when set, this "job" is not a
+    // primitive. Every worker stops at it; the last to arrive calls
+    // upApply(upCtx) (which writes VRAM and frees upCtx) and bumps the pages it
+    // wrote, then all continue. Earlier jobs (old texture readers) are done and
+    // later ones see the new data, the same order as the old producer-side
+    // wait, but the producer never waits.
+    void (*upApply)(void *) = nullptr;
+    void *upCtx = nullptr;
+    uint32_t upLo[2] = {}, upHi[2] = {};
+    int upN = 0;
 };
 
 // Per-page generation: bumped by the producer before VRAM in that page changes
@@ -915,6 +925,55 @@ void rectBlocks(uint32_t base, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t 
     }
 }
 
+// rectBlocks, but exact for a small rect inside one page: the [min, max] run
+// of blocks its pixels really occupy, from the same address functions the GS
+// writes with. Producer-side syncs only (draw ranges stay page-granular). A
+// 16x16 CLUT at a block that is not page aligned (SDBZ: 0x2b04) otherwise
+// reads as a whole page and overlaps the texture after it (0x2b20), so every
+// CLUT upload waited for the draws sampling that texture (10-09: ~300/s,
+// ~half the GS thread in a fight).
+template <typename F>
+void rectBlocksTight(uint32_t base, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, F &&add)
+{
+    u32 (*lookup)(u32, u32, u32, u32) = nullptr;
+    uint32_t bpp = 0;
+    switch (psm)
+    {
+    case GS_PSM_CT32: case GS_PSM_CT24: case GS_PSM_T8H: case GS_PSM_T4HL: case GS_PSM_T4HH:
+        lookup = GSMem::LookupPixelAddressCT32; bpp = 32; break;
+    case GS_PSM_Z32: case GS_PSM_Z24:
+        lookup = GSMem::LookupPixelAddressZ32; bpp = 32; break;
+    case GS_PSM_CT16: lookup = GSMem::LookupPixelAddressCT16; bpp = 16; break;
+    case GS_PSM_CT16S: lookup = GSMem::LookupPixelAddressCT16S; bpp = 16; break;
+    case GS_PSM_Z16: lookup = GSMem::LookupPixelAddressZ16; bpp = 16; break;
+    case GS_PSM_Z16S: lookup = GSMem::LookupPixelAddressZ16S; bpp = 16; break;
+    case GS_PSM_T8: lookup = GSMem::LookupPixelAddressP8; bpp = 8; break;
+    case GS_PSM_T4: lookup = GSMem::LookupPixelAddressP4; bpp = 4; break;
+    default: break;
+    }
+    const PageDims d = pageDims(psm);
+    const uint64_t area = static_cast<uint64_t>(x1 - x0 + 1u) * (y1 - y0 + 1u);
+    if (!lookup || x1 < x0 || y1 < y0 || x0 / d.w != x1 / d.w || y0 / d.h != y1 / d.h || area > 1024u)
+    {
+        rectBlocks(base, bw, psm, x0, y0, x1, y1, add);
+        return;
+    }
+    uint32_t mn = ~0u, mx = 0u;
+    for (uint32_t y = y0; y <= y1; ++y)
+        for (uint32_t x = x0; x <= x1; ++x)
+        {
+            const uint32_t blk = static_cast<uint32_t>((static_cast<uint64_t>(lookup(base, bw, x, y)) * bpp) / 2048u) % kVramBlocks;
+            mn = std::min(mn, blk);
+            mx = std::max(mx, blk);
+        }
+    if (mx - mn >= 32u)
+    {
+        rectBlocks(base, bw, psm, x0, y0, x1, y1, add); // wrapped past the end of VRAM
+        return;
+    }
+    add(mn, mx + 1u);
+}
+
 // ---- engine -----------------------------------------------------------------
 struct alignas(64) Counter
 {
@@ -929,9 +988,13 @@ struct Engine
     alignas(64) std::atomic<int> sleepers{0};
     Counter done[kMaxWorkers];
 
+    alignas(64) std::atomic<uint64_t> upArrive{0};
+    alignas(64) std::atomic<uint64_t> upDone{0}; // ring index + 1 of the last applied upload
+
     // producer only (callers hold the GS state mutex)
     std::vector<Range> writes;
     std::vector<Range> reads;
+    std::vector<Range> uploads; // queued deferred uploads; ordered with jobs, so only producer-side VRAM access checks them
     TexCache *producerCache = nullptr;
     struct ClutSlot
     {
@@ -983,16 +1046,40 @@ struct Engine
         waitDone(w.load(std::memory_order_relaxed));
         writes.clear();
         reads.clear();
+        uploads.clear();
     }
 
     void prune()
     {
-        if (writes.empty() && reads.empty())
+        if (writes.empty() && reads.empty() && uploads.empty())
             return;
         const uint64_t md = minDone();
         auto old = [md](const Range &r) { return r.seq < md; };
         writes.erase(std::remove_if(writes.begin(), writes.end(), old), writes.end());
         reads.erase(std::remove_if(reads.begin(), reads.end(), old), reads.end());
+        uploads.erase(std::remove_if(uploads.begin(), uploads.end(), old), uploads.end());
+    }
+
+    // Worker side of a deferred upload at ring index r (see Job::upApply).
+    void uploadBarrier(const Job &j, uint64_t r)
+    {
+        const uint64_t a = upArrive.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        if (a % static_cast<uint64_t>(n) == 0u)
+        {
+            j.upApply(j.upCtx);
+            for (int k = 0; k < j.upN; ++k)
+                bumpPages(j.upLo[k], j.upHi[k]);
+            upDone.store(r + 1u, std::memory_order_release);
+            return;
+        }
+        uint32_t spins = 0;
+        while (upDone.load(std::memory_order_acquire) < r + 1u)
+        {
+            if (++spins < 4000u)
+                _mm_pause();
+            else
+                std::this_thread::yield();
+        }
     }
 
     static bool overlaps(const std::vector<Range> &set, uint32_t lo, uint32_t hi)
@@ -1066,7 +1153,11 @@ struct Engine
             }
             while (r < avail)
             {
-                runJob(ring[r & (kRingSize - 1u)], *cache, n, idx);
+                const Job &job = ring[r & (kRingSize - 1u)];
+                if (job.upApply)
+                    uploadBarrier(job, r);
+                else
+                    runJob(job, *cache, n, idx);
                 ++r;
                 done[idx].v.store(r, std::memory_order_release);
             }
@@ -1312,10 +1403,11 @@ void ps2xGsRasterSyncRect(uint32_t baseBlock, uint32_t bw, uint32_t psm,
     auto check = [&](uint32_t lo, uint32_t hi)
     {
         note(e.writes, lo, hi);
+        note(e.uploads, lo, hi);
         if (write)
             note(e.reads, lo, hi);
     };
-    gsmt::rectBlocks(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u, check);
+    gsmt::rectBlocksTight(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u, check);
     if (hazard)
     {
         ++e.stBarriers;
@@ -1323,8 +1415,50 @@ void ps2xGsRasterSyncRect(uint32_t baseBlock, uint32_t bw, uint32_t psm,
         e.waitDone(lastSeq + 1u);
     }
     if (write)
-        gsmt::rectBlocks(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u,
+        gsmt::rectBlocksTight(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u,
                          [](uint32_t lo, uint32_t hi) { gsmt::Engine::bumpPages(lo, hi); });
+}
+
+// Host->local upload of a rect, deferred into the job queue (see Job::upApply):
+// apply(ctx) runs once, on a worker, after every job queued before it and
+// before any queued after it, then must free ctx. Returns false (nothing
+// queued, caller writes VRAM itself after ps2xGsRasterSyncRect) when the
+// workers are not running. 10-09: the producer-side wait here was ~half of
+// the GS thread in a fight (each upload waited for the queued draws still
+// sampling the old texture).
+bool ps2xGsRasterDeferUpload(uint8_t *vram, uint32_t baseBlock, uint32_t bw, uint32_t psm,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             void (*apply)(void *), void *ctx)
+{
+    if (!gsmt::active() || w == 0u || h == 0u)
+        return false;
+    gsmt::Engine &e = *gsmt::g_engine;
+    if (e.n <= 0 || vram != e.lastVram)
+        return false; // no workers; or a new VRAM, which goes through submit's flush first
+    gsmt::Job job;
+    job.vram = vram;
+    job.upApply = apply;
+    job.upCtx = ctx;
+    bool tooMany = false;
+    gsmt::rectBlocks(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u, [&](uint32_t lo, uint32_t hi)
+    {
+        if (job.upN < 2)
+        {
+            job.upLo[job.upN] = lo;
+            job.upHi[job.upN] = hi;
+            ++job.upN;
+        }
+        else
+            tooMany = true;
+    });
+    if (tooMany)
+        return false;
+    e.prune();
+    const uint64_t index = e.w.load(std::memory_order_relaxed);
+    e.publish(job);
+    for (int k = 0; k < job.upN; ++k)
+        gsmt::Engine::addRange(e.uploads, job.upLo[k], job.upHi[k], index);
+    return true;
 }
 
 // The CLUT cache (GS::m_clut_cache) was reloaded.

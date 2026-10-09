@@ -27,6 +27,9 @@ void ps2xGsRasterReset();
 void ps2xGsRasterSyncRect(uint32_t baseBlock, uint32_t bw, uint32_t psm,
                           uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool write);
 void ps2xGsRasterClutChanged();
+bool ps2xGsRasterDeferUpload(uint8_t *vram, uint32_t baseBlock, uint32_t bw, uint32_t psm,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             void (*apply)(void *), void *ctx);
 
 // Texture page cache slots (defined next to GS::ReadTexturePageCache).
 static void texPageCacheNewPrimitive();
@@ -6195,6 +6198,421 @@ namespace
     };
 }
 
+// 10-09: processImageData's per-format write loops, unchanged, on an explicit
+// transfer state so a raster worker can run them for a deferred upload
+// (ps2xGsRasterDeferUpload). Returns true when the transfer completed (the
+// caller then runs EndTransfer()); consumed = payload bytes used.
+struct GsImgState
+{
+    uint32_t x, y, total_pixels, copied_pixels;
+};
+
+static bool gsImageWrite(uint8_t *vram, u32 dbp, u8 dbw, u8 dpsm, u32 rrw, u32 dsax, GsImgState &ts,
+                         const uint8_t *data, u32 sizeBytes, u32 &consumed)
+{
+    bool ended = false;
+    u32 data_offset = 0;
+    switch (dpsm)
+    {
+    case GS_PSM_CT32:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelCT32(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 4;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z32:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelZ32(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 4;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_CT24:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelCT24(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 3;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z24:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelZ24(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 3;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_CT16:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelCT16(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z16:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelZ16(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_CT16S:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelCT16S(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z16S:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelZ16S(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_T8:
+        // Row-at-a-time: identical order of effects to the per-pixel loop
+        // (write, advance, wrap at the row end, EndTransfer at the total).
+        while (data_offset < sizeBytes)
+        {
+            const u32 rowLeft = rrw - (ts.copied_pixels % rrw);
+            const u32 totalLeft = ts.copied_pixels < ts.total_pixels
+                                        ? ts.total_pixels - ts.copied_pixels
+                                        : 1u;
+            const u32 n = std::min({rowLeft, sizeBytes - data_offset, totalLeft});
+
+            GSMem::WriteRowP8(vram, dbp, dbw, ts.x, ts.y, &data[data_offset], n);
+
+            ts.x += n;
+            ts.copied_pixels += n;
+            data_offset += n;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_T8H:
+        while (data_offset < sizeBytes)
+        {
+            u8 c = data[data_offset];
+
+            GSMem::WritePixelP8H(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    case GS_PSM_T4:
+        while (data_offset < sizeBytes)
+        {
+            u8 c0 = data[data_offset] & 0xF;
+            u8 c1 = (data[data_offset] >> 4) & 0xF;
+
+            GSMem::WritePixelP4(vram, dbp, dbw, ts.x, ts.y, c0);
+            GSMem::WritePixelP4(vram, dbp, dbw, ts.x + 1, ts.y, c1);
+
+            ts.x += 2;
+            ts.copied_pixels += 2;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    case GS_PSM_T4HL:
+        while (data_offset < sizeBytes)
+        {
+            u8 c0 = data[data_offset] & 0xF;
+            u8 c1 = (data[data_offset] >> 4) & 0xF;
+
+            GSMem::WritePixelP4HL(vram, dbp, dbw, ts.x, ts.y, c0);
+            GSMem::WritePixelP4HL(vram, dbp, dbw, ts.x + 1, ts.y, c1);
+
+            ts.x += 2;
+            ts.copied_pixels += 2;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    case GS_PSM_T4HH:
+        while (data_offset < sizeBytes)
+        {
+            u8 c0 = data[data_offset] & 0xF;
+            u8 c1 = (data[data_offset] >> 4) & 0xF;
+
+            GSMem::WritePixelP4HH(vram, dbp, dbw, ts.x, ts.y, c0);
+            GSMem::WritePixelP4HH(vram, dbp, dbw, ts.x + 1, ts.y, c1);
+
+            ts.x += 2;
+            ts.copied_pixels += 2;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    }
+    consumed = data_offset;
+    return ended;
+}
+
+// The transfer-state effect of gsImageWrite without the VRAM writes: same
+// bytes and pixels per step, same row wrap (copied % rrw == 0, tracked as a
+// running column) and end test.
+static bool gsImageAdvance(u8 dpsm, u32 rrw, u32 dsax, GsImgState &ts, u32 sizeBytes)
+{
+    u32 b, p;
+    switch (dpsm)
+    {
+    case GS_PSM_CT32: case GS_PSM_Z32: b = 4; p = 1; break;
+    case GS_PSM_CT24: case GS_PSM_Z24: b = 3; p = 1; break;
+    case GS_PSM_CT16: case GS_PSM_Z16: case GS_PSM_CT16S: case GS_PSM_Z16S: b = 2; p = 1; break;
+    case GS_PSM_T8: case GS_PSM_T8H: b = 1; p = 1; break;
+    case GS_PSM_T4: case GS_PSM_T4HL: case GS_PSM_T4HH: b = 1; p = 2; break;
+    default: return false;
+    }
+    u32 steps = (sizeBytes + b - 1u) / b;
+    u32 col = ts.copied_pixels % rrw;
+    while (steps-- != 0u)
+    {
+        ts.x += p;
+        ts.copied_pixels += p;
+        col += p;
+        while (col >= rrw)
+            col -= rrw;
+        if (col == 0u)
+        {
+            ts.x = dsax;
+            ts.y++;
+        }
+        if (ts.copied_pixels >= ts.total_pixels)
+            return true;
+    }
+    return false;
+}
+
+struct GsDeferredUpload
+{
+    uint8_t *vram;
+    u32 dbp, rrw, dsax;
+    u8 dbw, dpsm;
+    GsImgState ts;
+    std::vector<uint8_t> data;
+};
+
+static void gsApplyDeferredUpload(void *p)
+{
+    GsDeferredUpload *up = static_cast<GsDeferredUpload *>(p);
+    u32 consumed = 0;
+    (void)gsImageWrite(up->vram, up->dbp, up->dbw, up->dpsm, up->rrw, up->dsax, up->ts,
+                       up->data.data(), static_cast<u32>(up->data.size()), consumed);
+    delete up;
+}
+
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
     std::FILE *const thFile = texhashFile();
@@ -6323,296 +6741,56 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     {
         return;
     }
-    ps2xGsRasterSyncRect(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, true);
-
     if (rrw == 0 || rrh == 0)
     {
         return;
     }
 
-    u32 data_offset = 0;
+    GsImgState ts{m_transferState.x, m_transferState.y, m_transferState.total_pixels, m_transferState.copied_pixels};
 
-    // remove the format branching from the loops
-    // TODO: fixup copypasta
-    switch (dpsm)
+    // 10-09: with raster workers running, queue the writes behind the draws
+    // already queued instead of waiting for them (ps2xGsRasterDeferUpload).
+    // Only textures: a CLUT upload (<= 1 KB) is read back by the CLUT load
+    // right after it, which would then wait for the deferred write behind every
+    // queued draw (measured: 161 s of 320 in a fight). HWREG writes come 8
+    // bytes at a time and also keep the direct path; its SyncRect waits for any
+    // deferred upload to the same blocks.
+    const uint64_t transferBytes =
+        (static_cast<uint64_t>(ts.total_pixels) * GSMem::BitsPerPixel(static_cast<GSMem::PixelStorageMode>(dpsm))) / 8u;
+    if (transferBytes >= 4096u && sizeBytes >= 64u && !ps2_diag::enabled())
     {
-    case GS_PSM_CT32:
-        while (data_offset < sizeBytes)
+        GsImgState after = ts;
+        const bool ended = gsImageAdvance(dpsm, rrw, dsax, after, sizeBytes);
+        auto *up = new GsDeferredUpload{m_vram, dbp, rrw, dsax, dbw, dpsm, ts,
+                                        std::vector<uint8_t>(data, data + sizeBytes)};
+        if (ps2xGsRasterDeferUpload(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh, &gsApplyDeferredUpload, up))
         {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
-
-            GSMem::WritePixelCT32(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 4;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
+            if (ended)
                 EndTransfer();
-                break;
+            else
+            {
+                m_transferState.x = after.x;
+                m_transferState.y = after.y;
+                m_transferState.copied_pixels = after.copied_pixels;
             }
+            return;
         }
-        break;
+        delete up;
+    }
 
-    case GS_PSM_Z32:
-        while (data_offset < sizeBytes)
-        {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
+    ps2xGsRasterSyncRect(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, true);
 
-            GSMem::WritePixelZ32(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 4;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_CT24:
-        while (data_offset < sizeBytes)
-        {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
-
-            GSMem::WritePixelCT24(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 3;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_Z24:
-        while (data_offset < sizeBytes)
-        {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
-
-            GSMem::WritePixelZ24(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 3;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_CT16:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelCT16(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_Z16:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelZ16(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_CT16S:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelCT16S(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_Z16S:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelZ16S(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_T8:
-        // Row-at-a-time: identical order of effects to the per-pixel loop
-        // (write, advance, wrap at the row end, EndTransfer at the total).
-        while (data_offset < sizeBytes)
-        {
-            const u32 rowLeft = rrw - (m_transferState.copied_pixels % rrw);
-            const u32 totalLeft = m_transferState.copied_pixels < m_transferState.total_pixels
-                                        ? m_transferState.total_pixels - m_transferState.copied_pixels
-                                        : 1u;
-            const u32 n = std::min({rowLeft, sizeBytes - data_offset, totalLeft});
-
-            GSMem::WriteRowP8(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, &data[data_offset], n);
-
-            m_transferState.x += n;
-            m_transferState.copied_pixels += n;
-            data_offset += n;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_T8H:
-        while (data_offset < sizeBytes)
-        {
-            u8 c = data[data_offset];
-
-            GSMem::WritePixelP8H(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-    case GS_PSM_T4:
+    uint64_t t4n = 0;
+    bool t4log = false;
+    u32 t4x0 = 0, t4y0 = 0;
+    if (dpsm == GS_PSM_T4)
     {
-        // [psmt4] Stage 5.9 probe. PSMT4 uploads to dbp=0x2b60/0x2b80 are demonstrably
-        // issued (434/440 of them, 32768 bytes each) yet the destination census reads
-        // back all-zero. The census is swizzle-blind but NOT zero-blind, so it cannot
-        // tell "never written" from "written all-zero nibbles". This logs the source
-        // bytes before the loop and reads the same texels back after it, which
-        // separates those two cases in a single run.
         static std::atomic<uint64_t> s_t4Count{0};
-        const uint64_t t4n = s_t4Count.fetch_add(1, std::memory_order_relaxed);
-        const bool t4log = ps2_diag::enabled() && ps2_diag::should_log(t4n, 8, 400);
+        t4n = s_t4Count.fetch_add(1, std::memory_order_relaxed);
+        t4log = ps2_diag::enabled() && ps2_diag::should_log(t4n, 8, 400);
 
-        const u32 t4x0 = m_transferState.x;
-        const u32 t4y0 = m_transferState.y;
+        t4x0 = m_transferState.x;
+        t4y0 = m_transferState.y;
 
         // Published by ps2_memory.cpp so the payload pointer can be resolved back to a
         // guest physical address. Block-scope extern: binds to the namespace-scope
@@ -6679,32 +6857,21 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                                          << " srcNonZero=" << srcNonZero
                                          << " head=" << head);
         }
+    }
 
-        while (data_offset < sizeBytes)
-        {
-            u8 c0 = data[data_offset] & 0xF;
-            u8 c1 = (data[data_offset] >> 4) & 0xF;
+    u32 t4consumed = 0;
+    const bool ended = gsImageWrite(m_vram, dbp, dbw, dpsm, rrw, dsax, ts, data, sizeBytes, t4consumed);
+    if (ended)
+        EndTransfer();
+    else
+    {
+        m_transferState.x = ts.x;
+        m_transferState.y = ts.y;
+        m_transferState.copied_pixels = ts.copied_pixels;
+    }
 
-            GSMem::WritePixelP4(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WritePixelP4(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
-
-            m_transferState.x += 2;
-            m_transferState.copied_pixels += 2;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-
+    if (dpsm == GS_PSM_T4)
+    {
         if (t4log)
         {
             static const char kHex[] = "0123456789abcdef";
@@ -6721,67 +6888,13 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             RUNTIME_LOG("[psmt4] post n=" << std::dec << t4n
                                           << " addr0=0x" << std::hex << addr0
                                           << " vramBytes=" << std::dec << (m_vramSize)
-                                          << " consumed=" << data_offset
+                                          << " consumed=" << t4consumed
                                           << " x=" << m_transferState.x
                                           << " y=" << m_transferState.y
                                           << " copied=" << m_transferState.copied_pixels
                                           << " total=" << m_transferState.total_pixels
                                           << " readback=" << back);
         }
-        break;
-    }
-    case GS_PSM_T4HL:
-        while (data_offset < sizeBytes)
-        {
-            u8 c0 = data[data_offset] & 0xF;
-            u8 c1 = (data[data_offset] >> 4) & 0xF;
-
-            GSMem::WritePixelP4HL(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WritePixelP4HL(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
-
-            m_transferState.x += 2;
-            m_transferState.copied_pixels += 2;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-    case GS_PSM_T4HH:
-        while (data_offset < sizeBytes)
-        {
-            u8 c0 = data[data_offset] & 0xF;
-            u8 c1 = (data[data_offset] >> 4) & 0xF;
-
-            GSMem::WritePixelP4HH(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WritePixelP4HH(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
-
-            m_transferState.x += 2;
-            m_transferState.copied_pixels += 2;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
     }
 }
 
