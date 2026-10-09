@@ -673,7 +673,7 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
-    IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+    IopThread *IopKernel::beginNextReady(uint64_t currentCycle, uint64_t *minDelayWake)
     {
         // 2026-09-28 Part 165 diagnostic: every 10 s of host time, dump every
         // IOP thread and semaphore plus the ARKD_DVD SE-loader globals (module
@@ -734,16 +734,24 @@ namespace ps2x::iop::detail
         // waking a Delay thread before testing it gives the same pick as the
         // old wake-all-then-select passes.
         IopThread *next = nullptr;
+        uint64_t delayWake = UINT64_MAX;
         for (auto &[id, thread] : m_threads)
         {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
+            if (thread.state == IopThreadState::Delay)
+            {
+                if (thread.wakeCycle <= currentCycle)
+                    thread.state = IopThreadState::Ready;
+                else
+                    delayWake = std::min(delayWake, thread.wakeCycle);
+            }
             if (thread.state != IopThreadState::Ready)
                 continue;
             if (next == nullptr || thread.priority < next->priority ||
                 (thread.priority == next->priority && thread.id < next->id))
                 next = &thread;
         }
+        if (minDelayWake)
+            *minDelayWake = delayWake;
         if (next == nullptr)
             return nullptr;
 

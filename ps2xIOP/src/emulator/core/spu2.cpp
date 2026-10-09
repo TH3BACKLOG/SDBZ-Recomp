@@ -348,6 +348,9 @@ namespace ps2x::iop::spu2
         }
 
         // One 48 kHz frame of one voice. Returns the post-ADSR sample (before voice volume).
+        // kSample=false keeps every guest-visible effect (NAX, ENDX, ENVX, volume slides) and skips the
+        // interpolation; only valid while nothing reads the sample (no output and PMON off on this core).
+        template <bool kSample>
         int32_t voiceSample(Core &c, int idx)
         {
             Voice &v = c.v[idx];
@@ -363,7 +366,7 @@ namespace ps2x::iop::spu2
             while (static_cast<int32_t>(v.wr - v.rd) < 4 && v.phase != PhaseStopped && guard++ < 8)
                 fetchWord(c, idx);
             int32_t out = 0;
-            if (static_cast<int32_t>(v.wr - v.rd) >= 4)
+            if (kSample && static_cast<int32_t>(v.wr - v.rd) >= 4)
             {
                 const auto &taps = g.gauss[(v.sp >> 4) & 0xFFu];
                 for (int i = 0; i < 4; ++i)
@@ -439,19 +442,42 @@ namespace ps2x::iop::spu2
             }
         }
 
+        // False when no one consumes samples: host output off (PS2X_SPU2_HOST=0) and no WAV dump.
+        bool samplesWanted()
+        {
+            static const bool wanted = []
+            {
+                const char *host = std::getenv("PS2X_SPU2_HOST");
+                const char *wav = std::getenv("PS2X_SPU2_WAV");
+                return !(host && host[0] == '0') || (wav && *wav);
+            }();
+            return wanted;
+        }
+
         // One 48 kHz output frame.
         void mixFrame()
         {
+            const bool wanted = samplesWanted();
             int32_t coreL[2] = {0, 0};
             int32_t coreR[2] = {0, 0};
             for (int ci = 0; ci < 2; ++ci)
             {
                 Core &c = g.core[ci];
                 int32_t dryL = 0, dryR = 0;
+                if (!wanted && c.pmon == 0u)
+                {
+                    // Perf 10-09: voice state only. PMON reads the previous voice's sample, so a core
+                    // with PMON on still computes samples; it refreshes outx before use in this loop.
+                    for (int vi = 0; vi < kVoices; ++vi)
+                        voiceSample<false>(c, vi);
+                    slideUpdate(c.masterL);
+                    slideUpdate(c.masterR);
+                    continue;
+                }
                 for (int vi = 0; vi < kVoices; ++vi)
                 {
                     Voice &v = c.v[vi];
-                    const int32_t s = voiceSample(c, vi);
+                    const int32_t s = voiceSample<true>(c, vi);
                     if (s == 0)
                         continue;
                     const int32_t l = applyVol(s, v.volL.value);
@@ -465,6 +491,11 @@ namespace ps2x::iop::spu2
                 coreR[ci] = (c.mmix & 0x400u) ? clamp16(dryR) : 0;
                 slideUpdate(c.masterL);
                 slideUpdate(c.masterR);
+            }
+            if (!wanted)
+            {
+                ++g.frames;
+                return;
             }
             // core 0 -> master volume -> core 1 external input
             const int32_t extL = applyVol(coreL[0], g.core[0].masterL.value);
