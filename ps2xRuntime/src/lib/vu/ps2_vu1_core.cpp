@@ -20,6 +20,11 @@
 #include <limits>
 #include <vector>
 #include <ps2_log.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 namespace
 {
@@ -1873,11 +1878,28 @@ namespace
     std::atomic<uint64_t> g_budgetVu1RecompNs{0};
     std::atomic<uint64_t> g_budgetVu1RecompRuns{0};
 
+    // TSC ticks, not steady_clock: ~6 reads per VU1 run made QPC ~0.7% of the
+    // game thread in a fight (perf 10-09). Converted to ns only when read.
     inline uint64_t budgetVu1Now()
     {
-        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                         std::chrono::steady_clock::now().time_since_epoch())
-                                         .count());
+        return __rdtsc();
+    }
+
+    uint64_t budgetVu1TicksToNs(uint64_t ticks)
+    {
+        static const double nsPerTick = []
+        {
+            using clock = std::chrono::steady_clock;
+            const auto c0 = clock::now();
+            const uint64_t t0 = __rdtsc();
+            while (clock::now() - c0 < std::chrono::milliseconds(2))
+            {
+            }
+            const uint64_t t1 = __rdtsc();
+            const double ns = std::chrono::duration<double, std::nano>(clock::now() - c0).count();
+            return t1 > t0 ? ns / static_cast<double>(t1 - t0) : 0.0;
+        }();
+        return static_cast<uint64_t>(static_cast<double>(ticks) * nsPerTick);
     }
 
     struct BudgetVu1Timer
@@ -1893,10 +1915,10 @@ namespace
 
 extern "C" void ps2x_budget_vu1(uint64_t *out, int n)
 {
-    const uint64_t v[] = {g_budgetVu1Ns.load(std::memory_order_relaxed),
+    const uint64_t v[] = {budgetVu1TicksToNs(g_budgetVu1Ns.load(std::memory_order_relaxed)),
                           g_budgetVu1Runs.load(std::memory_order_relaxed),
-                          g_budgetVu1KickNs.load(std::memory_order_relaxed),
-                          g_budgetVu1RecompNs.load(std::memory_order_relaxed),
+                          budgetVu1TicksToNs(g_budgetVu1KickNs.load(std::memory_order_relaxed)),
+                          budgetVu1TicksToNs(g_budgetVu1RecompNs.load(std::memory_order_relaxed)),
                           g_budgetVu1RecompRuns.load(std::memory_order_relaxed)};
     for (int i = 0; i < n; ++i)
         out[i] = i < 5 ? v[i] : 0u;
