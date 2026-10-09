@@ -54,6 +54,7 @@ try {
         '{0,-24} gs median {1,8:N1} ms  (min {2:N1}, max {3:N1})' -f (Split-Path $path -Leaf), $median, $min, $max
         # VRAM hash gate: first run saves the baseline; later runs must match it.
         # Delete the .vramhash file on purpose when a change is meant to alter output.
+        $hash = ''
         if ($out -match 'bench: vram hash ([0-9a-f]+)') {
             $hash = $Matches[1]
             $hashFile = Join-Path $histDir ((Split-Path $path -Leaf) + '.vramhash')
@@ -63,9 +64,21 @@ try {
         }
         if ($Bmp) { ($out -split "`n" | Select-String 'bmp') -join '' }
 
-        if (-not (Test-Path $history)) { 'date,commit,label,dump,repeat,median_ms,min_ms,max_ms' | Set-Content $history }
-        '{0},{1}{2},{3},{4},{5},{6:F1},{7:F1},{8:F1}' -f (Get-Date -Format s), $commit, $dirty, $Label,
-            (Split-Path $path -Leaf), $Repeat, $median, $min, $max | Add-Content $history
+        $hdr = 'date,commit,label,dump,repeat,median_ms,min_ms,max_ms,vramhash,raster_threads'
+        if (-not (Test-Path $history)) { $hdr | Set-Content $history }
+        else {
+            # 10-09: older files have 8 columns; widen the header (rows keep their length).
+            $lines = @(Get-Content $history)
+            if ($lines[0] -notmatch 'vramhash') {
+                $lines[0] = $hdr
+                $tmp = "$history.tmp"
+                $lines | Set-Content $tmp
+                Move-Item -Force $tmp $history
+            }
+        }
+        $thr = if ($env:PS2X_GS_RASTER_THREADS) { $env:PS2X_GS_RASTER_THREADS } else { 'default' }
+        '{0},{1}{2},{3},{4},{5},{6:F1},{7:F1},{8:F1},{9},{10}' -f (Get-Date -Format s), $commit, $dirty, $Label,
+            (Split-Path $path -Leaf), $Repeat, $median, $min, $max, $hash, $thr | Add-Content $history
     }
 }
 finally {

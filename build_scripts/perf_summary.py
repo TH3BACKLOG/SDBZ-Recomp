@@ -21,6 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analyze_run import DEFAULT_LOG, read_text_any  # noqa: E402
 
 WD = re.compile(r"\[watchdog\] t=(\d+)s.*?busy%=(\d+).*?vbl/s=(\d+)")
+# 10-09 [budget] line (ps2_runtime.cpp watchdog): per-vblank cost figures.
+BUDGET_KEYS = ("xfer/vbl", "unwindUs/vbl", "vu1Us/vbl", "vu1RecompUs/vbl", "vu1KickUs/vbl",
+               "vu1Runs/vbl", "rastKpx/vbl", "tris/vbl", "sprites/vbl", "abeKpx/vbl", "zKpx/vbl",
+               "gifCopies/vbl")
+BD = re.compile(r"\[budget\] t=(\d+) vbl/s=(\d+)([^\r\n]*)")
 
 
 def summarize(path, lo, hi):
@@ -42,6 +47,21 @@ def summarize(path, lo, hi):
     }
     print("   vbl/s  mean=%.1f median=%.1f min=%d max=%d   busy%% mean=%.1f"
           % (out["vbl_mean"], out["vbl_med"], out["vbl_min"], out["vbl_max"], out["busy_mean"]))
+    # [budget]: median of each per-vblank figure over the window, seconds with vbl/s >= 5 only
+    # (idle seconds divide by ~0 and are noise).
+    brows = []
+    for bt, bv, rest in BD.findall(text):
+        if lo <= int(bt) <= hi and int(bv) >= 5:
+            row = {}
+            for k in BUDGET_KEYS:
+                m = re.search(re.escape(k) + r"=(\d+)", rest)
+                if m:
+                    row[k] = int(m.group(1))
+            brows.append(row)
+    if brows:
+        print("   [budget] medians per vblank over %d active seconds:" % len(brows))
+        print("     " + "  ".join("%s=%d" % (k, statistics.median([r[k] for r in brows if k in r]))
+                                  for k in BUDGET_KEYS if any(k in r for r in brows)))
     for tag in ("gsraster-wait", "cputime"):
         recs = [m for m in re.findall(r"\[%s\][^\[]*" % re.escape(tag), text)]
         if recs:

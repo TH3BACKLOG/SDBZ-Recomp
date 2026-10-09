@@ -8,8 +8,10 @@
 #include "Kernel/Vu1Recomp/vu1_recomp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cfenv>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1859,6 +1861,47 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
 
+// 10-09 60fps P0 -- host time inside VU1Interpreter::run (recompiled programs
+// plus interpreter fallback), the part of it spent handing XGKICK packets to the
+// GIF (submitGifPacket, which can block on GS backpressure), and the recompiled
+// programs alone. Read by the 1 Hz [budget] line in ps2_runtime.cpp.
+namespace
+{
+    std::atomic<uint64_t> g_budgetVu1Ns{0};
+    std::atomic<uint64_t> g_budgetVu1Runs{0};
+    std::atomic<uint64_t> g_budgetVu1KickNs{0};
+    std::atomic<uint64_t> g_budgetVu1RecompNs{0};
+    std::atomic<uint64_t> g_budgetVu1RecompRuns{0};
+
+    inline uint64_t budgetVu1Now()
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    }
+
+    struct BudgetVu1Timer
+    {
+        const uint64_t t0 = budgetVu1Now();
+        ~BudgetVu1Timer()
+        {
+            g_budgetVu1Ns.fetch_add(budgetVu1Now() - t0, std::memory_order_relaxed);
+            g_budgetVu1Runs.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+}
+
+extern "C" void ps2x_budget_vu1(uint64_t *out, int n)
+{
+    const uint64_t v[] = {g_budgetVu1Ns.load(std::memory_order_relaxed),
+                          g_budgetVu1Runs.load(std::memory_order_relaxed),
+                          g_budgetVu1KickNs.load(std::memory_order_relaxed),
+                          g_budgetVu1RecompNs.load(std::memory_order_relaxed),
+                          g_budgetVu1RecompRuns.load(std::memory_order_relaxed)};
+    for (int i = 0; i < n; ++i)
+        out[i] = i < 5 ? v[i] : 0u;
+}
+
 void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
@@ -1867,6 +1910,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeVuDataSize = dataSize;
     m_activeGs = &gs;
     m_activeMemory = memory;
+    const BudgetVu1Timer budgetTimer;
 
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
@@ -1929,10 +1973,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                     ps2_pipeline_stats::g_xgkickBytes.fetch_add(bytes, std::memory_order_relaxed);
                     if (vucap::hot())
                         vucap::kick(srcAddr, pkt, bytes);
+                    const uint64_t kickT0 = budgetVu1Now();
                     if (vu.m_activeMemory)
                         vu.m_activeMemory->submitGifPacket(GifPathId::Path1, pkt, bytes);
                     else if (vu.m_activeGs)
                         vu.m_activeGs->processGIFPacket(pkt, bytes);
+                    g_budgetVu1KickNs.fetch_add(budgetVu1Now() - kickT0, std::memory_order_relaxed);
                 };
             }
             ctx.workingClip = m_workingClip;
@@ -1942,8 +1988,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             const uint32_t startPc = m_state.pc;
 
             bool ran = false;
+            const uint64_t recompT0 = budgetVu1Now();
             for (uint32_t k = 0; k < g_recompLookup.count && !ran; ++k)
                 ran = g_recompLookup.programs[k](ctx);
+            g_budgetVu1RecompNs.fetch_add(budgetVu1Now() - recompT0, std::memory_order_relaxed);
+            g_budgetVu1RecompRuns.fetch_add(1, std::memory_order_relaxed);
             if (!ran)
                 noteUncompiledVu1Program(recompImageCrc(vuCode, codeSize), vuCode, codeSize, startPc, true);
             if (ran)

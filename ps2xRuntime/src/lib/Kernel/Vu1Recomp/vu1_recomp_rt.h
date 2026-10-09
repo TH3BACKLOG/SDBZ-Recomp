@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <emmintrin.h>
 
 #define VU1RC_INLINE __forceinline
 
@@ -196,6 +197,77 @@ namespace vu1rc
         }
         const float res = (K == kMadd) ? a + product : a - product;
         return laneFinish<K>(res, l, r, a, flags);
+    }
+
+    // --- 4-lane SSE fast path (10-09) -------------------------------------
+    // Same arithmetic as lane<>() for dest=xyzw: normalize, one separate mul and add (no FMA), then
+    // the fast flag rule (exponent in [27,227] => flags = sign only). Returns false, writing nothing,
+    // when any lane (product or result) is outside that range or the exact-flag path is needed; the
+    // caller then runs the scalar lanes unchanged. Bit-identical by construction; gated by
+    // vu1_bench -Verify.
+    VU1RC_INLINE __m128 normalize4(__m128 v)
+    {
+        const __m128i bits = _mm_castps_si128(v);
+        const __m128i exp = _mm_and_si128(_mm_srli_epi32(bits, 23), _mm_set1_epi32(0xFF));
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        const __m128i isZero = _mm_cmpeq_epi32(exp, _mm_setzero_si128());
+        const __m128i isMax = _mm_cmpeq_epi32(exp, _mm_set1_epi32(0xFF));
+        __m128i out = _mm_andnot_si128(isZero, bits);                 // exp==0 -> 0 (sign added below)
+        out = _mm_or_si128(_mm_andnot_si128(isMax, out), _mm_and_si128(isMax, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
+        out = _mm_or_si128(out, _mm_and_si128(isZero, sign));
+        return _mm_castsi128_ps(out);
+    }
+
+    // True when every lane's exponent is in [27,227]; *signMask gets the 4 sign bits (bit c = lane c).
+    VU1RC_INLINE bool fastRange4(__m128 v, int &signMask)
+    {
+        const __m128i bits = _mm_castps_si128(v);
+        const __m128i exp = _mm_and_si128(_mm_srli_epi32(bits, 23), _mm_set1_epi32(0xFF));
+        const __m128i ok = _mm_and_si128(_mm_cmpgt_epi32(exp, _mm_set1_epi32(26)), _mm_cmplt_epi32(exp, _mm_set1_epi32(228)));
+        signMask = _mm_movemask_ps(v);
+        return _mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF;
+    }
+
+    // l, r already normalized; a = normalized ACC (product kinds only).
+    template <Kind K>
+    VU1RC_INLINE bool fmac4(__m128 l, __m128 r, __m128 a, float out[4], uint8_t lf[4], uint32_t &sticky)
+    {
+        __m128 res;
+        int resSign, prodSign = 0;
+        if constexpr (K == kAdd)
+            res = _mm_add_ps(l, r);
+        else if constexpr (K == kSub)
+            res = _mm_sub_ps(l, r);
+        else if constexpr (K == kMul)
+            res = _mm_mul_ps(l, r);
+        else
+        {
+            const __m128 product = _mm_mul_ps(l, r);
+            if (!fastRange4(product, prodSign))
+                return false;
+            res = (K == kMadd) ? _mm_add_ps(a, product) : _mm_sub_ps(a, product);
+        }
+        if (!fastRange4(res, resSign))
+            return false;
+        _mm_storeu_ps(out, res);
+        for (int c = 0; c < 4; ++c)
+            lf[c] = ((resSign >> c) & 1) ? 0x2u : 0u;
+        if constexpr (K == kMadd || K == kMsub)
+            if (prodSign != 0)
+                sticky |= 0x2u;
+        return true;
+    }
+
+    // Out-of-line wrapper used by the generated code. Inlining the SSE body at thousands of sites made
+    // MSVC /O2 take >45 min on one program (10-09); a call keeps the generated functions small.
+    // rhsIsScalar: *rhs is one float broadcast to all lanes; otherwise rhs points at a 4-float VF.
+    template <Kind K, bool RhsIsScalar>
+    __declspec(noinline) bool fmac4p(const float *lhs, const float *rhs, const float *acc, float out[4], uint8_t lf[4], uint32_t &sticky)
+    {
+        const __m128 l = normalize4(_mm_loadu_ps(lhs));
+        const __m128 r = RhsIsScalar ? _mm_set1_ps(*rhs) : normalize4(_mm_loadu_ps(rhs));
+        const __m128 a = (K == kMadd || K == kMsub) ? normalize4(_mm_loadu_ps(acc)) : _mm_setzero_ps();
+        return fmac4<K>(l, r, a, out, lf, sticky);
     }
 
     // Product sticky bits of one MADD/MSUB/OPMSUB lane.

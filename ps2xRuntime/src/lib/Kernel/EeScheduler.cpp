@@ -17,6 +17,49 @@
 
 void ps2xGsThreadVblank(); // ps2_gif_arbiter.cpp
 
+// 10-09 60fps P0 -- what a guest thread transfer (C++ throw of
+// EeDispatcherTransfer) costs and which site fires it. Throw sites: 0 thread
+// exit, 1 reschedule/preempt, 2 push invocation, 3 push sequence, 4 block
+// current. Unwind ns = steady_clock from the throw to the catch that swallows
+// it (the 6.5% "_NLG_Return2" in the P0 profile is C++ EH internals; this
+// measures it directly). Read by the 1 Hz [budget] line in ps2_runtime.cpp.
+namespace
+{
+std::atomic<uint64_t> g_budgetXferSite[5];
+std::atomic<uint64_t> g_budgetUnwindNs{0};
+thread_local int64_t t_budgetThrowNs = 0;
+
+inline int64_t budgetNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+inline void budgetNoteThrow(int site)
+{
+    g_budgetXferSite[site].fetch_add(1, std::memory_order_relaxed);
+    t_budgetThrowNs = budgetNowNs();
+}
+
+inline void budgetNoteCatch()
+{
+    if (t_budgetThrowNs != 0)
+    {
+        g_budgetUnwindNs.fetch_add(static_cast<uint64_t>(budgetNowNs() - t_budgetThrowNs),
+                                   std::memory_order_relaxed);
+        t_budgetThrowNs = 0;
+    }
+}
+} // namespace
+
+extern "C" void ps2x_budget_xfer(uint64_t *out, int n)
+{
+    for (int i = 0; i < n; ++i)
+        out[i] = i < 5 ? g_budgetXferSite[i].load(std::memory_order_relaxed)
+                       : (i == 5 ? g_budgetUnwindNs.load(std::memory_order_relaxed) : 0u);
+}
+
 // 2026-09-03 part 55 -- DISPATCH: which threads actually get the CPU.
 //
 // The 400s run leaves thread 6 RUNNING at priority 1 while threads 1, 4 and 5
@@ -1068,6 +1111,7 @@ void EeScheduler::run()
             }
             catch (const EeDispatcherTransfer &)
             {
+                budgetNoteCatch();
             }
             if (m_currentThreadId == 0)
             {
@@ -1176,6 +1220,7 @@ void EeScheduler::run()
                     }
                     catch (const EeDispatcherTransfer &)
                     {
+                        budgetNoteCatch();
                     }
                 }
                 continue;
@@ -2051,6 +2096,7 @@ void EeScheduler::run()
         }
         catch (const EeDispatcherTransfer &)
         {
+            budgetNoteCatch();
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
             g_guest_busy_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - dispatchStart).count()), std::memory_order_relaxed);
@@ -2358,6 +2404,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         m_runtime.guestFree(ownedStack);
     }
     publishSnapshot();
+    budgetNoteThrow(0);
     throw EeDispatcherTransfer{};
 }
 
@@ -3094,6 +3141,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     publishSnapshot();
+    budgetNoteThrow(1);
     throw EeDispatcherTransfer{};
 }
 
@@ -3612,6 +3660,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
                     owner->invocations.size(), m_eeCycle, invKind);
     }
     publishSnapshot();
+    budgetNoteThrow(2);
     throw EeDispatcherTransfer{};
 }
 
@@ -3640,6 +3689,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         }
     }
     publishSnapshot();
+    budgetNoteThrow(3);
     throw EeDispatcherTransfer{};
 }
 
@@ -4444,6 +4494,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
     publishSnapshot();
+    budgetNoteThrow(4);
     throw EeDispatcherTransfer{};
 }
 

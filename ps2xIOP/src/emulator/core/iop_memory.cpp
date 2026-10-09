@@ -1,6 +1,9 @@
 #include "iop_memory.h"
+#include "spu2.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2x::iop::detail
@@ -17,6 +20,37 @@ namespace ps2x::iop::detail
         {
             return (value + alignment - 1u) & ~(alignment - 1u);
         }
+
+        // E0 census (2026-10-09): PS2X_SPU2_TRACE=<file> logs every SPU2 register write as
+        // "seq size addr value" (size 1/2/4 as the guest issued it) plus one "D" line per SPU DMA start
+        // (MADR/BCR/CHCR). Off unless the env var is set. Feeds build_scripts/spu2/spu2_census.py.
+        std::FILE *spu2TraceFile()
+        {
+            static std::FILE *file = []() -> std::FILE *
+            {
+                const char *path = std::getenv("PS2X_SPU2_TRACE");
+                return (path && *path) ? std::fopen(path, "w") : nullptr;
+            }();
+            return file;
+        }
+
+        bool spu2TraceRange(uint32_t phys)
+        {
+            return phys >= 0x1F900000u && phys < 0x1F910000u;
+        }
+
+        void spu2Trace(uint32_t phys, unsigned size, uint32_t value)
+        {
+            static uint64_t seq = 0;
+            std::FILE *f = spu2TraceFile();
+            if (!f)
+                return;
+            std::fprintf(f, "%llu %u %08X %X\n", static_cast<unsigned long long>(seq), size, phys, value);
+            if ((++seq & 0xFFu) == 0u)
+                std::fflush(f);
+        }
+
+        thread_local bool t_spu2TraceSuppress = false;
     }
 
     IopMemory::IopMemory()
@@ -37,6 +71,7 @@ namespace ps2x::iop::detail
         m_interruptMask = 0;
         m_interruptControl = 1;
         m_dmaStart.reset();
+        spu2::reset();
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -105,11 +140,15 @@ namespace ps2x::iop::detail
             m_scratch[phys - ScratchBase] = value;
             return;
         }
+        if (!t_spu2TraceSuppress && spu2TraceRange(phys))
+            spu2Trace(phys, 1u, value);
         const uint32_t aligned = phys & ~3u;
         uint32_t current = readHardware32(aligned);
         const uint32_t shift = (phys & 3u) * 8u;
         current = (current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift);
         writeHardware32(aligned, current);
+        if (!t_spu2TraceSuppress && spu2TraceRange(phys))
+            spu2::writeReg((phys & ~1u) - spu2::kBase, static_cast<uint16_t>(current >> ((phys & 2u) * 8u)));
     }
 
     void IopMemory::write16(uint32_t address, uint16_t value)
@@ -121,8 +160,15 @@ namespace ps2x::iop::detail
             markOwned(phys, sizeof(value));
             return;
         }
+        if (spu2TraceRange(phys))
+            spu2Trace(phys, 2u, value);
+        const bool prevSuppress = t_spu2TraceSuppress;
+        t_spu2TraceSuppress = true;
         write8(address, static_cast<uint8_t>(value));
         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+        t_spu2TraceSuppress = prevSuppress;
+        if (!prevSuppress && spu2TraceRange(phys))
+            spu2::writeReg(phys - spu2::kBase, value);
     }
 
     void IopMemory::write32(uint32_t address, uint32_t value)
@@ -141,7 +187,14 @@ namespace ps2x::iop::detail
         }
         if ((phys & 3u) == 0u)
         {
+            if (spu2TraceRange(phys))
+                spu2Trace(phys, 4u, value);
             writeHardware32(phys, value);
+            if (spu2TraceRange(phys))
+            {
+                spu2::writeReg(phys - spu2::kBase, static_cast<uint16_t>(value));
+                spu2::writeReg(phys - spu2::kBase + 2u, static_cast<uint16_t>(value >> 16u));
+            }
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -214,6 +267,16 @@ namespace ps2x::iop::detail
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
         const auto value = m_hardware.find(address);
+        if (spu2TraceRange(address))
+        {
+            uint32_t word = value != m_hardware.end() ? value->second : 0u;
+            uint16_t live = 0;
+            if (spu2::readLive(address - spu2::kBase, &live))
+                word = (word & 0xFFFF0000u) | live;
+            if (spu2::readLive(address - spu2::kBase + 2u, &live))
+                word = (word & 0x0000FFFFu) | (static_cast<uint32_t>(live) << 16u);
+            return word;
+        }
         if (value != m_hardware.end())
             return value->second;
         switch (address)
@@ -247,19 +310,37 @@ namespace ps2x::iop::detail
         }
 
         m_hardware[address] = value;
-        // 2026-10-01: SPU2 is a plain register store, so ENDX (core0 0x340/342,
-        // core1 0x740/742) never latched. ARKD_DVD's voice poller (sub_2C90)
-        // only clears a voice's busy bit in sreg14/15 once ENDX reports it, so
-        // voices 3 and 17 stayed busy forever => scene node 0x1C stuck (PLEASE
-        // WAIT, looping outro). KON is word 0x188 / 0x588: report every keyed
-        // voice as ended at once (no sample playback to time it against).
-        if (address == 0x1F900188u || address == 0x1F900588u)
-            m_hardware[address + 0x1B8u] |= (value & 0x00FFFFFFu);
+        // 2026-10-09: ENDX is now real (spu2.cpp latches it when a voice passes an end-flagged ADPCM block).
+        // The old 2026-10-01 stand-in OR-ed every word written at 0x...188/0x...588 into ENDX; that offset is
+        // VMIXL, not KON (KON is 0x1A0), so it only worked by accident (voices 3 and 17 are in the mix mask).
         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
             return;
 
         const bool secondCore = address == kDmaSpu1Chcr;
         m_hardware[address] = value & ~kDmaStart;
+        {
+            // The sample data really moves now: IOP RAM <-> SPU RAM at the core's TSA (CHCR bit 0 = from memory).
+            const auto word = [&](uint32_t a)
+            { const auto it = m_hardware.find(a); return it != m_hardware.end() ? it->second : 0u; };
+            const uint32_t madr = word(address - 8u) & 0x1FFFFCu;
+            const uint32_t bcr = word(address - 4u);
+            const uint64_t bytes = static_cast<uint64_t>(std::max<uint32_t>(bcr & 0xFFFFu, 1u)) *
+                                   std::max<uint32_t>(bcr >> 16u, 1u) * 4u;
+            if (madr < RamSize && bytes <= RamSize - madr)
+            {
+                if (value & 1u)
+                    spu2::dmaToSpu(secondCore ? 1 : 0, m_ram.data() + madr, static_cast<size_t>(bytes));
+                else
+                    spu2::dmaFromSpu(secondCore ? 1 : 0, m_ram.data() + madr, static_cast<size_t>(bytes));
+            }
+        }
+        if (std::FILE *f = spu2TraceFile())
+        {
+            const auto reg = [&](uint32_t a)
+            { const auto it = m_hardware.find(a); return it != m_hardware.end() ? it->second : 0u; };
+            std::fprintf(f, "D %u MADR=%08X BCR=%08X CHCR=%08X\n", secondCore ? 1u : 0u,
+                         reg(address - 8u), reg(address - 4u), value);
+        }
 
         const uint32_t statusAddress = 0x1F900344u + (secondCore ? 0x400u : 0u);
         const uint32_t alignedStatus = statusAddress & ~3u;

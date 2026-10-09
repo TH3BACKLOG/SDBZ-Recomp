@@ -579,6 +579,7 @@ void drawSprite(const Setup &S)
 
         for (int y = S.firstRow(drawY0); y <= drawY1; y += S.rowN)
         {
+            budgetRasterSpan(S.rowIdx, true, true, S.linear, S.abe, S.ztst >= 2, drawX1 - drawX0 + 1);
             float texVf = v0f + (static_cast<float>(y) - vy0) * dvDy;
 
             for (int x = drawX0; x <= drawX1; ++x)
@@ -607,8 +608,11 @@ void drawSprite(const Setup &S)
         if (S.fge)
             applyFog(S.fogcol, v1.fog << 7, r, g, b);
         for (int y = S.firstRow(drawY0); y <= drawY1; y += S.rowN)
+        {
+            budgetRasterSpan(S.rowIdx, true, false, false, S.abe, S.ztst >= 2, drawX1 - drawX0 + 1);
             for (int x = drawX0; x <= drawX1; ++x)
                 writePixel(S, x, y, z1, r, g, b, a);
+        }
     }
 }
 
@@ -690,11 +694,14 @@ void drawTriangle(const Setup &S)
             const int a = (i + 1) % 3;
             e[i] = edx[i] * (py - Y[a]) - edy[i] * (px0 - X[a]);
         }
-        for (int x = minX; x <= maxX; ++x, e[0] -= edy[0] * 16, e[1] -= edy[1] * 16, e[2] -= edy[2] * 16)
+        int xs, xe;
+        if (!triRowSpan(e, edy, bias, minX, maxX, xs, xe))
+            continue;
+        budgetRasterSpan(S.rowIdx, false, prim.tme != 0, S.linear, S.abe, S.ztst >= 2, xe - xs + 1);
+        for (int i = 0; i < 3; ++i)
+            e[i] -= edy[i] * 16 * (xs - minX);
+        for (int x = xs; x <= xe; ++x, e[0] -= edy[0] * 16, e[1] -= edy[1] * 16, e[2] -= edy[2] * 16)
         {
-            if (e[0] + bias[0] < 0 || e[1] + bias[1] < 0 || e[2] + bias[2] < 0)
-                continue;
-
             const float w0 = static_cast<float>(e[0]) * invArea;
             const float w1 = static_cast<float>(e[1]) * invArea;
             const float w2 = 1.0f - w0 - w1;
@@ -816,11 +823,15 @@ void runJob(const Job &j, TexCache &cache, int n, int idx)
     switch (j.prim.prim)
     {
     case GS_PRIM_SPRITE:
+        if (idx == 0)
+            ++g_budgetRaster[0].v[7];
         drawSprite(S);
         break;
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
+        if (idx == 0)
+            ++g_budgetRaster[0].v[6];
         drawTriangle(S);
         break;
     case GS_PRIM_LINE:

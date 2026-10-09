@@ -39,6 +39,10 @@
 #include <sstream>
 #include <vector>
 
+// ps2_spu2_out.cpp (SPU2 device -> raylib audio stream)
+void ps2xSpu2OutputStart();
+void ps2xSpu2OutputStop();
+
 // GS thread, ps2_gif_arbiter.cpp.
 bool ps2xGsThreadEnabled();
 void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes);
@@ -722,6 +726,13 @@ namespace
     // 2026-09-06 part 87 -- host-side EE scheduler counters, defined in
     // Kernel/EeScheduler.cpp. Same extern-between-.cpp rule as above.
     extern "C" void ps2x_sched_diag(uint64_t *out, int n);
+
+    // 10-09 60fps P0 -- per-second cost counters behind the [budget] line:
+    // guest thread-transfer throws (Kernel/EeScheduler.cpp), VU1 host time
+    // (vu/ps2_vu1_core.cpp), raster workload classes (ps2_gs_rasterizer.cpp).
+    extern "C" void ps2x_budget_xfer(uint64_t *out, int n);
+    extern "C" void ps2x_budget_vu1(uint64_t *out, int n);
+    extern "C" void ps2x_budget_raster(uint64_t *out, int n);
 
     // Periodic SRD histogram dump, also defined in game_overrides.cpp. The
     // watchdog is the only thing in the process guaranteed to keep ticking when
@@ -1515,6 +1526,7 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
+            ps2xSpu2OutputStop();
             CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
         }
@@ -1688,7 +1700,9 @@ bool PS2Runtime::syncCoreSubsystems()
                                  {
                                      ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
                                      ps2_pipeline_stats::g_lastMscalPC.store(startPC, std::memory_order_relaxed);
-                                     probeVu1MemoryOccupancy();
+                                     // 32 KB byte scan per MSCAL was 2.5% of the fight game thread (10-09 profile); stats-only.
+                                     if (ps2_diag::enabled())
+                                         probeVu1MemoryOccupancy();
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -1772,6 +1786,8 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        if (IsAudioDeviceReady())
+            ps2xSpu2OutputStart();
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -4104,6 +4120,7 @@ void PS2Runtime::run()
                 //            the bottleneck and gif/s merely follows it.
                 uint64_t prevBusyNs = 0, prevResumes = 0, prevVbl = 0;
                 uint64_t prevVblQ = 0, prevVblI = 0, prevVblS = 0;
+                uint64_t prevBudgetXfer[6] = {}, prevBudgetVu1[5] = {}, prevBudgetRaster[10] = {};
                 // Stage 5.7. Every rate field above measures the *render* loop,
                 // and they all read healthy while the screen stays black -- so
                 // none of them can answer the question that is actually open:
@@ -6774,6 +6791,41 @@ void PS2Runtime::run()
                     // Self-silencing: prints nothing on a second where no traced
                     // slot's count moved.
                     ps2x_dump_frametrace_calls();
+                    {
+                        // 10-09 60fps P0: per-second deltas of the cost counters,
+                        // plus per-vblank figures (vblank = the frame budget, 16.7
+                        // ms at 60). Reads of other threads' counters are racy by
+                        // design; this is a statistic, not a gate.
+                        uint64_t bx[6], bv[5], br[10];
+                        ps2x_budget_xfer(bx, 6);
+                        ps2x_budget_vu1(bv, 5);
+                        ps2x_budget_raster(br, 10);
+                        uint64_t dx[6], dv[5], dr[10];
+                        for (int i = 0; i < 6; ++i) { dx[i] = bx[i] - prevBudgetXfer[i]; prevBudgetXfer[i] = bx[i]; }
+                        for (int i = 0; i < 5; ++i) { dv[i] = bv[i] - prevBudgetVu1[i]; prevBudgetVu1[i] = bv[i]; }
+                        for (int i = 0; i < 10; ++i) { dr[i] = br[i] - prevBudgetRaster[i]; prevBudgetRaster[i] = br[i]; }
+                        const uint64_t nv = dVbl != 0 ? dVbl : 1;
+                        const uint64_t xferTotal = dx[0] + dx[1] + dx[2] + dx[3] + dx[4];
+                        const uint64_t rastPx = dr[0] + dr[1] + dr[2] + dr[3] + dr[4] + dr[5];
+                        std::cerr << "[budget] t=" << (t + 1) << " vbl/s=" << dVbl
+                                  << " xfer/s=" << xferTotal << " (exit/resched/pushInv/pushSeq/block="
+                                  << dx[0] << "/" << dx[1] << "/" << dx[2] << "/" << dx[3] << "/" << dx[4] << ")"
+                                  << " res/s=" << dResumes
+                                  << " xfer/vbl=" << (xferTotal / nv)
+                                  << " unwindUs/vbl=" << (dx[5] / 1000 / nv)
+                                  << " vu1Us/vbl=" << (dv[0] / 1000 / nv)
+                                  << " vu1RecompUs/vbl=" << (dv[3] / 1000 / nv)
+                                  << " vu1KickUs/vbl=" << (dv[2] / 1000 / nv)
+                                  << " vu1Runs/vbl=" << (dv[1] / nv)
+                                  << " rastKpx/vbl=" << (rastPx / 1000 / nv)
+                                  << " (triFlat/triTex/triLin/sprFlat/sprTex/sprLin Kpx/vbl="
+                                  << (dr[0] / 1000 / nv) << "/" << (dr[1] / 1000 / nv) << "/" << (dr[2] / 1000 / nv) << "/"
+                                  << (dr[3] / 1000 / nv) << "/" << (dr[4] / 1000 / nv) << "/" << (dr[5] / 1000 / nv) << ")"
+                                  << " tris/vbl=" << (dr[6] / nv) << " sprites/vbl=" << (dr[7] / nv)
+                                  << " abeKpx/vbl=" << (dr[8] / 1000 / nv) << " zKpx/vbl=" << (dr[9] / 1000 / nv)
+                                  << " gifCopies/vbl=" << (dGif / nv)
+                                  << std::endl;
+                    }
                     std::cerr << "[watchdog] t=" << (++t) << "s"
                               // cov=<distinct>/<game band>. A game-band count
                               // that never rises is the Stage 5.7 answer.

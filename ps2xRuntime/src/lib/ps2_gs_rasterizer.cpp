@@ -1680,6 +1680,16 @@ namespace
 
     bool tex1UsesLinearFilter(uint64_t tex1)
     {
+        // 10-09: PS2X_GS_NEAREST=1 forces point sampling everywhere (both
+        // rasterisers go through here): speed over fidelity, for manual play
+        // (build_scripts/play.ps1). Off by default; the oracle gates never set it.
+        static const bool forceNearest = []
+        {
+            const char *e = std::getenv("PS2X_GS_NEAREST");
+            return e != nullptr && *e == '1';
+        }();
+        if (forceNearest)
+            return false;
         const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5) & 0x1u);
         const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6) & 0x7u);
         return mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
@@ -1918,6 +1928,43 @@ namespace
     }
 }
 
+// Perf (10-09): x-span of one triangle row. A pixel is inside when every
+// e[i]+bias[i] >= 0, with e[i] advancing by -edy[i]*16 per pixel. The inside set
+// is convex, so it is contiguous within a row; returns false for an empty row,
+// else [xs,xe] within [minX,maxX]. Integer-exact: the same pixels the old
+// test-every-pixel loop kept, minus the walk over the empty part of the bbox.
+static inline bool triRowSpan(const int64_t e0[3], const int64_t edy[3], const int64_t bias[3],
+                              int minX, int maxX, int &xs, int &xe)
+{
+    int64_t lo = minX, hi = maxX;
+    for (int i = 0; i < 3; ++i)
+    {
+        const int64_t v = e0[i] + bias[i]; // value at x == minX
+        const int64_t c = -edy[i] * 16;    // change per pixel
+        if (c == 0)
+        {
+            if (v < 0)
+                return false;
+        }
+        else if (c > 0)
+        {
+            if (v < 0)
+                lo = std::max<int64_t>(lo, minX + (-v + c - 1) / c);
+        }
+        else
+        {
+            if (v < 0)
+                return false;
+            hi = std::min<int64_t>(hi, minX + v / (-c));
+        }
+    }
+    if (lo > hi)
+        return false;
+    xs = static_cast<int>(lo);
+    xe = static_cast<int>(hi);
+    return true;
+}
+
 // Time the GS thread spends waiting on the raster workers (printed by
 // PS2X_GS_THREAD_STATS=1 in ps2_gif_arbiter.cpp).
 #include <chrono>
@@ -1928,6 +1975,44 @@ std::atomic<uint64_t> g_gsmtWaitDoneCalls{0};
 // (set by the ps2_gs_gpu.cpp caller), 0 unknown.
 std::atomic<uint64_t> g_gsmtWaitByReason[16][2];
 int g_gsmtWaitReason = 0;
+
+// 10-09 60fps P0: raster workload classes per worker, summed by
+// ps2x_budget_raster() for the [budget] line. Every worker owns distinct rows,
+// so the sum over workers is the true pixel count. Plain adds (one writer per
+// slot); the reader is racy by design (stats only).
+//   v: 0 triFlat 1 triTex 2 triTexLinear 3 sprFlat 4 sprTex 5 sprTexLinear
+//      6 tris (worker 0) 7 sprites (worker 0) 8 abe px 9 z-tested px
+struct alignas(64) BudgetRasterSlot
+{
+    uint64_t v[10];
+};
+static BudgetRasterSlot g_budgetRaster[16];
+
+static inline void budgetRasterSpan(int worker, bool sprite, bool tme, bool lin, bool abe, bool zt, int n)
+{
+    if (n <= 0)
+        return;
+    uint64_t *v = g_budgetRaster[worker & 15].v;
+    const uint64_t px = static_cast<uint64_t>(n);
+    v[(sprite ? 3 : 0) + (tme ? (lin ? 2 : 1) : 0)] += px;
+    if (abe)
+        v[8] += px;
+    if (zt)
+        v[9] += px;
+}
+
+extern "C" void ps2x_budget_raster(uint64_t *out, int n)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        uint64_t s = 0;
+        if (i < 10)
+            for (const BudgetRasterSlot &slot : g_budgetRaster)
+                s += slot.v[i];
+        out[i] = s;
+    }
+}
+
 #include "ps2_gs_raster_mt.inl"
 
 void GSRasterizer::drawPrimitive(GS *gs)
@@ -3779,11 +3864,13 @@ void GSRasterizer::drawTriangle(GS *gs)
             const int a = (i + 1) % 3;
             e[i] = edx[i] * (py - Y[a]) - edy[i] * (px0 - X[a]);
         }
-        for (int x = minX; x <= maxX; ++x, e[0] -= edy[0] * 16, e[1] -= edy[1] * 16, e[2] -= edy[2] * 16)
+        int xs, xe;
+        if (!triRowSpan(e, edy, bias, minX, maxX, xs, xe))
+            continue;
+        for (int i = 0; i < 3; ++i)
+            e[i] -= edy[i] * 16 * (xs - minX);
+        for (int x = xs; x <= xe; ++x, e[0] -= edy[0] * 16, e[1] -= edy[1] * 16, e[2] -= edy[2] * 16)
         {
-            if (e[0] + bias[0] < 0 || e[1] + bias[1] < 0 || e[2] + bias[2] < 0)
-                continue;
-
             const float w0 = static_cast<float>(e[0]) * invArea;
             const float w1 = static_cast<float>(e[1]) * invArea;
             const float w2 = 1.0f - w0 - w1;

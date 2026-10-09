@@ -783,7 +783,33 @@ class Gen:
                 # lane() ORs each product's sticky bits into ps_ (one multiply
                 # per lane instead of a second one in productSticky).
                 self.w("            uint32_t ps_ = 0u;")
-            for c in lanes:
+            simd = (list(lanes) == [0, 1, 2, 3] and kind in ("kAdd", "kSub", "kMul", "kMadd", "kMsub"))
+            if simd:
+                # 4-lane SSE attempt (fmac4 in vu1_recomp_rt.h); any lane outside the fast flag range
+                # falls through to the scalar lanes below, unchanged. Writes lf/ps_ only on success.
+                # rhs: bc_/q_/i_ are already-normalized scalars (taken by address); otherwise the VF row.
+                if rk in ("bc", "q", "i"):
+                    sname = {"bc": "bc_", "q": "q_", "i": "i_"}[rk]
+                    rv, scal = "&" + sname, "true"
+                else:
+                    rv, scal = "vf[%d]" % ft, "false"
+                self.w("            float r0, r1, r2, r3;")
+                self.w("            {")
+                self.w("                float v4_[4];")
+                if not product_form:
+                    self.w("                uint32_t ps_unused_ = 0u; (void)ps_unused_;")
+                self.w("                if (fmac4p<%s, %s>(vf[%d], %s, acc, v4_, lf, %s))" % (kind, scal, fs, rv, "ps_" if product_form else "ps_unused_"))
+                self.w("                { r0 = v4_[0]; r1 = v4_[1]; r2 = v4_[2]; r3 = v4_[3]; }")
+                self.w("                else")
+                self.w("                {")
+                for c in lanes:
+                    a = "N(acc[%d])" % c if product_form else "0.0f"
+                    tail = ", ps_" if product_form else ""
+                    self.w("                    r%d = lane<%s>(%s, %s, %s, false, lf[%d]%s);" % (c, kind, left(c), right(c), a, c, tail))
+                self.w("                }")
+                self.w("            }")
+            else:
+              for c in lanes:
                 a = "N(acc[%d])" % c if product_form else "0.0f"
                 opmw = "true" if (c == 3 and kind in ("kOpmsub", "kOpmula")) else "false"
                 tail = ", ps_" if product_form else ""

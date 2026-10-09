@@ -8,6 +8,7 @@
 #include "core/iop_kernel.h"
 #include "imports/iop_loadcore.h"
 #include "core/iop_memory.h"
+#include "core/spu2.h"
 #include "services/iop_module_loader.h"
 #include "services/iop_rpc.h"
 #include "imports/iop_stdio.h"
@@ -906,6 +907,7 @@ namespace ps2x::iop::detail
                 {
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
+                    spu2::advance(totalCycles);
                     timrman.serviceDue(totalCycles, *this);
                     vblank.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
