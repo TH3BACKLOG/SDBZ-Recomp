@@ -76,6 +76,69 @@ uint32_t resolveSrc(uint32_t pos)
 }
 // -------------------------------------------------------------------------
 
+// ---- [p5a] -- 10-09 P5 go/no-go counters (docs/perf/P5_VU1_THREAD_DESIGN.md)
+// Measure only, PS2X_P5A=1. Counts the EE observations a VU1 worker thread
+// would have to sync on (S2 VIF1 regs, S4 VPU_STAT readers, S5 GS syncs) and
+// splits each frame into EE time inside VIF1 kicks vs outside them.
+// Slots: 0 vif1 reg reads, 1 vif1 reg writes, 2 D1 kicks, 3 ns inside D1 kicks,
+// 4 ns vblank->vblank, 5 ns last kick end->vblank, 6 vblanks, 7 GS syncs,
+// 8..10 calls of the VPU_STAT readers 0x172278 / 0x1731e0 / 0x1733e0.
+namespace
+{
+constexpr int kP5aSlots = 11;
+std::atomic<uint64_t> g_p5a[kP5aSlots];
+uint64_t g_p5aLastVblNs = 0;     // EE thread only
+uint64_t g_p5aLastKickEndNs = 0; // EE thread only
+
+bool p5aOn()
+{
+    static const bool on = []
+    {
+        const char *e = std::getenv("PS2X_P5A");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+uint64_t p5aNowNs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+}
+
+extern "C" void ps2x_p5a_bump(int slot) noexcept
+{
+    if (p5aOn() && slot >= 0 && slot < kP5aSlots)
+        g_p5a[slot].fetch_add(1u, std::memory_order_relaxed);
+}
+
+extern "C" int ps2x_p5a_enabled() noexcept { return p5aOn() ? 1 : 0; }
+
+// EE thread, at every vblank (ps2xGsThreadVblank entry).
+extern "C" void ps2x_p5a_vblank() noexcept
+{
+    if (!p5aOn())
+        return;
+    const uint64_t now = p5aNowNs();
+    if (g_p5aLastVblNs != 0u)
+    {
+        g_p5a[4].fetch_add(now - g_p5aLastVblNs, std::memory_order_relaxed);
+        if (g_p5aLastKickEndNs > g_p5aLastVblNs)
+            g_p5a[5].fetch_add(now - g_p5aLastKickEndNs, std::memory_order_relaxed);
+        g_p5a[6].fetch_add(1u, std::memory_order_relaxed);
+    }
+    g_p5aLastVblNs = now;
+}
+
+extern "C" void ps2x_p5a_counts(uint64_t *out, int n) noexcept
+{
+    for (int i = 0; i < n && i < kP5aSlots; ++i)
+        out[i] = g_p5a[i].load(std::memory_order_relaxed);
+}
+// -------------------------------------------------------------------------
+
 namespace
 {
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
@@ -1709,6 +1772,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        ps2x_p5a_bump(1);
 
         switch (address)
         {
@@ -2235,7 +2299,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
                 if (autoProcessTransfers)
                 {
+                    const bool p5aKick = channelBase == 0x10009000u && p5aOn();
+                    const uint64_t p5aT0 = p5aKick ? p5aNowNs() : 0u;
                     processPendingTransfers();
+                    if (p5aKick)
+                    {
+                        g_p5aLastKickEndNs = p5aNowNs();
+                        g_p5a[2].fetch_add(1u, std::memory_order_relaxed);
+                        g_p5a[3].fetch_add(g_p5aLastKickEndNs - p5aT0, std::memory_order_relaxed);
+                    }
                 }
             }
         }
@@ -3053,6 +3125,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (address >= 0x10003C00u && address < 0x10003E00u)
+        ps2x_p5a_bump(0);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

@@ -734,6 +734,9 @@ namespace
     extern "C" void ps2x_budget_xfer(uint64_t *out, int n);
     extern "C" void ps2x_budget_vu1(uint64_t *out, int n);
     extern "C" void ps2x_budget_raster(uint64_t *out, int n);
+    // 10-09 P5a go/no-go counters (ps2_memory.cpp), PS2X_P5A=1.
+    extern "C" void ps2x_p5a_counts(uint64_t *out, int n) noexcept;
+    extern "C" int ps2x_p5a_enabled() noexcept;
 
     // Periodic SRD histogram dump, also defined in game_overrides.cpp. The
     // watchdog is the only thing in the process guaranteed to keep ticking when
@@ -4122,6 +4125,7 @@ void PS2Runtime::run()
                 uint64_t prevBusyNs = 0, prevResumes = 0, prevVbl = 0;
                 uint64_t prevVblQ = 0, prevVblI = 0, prevVblS = 0;
                 uint64_t prevBudgetXfer[6] = {}, prevBudgetVu1[5] = {}, prevBudgetRaster[10] = {};
+                uint64_t prevP5a[11] = {};
                 // Stage 5.7. Every rate field above measures the *render* loop,
                 // and they all read healthy while the screen stays black -- so
                 // none of them can answer the question that is actually open:
@@ -6829,6 +6833,25 @@ void PS2Runtime::run()
                                   << " abeKpx/vbl=" << (dr[8] / 1000 / nv) << " zKpx/vbl=" << (dr[9] / 1000 / nv)
                                   << " gifCopies/vbl=" << (dGif / nv)
                                   << std::endl;
+                        if (ps2x_p5a_enabled())
+                        {
+                            // P5 design S2/S4/S5 counts per second, and per vblank
+                            // the EE time inside VIF1 kicks vs the whole frame.
+                            uint64_t p[11], d[11];
+                            ps2x_p5a_counts(p, 11);
+                            for (int i = 0; i < 11; ++i) { d[i] = p[i] - prevP5a[i]; prevP5a[i] = p[i]; }
+                            const uint64_t nf = d[6] != 0 ? d[6] : 1;
+                            std::cerr << "[p5a] t=" << (t + 1) << " vbl/s=" << dVbl
+                                      << " vif1Rd/s=" << d[0] << " vif1Wr/s=" << d[1]
+                                      << " vpuStat/s=" << (d[8] + d[9] + d[10])
+                                      << " (172278/1731e0/1733e0=" << d[8] << "/" << d[9] << "/" << d[10] << ")"
+                                      << " gsSync/s=" << d[7] << " d1Kicks/s=" << d[2]
+                                      << " frameUs=" << (d[4] / 1000 / nf)
+                                      << " kickUs/vbl=" << (d[3] / 1000 / nf)
+                                      << " outsideUs/vbl=" << ((d[4] > d[3] ? d[4] - d[3] : 0) / 1000 / nf)
+                                      << " postKickUs/vbl=" << (d[5] / 1000 / nf)
+                                      << std::endl;
+                        }
                     }
                     std::cerr << "[watchdog] t=" << (++t) << "s"
                               // cov=<distinct>/<game band>. A game-band count

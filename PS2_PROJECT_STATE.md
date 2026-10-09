@@ -24138,3 +24138,15 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
   - 2d IOP: `beginNextReady(cycle, &minDelayWake)` returns the earliest Delay wake from its one pass; `nextWakeCycle` walk gone from the idle path (was 2.5 s per run).
   - Result: game-thread CPU in the targeted rows ~8 s less per 320 s run (~3%). Fight median 30 / 31 in two runs vs 33 baseline, BUT those runs drew bigger triangles (rastKpx 963-991 vs 875, same tris/vbl 9.8K): **the pad-script fight's content varies run to run** (H: AI/camera), so wall vbl/s A/B across runs is confounded. Logs `p4_cheap_log.txt`, `p4_cheap_log2.txt`.
 - **Step 3 P5 design** -> `docs/perf/P5_VU1_THREAD_DESIGN.md` (STOP for user review). Findings (V): a VIF1 kick runs the whole chain + all VU1 runs inside the EE's D1_CHCR store; chain data is already a copy; in fights the EE sees only "DMA done" (2 kicks/vbl) and the vblank latch: 0 GS syncs, no EE refs to VU1 memory, VIF1-register and cfc2 vi29 readers only in GS readback/debug code (0x1721xx-0x1734xx). Design: worker thread owns VIF1 + VU1 + all GIF submission (PATH3 + vblank marker through the same ring), sync on S2/S5 hooks, `PS2X_VU1_THREAD`. H: ~33 -> ~45 vbl/s, then raster (4 workers ~67% busy) is the wall; 60 needs P5 + raster. First step P5a = measure-only counters (go/no-go).
+
+## Part 183 - 10-09 P5a: VU1-thread go/no-go counters = GO
+
+- User approved P5a ("P5a Go"). Measure only, `PS2X_P5A=1` (set by `-PerfFight`). Counters: `ps2_memory.cpp` (file-static `g_p5a`, VIF1 reg reads/writes, D1 kick timing), `ps2_gif_arbiter.cpp` (GS syncs, vblank hook), `game_overrides.cpp` (entry wrappers on the 3 `cfc2 vi29` functions 0x172278 / 0x1731e0 / 0x1733e0), `ps2_runtime.cpp` (`[p5a]` line per second), `perf_summary.py --fight` (medians + max).
+- Static: 0x1731e0 is reachable from SyncFrame via `sub_102560` -> `sub_173460`, but only on `sub_102560`'s 3000-poll timeout path (register dump then hang).
+- verify_fix `p5a_counters` PASS (conformance, build, gsfeature 96, boot).
+- **Fight (`logs/p5a_fight_log.txt`, 284 fight seconds, median 29 vbl/s, rastKpx 1055 = heavy content):**
+  - S2 VIF1 reg reads/writes, S4 VPU_STAT reader calls, S5 GS syncs: **0 in every fight second (max 0)**.
+  - 1 VIF1 kick per vblank. Frame 34.7 ms = **kick 18.0 ms** (VIF1+VU1+XGKICK inline) + **outside 16.8 ms** (EE logic, spin, GS vblank wait). Kick ends ~11 ms before the vblank.
+  - => **GO**: nothing to sync on in fights; a worker overlaps 18 ms with 16.8 ms of EE work. H: game thread ~17 ms/vbl, worker ~18 ms/vbl, so ~55 vbl/s before raster; raster threads ~67% busy at 29 vbl/s -> raster saturates ~43-45 (unchanged estimate).
+- Note: `voiceSample<1>` 1.8% is present: -PerfFight leaves SPU2 host audio on (2c skip only applies with PS2X_SPU2_HOST=0).
+- Next: P5b skeleton (`PS2X_VU1_THREAD=1`, default off) — awaits user go.

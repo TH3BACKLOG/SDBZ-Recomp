@@ -119,7 +119,8 @@ if ($PerfFight) {
     $env:PS2X_PAD_SCRIPT = Join-Path (Split-Path -Parent $PSCommandPath) 'build_scripts\sweeps\perf_fight.txt'
     $env:PS2X_PROFILE_GATE = '1'
     $env:PS2X_PROFILE_START = '0'
-    Write-Host "[launch_recomp] -PerfFight: perf_fight.txt pad script, ${RunSeconds}s, quantum 3000, DIAG=0, profile gate on, exe=$Exe" -ForegroundColor Cyan
+    $env:PS2X_P5A = '1'   # [p5a] VU1-thread go/no-go counters (measure only)
+    Write-Host "[launch_recomp] -PerfFight: perf_fight.txt pad script, ${RunSeconds}s, quantum 3000, DIAG=0, profile gate on, P5A counters, exe=$Exe" -ForegroundColor Cyan
 }
 
 # --- Tracers -----------------------------------------------------------------

@@ -1856,8 +1856,37 @@ namespace
         ctx->pc = GPR_U32(ctx, 31);
     }
 
+    // 10-09 P5a (measure only, PS2X_P5A=1): count calls of the only three
+    // functions holding `cfc2 vi29` (VPU_STAT reads, design S4). Wrapped at the
+    // entry slot; the original body runs unchanged.
+    extern "C" void ps2x_p5a_bump(int slot) noexcept; // ps2_memory.cpp
+    extern "C" int ps2x_p5a_enabled() noexcept;
+    constexpr uint32_t kP5aVpuStatFns[3] = {0x00172278u, 0x001731E0u, 0x001733E0u};
+    PS2Runtime::RecompiledFunction g_p5aVpuStatOrig[3] = {};
+
+    template <int I>
+    void p5aVpuStatWrapper(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ps2x_p5a_bump(8 + I);
+        g_p5aVpuStatOrig[I](rdram, ctx, runtime);
+    }
+
+    void installP5aVpuStatWrappers(PS2Runtime &runtime)
+    {
+        if (!ps2x_p5a_enabled())
+            return;
+        constexpr PS2Runtime::RecompiledFunction wrappers[3] = {
+            &p5aVpuStatWrapper<0>, &p5aVpuStatWrapper<1>, &p5aVpuStatWrapper<2>};
+        for (int i = 0; i < 3; ++i)
+            g_p5aVpuStatOrig[i] = runtime.lookupFunction(kP5aVpuStatFns[i]);
+        for (int i = 0; i < 3; ++i)
+            if (g_p5aVpuStatOrig[i] != nullptr)
+                runtime.replaceFunction(kP5aVpuStatFns[i], wrappers[i]);
+    }
+
     void applySdbzKernelThunkFixes(PS2Runtime &runtime)
     {
+        installP5aVpuStatWrappers(runtime);
         for (const uint32_t pc : {0x1751C0u, 0x1751D8u, 0x1751E0u, 0x175204u, 0x175210u, 0x175234u, 0x175254u})
             runtime.replaceFunction(pc, &sdbzWaitVSync1751C0);
         runtime.replaceFunction(0x00178A08u, &sdbzGuestSifBindRpc178A08);

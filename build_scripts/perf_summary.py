@@ -146,6 +146,19 @@ def fight(path, vu1_min, thread, top):
     gs = re.findall(r"\[gsthread\] submits=[^\r\n]*", text)
     if gs:
         print("   last " + gs[-1][:260])
+    # [p5a] (PS2X_P5A=1): VU1-thread go/no-go counters, fight seconds only.
+    fight_t = {r["t"] for r in rows}
+    p5 = []
+    for pt, rest in re.findall(r"\[p5a\] t=(\d+)([^\r\n]*)", text):
+        if int(pt) in fight_t:
+            p5.append({k: int(v) for k, v in re.findall(r"([\w/]+)=(\d+)", rest)})
+    if p5:
+        keys = ("vif1Rd/s", "vif1Wr/s", "vpuStat/s", "gsSync/s", "d1Kicks/s", "frameUs",
+                "kickUs/vbl", "outsideUs/vbl", "postKickUs/vbl")
+        print("   [p5a] medians over %d fight seconds: " % len(p5) + "  ".join(
+            "%s=%d" % (k, statistics.median([r[k] for r in p5 if k in r])) for k in keys if any(k in r for r in p5)))
+        print("   [p5a] max: " + "  ".join(
+            "%s=%d" % (k, max(r.get(k, 0) for r in p5)) for k in ("vif1Rd/s", "vif1Wr/s", "vpuStat/s", "gsSync/s")))
     return 0
 
 

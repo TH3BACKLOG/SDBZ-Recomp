@@ -104,3 +104,11 @@ PCSX2's "MTVU" runs VU1 on its own thread. The EE/VIF side writes unpacked data,
 - **P5d:** flip the default on, then re-tune the raster worker count. Next: raster throughput (P1).
 
 **STOP: review this design before any P5 code.**
+
+## 9. P5a result (10-09, user approved P5a): GO
+- **V** `-PerfFight` with `PS2X_P5A=1` (`logs/p5a_fight_log.txt`, 284 fight seconds, median 29 vbl/s, heavy content rastKpx 1055):
+  - S2 VIF1 register reads/writes: **0** (max 0). S4 calls of 0x172278 / 0x1731e0 / 0x1733e0: **0**. S5 GS syncs: **0**.
+  - 1 VIF1 kick per vblank. Frame 34.7 ms = kick **18.0 ms** + outside **16.8 ms**; the kick ends ~11 ms before the vblank.
+- **V** (static) 0x1731e0 is reachable from SyncFrame (`sub_102560` -> `sub_173460`), but only on the 3000-poll timeout path (debug register dump, then a hang loop).
+- **H** With the worker: game thread ~17 ms/vbl, worker ~18 ms/vbl -> ~55 vbl/s before raster; raster saturates first (~43-45), as in section 5.
+- Next: P5b (needs the user's go).

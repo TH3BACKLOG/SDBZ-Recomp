@@ -402,9 +402,13 @@ void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+extern "C" void ps2x_p5a_bump(int slot) noexcept; // ps2_memory.cpp, P5a counters
+extern "C" void ps2x_p5a_vblank() noexcept;
+
 // reason: 1 CSR, 2 SIGLBLID, 3 local->host, 4 direct GS call, 5 native GIF chain.
 void ps2xGsThreadSync(uint32_t reason)
 {
+    ps2x_p5a_bump(7);
     GsThread *t = g_gsThread;
     if (!t)
         return;
@@ -431,6 +435,7 @@ void ps2xGsThreadSync(uint32_t reason)
 // processed everything submitted before the previous vblank.
 void ps2xGsThreadVblank()
 {
+    ps2x_p5a_vblank();
     GsThread *t = g_gsThread;
     if (!t)
         return;
