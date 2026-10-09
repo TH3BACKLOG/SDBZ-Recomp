@@ -99,10 +99,13 @@ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF0Data(m_rdram + srcPhys, sizeBytes);
 }
 
+extern "C" void ps2x_vuw_sync_ee(int reason) noexcept; // ps2_memory.cpp, VU worker
+
 void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    ps2x_vuw_sync_ee(3);
 
     uint32_t pos = 0;
     while (pos + 4 <= sizeBytes)
@@ -380,6 +383,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    ps2x_vuw_sync_ee(3); // no-op on the VU worker itself
 
     // PS2X_VUCAP recorder (Kernel/VuCap): this buffer, plus MEMSYNC when the EE
     // wrote VU1 memory since the previous call. Named so it lives to the return.

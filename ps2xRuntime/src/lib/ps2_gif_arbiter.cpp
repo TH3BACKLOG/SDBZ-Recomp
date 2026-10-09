@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -207,6 +208,11 @@ struct GsThread
     std::atomic<uint64_t> submittedSeq{0}; // packets submitted, ever
     std::atomic<uint64_t> completedSeq{0}; // packets processed, ever
     uint64_t prevVblankMark = 0;           // submittedSeq at the previous vblank
+    // P5b (VU worker): vblank markers go through the worker's queue, so the pacing
+    // target comes from the marker job instead of from the EE thread.
+    uint64_t vblTicketNext = 0;                // EE thread only
+    std::atomic<uint64_t> markDone{0};         // last ticket whose marker job ran
+    std::atomic<uint64_t> markSeq[2]{}; // submittedSeq after marker ticket&1
 
     // stats (game thread only, except syncWaitNs)
     bool stats = false;
@@ -321,6 +327,17 @@ extern "C" int ps2x_ee_waiting_on_gs()
     return g_eeWaitingOnGs.load(std::memory_order_acquire);
 }
 
+// The VU worker wait (ps2_memory.cpp, [vuw]) counts as "EE waiting" too.
+extern "C" void ps2x_ee_wait_enter()
+{
+    g_eeWaitingOnGs.fetch_add(1, std::memory_order_acq_rel);
+}
+
+extern "C" void ps2x_ee_wait_leave()
+{
+    g_eeWaitingOnGs.fetch_sub(1, std::memory_order_acq_rel);
+}
+
 // Host present loop brackets its GS frame latch/copy with these.
 extern "C" void ps2x_gs_present_begin()
 {
@@ -404,11 +421,16 @@ void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes)
 
 extern "C" void ps2x_p5a_bump(int slot) noexcept; // ps2_memory.cpp, P5a counters
 extern "C" void ps2x_p5a_vblank() noexcept;
+extern "C" void ps2x_vuw_sync_ee(int reason) noexcept; // ps2_memory.cpp, VU worker
+bool ps2xVuwActive();
+void ps2xVuwEnqueue(std::function<void()> fn);
+void ps2xVuwStop();
 
 // reason: 1 CSR, 2 SIGLBLID, 3 local->host, 4 direct GS call, 5 native GIF chain.
 void ps2xGsThreadSync(uint32_t reason)
 {
     ps2x_p5a_bump(7);
+    ps2x_vuw_sync_ee(4); // packets still queued on the VU worker have not reached the GS yet
     GsThread *t = g_gsThread;
     if (!t)
         return;
@@ -433,14 +455,11 @@ void ps2xGsThreadSync(uint32_t reason)
 
 // Called at every vblank (EeScheduler VBlankStart): wait until the GS has
 // processed everything submitted before the previous vblank.
-void ps2xGsThreadVblank()
+// Empty packet = vblank marker; the GS thread latches the host frame there.
+// Returns submittedSeq after the marker.
+static uint64_t gsThreadPushMarker(GsThread *t)
 {
-    ps2x_p5a_vblank();
-    GsThread *t = g_gsThread;
-    if (!t)
-        return;
     {
-        // Empty packet = vblank marker; the GS thread latches the host frame there.
         std::lock_guard<std::mutex> lock(t->m);
         if (!t->stop)
         {
@@ -457,8 +476,51 @@ void ps2xGsThreadVblank()
         }
     }
     t->cvWork.notify_one();
-    const uint64_t target = t->prevVblankMark;
-    t->prevVblankMark = t->submittedSeq.load(std::memory_order_acquire);
+    return t->submittedSeq.load(std::memory_order_acquire);
+}
+
+void ps2xGsThreadVblank()
+{
+    ps2x_p5a_vblank();
+    GsThread *t = g_gsThread;
+    if (!t)
+        return;
+    uint64_t target = 0;
+    if (ps2xVuwActive())
+    {
+        // The marker has to follow every packet kicked before this vblank, and
+        // those are still on the VU worker: queue the marker behind them.
+        const uint64_t ticket = ++t->vblTicketNext;
+        ps2xVuwEnqueue([t, ticket]
+                       {
+            const uint64_t seq = gsThreadPushMarker(t);
+            t->markSeq[ticket & 1u].store(seq, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(t->m);
+                t->markDone.store(ticket, std::memory_order_release);
+            }
+            t->cvIdle.notify_all(); });
+        if (ticket == 1u)
+            return;
+        // Same pacing as below: wait for the GS to finish what was submitted
+        // before the previous vblank, i.e. up to the previous marker.
+        const uint64_t prev = ticket - 1u;
+        if (t->markDone.load(std::memory_order_acquire) < prev)
+        {
+            EeWaitScope waiting;
+            std::unique_lock<std::mutex> lock(t->m);
+            t->cvIdle.wait(lock, [t, prev]
+                           { return t->stop || t->markDone.load(std::memory_order_acquire) >= prev; });
+        }
+        if (t->markDone.load(std::memory_order_acquire) >= prev)
+            target = t->markSeq[prev & 1u].load(std::memory_order_acquire);
+    }
+    else
+    {
+        gsThreadPushMarker(t);
+        target = t->prevVblankMark;
+        t->prevVblankMark = t->submittedSeq.load(std::memory_order_acquire);
+    }
     if (t->completedSeq.load(std::memory_order_acquire) >= target)
         return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -478,6 +540,7 @@ void ps2xGsThreadVblank()
 
 void ps2xGsThreadStop()
 {
+    ps2xVuwStop(); // the VU worker feeds this thread; finish and join it first
     // The object is kept (never deleted): a late submit from the game thread
     // then runs the packet itself instead of touching freed memory.
     GsThread *t = g_gsThread;

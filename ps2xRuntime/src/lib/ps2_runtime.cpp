@@ -45,6 +45,8 @@ void ps2xSpu2OutputStop();
 
 // GS thread, ps2_gif_arbiter.cpp.
 bool ps2xGsThreadEnabled();
+extern "C" int ps2x_vuw_on_worker() noexcept;          // ps2_memory.cpp, VU worker
+void ps2xVuwSetKickPrepare(std::function<bool()> fn);  // ps2_memory.cpp
 void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes);
 void ps2xGsThreadSync(uint32_t reason);
 void ps2xGsThreadStop();
@@ -1700,10 +1702,32 @@ bool PS2Runtime::syncCoreSubsystems()
                                     });
     m_memory.setGifArbiter(&m_gifArbiter);
     vucap::setStateSource(&m_vu1.state());
+    // P5b: a VU1 run queued on the VU worker must not touch the EE context. The
+    // kick (EE thread) checks FBRST D/T here, and clears the stop bits the run
+    // would clear; it returns false to keep that kick inline.
+    ps2xVuwSetKickPrepare([this]() -> bool
+                          {
+                              R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                              if (!cpuContext)
+                                  cpuContext = &m_cpuContext;
+                              if ((cpuContext->vu0_fbrst & ((1u << 10) | (1u << 11))) != 0u)
+                                  return false;
+                              cpuContext->vu0_vpu_stat &= ~0x0600u;
+                              return true; });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
                                      ps2_pipeline_stats::g_lastMscalPC.store(startPC, std::memory_order_relaxed);
+                                     if (ps2x_vuw_on_worker())
+                                     {
+                                         // D/T bits were clear at kick time (see above).
+                                         m_vu1.state().dBitEnabled = false;
+                                         m_vu1.state().tBitEnabled = false;
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                         return;
+                                     }
                                      // 32 KB byte scan per MSCAL was 2.5% of the fight game thread (10-09 profile); stats-only.
                                      if (ps2_diag::enabled())
                                          probeVu1MemoryOccupancy();
@@ -1734,6 +1758,15 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
+                                     if (ps2x_vuw_on_worker())
+                                     {
+                                         m_vu1.state().dBitEnabled = false;
+                                         m_vu1.state().tBitEnabled = false;
+                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                      m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                      m_gs, &m_memory, top, itop, 65536);
+                                         return;
+                                     }
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {

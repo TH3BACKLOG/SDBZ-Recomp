@@ -2187,6 +2187,23 @@ void GS::latchHostPresentationFrame()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     latchHostPresentationFrameUnlocked();
+    // PS2X_FRAMEHASH=1: one FNV-1a per latched frame, for A/B runs (P5b). The latch
+    // count is the vblank marker count, so two deterministic runs line up by n.
+    static const bool hashOn = []
+    {
+        const char *e = std::getenv("PS2X_FRAMEHASH");
+        return e && *e && *e != '0';
+    }();
+    if (hashOn)
+    {
+        static uint64_t s_n = 0;
+        uint64_t h = 1469598103934665603ull;
+        for (const uint8_t b : m_hostPresentationFrame)
+            h = (h ^ b) * 1099511628211ull;
+        std::printf("[framehash] n=%llu has=%d w=%u h=%u hash=%016llx\n", (unsigned long long)s_n++,
+                    m_hasHostPresentationFrame ? 1 : 0, m_hostPresentationWidth, m_hostPresentationHeight,
+                    (unsigned long long)h);
+    }
 }
 
 void GS::latchHostPresentationFrameUnlocked()
