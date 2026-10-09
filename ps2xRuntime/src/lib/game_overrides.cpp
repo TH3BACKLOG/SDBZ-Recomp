@@ -1738,8 +1738,128 @@ namespace
         ps2_syscalls::SifCallRpc(rdram, ctx, runtime);
     }
 
+    // 10-09 perf: WaitVSync (0x1751c0), runner body copied unchanged except the
+    // INTC_STAT spin at 0x175210. That spin only reads INTC_STAT and a stack word
+    // until the vblank handler changes one, and every pass paid a full
+    // eeCheckpointDue (~15% of the fight game thread). Under determinism vblank
+    // is paced by guest progress, so the spin was also what made vblank arrive.
+    // Each pass now accounts kSpinBatch passes in one ps2x_ee_spin_checkpoint
+    // call: the same cycles and progress per pass of guest time, ~kSpinBatch x
+    // fewer host calls. Interrupt latency stays one loop pass. Determinism off
+    // (wall-clock vblank) keeps one pass per checkpoint. PS2X_SPIN_BATCH=1
+    // restores the old cost for A/B.
+    extern "C" bool ps2x_ee_spin_checkpoint(uint32_t passes, uint32_t cycles) noexcept;
+    extern "C" int ps2x_determinism_enabled();
+
+    uint32_t sdbzSpinBatch()
+    {
+        static const uint32_t batch = []() -> uint32_t
+        {
+            if (ps2x_determinism_enabled() == 0)
+                return 1u;
+            const char *e = std::getenv("PS2X_SPIN_BATCH");
+            const unsigned long v = (e && *e) ? std::strtoul(e, nullptr, 0) : 128ul;
+            return v == 0ul ? 1u : static_cast<uint32_t>(std::min<unsigned long>(v, 4096ul));
+        }();
+        return batch;
+    }
+
+    void sdbzWaitVSync1751C0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        switch (ctx->pc)
+        {
+        case 0x1751d8u: goto label_1751d8;
+        case 0x1751e0u: goto label_1751e0;
+        case 0x175204u: goto label_175204;
+        case 0x175210u: goto label_175210;
+        case 0x175234u: goto label_175234;
+        case 0x175254u: goto label_175254;
+        default: break;
+        }
+        ctx->pc = 0x1751c0u;
+        SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 4294967264));
+        WRITE64(ADD32(GPR_U32(ctx, 29), 16), GPR_U64(ctx, 31));
+        SET_GPR_U64(ctx, 4, (uint64_t)GPR_U64(ctx, 29) + (uint64_t)GPR_U64(ctx, 0));
+        WRITE32(ADD32(GPR_U32(ctx, 29), 0), GPR_U32(ctx, 0));
+        SET_GPR_U32(ctx, 31, 0x1751D8u);
+        ctx->branch_pc = 0x1751D0u;
+        SET_GPR_U64(ctx, 5, GPR_U64(ctx, 29) | (uint64_t)(uint16_t)8);
+        ctx->pc = 0x175010u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x175010u, 0x1751D0u, 0x1751D8u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+    label_1751d8:
+        SET_GPR_U32(ctx, 31, 0x1751E0u);
+        ctx->pc = 0x17ED60u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x17ED60u, 0x1751D8u, 0x1751E0u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+    label_1751e0:
+        SET_GPR_S32(ctx, 3, (int32_t)((uint32_t)4096 << 16));
+        SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 0), 4));
+        SET_GPR_U64(ctx, 3, GPR_U64(ctx, 3) | (uint64_t)(uint16_t)61440);
+        ctx->pc = 0x1751ecu;
+        runtime->Store32(rdram, ctx, 0x1000F000u, GPR_U32(ctx, 4));
+        {
+            const bool taken = (GPR_U64(ctx, 2) == GPR_U64(ctx, 0));
+            ctx->branch_pc = 0x1751F4u;
+            SET_GPR_S32(ctx, 3, (int32_t)((uint32_t)4096 << 16)); // delay slot
+            if (taken)
+                goto label_175208;
+        }
+        SET_GPR_U32(ctx, 31, 0x175204u);
+        ctx->pc = 0x17EDB0u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x17EDB0u, 0x1751FCu, 0x175204u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+    label_175204:
+        SET_GPR_S32(ctx, 3, (int32_t)((uint32_t)4096 << 16));
+    label_175208:
+        SET_GPR_U64(ctx, 3, GPR_U64(ctx, 3) | (uint64_t)(uint16_t)61440);
+    label_175210:
+        {
+            const uint32_t batch = sdbzSpinBatch();
+            for (;;)
+            {
+                ctx->pc = 0x175210u;
+                SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 3), 0)));
+                SET_GPR_U64(ctx, 2, GPR_U64(ctx, 2) & (uint64_t)(uint16_t)4);
+                if (GPR_U64(ctx, 2) != GPR_U64(ctx, 0))
+                    break;
+                SET_GPR_S32(ctx, 2, (int32_t)READ32(ADD32(GPR_U32(ctx, 29), 0)));
+                if (GPR_U64(ctx, 2) != GPR_U64(ctx, 0))
+                    break;
+                ctx->pc = 0x175210u;
+                if (batch == 1u ? runtime->eeCheckpointDue() : ps2x_ee_spin_checkpoint(batch, 32u))
+                    return;
+            }
+        }
+        // 0x17522c
+        SET_GPR_U32(ctx, 31, 0x175234u);
+        ctx->pc = 0x17ED60u;
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x17ED60u, 0x17522Cu, 0x175234u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+            return;
+    label_175234:
+        SET_GPR_S32(ctx, 3, (int32_t)ADD32(GPR_U32(ctx, 0), 4));
+        SET_GPR_S32(ctx, 1, (int32_t)((uint32_t)4097 << 16));
+        ctx->pc = 0x17523cu;
+        runtime->Store32(rdram, ctx, 0x1000F000u, GPR_U32(ctx, 3));
+        if (GPR_U64(ctx, 2) != GPR_U64(ctx, 0))
+        {
+            SET_GPR_U32(ctx, 31, 0x175254u);
+            ctx->pc = 0x17EDB0u;
+            if (!runtime->dispatchGuestBranch(rdram, ctx, 0x17EDB0u, 0x17524Cu, 0x175254u, PS2Runtime::GuestBranchKind::DirectCall, "JAL"))
+                return;
+        }
+    label_175254:
+        SET_GPR_U64(ctx, 2, READ64(ADD32(GPR_U32(ctx, 29), 8)));
+        SET_GPR_U64(ctx, 31, READ64(ADD32(GPR_U32(ctx, 29), 16)));
+        ctx->branch_pc = 0x17525Cu;
+        SET_GPR_S32(ctx, 29, (int32_t)ADD32(GPR_U32(ctx, 29), 32)); // jr $ra delay slot
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
     void applySdbzKernelThunkFixes(PS2Runtime &runtime)
     {
+        for (const uint32_t pc : {0x1751C0u, 0x1751D8u, 0x1751E0u, 0x175204u, 0x175210u, 0x175234u, 0x175254u})
+            runtime.replaceFunction(pc, &sdbzWaitVSync1751C0);
         runtime.replaceFunction(0x00178A08u, &sdbzGuestSifBindRpc178A08);
         runtime.replaceFunction(0x00178BE8u, &sdbzGuestSifCallRpc178BE8);
         runtime.replaceFunction(0x0017F5D0u, &sdbzKernelStoreWordEret);

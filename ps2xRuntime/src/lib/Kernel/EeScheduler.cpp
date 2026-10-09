@@ -2211,6 +2211,27 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+// `passes` back-to-back eeCheckpointDue(cycles) calls of a pure busy-wait loop
+// (one that only reads memory until an interrupt changes it), batched into one
+// call: the same EE cycles and the same guest-progress ticks, so vblank pacing
+// and timers see what they would have, but one decision per batch instead of
+// one per pass. game_overrides.cpp uses it for WaitVSync's INTC_STAT spin,
+// which was ~15% of the fight game thread in per-pass checkpoints (10-09).
+// extern "C" so it needs no header change.
+extern "C" bool ps2x_ee_spin_checkpoint(uint32_t passes, uint32_t cycles) noexcept
+{
+    EeScheduler *scheduler = s_activeScheduler;
+    if (scheduler == nullptr || passes == 0u)
+        return false;
+    // Multiples of 128 crossed by the first passes-1 increments (wrap-safe).
+    const uint32_t ticks = ((tls_progress_backedge_counter & 127u) + (passes - 1u)) >> 7;
+    tls_progress_backedge_counter += passes - 1u;
+    if (ticks != 0u)
+        g_guest_progress.fetch_add(ticks, std::memory_order_relaxed);
+    // The last pass goes through checkpointDue itself (its own ++counter / tick).
+    return scheduler->checkpointDue(passes * cycles);
+}
+
 // Defined in ps2_memory.cpp / iop_emulator.cpp (see the comments there); the
 // definitions must stay identical. accountCycles() runs on every guest
 // checkpoint with a handful of cycles, and the two calls below were ~6% of

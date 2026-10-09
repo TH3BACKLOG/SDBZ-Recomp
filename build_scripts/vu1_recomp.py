@@ -787,50 +787,49 @@ class Gen:
                 self.w("            const float q_ = N(r.q());")
             elif rk == "i":
                 self.w("            const float i_ = N(s.i);")
-            self.w("            uint8_t lf[4] = {0, 0, 0, 0};")
             product_form = kind in ("kMadd", "kMsub", "kOpmsub")
-            if product_form:
-                # lane() ORs each product's sticky bits into ps_ (one multiply
-                # per lane instead of a second one in productSticky).
-                self.w("            uint32_t ps_ = 0u;")
-            simd = (list(lanes) == [0, 1, 2, 3] and kind in ("kAdd", "kSub", "kMul", "kMadd", "kMsub"))
+            dead = p.pc in self.dead_flags
+            ex = "ps_" if product_form else "0u"
+            simd = (len(lanes) >= 2 and kind in ("kAdd", "kSub", "kMul", "kMadd", "kMsub"))
+            ind = "            "
             if simd:
-                # 4-lane SSE attempt (fmac4 in vu1_recomp_rt.h); any lane outside the fast flag range
-                # falls through to the scalar lanes below, unchanged. Writes lf/ps_ only on success.
+                # 4-lane SSE attempt (fmac4d in vu1_recomp_rt.h): on success it has already stored the
+                # dest lanes to the target and returns the sign summary for the flag entry. Any dest lane
+                # outside the fast flag range returns -1 and the scalar lanes below run unchanged.
                 # rhs: bc_/q_/i_ are already-normalized scalars (taken by address); otherwise the VF row.
                 if rk in ("bc", "q", "i"):
                     sname = {"bc": "bc_", "q": "q_", "i": "i_"}[rk]
                     rv, scal = "&" + sname, "true"
                 else:
                     rv, scal = "vf[%d]" % ft, "false"
-                self.w("            float r0, r1, r2, r3;")
+                lmask = sum(1 << c for c in lanes)  # bit c = lane c (x = bit 0)
+                self.w("            const int m_ = fmac4d<%s, %s, 0x%X>(vf[%d], %s, acc, %s);" % (kind, scal, lmask, fs, rv, out))
+                self.w("            if (m_ >= 0)")
+                if dead:
+                    self.w("                r.fmacStickyOnly4(m_); // entry dead, see find_dead_flags")
+                else:
+                    self.w("                r.fmacFlags4(m_);")
+                self.w("            else")
                 self.w("            {")
-                self.w("                float v4_[4];")
-                if not product_form:
-                    self.w("                uint32_t ps_unused_ = 0u; (void)ps_unused_;")
-                self.w("                if (fmac4p<%s, %s>(vf[%d], %s, acc, v4_, lf, %s))" % (kind, scal, fs, rv, "ps_" if product_form else "ps_unused_"))
-                self.w("                { r0 = v4_[0]; r1 = v4_[1]; r2 = v4_[2]; r3 = v4_[3]; }")
-                self.w("                else")
-                self.w("                {")
-                for c in lanes:
-                    a = "N(acc[%d])" % c if product_form else "0.0f"
-                    tail = ", ps_" if product_form else ""
-                    self.w("                    r%d = lane<%s>(%s, %s, %s, false, lf[%d]%s);" % (c, kind, left(c), right(c), a, c, tail))
-                self.w("                }")
-                self.w("            }")
-            else:
-              for c in lanes:
+                ind = "                "
+            self.w(ind + "uint8_t lf[4] = {0, 0, 0, 0};")
+            if product_form:
+                # lane() ORs each product's sticky bits into ps_ (one multiply
+                # per lane instead of a second one in productSticky).
+                self.w(ind + "uint32_t ps_ = 0u;")
+            for c in lanes:
                 a = "N(acc[%d])" % c if product_form else "0.0f"
                 opmw = "true" if (c == 3 and kind in ("kOpmsub", "kOpmula")) else "false"
                 tail = ", ps_" if product_form else ""
-                self.w("            const float r%d = lane<%s>(%s, %s, %s, %s, lf[%d]%s);" % (c, kind, left(c), right(c), a, opmw, c, tail))
-            ex = "ps_" if product_form else "0u"
-            if p.pc in self.dead_flags:
-                self.w("            r.fmacStickyOnly(lf, %d, %s); // entry dead, see find_dead_flags" % (dest, ex))
+                self.w(ind + "const float r%d = lane<%s>(%s, %s, %s, %s, lf[%d]%s);" % (c, kind, left(c), right(c), a, opmw, c, tail))
+            if dead:
+                self.w(ind + "r.fmacStickyOnly(lf, %d, %s); // entry dead, see find_dead_flags" % (dest, ex))
             else:
-                self.w("            r.fmacFlags(lf, %d, %s);" % (dest, ex))
+                self.w(ind + "r.fmacFlags(lf, %d, %s);" % (dest, ex))
             for c in lanes:
-                self.w("            %s[%d] = r%d;" % (out, c, c))
+                self.w(ind + "%s[%d] = r%d;" % (out, c, c))
+            if simd:
+                self.w("            }")
             self.w("        }")
             return
 

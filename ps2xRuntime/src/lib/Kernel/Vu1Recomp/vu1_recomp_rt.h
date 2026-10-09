@@ -218,20 +218,32 @@ namespace vu1rc
         return _mm_castsi128_ps(out);
     }
 
-    // True when every lane's exponent is in [27,227]; *signMask gets the 4 sign bits (bit c = lane c).
+    // True when every lane in Mask (bit c = lane c) has its exponent in [27,227]; *signMask gets those
+    // lanes' sign bits.
+    template <int Mask = 0xF>
     VU1RC_INLINE bool fastRange4(__m128 v, int &signMask)
     {
         const __m128i bits = _mm_castps_si128(v);
         const __m128i exp = _mm_and_si128(_mm_srli_epi32(bits, 23), _mm_set1_epi32(0xFF));
         const __m128i ok = _mm_and_si128(_mm_cmpgt_epi32(exp, _mm_set1_epi32(26)), _mm_cmplt_epi32(exp, _mm_set1_epi32(228)));
-        signMask = _mm_movemask_ps(v);
-        return _mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF;
+        signMask = _mm_movemask_ps(v) & Mask;
+        return (_mm_movemask_ps(_mm_castsi128_ps(ok)) & Mask) == Mask;
     }
 
-    // l, r already normalized; a = normalized ACC (product kinds only).
-    template <Kind K>
-    VU1RC_INLINE bool fmac4(__m128 l, __m128 r, __m128 a, float out[4], uint8_t lf[4], uint32_t &sticky)
+    // Out-of-line, used by the generated code. Inlining the SSE body at thousands of sites made
+    // MSVC /O2 take >45 min on one program (10-09); a call keeps the generated functions small.
+    // rhsIsScalar: *rhs is one float broadcast to all lanes; otherwise rhs points at a 4-float VF.
+    // Mask = the dest lanes (bit c = lane c). On success writes the dest lanes' results straight to
+    // dst (other lanes keep their value) and returns the fast flag summary: bit c = sign of dest lane
+    // c's result, bit 4 = some dest lane's product was negative (MADD/MSUB sticky S). Lanes outside
+    // Mask are computed but ignored (range, sign, store), exactly as the scalar path never runs them.
+    // Returns -1 with dst untouched when the scalar lanes must run. Every input is loaded before dst is
+    // stored, so dst may alias lhs/rhs/acc.
+    template <Kind K, bool RhsIsScalar, int Mask = 0xF>
+    __declspec(noinline) int fmac4d(const float *lhs, const float *rhs, const float *acc, float *dst)
     {
+        const __m128 l = normalize4(_mm_loadu_ps(lhs));
+        const __m128 r = RhsIsScalar ? _mm_set1_ps(*rhs) : normalize4(_mm_loadu_ps(rhs));
         __m128 res;
         int resSign, prodSign = 0;
         if constexpr (K == kAdd)
@@ -242,32 +254,26 @@ namespace vu1rc
             res = _mm_mul_ps(l, r);
         else
         {
+            static_assert(K == kMadd || K == kMsub, "fmac4d: xyzw ADD/SUB/MUL/MADD/MSUB only");
+            const __m128 a = normalize4(_mm_loadu_ps(acc));
             const __m128 product = _mm_mul_ps(l, r);
-            if (!fastRange4(product, prodSign))
-                return false;
+            if (!fastRange4<Mask>(product, prodSign))
+                return -1;
             res = (K == kMadd) ? _mm_add_ps(a, product) : _mm_sub_ps(a, product);
         }
-        if (!fastRange4(res, resSign))
-            return false;
-        _mm_storeu_ps(out, res);
-        for (int c = 0; c < 4; ++c)
-            lf[c] = ((resSign >> c) & 1) ? 0x2u : 0u;
-        if constexpr (K == kMadd || K == kMsub)
-            if (prodSign != 0)
-                sticky |= 0x2u;
-        return true;
-    }
-
-    // Out-of-line wrapper used by the generated code. Inlining the SSE body at thousands of sites made
-    // MSVC /O2 take >45 min on one program (10-09); a call keeps the generated functions small.
-    // rhsIsScalar: *rhs is one float broadcast to all lanes; otherwise rhs points at a 4-float VF.
-    template <Kind K, bool RhsIsScalar>
-    __declspec(noinline) bool fmac4p(const float *lhs, const float *rhs, const float *acc, float out[4], uint8_t lf[4], uint32_t &sticky)
-    {
-        const __m128 l = normalize4(_mm_loadu_ps(lhs));
-        const __m128 r = RhsIsScalar ? _mm_set1_ps(*rhs) : normalize4(_mm_loadu_ps(rhs));
-        const __m128 a = (K == kMadd || K == kMsub) ? normalize4(_mm_loadu_ps(acc)) : _mm_setzero_ps();
-        return fmac4<K>(l, r, a, out, lf, sticky);
+        if (!fastRange4<Mask>(res, resSign))
+            return -1;
+        if constexpr (Mask == 0xF)
+        {
+            _mm_storeu_ps(dst, res);
+        }
+        else
+        {
+            const __m128 sel = _mm_castsi128_ps(_mm_set_epi32((Mask & 8) ? -1 : 0, (Mask & 4) ? -1 : 0,
+                                                               (Mask & 2) ? -1 : 0, (Mask & 1) ? -1 : 0));
+            _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(sel, res), _mm_andnot_ps(sel, _mm_loadu_ps(dst))));
+        }
+        return resSign | (prodSign != 0 ? 0x10 : 0);
     }
 
     // Product sticky bits of one MADD/MSUB/OPMSUB lane.
@@ -438,6 +444,25 @@ namespace vu1rc
                 if (dest & (1u << (3u - c)))
                     status |= lf[c] & 0xFu;
             stickyCarry |= status | extraSticky;
+        }
+
+        // fmacFlags / fmacStickyOnly for a dest=xyzw fmac4d success: every lane's flags are sign only,
+        // so lane c's S bit lands at MAC bit 4 + (3 - c) and status/sticky is S when any sign is set.
+        VU1RC_INLINE void fmacFlags4(int m)
+        {
+            static constexpr uint8_t kRev4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                                                  0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+            FlagEntry &e = pushFlag();
+            e.mac = static_cast<uint32_t>(kRev4[m & 0xF]) << 4;
+            e.status = (m & 0xF) != 0 ? 0x2u : 0u;
+            e.extra = ((m & 0x10) != 0 ? 0x2u : 0u) | stickyCarry;
+            stickyCarry = 0u;
+            e.what = 3u;
+        }
+
+        VU1RC_INLINE void fmacStickyOnly4(int m)
+        {
+            stickyCarry |= m != 0 ? 0x2u : 0u;
         }
 
         // FSSET / FCSET cancel the same-cycle entry's status / clip write.
