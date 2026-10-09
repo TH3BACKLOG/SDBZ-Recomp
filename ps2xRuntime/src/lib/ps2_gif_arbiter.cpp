@@ -52,6 +52,17 @@ std::atomic<uint32_t> g_curSrc{0xFFFFFFFFu};
 }
 // -------------------------------------------------------------------------
 
+namespace
+{
+// Packet buffers recycled across GifArbiter::submit calls (game thread only,
+// like m_queue): no heap alloc + zero fill per packet.
+std::vector<std::vector<uint8_t>> g_arbPool;
+// The packet drain() is handing to m_processFn right now. ps2xGsThreadSubmit
+// takes this buffer instead of copying the bytes a second time (perf 10-09:
+// that copy was ~3% of the game thread in a fight).
+std::vector<uint8_t> *g_drainingPkt = nullptr;
+}
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -77,8 +88,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    if (!g_arbPool.empty())
+    {
+        pkt.data = std::move(g_arbPool.back());
+        g_arbPool.pop_back();
+    }
+    pkt.data.assign(data, data + sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -109,9 +124,16 @@ void GifArbiter::drain()
             // [drawpath] run 32: stamp the origin of every draw this packet emits.
             ps2diag_gifpath::g_curPath.store(static_cast<uint32_t>(pkt.pathId),
                                              std::memory_order_relaxed);
+            g_drainingPkt = &pkt.data;
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            g_drainingPkt = nullptr;
             ps2diag_gifpath::g_curPath.store(0u, std::memory_order_relaxed);
         }
+    }
+    for (auto &pkt : m_queue)
+    {
+        if (pkt.data.capacity() != 0u)
+            g_arbPool.push_back(std::move(pkt.data));
     }
     m_queue.clear();
 }
@@ -363,7 +385,10 @@ void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes)
             buf = std::move(t.pool.back());
             t.pool.pop_back();
         }
-        buf.assign(data, data + sizeBytes);
+        if (g_drainingPkt && g_drainingPkt->data() == data && g_drainingPkt->size() == sizeBytes)
+            buf.swap(*g_drainingPkt); // take the arbiter's copy; it gets the pool buffer back
+        else
+            buf.assign(data, data + sizeBytes);
         t.pending.push_back(std::move(buf));
         t.queuedBytes += sizeBytes;
         t.submittedSeq.fetch_add(1u, std::memory_order_acq_rel);
