@@ -17,6 +17,8 @@
 #include "runtime/ps2_gs_gpu.h"
 
 #include <algorithm>
+#include <atomic>
+#include <intrin.h>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +33,8 @@ void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes);
 void ps2xGsRasterFlush(); // ps2_gs_raster_mt.inl
 void ps2xGsThreadSync(uint32_t reason);
 void ps2xGsThreadStop();
+extern std::atomic<uint64_t> g_gsmtWaitByReason[16][2]; // ps2_gs_rasterizer.cpp: wait count / ns per reason
+extern std::atomic<uint64_t> g_gsmtBusyTsc[16], g_gsmtBarrierTsc[16], g_gsmtJobs[16], g_gsmtSubmitTsc, g_gsmtUpDirect, g_gsmtUpDeferred, g_gsmtApplyTsc;
 
 namespace
 {
@@ -280,6 +284,39 @@ int main(int argc, char **argv)
     }
     ps2x_host_sampler_stop();
     ps2xGsThreadStop();
+
+    if (const char *st = std::getenv("PS2X_GS_THREAD_STATS"); st && *st && *st != '0')
+    {
+        // Producer waits on the raster workers, per reason (see ps2_gs_raster_mt.inl),
+        // totals over all replays. r1 vram change, r2 CLUT slot, r3 self-sample, r4 hazard,
+        // r5/r6 syncRect read/write, r7 ring full, r9/r10 flush at latch/vblank.
+        std::printf("[gsraster-wait]");
+        for (int r = 0; r < 16; ++r)
+            if (const uint64_t c = g_gsmtWaitByReason[r][0].load(std::memory_order_relaxed))
+                std::printf(" r%d=%llu/%.1fms", r, static_cast<unsigned long long>(c),
+                            g_gsmtWaitByReason[r][1].load(std::memory_order_relaxed) / 1e6);
+        std::printf("\n");
+        // TSC -> ms (calibrated against steady_clock): per worker busy time and the
+        // producer's time inside gsmt::submit, totals over all replays.
+        const auto c0 = std::chrono::steady_clock::now();
+        const uint64_t t0 = __rdtsc();
+        while (std::chrono::steady_clock::now() - c0 < std::chrono::milliseconds(20)) {}
+        const double perMs = static_cast<double>(__rdtsc() - t0) /
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        double total = 0.0;
+        for (const double t : times)
+            total += t;
+        std::printf("[gsmt] applyMs=%.1f ", g_gsmtApplyTsc.load(std::memory_order_relaxed) / perMs);
+        std::printf("replays=%.1fms submit=%.1fms upDirect=%llu upDeferred=%llu", total, g_gsmtSubmitTsc.load(std::memory_order_relaxed) / perMs,
+                    static_cast<unsigned long long>(g_gsmtUpDirect.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(g_gsmtUpDeferred.load(std::memory_order_relaxed)));
+        for (int i = 0; i < 16; ++i)
+            if (const uint64_t j = g_gsmtJobs[i].load(std::memory_order_relaxed))
+                std::printf(" w%d=%llujobs/%.1fms(barrier %.1f)", i, static_cast<unsigned long long>(j),
+                            g_gsmtBusyTsc[i].load(std::memory_order_relaxed) / perMs,
+                            g_gsmtBarrierTsc[i].load(std::memory_order_relaxed) / perMs);
+        std::printf("\n");
+    }
 
     std::vector<double> sorted = times;
     std::sort(sorted.begin(), sorted.end());

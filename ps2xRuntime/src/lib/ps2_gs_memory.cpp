@@ -225,6 +225,13 @@ namespace GSMem
         return PixelStorageTraits<C32>::Address(PageTableC32, bp, bw, x, y);
     }
 
+    // [32 blocks][32 rows][64 cols] pixel offsets within a page, for the raster
+    // workers' inlined 32-bit frame/z access (same table LookupPixelAddress* uses).
+    const u16 *FastPageTable32(bool z)
+    {
+        return z ? &PageTableZ32[0][0][0] : &PageTableC32[0][0][0];
+    }
+
     u32 LookupPixelAddressCT16(u32 bp, u32 bw, u32 x, u32 y)
     {
         return PixelStorageTraits<C16>::Address(PageTableC16, bp, bw, x, y);

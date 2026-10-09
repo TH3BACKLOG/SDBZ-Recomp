@@ -25,6 +25,11 @@ using namespace GSInternal;
 // Per-pixel VRAM access without std::function (perf 09-27). GS::ReadVram /
 // WriteVram go through std::function tables declared in ps2_gs_gpu.h (which we
 // cannot edit); every pixel paid for that indirection twice or three times.
+namespace GSMem
+{
+const u16 *FastPageTable32(bool z); // ps2_gs_memory.cpp (declared here: no header change)
+}
+
 // Same PSM -> GSMem mapping as GS::GS(); unknown PSMs map to the Null access.
 namespace
 {
@@ -1980,9 +1985,13 @@ int g_gsmtWaitReason = 0;
 // 10-09 P6 stats: TSC ticks each raster worker spends in runJob / the upload
 // barrier (idle spinning excluded), and ticks the producer spends in submit().
 std::atomic<uint64_t> g_gsmtBusyTsc[16];
+std::atomic<uint64_t> g_gsmtBarrierTsc[16]; // part of Busy spent in the upload barrier (waiting + applying)
 std::atomic<uint64_t> g_gsmtJobs[16];
 std::atomic<uint64_t> g_gsmtSubmitTsc{0};
 std::atomic<uint64_t> g_gsmtSubmitCalls{0};
+std::atomic<uint64_t> g_gsmtApplyTsc{0};   // deferred-upload apply (one worker, others wait)
+std::atomic<uint64_t> g_gsmtUpDirect{0};   // large uploads written by the producer (no hazard)
+std::atomic<uint64_t> g_gsmtUpDeferred{0}; // large uploads queued behind draws (hazard)
 
 // 10-09 60fps P0: raster workload classes per worker, summed by
 // ps2x_budget_raster() for the [budget] line. Every worker owns distinct rows,

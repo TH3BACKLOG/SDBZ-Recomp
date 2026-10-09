@@ -53,7 +53,7 @@ constexpr uint32_t kVramBlocks = 0x4000u; // 4 MB / 256-byte blocks
 constexpr uint32_t kVramPages = kVramBlocks / 32u;
 constexpr uint32_t kMaxWorkers = 16u;
 constexpr uint32_t kRingSize = 4096u; // power of two
-constexpr uint32_t kClutSlots = 64u;
+constexpr uint32_t kClutSlots = 2048u; // was 64: r2 (slot-reuse wait) cost 54 s of a 200 s fight
 constexpr uint32_t kTexSlots = 16u;
 
 struct Job
@@ -97,6 +97,64 @@ inline bool isPaletted(uint32_t psm)
            psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
 }
 
+// Job-constant part of TexCache::read, decoded once per job (Setup::init).
+struct TexPrep
+{
+    u32 psm = 0;          // normalised (CT24/T8H/T4H* -> CT32, Z24 -> Z32)
+    u32 pw2 = 0, ph2 = 0; // page size shifts
+    u32 bpp = 0, pitch = 0;
+    u32 pagesPerRow = 1;
+    u32 tbp0 = 0;
+    bool ok = false;      // false: unsupported psm, read() returns 0
+};
+
+inline TexPrep makeTexPrep(u32 psm, u32 tbp0, u32 tbw)
+{
+    TexPrep p;
+    switch (psm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_CT24:
+    case GS_PSM_T8H:
+    case GS_PSM_T4HH:
+    case GS_PSM_T4HL:
+        psm = GS_PSM_CT32;
+        break;
+    case GS_PSM_Z32:
+    case GS_PSM_Z24:
+        psm = GS_PSM_Z32;
+        break;
+    default:
+        break;
+    }
+    switch (psm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_Z32:
+        p.pw2 = 6; p.ph2 = 5; p.bpp = 4; p.pitch = 256;
+        break;
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        p.pw2 = 6; p.ph2 = 6; p.bpp = 2; p.pitch = 128;
+        break;
+    case GS_PSM_T8:
+        p.pw2 = 7; p.ph2 = 6; p.bpp = 1; p.pitch = 128;
+        break;
+    case GS_PSM_T4:
+        p.pw2 = 7; p.ph2 = 7; p.bpp = 1; p.pitch = 128;
+        break;
+    default:
+        return p;
+    }
+    p.psm = psm;
+    p.tbp0 = tbp0;
+    p.pagesPerRow = std::max(1u, (tbw * 64u) >> p.pw2);
+    p.ok = true;
+    return p;
+}
+
 // ---- texture page cache (one per worker) ---------------------------------
 // Same page decode and addressing as GS::ReadTexturePageCache.
 struct TexCache
@@ -108,12 +166,96 @@ struct TexCache
         uint32_t gen0 = 0;
         uint32_t gen1 = 0;
         uint32_t epoch = 0;
+        uint64_t stamp = 0; // job (beginJob) that last validated this slot
         const uint8_t *vram = nullptr;
         alignas(64) uint8_t buf[16 * 1024];
     };
     Slot slot[kTexSlots];
     int mru = -1;
     uint32_t nextVictim = 0;
+    // Per-job validation (10-09 P7): a page a queued job samples is never written
+    // while that job is queued or running (submit's read/write hazard check
+    // flushes first, and bumps the generation only afterwards), so one
+    // generation check per slot per job is enough. Checking on every texel
+    // loaded g_pageGen (a line the producer keeps dirtying) per sample.
+    uint64_t seq = 0;
+    uint32_t epochNow = 0;
+
+    void beginJob(const uint8_t *vram)
+    {
+        (void)vram;
+        ++seq;
+        epochNow = g_epoch.load(std::memory_order_relaxed);
+    }
+
+    bool validJob(Slot &s, const uint8_t *vram, uint32_t block, uint32_t psm)
+    {
+        if (s.stamp == seq)
+            return s.block == block && s.psm == psm;
+        if (valid(s, vram, block, psm, epochNow))
+        {
+            s.stamp = seq;
+            return true;
+        }
+        return false;
+    }
+
+    // Same result as read(), with the per-job decode done by makeTexPrep and
+    // the generation check once per job. Needs beginJob() for the running job.
+    __forceinline u32 readPrep(uint8_t *vram, const TexPrep &p, u32 u, u32 v)
+    {
+        const u32 pageId = (v >> p.ph2) * p.pagesPerRow + (u >> p.pw2);
+        const u32 block = (p.tbp0 + pageId * 32u) & 0x3FFF;
+        if (mru < 0 || slot[mru].stamp != seq || slot[mru].block != block || slot[mru].psm != p.psm)
+            selectSlot(vram, p.psm, block);
+        const u32 off = (v & ((1u << p.ph2) - 1u)) * p.pitch + (u & ((1u << p.pw2) - 1u)) * p.bpp;
+        const uint8_t *ptr = &slot[mru].buf[off];
+        if (p.bpp == 4)
+        {
+            u32 val;
+            std::memcpy(&val, ptr, 4);
+            return val;
+        }
+        if (p.bpp == 2)
+        {
+            u16 val;
+            std::memcpy(&val, ptr, 2);
+            return val;
+        }
+        return static_cast<u32>(*ptr);
+    }
+
+    __declspec(noinline) void selectSlot(uint8_t *vram, u32 psm, u32 block)
+    {
+        int hit = -1;
+        for (uint32_t i = 0; i < kTexSlots; ++i)
+        {
+            if (validJob(slot[i], vram, block, psm))
+            {
+                hit = static_cast<int>(i);
+                break;
+            }
+        }
+        if (hit < 0)
+        {
+            uint32_t victim = nextVictim++ % kTexSlots;
+            if (static_cast<int>(victim) == mru)
+                victim = nextVictim++ % kTexSlots;
+            Slot &s = slot[victim];
+            // Generations first: a page written after this load then
+            // reads as changed, never as current.
+            s.gen0 = g_pageGen[(block >> 5) & (kVramPages - 1u)].load(std::memory_order_acquire);
+            s.gen1 = g_pageGen[((block + 31u) >> 5) & (kVramPages - 1u)].load(std::memory_order_acquire);
+            loadTexturePage(s.buf, vram, psm, block);
+            s.block = block;
+            s.psm = psm;
+            s.vram = vram;
+            s.epoch = epochNow;
+            s.stamp = seq;
+            hit = static_cast<int>(victim);
+        }
+        mru = hit;
+    }
 
     bool valid(const Slot &s, const uint8_t *vram, uint32_t block, uint32_t psm, uint32_t epoch) const
     {
@@ -252,6 +394,58 @@ struct TexCache
     }
 };
 
+// Inlined 32-bit frame / z access (CT32, CT24, Z32, Z24). Same address and
+// read/write semantics as GSMem::ReadPixelCT32 / WritePixelZ32 / ... (page
+// table lookup, 4 MB wrap, 24-bit mask and RMW), without the indirect call and
+// the per-pixel page/block arithmetic of the generic path.
+struct Px32
+{
+    const u16 *tab = nullptr; // &table[base % 32][0][0]
+    u32 pageBase = 0, bw = 0;
+    bool on = false, is24 = false;
+
+    void init(bool z, u32 psm6, u32 base, u32 bw_)
+    {
+        const u32 full = z ? GS_PSM_Z32 : GS_PSM_CT32, part = z ? GS_PSM_Z24 : GS_PSM_CT24;
+        static const bool enabled = []
+        {
+            const char *e = std::getenv("PS2X_GS_PX32"); // =0: generic indirect path (A/B)
+            return !(e && *e == '0');
+        }();
+        on = enabled && (psm6 == full || psm6 == part);
+        is24 = (psm6 == part);
+        if (!on)
+            return;
+        tab = GSMem::FastPageTable32(z) + (base % 32u) * 2048u;
+        pageBase = base / 32u;
+        bw = bw_;
+    }
+    __forceinline u32 byteOff(int x, int y) const
+    {
+        const u32 ux = static_cast<u32>(x), uy = static_cast<u32>(y);
+        const u32 page = pageBase + (uy >> 5) * bw + (ux >> 6);
+        const u32 a = page * 2048u + tab[((uy & 31u) << 6) | (ux & 63u)];
+        return (a * 4u) & (4u * 1024u * 1024u - 4u);
+    }
+    __forceinline u32 rd(const uint8_t *vram, int x, int y) const
+    {
+        u32 v;
+        std::memcpy(&v, vram + byteOff(x, y), 4);
+        return is24 ? (v & 0x00FFFFFFu) : v;
+    }
+    __forceinline void wr(uint8_t *vram, int x, int y, u32 value) const
+    {
+        uint8_t *p = vram + byteOff(x, y);
+        if (is24)
+        {
+            u32 old;
+            std::memcpy(&old, p, 4);
+            value = (old & 0xFF000000u) | (value & 0x00FFFFFFu);
+        }
+        std::memcpy(p, &value, 4);
+    }
+};
+
 // ---- per-job drawing state ------------------------------------------------
 struct Setup
 {
@@ -264,6 +458,7 @@ struct Setup
 
     RasterReadFn frd, zrd;
     RasterWriteFn fwr, zwr;
+    Px32 fpx, zpx;
     u32 fbp, fbw, fpsm, fmsk, zbp, zpsm;
     bool fb16, zmsk, abe, pabe, clamp, fbaOr, fge, dither;
     uint64_t test, fogcol, scanmsk, dimx;
@@ -276,6 +471,10 @@ struct Setup
     GSTexaReg texa;
     bool fst, linear;
     int texW, texH;
+    bool earlyZ = false; // ztst 2/3: reject on the z buffer before texturing (see zFails)
+    TexPrep tp;
+    unsigned wms, wmt;
+    int minu, maxu, minv, maxv;
 
     void init(const Job &j, TexCache &c, int n, int idx)
     {
@@ -298,6 +497,8 @@ struct Setup
         zwr = g_rasterVram.write[zpsm & 0x3Fu];
         fb16 = GSInternal::bitsPerPixel(static_cast<uint8_t>(fpsm)) == 16;
         zmsk = ctx.zbuf.zmsk;
+        fpx.init(false, fpsm & 0x3Fu, fbp, fbw);
+        zpx.init(true, zpsm & 0x3Fu, zbp, fbw);
         dither = (j.dthe & 1u) != 0u && fb16; // PCSX2: 16-bit frames only
         abe = j.prim.abe;
         pabe = j.pabe.pabe;
@@ -309,6 +510,14 @@ struct Setup
         scanmsk = j.scanmsk;
         dimx = j.dimx;
         ztst = static_cast<uint32_t>((ctx.test.data >> 17) & 3);
+        {
+            static const bool earlyEnabled = []
+            {
+                const char *e = std::getenv("PS2X_GS_EARLYZ"); // =0: off (A/B)
+                return !(e && *e == '0');
+            }();
+            earlyZ = earlyEnabled && ztst >= 2;
+        }
         sx0 = static_cast<int>(ctx.scissor.x0);
         sx1 = static_cast<int>(ctx.scissor.x1);
         sy0 = static_cast<int>(ctx.scissor.y0);
@@ -325,6 +534,25 @@ struct Setup
         linear = tex1UsesLinearFilter(ctx.tex1.data);
         texW = 1 << tex.tw;
         texH = 1 << tex.th;
+        if (j.prim.tme)
+        {
+            tp = makeTexPrep(tex.psm, tex.tbp0, tex.tbw);
+            wms = static_cast<unsigned>(ctx.clamp.wms);
+            wmt = static_cast<unsigned>(ctx.clamp.wmt);
+            minu = static_cast<int>(ctx.clamp.minu);
+            maxu = static_cast<int>(ctx.clamp.maxu);
+            minv = static_cast<int>(ctx.clamp.minv);
+            maxv = static_cast<int>(ctx.clamp.maxv);
+        }
+    }
+
+    // writePixel returns when the z test fails, before any write or the alpha
+    // test's effects, whatever the pixel colour is. So a failing z can be
+    // detected before the texture sample / combine (exact, saves their cost).
+    __forceinline bool zFails(const uint8_t *vram_, int x, int y, u32 z) const
+    {
+        const u32 zb = zpx.on ? zpx.rd(vram_, x, y) : zrd(const_cast<uint8_t *>(vram_), zbp, fbw, x, y);
+        return ztst == 2 ? !(z >= zb) : !(z > zb);
     }
 
     // First row >= y0 this worker owns (y0 >= 0).
@@ -373,7 +601,7 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
     u32 fbrgba = 0;
     if (frmw)
     {
-        fbrgba = S.frd(vram, S.fbp, S.fbw, x, y);
+        fbrgba = S.fpx.on ? S.fpx.rd(vram, x, y) : S.frd(vram, S.fbp, S.fbw, x, y);
         if (S.fb16)
             fbrgba = Rgba5551ToRgba8888(fbrgba);
     }
@@ -388,10 +616,10 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
         zpass = true;
         break;
     case 2:
-        zpass = z >= S.zrd(vram, S.zbp, S.fbw, x, y);
+        zpass = z >= (S.zpx.on ? S.zpx.rd(vram, x, y) : S.zrd(vram, S.zbp, S.fbw, x, y));
         break;
     case 3:
-        zpass = z > S.zrd(vram, S.zbp, S.fbw, x, y);
+        zpass = z > (S.zpx.on ? S.zpx.rd(vram, x, y) : S.zrd(vram, S.zbp, S.fbw, x, y));
         break;
     }
     if (!zpass)
@@ -440,9 +668,19 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
         pixel = Rgba8888ToRgba5551(pixel);
 
     if (alphaTest.writeFramebuffer)
-        S.fwr(vram, S.fbp, S.fbw, x, y, pixel);
+    {
+        if (S.fpx.on)
+            S.fpx.wr(vram, x, y, pixel);
+        else
+            S.fwr(vram, S.fbp, S.fbw, x, y, pixel);
+    }
     if (!S.zmsk && alphaTest.writeZ)
-        S.zwr(vram, S.zbp, S.fbw, x, y, z);
+    {
+        if (S.zpx.on)
+            S.zpx.wr(vram, x, y, z);
+        else
+            S.zwr(vram, S.zbp, S.fbw, x, y, z);
+    }
 }
 
 // GSRasterizer::sampleTexture without the probes.
@@ -452,13 +690,10 @@ __forceinline uint32_t samplePoint(const Setup &S, int sampleU, int sampleV)
     // CLAMP_1/2 WMS/WMT (REPEAT / CLAMP / REGION_*), same as GSRasterizer::sampleTexture. This used to clamp
     // unconditionally, so every REPEAT texture sampled the edge texel instead of wrapping (10-06: orig3 Demo
     // fountain spray: bilinear neighbour u/v = -1 or 128 must wrap; threads=0 matched PCSX2, threads>=1 did not).
-    const auto &wrapReg = S.job->ctx.clamp;
-    sampleU = wrapTexCoord(sampleU, S.texW, static_cast<unsigned>(wrapReg.wms),
-                           static_cast<int>(wrapReg.minu), static_cast<int>(wrapReg.maxu));
-    sampleV = wrapTexCoord(sampleV, S.texH, static_cast<unsigned>(wrapReg.wmt),
-                           static_cast<int>(wrapReg.minv), static_cast<int>(wrapReg.maxv));
+    sampleU = wrapTexCoord(sampleU, S.texW, S.wms, S.minu, S.maxu);
+    sampleV = wrapTexCoord(sampleV, S.texH, S.wmt, S.minv, S.maxv);
 
-    u32 out = S.cache->read(S.vram, tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+    u32 out = S.tp.ok ? S.cache->readPrep(S.vram, S.tp, static_cast<u32>(sampleU), static_cast<u32>(sampleV)) : 0u;
 
     switch (tex.psm)
     {
@@ -629,6 +864,8 @@ void drawSprite(const Setup &S)
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
+                if (S.earlyZ && S.zFails(S.vram, x, y, z1))
+                    continue;
                 float texUf = u0f + (static_cast<float>(x) - vx0) * duDx;
                 // FST and STQ alike: PCSX2 steps sprite U/V in 16.16 texels.
                 // Rounding FST to 1/16 texel here broke scaled sprites
@@ -752,6 +989,9 @@ void drawTriangle(const Setup &S)
             const float w2 = 1.0f - w0 - w1;
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const u32 zi = static_cast<u32>(z + 0.5);
+            if (S.earlyZ && S.zFails(S.vram, x, y, zi))
+                continue;
 
             uint8_t r, g, b, a;
             if (prim.iip)
@@ -771,25 +1011,6 @@ void drawTriangle(const Setup &S)
 
             if (prim.tme)
             {
-                float is, it, iq;
-                uint16_t iu, iv;
-                if (prim.fst)
-                {
-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
-                    is = 0.0f;
-                    it = 0.0f;
-                    iq = 1.0f;
-                }
-                else
-                {
-                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
-                    iu = 0;
-                    iv = 0;
-                }
-
                 uint32_t texel;
                 if (triTexOn)
                 {
@@ -803,7 +1024,27 @@ void drawTriangle(const Setup &S)
                     texel = sampleTexelFixed(S, fu, fv);
                 }
                 else
+                {
+                    float is, it, iq;
+                    uint16_t iu, iv;
+                    if (prim.fst)
+                    {
+                        iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
+                        iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+                        is = 0.0f;
+                        it = 0.0f;
+                        iq = 1.0f;
+                    }
+                    else
+                    {
+                        is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                        it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                        iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                        iu = 0;
+                        iv = 0;
+                    }
                     texel = sampleTexture(S, is, it, iq, iu, iv);
+                }
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
                 uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
@@ -818,7 +1059,7 @@ void drawTriangle(const Setup &S)
 
             if (S.fge)
                 applyFog(S.fogcol, fogF16(v0.fog * w0 + v1.fog * w1 + v2.fog * w2), r, g, b);
-            writePixel(S, x, y, static_cast<u32>(z + 0.5), r, g, b, a);
+            writePixel(S, x, y, zi, r, g, b, a);
         }
     }
 }
@@ -888,6 +1129,7 @@ void runJob(const Job &j, TexCache &cache, int n, int idx)
                 return;
         }
     }
+    cache.beginJob(j.vram);
     Setup S;
     S.init(j, cache, n, idx);
     switch (j.prim.prim)
@@ -1122,7 +1364,9 @@ struct Engine
         const uint64_t a = upArrive.fetch_add(1u, std::memory_order_acq_rel) + 1u;
         if (a % static_cast<uint64_t>(n) == 0u)
         {
+            const uint64_t ta = __rdtsc();
             j.upApply(j.upCtx);
+            g_gsmtApplyTsc.fetch_add(__rdtsc() - ta, std::memory_order_relaxed);
             for (int k = 0; k < j.upN; ++k)
                 bumpPages(j.upLo[k], j.upHi[k]);
             upDone.store(r + 1u, std::memory_order_release);
@@ -1207,14 +1451,17 @@ struct Engine
                     spins = 0;
                 }
             }
-            uint64_t busy = 0;
+            uint64_t busy = 0, barrier = 0;
             const uint64_t first = r;
             while (r < avail)
             {
                 const Job &job = ring[r & (kRingSize - 1u)];
                 const uint64_t t0 = __rdtsc();
                 if (job.upApply)
+                {
                     uploadBarrier(job, r);
+                    barrier += __rdtsc() - t0;
+                }
                 else
                     runJob(job, *cache, n, idx);
                 busy += __rdtsc() - t0;
@@ -1222,6 +1469,7 @@ struct Engine
                 done[idx].v.store(r, std::memory_order_release);
             }
             g_gsmtBusyTsc[idx].fetch_add(busy, std::memory_order_relaxed);
+            g_gsmtBarrierTsc[idx].fetch_add(barrier, std::memory_order_relaxed);
             g_gsmtJobs[idx].fetch_add(r - first, std::memory_order_relaxed);
         }
     }
@@ -1530,6 +1778,39 @@ bool ps2xGsRasterDeferUpload(uint8_t *vram, uint32_t baseBlock, uint32_t bw, uin
     if (tooMany)
         return false;
     e.prune();
+    // 10-09 P7: with no queued draw reading or writing these blocks (and no
+    // earlier deferred upload to them) the producer can write the rect itself
+    // right now, as before the deferral existed: no barrier, no worker stalls
+    // while one of them converts the data, and the conversion overlaps the
+    // draws already queued. Only a real hazard (the draws still sampling the
+    // texture this upload replaces) defers it behind them.
+    static const bool directOk = []
+    {
+        const char *d = std::getenv("PS2X_GS_UPLOAD_DIRECT"); // =0: always defer (A/B)
+        return !(d && *d == '0');
+    }();
+    if (directOk)
+    {
+        bool hazard = false;
+        auto note = [&](const std::vector<gsmt::Range> &set, uint32_t lo, uint32_t hi)
+        {
+            for (const gsmt::Range &r : set)
+                if (lo < r.hi && r.lo < hi)
+                    hazard = true;
+        };
+        gsmt::rectBlocksTight(baseBlock, bw, psm, x, y, x + w - 1u, y + h - 1u, [&](uint32_t lo, uint32_t hi)
+        {
+            note(e.writes, lo, hi);
+            note(e.uploads, lo, hi);
+            note(e.reads, lo, hi);
+        });
+        if (!hazard)
+        {
+            g_gsmtUpDirect.fetch_add(1u, std::memory_order_relaxed);
+            return false; // caller: ps2xGsRasterSyncRect (no wait) + direct write
+        }
+    }
+    g_gsmtUpDeferred.fetch_add(1u, std::memory_order_relaxed);
     const uint64_t index = e.w.load(std::memory_order_relaxed);
     e.publish(job);
     for (int k = 0; k < job.upN; ++k)

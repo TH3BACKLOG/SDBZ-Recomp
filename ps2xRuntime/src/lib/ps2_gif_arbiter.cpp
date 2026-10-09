@@ -182,6 +182,7 @@ extern std::atomic<uint64_t> g_gsmtBusyTsc[16];
 extern std::atomic<uint64_t> g_gsmtJobs[16];
 extern std::atomic<uint64_t> g_gsmtSubmitTsc;
 extern std::atomic<uint64_t> g_gsmtSubmitCalls;
+extern std::atomic<uint64_t> g_gsmtUpDirect, g_gsmtUpDeferred, g_gsmtBarrierTsc[16];
 // TSC ticks -> ms (calibrated once, 2 ms spin).
 static double gsmtTicksToMs(uint64_t ticks)
 {
@@ -304,13 +305,16 @@ struct GsThread
                     (unsigned long long)syncs[1], (unsigned long long)syncs[2],
                     (unsigned long long)syncs[3], (unsigned long long)syncs[4], (unsigned long long)syncs[5],
                     (unsigned long long)syncs[0]);
-        std::printf("[gsmt] submitCalls=%llu submitMs=%.1f", (unsigned long long)g_gsmtSubmitCalls.load(std::memory_order_relaxed),
-                    gsmtTicksToMs(g_gsmtSubmitTsc.load(std::memory_order_relaxed)));
+        std::printf("[gsmt] submitCalls=%llu submitMs=%.1f upDirect=%llu upDeferred=%llu", (unsigned long long)g_gsmtSubmitCalls.load(std::memory_order_relaxed),
+                    gsmtTicksToMs(g_gsmtSubmitTsc.load(std::memory_order_relaxed)),
+                    (unsigned long long)g_gsmtUpDirect.load(std::memory_order_relaxed),
+                    (unsigned long long)g_gsmtUpDeferred.load(std::memory_order_relaxed));
         for (int i = 0; i < 16; ++i)
         {
             const uint64_t j = g_gsmtJobs[i].load(std::memory_order_relaxed);
             if (j)
-                std::printf(" w%d=%llu/%.1fms", i, (unsigned long long)j, gsmtTicksToMs(g_gsmtBusyTsc[i].load(std::memory_order_relaxed)));
+                std::printf(" w%d=%llu/%.1fms(bar %.1f)", i, (unsigned long long)j, gsmtTicksToMs(g_gsmtBusyTsc[i].load(std::memory_order_relaxed)),
+                            gsmtTicksToMs(g_gsmtBarrierTsc[i].load(std::memory_order_relaxed)));
         }
         std::printf("\n");
         std::printf("[gsraster-wait]");
