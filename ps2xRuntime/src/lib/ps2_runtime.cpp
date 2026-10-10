@@ -7238,6 +7238,49 @@ void PS2Runtime::run()
         // actually playing.
         ps2x_fmv_host_draw();
 
+        // Host FPS overlay (10-10): drawn on the window after the guest frame was
+        // uploaded, so it never touches the GS framebuffer / VRAM hashes. F3 toggles
+        // (F1 is the debug panel); PS2X_FPS=1 starts it on. Off = one bool test.
+        {
+            static bool s_fpsShow = ps2_diag::env_int("PS2X_FPS", 0) != 0;
+            static uint32_t s_fpsFrames = 0u;
+            static uint64_t s_fpsTick0 = 0u;
+            static double s_fpsT0 = 0.0;
+            static char s_fpsText[64] = "game - vbl/s";
+            if (IsKeyPressed(KEY_F3))
+            {
+                s_fpsShow = !s_fpsShow;
+                s_fpsFrames = 0u;
+                s_fpsT0 = GetTime();
+                s_fpsTick0 = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            }
+            if (s_fpsShow)
+            {
+                ++s_fpsFrames;
+                const double now = GetTime();
+                if (s_fpsT0 == 0.0)
+                {
+                    s_fpsT0 = now;
+                    s_fpsTick0 = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+                }
+                else if (now - s_fpsT0 >= 1.0)
+                {
+                    const uint64_t tick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+                    const double dt = now - s_fpsT0;
+                    // The window loop re-presents the latched frame at the monitor
+                    // rate (60) whatever the guest does, so "frames presented"
+                    // says nothing about speed. Guest vblanks/s do: 60 = full speed.
+                    const double vbl = static_cast<double>(tick - s_fpsTick0) / dt;
+                    std::snprintf(s_fpsText, sizeof(s_fpsText), "game %.0f vbl/s = %.0f%% speed", vbl, vbl * (100.0 / 60.0));
+                    s_fpsT0 = now;
+                    s_fpsTick0 = tick;
+                    s_fpsFrames = 0u;
+                }
+                DrawText(s_fpsText, 11, 11, 20, BLACK);
+                DrawText(s_fpsText, 10, 10, 20, YELLOW);
+            }
+        }
+
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

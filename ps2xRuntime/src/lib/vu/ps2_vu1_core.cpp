@@ -2008,6 +2008,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             ctx.bkReg = m_viBranchBackupReg;
             ctx.bkVal = m_viBranchBackupValue;
             const uint32_t startPc = m_state.pc;
+            vu1rc::clearJrMiss();
 
             bool ran = false;
             const uint64_t recompT0 = budgetVu1Now();
@@ -2032,6 +2033,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                         ps2_pipeline_stats::g_vu1EndEbit.fetch_add(1, std::memory_order_relaxed);
                     else if (ctx.end == vu1rc::kEndCycleLimit)
                         ps2_pipeline_stats::g_vu1EndCycleLimit.fetch_add(1, std::memory_order_relaxed);
+                    else if (uint32_t jrTarget; vu1rc::takeJrMiss(jrTarget))
+                    {
+                        // Computed JR into a pair the recompiler has no label for: the
+                        // generated code stopped with its pipelines committed and pc =
+                        // target (as for a cycle-limit stop); run the rest of the program
+                        // in the interpreter below instead of dropping the packet.
+                        m_state.pc = jrTarget;
+                        goto interpret_rest;
+                    }
                     else
                         m_stopRequested = true;
                     if (useVuRounding && previousRoundingMode != -1)
@@ -2054,6 +2064,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             }
         }
     }
+interpret_rest:
     const uint64_t verifyStartCycle = m_cycle;
 
     uint64_t retired = 0;

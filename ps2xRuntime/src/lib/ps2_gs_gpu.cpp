@@ -16,6 +16,8 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <array>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1303,6 +1305,119 @@ extern "C" void ps2x_probe_kv(const char *name, int n,
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_texmissStart).count();
     }
 
+    // Size cap + repeat filter. A 33-minute manual play wrote 39.5 GB (disk full,
+    // 10-10): every draw of every frame was logged although build_scripts/texmiss.py
+    // only keys on (a) the first read of each texture/CLUT key, (b) a write rect not
+    // already covered by an earlier rect of the same (psm,bp,bw), (c) the first
+    // occurrence of each distinct transfer. Rows that cannot change a verdict are
+    // not written. PS2X_TEXMISS_MAX_MB=<n> closes the log at n MB (default 4096,
+    // 0 = unlimited). The "draws" column of the report counts logged draws only.
+    static uint64_t g_texmissCapBytes = 4096ull << 20;
+    static uint64_t g_texmissBatches = 0;
+    static uint64_t g_texmissFiltered = 0;
+    static std::unordered_set<uint64_t> g_texmissReadSeen;
+    static std::unordered_set<uint64_t> g_texmissXferSeen;
+    static std::unordered_map<uint64_t, std::vector<std::array<int32_t, 4>>> g_texmissCovered;
+
+    inline void texmissMix(uint64_t &h, uint64_t v)
+    {
+        h = (h ^ v) * 1099511628211ull;
+    }
+
+    static bool g_texmissLogAll = false; // PS2X_TEXMISS_ALL=1: no repeat filter (texmiss.py --scene needs it)
+
+    bool texmissKeepDraw(const GSDebugHistoryEntry &e)
+    {
+        if (g_texmissLogAll)
+        {
+            return true;
+        }
+        bool keep = false;
+        if (e.prim.tme)
+        {
+            uint64_t h = 1469598103934665603ull;
+            texmissMix(h, e.tex0.tbp0);
+            texmissMix(h, e.tex0.tbw);
+            texmissMix(h, e.tex0.psm);
+            texmissMix(h, e.tex0.tw);
+            texmissMix(h, e.tex0.th);
+            texmissMix(h, e.tex0.cbp);
+            texmissMix(h, e.tex0.cpsm);
+            texmissMix(h, e.tex0.csm);
+            texmissMix(h, e.gifSizeBytes); // CLAMP low/high words (see header comment)
+            texmissMix(h, e.gifNloop);
+            keep = g_texmissReadSeen.insert(h).second;
+        }
+        if ((static_cast<uint32_t>(e.frame.fbmsk) & 0xFFFFFFFFu) != 0xFFFFFFFFu)
+        {
+            // Same clip as texmiss.py draw(): bbox - XYOFFSET, inside the scissor.
+            const int32_t ofx = static_cast<int32_t>((e.regValue & 0xFFFFull) >> 4);
+            const int32_t ofy = static_cast<int32_t>(((e.regValue >> 32) & 0xFFFFull) >> 4);
+            const int32_t x0 = std::max({static_cast<int32_t>(e.xMin) - ofx, static_cast<int32_t>(e.scissor.x0), 0});
+            const int32_t y0 = std::max({static_cast<int32_t>(e.yMin) - ofy, static_cast<int32_t>(e.scissor.y0), 0});
+            const int32_t x1 = std::min(static_cast<int32_t>(e.xMax) - ofx, static_cast<int32_t>(e.scissor.x1));
+            const int32_t y1 = std::min(static_cast<int32_t>(e.yMax) - ofy, static_cast<int32_t>(e.scissor.y1));
+            if (x1 >= x0 && y1 >= y0)
+            {
+                const uint64_t k = (static_cast<uint64_t>(e.frame.psm) << 40) |
+                                   (static_cast<uint64_t>(e.frame.fbp) << 8) |
+                                   static_cast<uint64_t>(e.frame.fbw);
+                std::vector<std::array<int32_t, 4>> &list = g_texmissCovered[k];
+                bool inside = false;
+                for (const std::array<int32_t, 4> &r : list)
+                {
+                    if (r[0] <= x0 && r[1] <= y0 && x1 <= r[2] && y1 <= r[3])
+                    {
+                        inside = true;
+                        break;
+                    }
+                }
+                if (!inside)
+                {
+                    keep = true;
+                    list.push_back({x0, y0, x1, y1});
+                    if (list.size() > 24)
+                    {
+                        list.erase(list.begin());
+                    }
+                }
+            }
+        }
+        if (!keep)
+        {
+            ++g_texmissFiltered;
+        }
+        return keep;
+    }
+
+    bool texmissKeepTransfer(const GSDebugHistoryEntry &e)
+    {
+        if (g_texmissLogAll)
+        {
+            return true;
+        }
+        uint64_t h = 1469598103934665603ull;
+        texmissMix(h, e.trxdir & 3u);
+        texmissMix(h, e.bitbltbuf.sbp);
+        texmissMix(h, e.bitbltbuf.sbw);
+        texmissMix(h, e.bitbltbuf.spsm);
+        texmissMix(h, e.trxpos.ssax);
+        texmissMix(h, e.trxpos.ssay);
+        texmissMix(h, e.bitbltbuf.dbp);
+        texmissMix(h, e.bitbltbuf.dbw);
+        texmissMix(h, e.bitbltbuf.dpsm);
+        texmissMix(h, e.trxpos.dsax);
+        texmissMix(h, e.trxpos.dsay);
+        texmissMix(h, e.trxreg.rrw);
+        texmissMix(h, e.trxreg.rrh);
+        if (g_texmissXferSeen.insert(h).second)
+        {
+            return true;
+        }
+        ++g_texmissFiltered;
+        return false;
+    }
+
     void texmissEnsureInit(GS &gs)
     {
         if (g_texmissInitialized)
@@ -1323,6 +1438,14 @@ extern "C" void ps2x_probe_kv(const char *name, int n,
             return;
         }
         g_texmissStart = std::chrono::steady_clock::now();
+        if (const char *cap = std::getenv("PS2X_TEXMISS_MAX_MB"); cap && *cap)
+        {
+            g_texmissCapBytes = static_cast<uint64_t>(std::strtoull(cap, nullptr, 10)) << 20;
+        }
+        if (const char *all = std::getenv("PS2X_TEXMISS_ALL"); all && *all && all[0] != '0')
+        {
+            g_texmissLogAll = true;
+        }
         gs.setDebugHistoryPaused(false);
         // ring = GS::kDebugHistoryCapacity (ps2_gs_gpu.h).
         std::fprintf(g_texmissFile, "{\"k\":\"H\",\"ver\":1,\"ring\":512}\n");
@@ -1373,6 +1496,10 @@ extern "C" void ps2x_probe_kv(const char *name, int n,
             const unsigned long long tick = static_cast<unsigned long long>(e.vsyncTick);
             if (e.kind == GSDebugEventKind::Draw)
             {
+                if (!texmissKeepDraw(e))
+                {
+                    continue;
+                }
                 const unsigned long long clamp =
                     static_cast<unsigned long long>(e.gifSizeBytes) |
                     (static_cast<unsigned long long>(e.gifNloop) << 32);
@@ -1405,6 +1532,10 @@ extern "C" void ps2x_probe_kv(const char *name, int n,
             }
             else if (e.kind == GSDebugEventKind::Transfer)
             {
+                if (!texmissKeepTransfer(e))
+                {
+                    continue;
+                }
                 std::fprintf(f,
                     "{\"k\":\"X\",\"s\":%llu,\"v\":%llu,\"t\":%.3f,\"xdir\":%u,"
                     "\"sbp\":%u,\"sbw\":%u,\"spsm\":%u,\"sx\":%u,\"sy\":%u,"
@@ -1432,6 +1563,26 @@ extern "C" void ps2x_probe_kv(const char *name, int n,
             }
         }
         std::fflush(f);
+
+        // Size cap, checked every 1024 batches (ftell is a CRT call).
+        if (g_texmissCapBytes && (++g_texmissBatches & 1023u) == 0)
+        {
+#ifdef _WIN32
+            const long long pos = _ftelli64(f);
+#else
+            const long long pos = ftello(f);
+#endif
+            if (pos >= 0 && static_cast<uint64_t>(pos) >= g_texmissCapBytes)
+            {
+                std::fprintf(f, "{\"k\":\"CAP\",\"t\":%.3f,\"bytes\":%lld,\"filtered\":%llu}\n", t, pos,
+                             static_cast<unsigned long long>(g_texmissFiltered));
+                std::fclose(f);
+                g_texmissFile = nullptr;
+                std::cerr << "[texmiss] size cap reached (" << pos << " bytes, PS2X_TEXMISS_MAX_MB) at t="
+                          << t << "s -- log closed; " << g_texmissFiltered << " repeat rows were not written"
+                          << std::endl;
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

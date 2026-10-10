@@ -27,18 +27,22 @@ param(
     # VU1 + VIF1 + GIF submission run on their own thread (PS2X_VU1_THREAD=1, P5b):
     # the EE thread no longer waits for VU1 microprograms. Default ON here (measured
     # 37 -> 41 vbl/s in a fight); -NoVuThread runs them inline on the EE thread.
-    [switch]$NoVuThread
+    [switch]$NoVuThread,
+    # On-screen counter (host overlay, top-left): vbl/s = emulated vblanks per second,
+    # present = frames shown per second. Same as PS2X_FPS=1; F3 toggles it in the window.
+    [switch]$Fps
 )
 
 $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 
 # Env persists across runs in one shell: clear anything a test run left behind.
 foreach ($v in 'PS2X_PAD_AUTOPRESS', 'PS2X_PAD_AUTOPRESS_BTNS', 'PS2X_PAD_AUTOPRESS_HOLD', 'PS2X_PAD_AUTOPRESS_SECS',
-               'PS2X_PAD_SCRIPT', 'PS2X_VUCAP', 'PS2X_GSCAP', 'PS2X_HWWATCH', 'PS2X_TEXMISS_LOG', 'PS2X_VU1_THREAD') {
+               'PS2X_PAD_SCRIPT', 'PS2X_VUCAP', 'PS2X_GSCAP', 'PS2X_HWWATCH', 'PS2X_TEXMISS_LOG', 'PS2X_TEXMISS_MAX_MB', 'PS2X_TEXMISS_ALL', 'PS2X_VU1_THREAD', 'PS2X_FPS') {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
 $env:PS2X_DIAG = '0'
 if (-not $NoVuThread) { $env:PS2X_VU1_THREAD = '1' }
+if ($Fps) { $env:PS2X_FPS = '1' }
 if ($AutoBoot) {
     $env:PS2X_PAD_SCRIPT = Join-Path $root 'build_scripts\sweeps\play_boot.txt'
 }
@@ -47,6 +51,12 @@ $env:PS2X_GS_NEAREST = if ($Bilinear) { '0' } else { '1' }
 $env:PS2X_DET_VBLANK_QUANTUM = "$Quantum"
 
 if ($Texmiss) {
+    # The log is capped by the runtime (PS2X_TEXMISS_MAX_MB, default 4096) but a full disk
+    # stops the run_log too (10-10: 39.5 GB log, F: at 0 bytes).
+    $free = (Get-PSDrive -Name (Split-Path -Qualifier $root).TrimEnd(':')).Free
+    if ($free -lt 10GB) {
+        Write-Host ("[play] WARNING: only {0:N1} GB free on {1} - texmiss log may fill the disk" -f ($free / 1GB), (Split-Path -Qualifier $root)) -ForegroundColor Yellow
+    }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $env:PS2X_TEXMISS_LOG = Join-Path $root "Logs\play_$stamp`_texmiss.jsonl"
     Write-Host "[play] texmiss log -> $($env:PS2X_TEXMISS_LOG)" -ForegroundColor Cyan

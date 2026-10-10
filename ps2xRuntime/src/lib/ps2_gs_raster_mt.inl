@@ -472,6 +472,9 @@ struct Setup
     bool fst, linear;
     int texW, texH;
     bool earlyZ = false; // ztst 2/3: reject on the z buffer before texturing (see zFails)
+    // P8: alpha test off, DATE off, no frame mask, 32/24-bit frame -> writePixelLean
+    // (same result as writePixel, minus the branches that cannot fire). PS2X_GS_LEAN=0: off.
+    bool lean = false;
     TexPrep tp;
     unsigned wms, wmt;
     int minu, maxu, minv, maxv;
@@ -517,6 +520,15 @@ struct Setup
                 return !(e && *e == '0');
             }();
             earlyZ = earlyEnabled && ztst >= 2;
+        }
+        {
+            static const bool leanEnabled = []
+            {
+                const char *e = std::getenv("PS2X_GS_LEAN"); // =0: always the general writePixel (A/B)
+                return !(e && *e == '0');
+            }();
+            // classifyAlphaTest -> {fb, !preserve, z} when ATE=0; frmw == abe when DATE=0, fbmsk=0.
+            lean = leanEnabled && (test & 1u) == 0u && ((test >> 14) & 1u) == 0u && fmsk == 0u && fpx.on;
         }
         sx0 = static_cast<int>(ctx.scissor.x0);
         sx1 = static_cast<int>(ctx.scissor.x1);
@@ -683,6 +695,84 @@ __forceinline void writePixel(const Setup &S, int x, int y, int z, uint8_t r, ui
     }
 }
 
+// writePixel for Setup::lean jobs (ATE=0, DATE=0, FBMASK=0, 32/24-bit frame): the alpha
+// test always passes (fb + z written, destination alpha not preserved), the frame is read
+// only to blend, there is no dither (16-bit only) and no mask. Everything else is
+// writePixel's code in the same order, so the result is identical.
+template <bool kAbe>
+__forceinline void writePixelLean(const Setup &S, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    if (x < S.sx0 || x > S.sx1 || y < S.sy0 || y > S.sy1)
+        return;
+    if (scanMasked(S.scanmsk, y))
+        return;
+
+    uint8_t *vram = S.vram;
+    switch (S.ztst)
+    {
+    case 0:
+        return;
+    case 1:
+        break;
+    case 2:
+        if (!(z >= (S.zpx.on ? S.zpx.rd(vram, x, y) : S.zrd(vram, S.zbp, S.fbw, x, y))))
+            return;
+        break;
+    default:
+        if (!(z > (S.zpx.on ? S.zpx.rd(vram, x, y) : S.zrd(vram, S.zbp, S.fbw, x, y))))
+            return;
+        break;
+    }
+
+    int ir = r, ig = g, ib = b;
+    if (kAbe)
+    {
+        const u32 fbrgba = S.fpx.rd(vram, x, y);
+        uint8_t dr = fbrgba & 0xFF;
+        uint8_t dg = (fbrgba >> 8) & 0xFF;
+        uint8_t db = (fbrgba >> 16) & 0xFF;
+        uint8_t da = (fbrgba >> 24) & 0xFF;
+
+        if (!(S.pabe && (a & 0x80u) == 0u))
+        {
+            auto pickRGB = [](uint8_t sel, int cs, int cd) -> int
+            {
+                if (sel == 0)
+                    return cs;
+                if (sel == 1)
+                    return cd;
+                return 0;
+            };
+            int cAlpha = (S.csel == 0) ? a : (S.csel == 1) ? (S.fpsm == GS_PSM_CT24 ? 128 : da)
+                                                             : S.afix;
+
+            ir = ((pickRGB(S.asel, r, dr) - pickRGB(S.bsel, r, dr)) * cAlpha >> 7) + pickRGB(S.dsel, r, dr);
+            ig = ((pickRGB(S.asel, g, dg) - pickRGB(S.bsel, g, dg)) * cAlpha >> 7) + pickRGB(S.dsel, g, dg);
+            ib = ((pickRGB(S.asel, b, db) - pickRGB(S.bsel, b, db)) * cAlpha >> 7) + pickRGB(S.dsel, b, db);
+        }
+    }
+    finishColour(false, S.dimx, S.clamp, x, y, ir, ig, ib, r, g, b);
+
+    if (S.fbaOr)
+        a = static_cast<uint8_t>(a | 0x80u);
+
+    S.fpx.wr(vram, x, y, pack32(r, g, b, a));
+    if (!S.zmsk)
+        S.zpx.on ? S.zpx.wr(vram, x, y, z) : S.zwr(vram, S.zbp, S.fbw, x, y, z);
+}
+
+// Frame the pixel through the right writer: 0 = general, 1 = lean opaque, 2 = lean blend.
+template <int M>
+__forceinline void putPixel(const Setup &S, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    if constexpr (M == 0)
+        writePixel(S, x, y, z, r, g, b, a);
+    else if constexpr (M == 1)
+        writePixelLean<false>(S, x, y, z, r, g, b, a);
+    else
+        writePixelLean<true>(S, x, y, z, r, g, b, a);
+}
+
 // GSRasterizer::sampleTexture without the probes.
 __forceinline uint32_t samplePoint(const Setup &S, int sampleU, int sampleV)
 {
@@ -786,6 +876,7 @@ __forceinline uint32_t sampleTexel(const Setup &S, float texUf, float texVf)
 
 // GSRasterizer::drawSprite, drawing only this worker's rows. The display-copy
 // detection it also did runs on the producer (submit()).
+template <int M>
 void drawSprite(const Setup &S)
 {
     const Job &j = *S.job;
@@ -857,6 +948,10 @@ void drawSprite(const Setup &S)
         const float duDx = (spanXf != 0.0f) ? (u1f - u0f) / spanXf : 0.0f;
         const float dvDy = (spanYf != 0.0f) ? (v1f - v0f) / spanYf : 0.0f;
 
+        // Locals: stores through vram (uint8_t*) force the compiler to reload S.* per pixel.
+        const bool earlyZ = S.earlyZ;
+        const bool fge = S.fge;
+        const uint8_t fogv = v1.fog;
         for (int y = S.firstRow(drawY0); y <= drawY1; y = S.nextRow(y))
         {
             budgetRasterSpan(S.rowIdx, true, true, S.linear, S.abe, S.ztst >= 2, drawX1 - drawX0 + 1);
@@ -864,7 +959,7 @@ void drawSprite(const Setup &S)
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
-                if (S.earlyZ && S.zFails(S.vram, x, y, z1))
+                if (earlyZ && S.zFails(S.vram, x, y, z1))
                     continue;
                 float texUf = u0f + (static_cast<float>(x) - vx0) * duDx;
                 // FST and STQ alike: PCSX2 steps sprite U/V in 16.16 texels.
@@ -879,9 +974,9 @@ void drawSprite(const Setup &S)
 
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
                 uint8_t fr = color.r, fg = color.g, fb = color.b;
-                if (S.fge) // PCSX2: a sprite's fog is v1's
-                    applyFog(S.fogcol, v1.fog << 7, fr, fg, fb);
-                writePixel(S, x, y, z1, fr, fg, fb, color.a);
+                if (fge) // PCSX2: a sprite's fog is v1's
+                    applyFog(S.fogcol, fogv << 7, fr, fg, fb);
+                putPixel<M>(S, x, y, z1, fr, fg, fb, color.a);
             }
         }
     }
@@ -893,12 +988,13 @@ void drawSprite(const Setup &S)
         {
             budgetRasterSpan(S.rowIdx, true, false, false, S.abe, S.ztst >= 2, drawX1 - drawX0 + 1);
             for (int x = drawX0; x <= drawX1; ++x)
-                writePixel(S, x, y, z1, r, g, b, a);
+                putPixel<M>(S, x, y, z1, r, g, b, a);
         }
     }
 }
 
 // GSRasterizer::drawTriangle, drawing only this worker's rows.
+template <int M>
 void drawTriangle(const Setup &S)
 {
     const Job &j = *S.job;
@@ -965,6 +1061,19 @@ void drawTriangle(const Setup &S)
                                        static_cast<int>(ctx.tex0.tw), static_cast<int>(ctx.tex0.th), S.linear);
     const auto &tex = ctx.tex0;
 
+    // Loop invariants in locals: every vram store is through uint8_t*, which the compiler
+    // must assume can change S.* / prim.* / the vertices, so it reloads them per pixel.
+    // Same types as the fields, so the arithmetic below is unchanged.
+    const bool iip = prim.iip != 0;
+    const bool tme = prim.tme != 0;
+    const bool fge = S.fge;
+    const bool earlyZ = S.earlyZ;
+    const double vz0 = v0.z, vz1 = v1.z, vz2 = v2.z;
+    const uint8_t vr0 = v0.r, vr1 = v1.r, vr2 = v2.r;
+    const uint8_t vg0 = v0.g, vg1 = v1.g, vg2 = v2.g;
+    const uint8_t vb0 = v0.b, vb1 = v1.b, vb2 = v2.b;
+    const uint8_t va0 = v0.a, va1 = v1.a, va2 = v2.a;
+
     for (int y = S.firstRow(minY); y <= maxY; y = S.nextRow(y))
     {
         const int64_t py = static_cast<int64_t>(y) * 16;
@@ -988,28 +1097,28 @@ void drawTriangle(const Setup &S)
             const float w1 = static_cast<float>(e[1]) * invArea;
             const float w2 = 1.0f - w0 - w1;
 
-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            double z = vz0 * w0 + vz1 * w1 + vz2 * w2;
             const u32 zi = static_cast<u32>(z + 0.5);
-            if (S.earlyZ && S.zFails(S.vram, x, y, zi))
+            if (earlyZ && S.zFails(S.vram, x, y, zi))
                 continue;
 
             uint8_t r, g, b, a;
-            if (prim.iip)
+            if (iip)
             {
-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                r = clampU8(static_cast<int>(vr0 * w0 + vr1 * w1 + vr2 * w2));
+                g = clampU8(static_cast<int>(vg0 * w0 + vg1 * w1 + vg2 * w2));
+                b = clampU8(static_cast<int>(vb0 * w0 + vb1 * w1 + vb2 * w2));
+                a = clampU8(static_cast<int>(va0 * w0 + va1 * w1 + va2 * w2));
             }
             else
             {
-                r = v2.r;
-                g = v2.g;
-                b = v2.b;
-                a = v2.a;
+                r = vr2;
+                g = vg2;
+                b = vb2;
+                a = va2;
             }
 
-            if (prim.tme)
+            if (tme)
             {
                 uint32_t texel;
                 if (triTexOn)
@@ -1057,9 +1166,9 @@ void drawTriangle(const Setup &S)
                 a = color.a;
             }
 
-            if (S.fge)
+            if (fge)
                 applyFog(S.fogcol, fogF16(v0.fog * w0 + v1.fog * w1 + v2.fog * w2), r, g, b);
-            writePixel(S, x, y, zi, r, g, b, a);
+            putPixel<M>(S, x, y, zi, r, g, b, a);
         }
     }
 }
@@ -1135,12 +1244,22 @@ void runJob(const Job &j, TexCache &cache, int n, int idx)
     switch (j.prim.prim)
     {
     case GS_PRIM_SPRITE:
-        drawSprite(S);
+        if (!S.lean)
+            drawSprite<0>(S);
+        else if (!S.abe)
+            drawSprite<1>(S);
+        else
+            drawSprite<2>(S);
         break;
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
-        drawTriangle(S);
+        if (!S.lean)
+            drawTriangle<0>(S);
+        else if (!S.abe)
+            drawTriangle<1>(S);
+        else
+            drawTriangle<2>(S);
         break;
     case GS_PRIM_LINE:
     case GS_PRIM_LINESTRIP:

@@ -52,6 +52,14 @@ namespace vu1rc
     // declines entry pcs it was not compiled for).
     uint32_t find(const uint8_t *microMem, uint32_t size, Program *out, uint32_t maxOut);
 
+    // A computed JR/JALR can land on a pair the recompiler never made a label
+    // (the target comes from VU data, e.g. a subroutine index the EE uploads).
+    // The generated code stops with kEndError and reports it; takeJrMiss()
+    // returns true once for that stop and gives the target pc, and the caller
+    // resumes in the interpreter there instead of dropping the packet.
+    void clearJrMiss();
+    bool takeJrMiss(uint32_t &target);
+
     // CRC-32 of the image (same as the vucap tools), for logs and dumps.
     uint32_t imageCrc(const uint8_t *microMem, uint32_t size);
 

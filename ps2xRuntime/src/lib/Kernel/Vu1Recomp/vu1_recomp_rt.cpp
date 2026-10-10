@@ -7,8 +7,45 @@
 
 namespace vu1rc
 {
+    namespace
+    {
+        thread_local bool t_jrMiss = false;
+        thread_local uint32_t t_jrTarget = 0;
+    }
+
+    void clearJrMiss()
+    {
+        t_jrMiss = false;
+    }
+
+    bool takeJrMiss(uint32_t &target)
+    {
+        if (!t_jrMiss)
+            return false;
+        t_jrMiss = false;
+        target = t_jrTarget;
+        return true;
+    }
+
     void reportError(const char *what, uint32_t pc, uint32_t value)
     {
+        if (std::strcmp(what, "JR to an address outside the compiled program") == 0)
+        {
+            t_jrMiss = true;
+            t_jrTarget = value;
+            // The interpreter finishes the packet. Say so once per distinct (entry, target).
+            static thread_local uint64_t seen[16];
+            static thread_local uint32_t nSeen = 0;
+            const uint64_t key = (static_cast<uint64_t>(pc) << 32) | value;
+            for (uint32_t i = 0; i < nSeen; ++i)
+                if (seen[i] == key)
+                    return;
+            if (nSeen < 16u)
+                seen[nSeen++] = key;
+            RUNTIME_ERROR("[VU1 recomp] " << what << " pc=0x" << std::hex << pc << " value=0x" << value << std::dec
+                                           << " (interpreter continues from the target)\n");
+            return;
+        }
         RUNTIME_ERROR("[VU1 recomp] " << what << " pc=0x" << std::hex << pc << " value=0x" << value << std::dec << '\n');
     }
 
