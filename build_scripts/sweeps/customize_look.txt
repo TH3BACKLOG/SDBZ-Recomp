@@ -1,0 +1,24 @@
+# customize_look.txt - NO pokes. Boot, open Customize (Kame House), step through the card screens slowly
+# so a screenshot loop can look at them. Pair with build_scripts\save\look_customize.ps1.
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+wait ticks=300
+log look: main menu
+press R hold=6 gap=60
+wait ticks=120
+press D hold=6 gap=60
+wait ticks=300
+log look: cursor on customize?
+press X hold=10 gap=50
+wait ticks=900
+log look: after X 1
+press X hold=10 gap=50
+wait ticks=900
+log look: after X 2
+press X hold=10 gap=50
+wait ticks=900
+log look: after X 3
+wait ticks=1800
