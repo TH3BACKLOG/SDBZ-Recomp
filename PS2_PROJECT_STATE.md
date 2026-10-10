@@ -24183,3 +24183,20 @@ c`  -> MATCH = stale-cache bug (then find the write path that skips the bump); s
 - **Live (matched content ~9.6 K tris/vbl)**: median 31 -> 37 vbl/s; with `PS2X_VU1_THREAD=1` 41 vbl/s at 9.9 K tris/vbl (workers 77 % busy, GS thread waits r6 109 s / r10 23 s, game thread 156 s CPU). `logs/p7_fight_a_log.txt`, `logs/p7_fight_vuw_log.txt`.
 - **play.ps1**: now sets `PS2X_VU1_THREAD=1` (`-NoVuThread` to run VU1 inline). Boot script verified reaching the main menu with the thread on. The runner default stays OFF until the thread is eyeballed in a real fight (exactness is reasoned + 0 sync reads in fights (P5a), not compared frame-by-frame: fights are not reproducible run to run).
 - **Next (H)**: (1) r6 waits (15 K x 7 ms in a fight): writes that must wait for queued readers - finer per-job upload dependency instead of the all-worker barrier; (2) worker per-pixel cost still ~40 % in writePixel (alpha test / blend / dither branches); (3) producer `writeRegisterPacked` / `submit` rectBlocks; (4) flip the VU1 thread default after a user look.
+
+## Part 187 - 10-10 P8a lean raster path, VU1 JR-miss fallback, FPS overlay, texmiss cap, 100% save tool (committed + pushed)
+
+- **Commits**: `3709193e` (runtime + play.ps1) and `93a999f5` (save tools). `imgui.ini` is never committed.
+- **P8a lean raster** (`ps2_gs_raster_mt.inl`, MT workers = live path): `Setup::lean` (ATE=0, DATE=0, FBMASK=0, 32/24-bit frame) -> `writePixelLean<kAbe>`, `putPixel<M>`, `drawSprite<M>`/`drawTriangle<M>` chosen per job (`PS2X_GS_LEAN=0` = off). Gates PASS: gs_bench linear `cfc30917d1085d7f`, nearest `d67399b9088ee3d7`, verify_fix `p8_lean` 96 cases + 120 s boot. Gain small (bench min -10 %, median -4 %).
+- **VU1 JR-miss interpreter fallback** (`vu1_recomp.h`, `vu1_recomp_rt.cpp`, `ps2_vu1_core.cpp`): a recompiled program that hits a `JR` to an unlabelled address finishes in the interpreter. V: run_log shows 1 line instead of 4716 per fight (prog `8d3c20655aac`).
+- **FPS overlay** (`ps2_runtime.cpp`, `play.ps1 -Fps`, F3 toggles): text is now "game N vbl/s = N% speed" (guest vblanks per second; 60 = full speed). The old "present" count was the host window rate and read 60 while the game ran at 15. F3 toggle not yet eyeballed.
+- **Texmiss log** (`ps2_gs_gpu.cpp`): repeat filter + 4 GB cap (`PS2X_TEXMISS_MAX_MB`, `PS2X_TEXMISS_ALL=1`); `play.ps1 -Texmiss` warns under 10 GB free. Previous run: 706 texture reads all OK, log was 39.5 GB and filled F:.
+- **Save tool** (`build_scripts/save/make_100pct_save.py --all-variants`, `check_save.ps1`, `look_customize.ps1`): 941 branch-variation cards in 32 sets of 30 (mc0 + mc1 sampler). V: memory-card slot 2 works (port 1 -> `ELF/mc1`). Unverified in game: per-card trees in Customize, Shenron wish list, learned-skill bits on new variations (copied from nearest real card).
+- **First clean live log** (user, 3 matches, `play.ps1 -Fps`, 664 s): fights typically 28-30 vbl/s (~47 % speed) at 10-15 K tris/vbl; menus 85-97 vbl/s (no limiter). VU1 recompiled execution 24-27 ms/vbl = ~80 % of the VU1 worker; EE thread ~50 % busy.
+- **Next (H)**: need VU1 execution ~1.8x faster plus raster gains for 60. Profile first: `$env:PS2X_VU1_THREAD='1'; & "F:\SDBZ Recomp\launch_recomp.ps1" -PerfFight` (320 s, `[hostprof]` top functions/lines of the VU1 worker), then optimise the hottest generated-program code. Also open: sprite row-fill fast path, r6 upload barrier skew, flip the VU1 thread runner default after an eyeball, JALR return-label gap in `vu1_recomp.py`, `[frametrace:RASLOT] BAD` (capped, likely benign).
+
+## HANDOFF 10-10 (end of session)
+
+- State: branch `sync/upstream-2026-09-24`, all work committed and pushed; tree clean except `imgui.ini`. Memory: `project_p7_raster_worker_cost_2026_10_09.md` has the 10-10 findings.
+- User to do: run the `-PerfFight` profile above and report; optionally eyeball F3 overlay, VU1 thread, Customize cards, Shenron wishes.
+- Rules: user builds and plays; I give exact commands. No push/commit unless asked.
