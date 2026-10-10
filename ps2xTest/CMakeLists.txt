@@ -5,6 +5,11 @@ project(ps2xTest LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(gs_cache)
+endif()
+
 # Static library with test logic (no main), used by ps2xStudio
 add_library(ps2_test_function_table OBJECT
     src/test_function_table.cpp
@@ -12,6 +17,7 @@ add_library(ps2_test_function_table OBJECT
 
 target_include_directories(ps2_test_function_table PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xIOP/include
 )
 
 add_library(ps2_test_lib STATIC
@@ -24,10 +30,13 @@ add_library(ps2_test_lib STATIC
     src/ps2_runtime_interrupt_tests.cpp
     src/ps2_memory_tests.cpp
     src/ps2_vu1_tests.cpp
+    src/ps2_vu1_capture_replay_tests.cpp
+    src/ps2_vu_tests.cpp
     src/ps2_gs_tests.cpp
     src/ps2_gsdump_replay_tests.cpp
     src/ps2_sif_rpc_tests.cpp
     src/ps2_sif_dma_tests.cpp
+    src/ps2_iop_tests.cpp
     src/ps2_recompiler_tests.cpp
     src/ps2_runtime_expansion_tests.cpp
     src/ps2_scheduler_workload_regression_tests.cpp
@@ -46,13 +55,95 @@ target_link_libraries(ps2_test_lib PRIVATE
     ps2_recomp_lib
     ps2_analyzer_lib
     ps2_runtime
+    ps2_iop
 )
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ps2_test_lib PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 add_executable(ps2x_tests
     src/main.cpp
     src/recomp_override_stubs.cpp
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
+
+# VU1 capture replay only (no ps2_test_lib), so it builds even when unrelated
+# test files fall behind runtime API changes.
+add_executable(ps2x_vucap_replay
+    src/vucap_replay_main.cpp
+    src/ps2_vu1_capture_replay_tests.cpp
+    src/recomp_override_stubs.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+target_include_directories(ps2x_vucap_replay PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+)
+
+target_link_libraries(ps2x_vucap_replay PRIVATE
+    ps2_runtime
+    ps2_iop
+)
+
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_vucap_replay)
+endif()
+
+# GS speed benchmark: replays a PCSX2 GS dump (.gsr) through our GS.
+add_executable(ps2x_gs_bench
+    src/gs_bench_main.cpp
+    src/recomp_override_stubs.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
+target_include_directories(ps2x_gs_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+)
+
+target_link_libraries(ps2x_gs_bench PRIVATE
+    ps2_runtime
+    ps2_iop
+)
+
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_gs_bench)
+endif()
+
+# Stage B opcode conformance (our side): the test functions ps2_recomp generated from
+# build_scripts/conformance/out/conformance.elf. Exists only after gen_conformance.py ran.
+set(PS2X_CONFORMANCE_GEN "${CMAKE_SOURCE_DIR}/build_scripts/conformance/out/gen")
+if(EXISTS "${PS2X_CONFORMANCE_GEN}/conformance_fns.inc")
+    file(GLOB PS2X_CONFORMANCE_SRCS CONFIGURE_DEPENDS "${PS2X_CONFORMANCE_GEN}/ct*.cpp")
+    add_executable(ps2x_conformance
+        src/conformance_main.cpp
+        src/recomp_override_stubs.cpp
+        $<TARGET_OBJECTS:ps2_test_function_table>
+        ${PS2X_CONFORMANCE_SRCS}
+    )
+    target_include_directories(ps2x_conformance PRIVATE
+        ${PS2X_CONFORMANCE_GEN}
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    )
+    target_link_libraries(ps2x_conformance PRIVATE
+        ps2_runtime
+        ps2_iop
+    )
+    # ~450 small generated files: batch them like the game runner's unity TUs.
+    set_target_properties(ps2x_conformance PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 32)
+    set_source_files_properties(src/conformance_main.cpp src/recomp_override_stubs.cpp
+        PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    if(MSVC)
+        target_compile_options(ps2x_conformance PRIVATE /bigobj /MP)
+    endif()
+    if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+        ps2x_stage_ffmpeg_runtime_dlls(ps2x_conformance)
+    endif()
+endif()
 
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
 if(PRINT_GENERATED_CODE)
@@ -74,6 +165,15 @@ target_link_libraries(ps2x_tests PRIVATE
     ps2_analyzer_lib
     ps2_runtime
 )
+
+# VU/GS tests intentionally instantiate large interpreter state.
+# Windows executables default to a much smaller stack than Linux, and
+# sanitizer/debug instrumentation can push these test frames over 1 MiB.
+if(MSVC)
+    target_link_options(ps2x_tests PRIVATE "/STACK:8388608")
+elseif(MINGW)
+    target_link_options(ps2x_tests PRIVATE "--stack,8388608")
+endif()
 
 if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_tests)

@@ -68,3 +68,200 @@ void singleton_get_camera_0x199db0(uint8_t *, R5900Context *, PS2Runtime *)
 {
     ps2xTestGuestStub("singleton_get_camera_0x199db0");
 }
+
+// Called by recovered bodies in ps2xRuntime/src/lib/Kernel/recovered/, which are
+// part of ps2_runtime; the callees are generated runner bodies.
+void sub_00175B68_0x175b68(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00175B68_0x175b68");
+}
+
+void array_call_dtor_0x171bb0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("array_call_dtor_0x171bb0");
+}
+
+void mem_copy_0x18e250(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("mem_copy_0x18e250");
+}
+
+// Callees of the recovered sub_293200 (ps2_runtime.lib); same abort-stub rule as above.
+void blend_state_get_field410_0x1c60e0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_get_field410_0x1c60e0");
+}
+
+void blend_state_is_idle_0x1c62a0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_is_idle_0x1c62a0");
+}
+
+void blend_state_start_0x1c6320(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_start_0x1c6320");
+}
+
+void blend_state_stop_0x1c62d0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("blend_state_stop_0x1c62d0");
+}
+
+void camera_fade_is_active_0x2c1bb0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("camera_fade_is_active_0x2c1bb0");
+}
+
+void camera_fade_set_0x2c1830(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("camera_fade_set_0x2c1830");
+}
+
+void camera_set_mode_0x2c1c20(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("camera_set_mode_0x2c1c20");
+}
+
+void math_acos_f_0x185bd8(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("math_acos_f_0x185bd8");
+}
+
+void math_asin_f_0x185e78(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("math_asin_f_0x185e78");
+}
+
+void mem_fill_z_31_clone_18_0x2926d0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("mem_fill_z_31_clone_18_0x2926d0");
+}
+
+void noop_wrapper____0x1f59c0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("noop_wrapper____0x1f59c0");
+}
+
+void noop_wrapper____0x240710(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("noop_wrapper____0x240710");
+}
+
+void obj_change_state_0x1cbe80(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_change_state_0x1cbe80");
+}
+
+void obj_enable_sphere_collide_0x1e6290(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_enable_sphere_collide_0x1e6290");
+}
+
+void obj_get_sub_entry_field_0x23a080(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_get_sub_entry_field_0x23a080");
+}
+
+void obj_set_fields_0x1e6260(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_set_fields_0x1e6260");
+}
+
+void singleton_sub_2be0_clone_01_0x23ad00(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("singleton_sub_2be0_clone_01_0x23ad00");
+}
+
+void sound_play_3d_0x2fd640(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sound_play_3d_0x2fd640");
+}
+
+void sub_0019E440_0x19e440(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_0019E440_0x19e440");
+}
+
+void sub_001CB750_0x1cb750(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_001CB750_0x1cb750");
+}
+
+void sub_001CD9D0_0x1cd9d0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_001CD9D0_0x1cd9d0");
+}
+
+void sub_001CDAF0_0x1cdaf0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_001CDAF0_0x1cdaf0");
+}
+
+void sub_00292450_0x292450(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00292450_0x292450");
+}
+
+void sub_00292570_0x292570(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00292570_0x292570");
+}
+
+void sub_00294900_0x294900(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00294900_0x294900");
+}
+
+void sub_00294A90_0x294a90(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00294A90_0x294a90");
+}
+
+void sub_00294B40_0x294b40(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("sub_00294B40_0x294b40");
+}
+
+void table_entry_get_stride8_0x3a32f0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("table_entry_get_stride8_0x3a32f0");
+}
+
+
+// Callees of the 10-05 hole-recovery bodies in ps2xRuntime/src/lib/Kernel/recovered/ (sub_001C1C70, sub_002B6240,
+// sub_003BFA50, sub_003EB7F0, sub_003EBD00, sub_003F8820, sub_00426C60..): generated runner bodies, stubbed for the bench.
+
+void return_zero_z_48_0x1c1970(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("return_zero_z_48_0x1c1970");
+}
+
+void get_data_ptr_z_185_0x2b6200(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("get_data_ptr_z_185_0x2b6200");
+}
+
+void j_obj_detach_and_free_resources_2_0x3b7910(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("j_obj_detach_and_free_resources_2_0x3b7910");
+}
+
+void obj_ctor_init_k_clone_02_0x3eb6f0(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_ctor_init_k_clone_02_0x3eb6f0");
+}
+
+void CAppFgtResDgnM_Ctor_0x3ebb60(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("CAppFgtResDgnM_Ctor_0x3ebb60");
+}
+
+void obj_ctor_init____0x3f4b70(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("obj_ctor_init____0x3f4b70");
+}
+
+void rpc_dispatch_or_async_0x429d28(uint8_t *, R5900Context *, PS2Runtime *)
+{
+    ps2xTestGuestStub("rpc_dispatch_or_async_0x429d28");
+}

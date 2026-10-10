@@ -1,6 +1,5 @@
 #include "Common.h"
 #include "System.h"
-#include "ps2_syscall_override_state.h"
 
 namespace ps2_syscalls
 {
@@ -251,32 +250,6 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
-    void GetRomName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        uint32_t bufAddr = getRegU32(ctx, 4); // $a0
-        size_t bufSize = getRegU32(ctx, 5);   // $a1
-        char *hostBuf = reinterpret_cast<char *>(getMemPtr(rdram, bufAddr));
-        const char *romName = "ROMVER 0100";
-
-        if (!hostBuf)
-        {
-            std::cerr << "GetRomName error: Invalid buffer address" << std::endl;
-            setReturnS32(ctx, -1); // Error
-            return;
-        }
-        if (bufSize == 0)
-        {
-            setReturnS32(ctx, 0);
-            return;
-        }
-
-        strncpy(hostBuf, romName, bufSize - 1);
-        hostBuf[bufSize - 1] = '\0';
-
-        // returns the length of the string (excluding null?) or error
-        setReturnS32(ctx, (int32_t)strlen(hostBuf));
-    }
-
     void SifLoadElfPart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0 - path
@@ -314,33 +287,40 @@ namespace ps2_syscalls
 
     void sceSifLoadModuleBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t bufferAddr = getRegU32(ctx, 4); // $a0
+        const uint32_t bufferAddr = getRegU32(ctx, 4);   // $a0
+        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
+        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
         if (!rdram || bufferAddr == 0u)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        // Match buffer-based module loads to stable synthetic tags so module ID lookup remains deterministic.
         const std::string moduleTag = makeSifModuleBufferTag(rdram, bufferAddr);
-        const int32_t moduleId = trackSifModuleLoad(moduleTag);
-        if (moduleId <= 0)
+        std::vector<uint8_t> arguments;
+        constexpr uint32_t kMaxIopModuleArguments = 64u * 1024u;
+        if (!copyGuestBytesBounded(rdram, argumentAddr, argumentSize, kMaxIopModuleArguments, arguments))
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        uint32_t refs = 0;
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
-            {
-                refs = it->second.refCount;
-            }
+            setReturnS32(ctx, -1);
+            return;
         }
-        logSifModuleAction("load-buffer", moduleId, moduleTag, refs);
-        setReturnS32(ctx, moduleId);
+
+        const auto loaded = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
+        if (!loaded.handled || loaded.moduleId <= 0)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        trackSifModuleLoadExternal(moduleTag, loaded.moduleId);
+        logSifModuleAction("load-buffer-emulated", loaded.moduleId, moduleTag, 1u);
+        setReturnS32(ctx, loaded.moduleId);
     }
 
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId)
@@ -405,11 +385,6 @@ namespace ps2_syscalls
         // Bootstrap default: avoid hard-failing loops that probe syscall availability.
         setReturnS32(ctx, 0);
     }
-
-    static uint32_t computeBuiltinFindAddressResult(uint8_t *rdram,
-                                                    uint32_t originalStart,
-                                                    uint32_t originalEnd,
-                                                    uint32_t target);
 
     static inline uint32_t normalizeKernelAlias(uint32_t addr)
     {
@@ -486,22 +461,35 @@ namespace ps2_syscalls
         return true;
     }
 
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28,
+    // continued): a fresh watchdog run showed g_findAddressCallCount pinned at
+    // 0 for the full 200s and [FindAddress:hit]/[miss] never printed once,
+    // even though sysNum sampled 0x83 repeatedly and the guest's progress
+    // counter climbed by 30M+ -- the real FindAddress() below is never
+    // reached. dispatchSyscallOverride() runs BEFORE the switch in
+    // dispatchNumericSyscall and can short-circuit case 0x83 entirely if the
+    // guest registered its own handler via SetSyscall (0x74). These atomics
+    // identify which of this function's exit branches is actually taken for
+    // syscall 0x83, and what handler address the guest registered, without
+    // guessing.
+    std::atomic<uint32_t> g_syscallOverrideCallCount{0u};
+    std::atomic<uint32_t> g_syscallOverrideLastHandler{0u};
+    std::atomic<uint32_t> g_syscallOverrideLastBranch{0u};
+
     bool dispatchSyscallOverride(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t handler = 0u;
-        {
-            std::lock_guard<std::mutex> lock(g_syscall_override_mutex);
-            auto it = g_syscall_overrides.find(syscallNumber);
-            if (it == g_syscall_overrides.end())
-            {
-                return false;
-            }
-            handler = it->second;
-        }
-
-        if (!runtime || !ctx || handler == 0u)
+        if (!runtime || !ctx ||
+            !runtime->findEeSyscallOverride(syscallNumber, handler) ||
+            handler == 0u)
         {
             return false;
+        }
+
+        if (syscallNumber == 0x83u)
+        {
+            g_syscallOverrideCallCount.fetch_add(1u, std::memory_order_relaxed);
+            g_syscallOverrideLastHandler.store(handler, std::memory_order_relaxed);
         }
 
         // Handlers copied into kernel RAM have no recompiled function; if the
@@ -523,136 +511,53 @@ namespace ps2_syscalls
                               << " result=0x" << hleV0
                               << std::dec << std::endl;
                 }
+                if (syscallNumber == 0x83u)
+                {
+                    g_syscallOverrideLastBranch.store(1u, std::memory_order_relaxed);
+                }
                 setReturnU32(ctx, hleV0);
                 return true;
             }
         }
 
-        const uint32_t overrideA0 = getRegU32(ctx, 4);
-        const uint32_t overrideA1 = getRegU32(ctx, 5);
-        const uint32_t overrideA2 = getRegU32(ctx, 6);
-        const uint32_t overrideA3 = getRegU32(ctx, 7);
-        const uint32_t overridePc = ctx->pc;
-        const uint32_t overrideRa = getRegU32(ctx, 31);
-
-        // Reentrancy guard scoped to the CALLING guest context. On a fiber (the
-        // N=1 executor) this resolves to the fiber's OWN stack, so a fiber parked
-        // mid-override never marks the syscall active for another fiber, and the
-        // pop_back below always removes THIS fiber's entry (push/pop is LIFO on
-        // one fiber's call chain). Host workers and direct non-fiber callers
-        // (e.g. the kernel-test main thread) use a PERSISTENT per-OS-thread
-        // fallback: each runs its override chain to completion without yielding,
-        // so a per-OS-thread stack is exactly right and still catches genuine
-        // single-context self-recursion (the 0x83 recursive-override case).
-        SyscallOverrideStack &overrideState = ps2sched::current_active_syscall_overrides();
-        std::vector<uint32_t> &s_activeSyscallOverrides = overrideState.active;
-        if (std::find(s_activeSyscallOverrides.begin(), s_activeSyscallOverrides.end(), syscallNumber) != s_activeSyscallOverrides.end())
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.bindMainContextForSyscall(*ctx, rdram);
+        if (scheduler.hasInvocation(GuestInvocationKind::SyscallOverride, syscallNumber))
         {
-            static std::atomic<uint32_t> s_reentrantLogs{0u};
-            constexpr uint32_t kMaxReentrantLogs = 32u;
-            const uint32_t logIndex = s_reentrantLogs.fetch_add(1u, std::memory_order_relaxed);
-            if (logIndex < kMaxReentrantLogs)
+            if (syscallNumber == 0x83u)
             {
-                PS2_IF_AGRESSIVE_LOGS({
-                    std::cerr << "[SyscallOverride:reentrant]"
-                              << " syscall=0x" << std::hex << syscallNumber
-                              << " handler=0x" << handler
-                              << " pc=0x" << ctx->pc
-                              << " ra=0x" << getRegU32(ctx, 31)
-                              << std::dec << std::endl;
-                });
+                g_syscallOverrideLastBranch.store(2u, std::memory_order_relaxed);
             }
             return false;
         }
 
-        s_activeSyscallOverrides.push_back(syscallNumber);
-        struct ScopedActiveOverride
+        if (!runtime->hasFunction(handler))
         {
-            std::vector<uint32_t> &active;
-            ~ScopedActiveOverride()
+            if (syscallNumber == 0x83u)
             {
-                if (!active.empty())
-                {
-                    active.pop_back();
-                }
+                g_syscallOverrideLastBranch.store(3u, std::memory_order_relaxed);
             }
-        } scopedActiveOverride{s_activeSyscallOverrides};
-
-        uint32_t retV0 = 0u;
-        const bool invoked = rpcInvokeFunction(rdram,
-                                               ctx,
-                                               runtime,
-                                               normalizeKernelAlias(handler),
-                                               getRegU32(ctx, 4),
-                                               getRegU32(ctx, 5),
-                                               getRegU32(ctx, 6),
-                                               getRegU32(ctx, 7),
-                                               &retV0);
+            setReturnS32(ctx, KE_ERROR);
+            return true;
+        }
 
         if (syscallNumber == 0x83u)
         {
-            const uint32_t builtinRet = computeBuiltinFindAddressResult(rdram, overrideA0, overrideA1, overrideA2);
-            const bool mismatch = (retV0 != builtinRet);
-
-            static std::atomic<uint32_t> s_findAddressOverrideLogs{0u};
-            static std::atomic<uint32_t> s_findAddressOverrideMismatchLogs{0u};
-            constexpr uint32_t kMaxFindAddressOverrideLogs = 64u;
-            constexpr uint32_t kMaxFindAddressOverrideMismatchLogs = 128u;
-
-            const uint32_t logIndex = s_findAddressOverrideLogs.fetch_add(1u, std::memory_order_relaxed);
-            const uint32_t mismatchIndex = mismatch
-                                               ? s_findAddressOverrideMismatchLogs.fetch_add(1u, std::memory_order_relaxed)
-                                               : 0u;
-            if (logIndex < kMaxFindAddressOverrideLogs ||
-                (mismatch && mismatchIndex < kMaxFindAddressOverrideMismatchLogs))
-            {
-                const uint32_t guestMinus20c = (retV0 != 0u) ? (retV0 - 0x20Cu) : 0u;
-                const uint32_t guestMinus168 = (retV0 != 0u) ? (retV0 - 0x168u) : 0u;
-                const uint32_t builtinMinus20c = (builtinRet != 0u) ? (builtinRet - 0x20Cu) : 0u;
-                const uint32_t builtinMinus168 = (builtinRet != 0u) ? (builtinRet - 0x168u) : 0u;
-
-                PS2_IF_AGRESSIVE_LOGS({
-                    std::cerr << "[Syscall83:override]"
-                              << " handler=0x" << std::hex << handler
-                              << " invoked=" << (invoked ? "true" : "false")
-                              << " pc=0x" << overridePc
-                              << " ra=0x" << overrideRa
-                              << " a0=0x" << overrideA0
-                              << " a1=0x" << overrideA1
-                              << " a2=0x" << overrideA2
-                              << " a3=0x" << overrideA3
-                              << " guestRet=0x" << retV0
-                              << " builtinRet=0x" << builtinRet
-                              << " guest-20c=0x" << guestMinus20c
-                              << " builtin-20c=0x" << builtinMinus20c
-                              << " guest-168=0x" << guestMinus168
-                              << " builtin-168=0x" << builtinMinus168
-                              << " match=" << (mismatch ? "false" : "true")
-                              << std::dec << std::endl;
-                });
-            }
+            g_syscallOverrideLastBranch.store(4u, std::memory_order_relaxed);
         }
 
-        if (!invoked)
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::SyscallOverride;
+        invocation.tag = syscallNumber;
+        invocation.context = *ctx;
+        invocation.context.pc = handler;
+        SET_GPR_U32(&invocation.context, 29, scheduler.invocationStackTop());
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        invocation.onComplete = [](const R5900Context &completed, R5900Context &parent)
         {
-            static std::atomic<uint32_t> s_fallbackLogs{0u};
-            constexpr uint32_t kMaxFallbackLogs = 64u;
-            const uint32_t logIndex = s_fallbackLogs.fetch_add(1u, std::memory_order_relaxed);
-            if (logIndex < kMaxFallbackLogs)
-            {
-                PS2_IF_AGRESSIVE_LOGS({
-                    std::cerr << "[SyscallOverride:fallback]"
-                              << " syscall=0x" << std::hex << syscallNumber
-                              << " handler=0x" << handler
-                              << " pc=0x" << ctx->pc
-                              << " ra=0x" << getRegU32(ctx, 31)
-                              << std::dec << std::endl;
-                });
-            }
-            return false;
-        }
-
-        setReturnU32(ctx, retV0);
+            parent.r[2] = completed.r[2];
+        };
+        scheduler.invokeCurrent(std::move(invocation));
         return true;
     }
 
@@ -683,73 +588,20 @@ namespace ps2_syscalls
         }
     }
 
-    static void seedGuestSyscallTableProbeLocked(uint8_t *rdram)
+    void initializeGuestKernelState(uint8_t *rdram, PS2Runtime *runtime)
     {
-        writeGuestKernelWord(rdram, kGuestSyscallTableProbeBase + 0u, kGuestSyscallTableGuestBase >> 16);
-        writeGuestKernelWord(rdram, kGuestSyscallTableProbeBase + 8u, kGuestSyscallTableGuestBase & 0xFFFFu);
-        g_syscall_mirror_addrs.insert(kGuestSyscallTableProbeBase + 0u);
-        g_syscall_mirror_addrs.insert(kGuestSyscallTableProbeBase + 8u);
-    }
-
-    static void mirrorGuestSyscallEntryLocked(uint8_t *rdram, uint32_t syscallIndex, uint32_t handler)
-    {
-        uint32_t guestAddr = 0u;
-        if (!tryResolveGuestSyscallMirrorAddr(syscallIndex, guestAddr))
+        if (!runtime)
         {
             return;
         }
-
-        writeGuestKernelWord(rdram, guestAddr, handler);
-        if (handler == 0u)
-        {
-            g_syscall_mirror_addrs.erase(guestAddr);
-            return;
-        }
-
-        g_syscall_mirror_addrs.insert(guestAddr);
-    }
-
-    void initializeGuestKernelState(uint8_t *rdram)
-    {
-        if (!rdram)
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(g_syscall_override_mutex);
-        for (uint32_t guestAddr : g_syscall_mirror_addrs)
-        {
-            writeGuestKernelWord(rdram, guestAddr, 0u);
-        }
-        g_syscall_mirror_addrs.clear();
-
-        seedGuestSyscallTableProbeLocked(rdram);
-
-        for (const auto &entry : g_syscall_overrides)
-        {
-            mirrorGuestSyscallEntryLocked(rdram, entry.first, entry.second);
-        }
+        runtime->initializeEeKernelState(rdram);
     }
 
     void SetSyscall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)runtime;
         const uint32_t syscallIndex = getRegU32(ctx, 4);
         const uint32_t handler = getRegU32(ctx, 5);
-
-        {
-            std::lock_guard<std::mutex> lock(g_syscall_override_mutex);
-            if (handler == 0u)
-            {
-                g_syscall_overrides.erase(syscallIndex);
-            }
-            else
-            {
-                g_syscall_overrides[syscallIndex] = handler;
-            }
-
-            mirrorGuestSyscallEntryLocked(rdram, syscallIndex, handler);
-        }
+        runtime->setEeSyscallOverride(rdram, syscallIndex, handler);
 
         setReturnS32(ctx, 0);
     }
@@ -762,6 +614,8 @@ namespace ps2_syscalls
         const uint32_t stack = getRegU32(ctx, 5);
         const int32_t stackSizeSigned = static_cast<int32_t>(getRegU32(ctx, 6));
         const uint32_t currentSp = getRegU32(ctx, 29);
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.bindMainContextForSyscall(*ctx, rdram);
 
         if (gp != 0u)
         {
@@ -769,6 +623,10 @@ namespace ps2_syscalls
         }
 
         uint32_t sp = currentSp;
+        uint32_t initialStack = 0u;
+        const uint32_t stackSize = stackSizeSigned > 0
+                                       ? static_cast<uint32_t>(stackSizeSigned)
+                                       : 0u;
         if (stack == 0xFFFFFFFFu)
         {
             if (stackSizeSigned > 0)
@@ -801,6 +659,16 @@ namespace ps2_syscalls
         }
 
         sp &= ~0xFu;
+        if (stack == 0xFFFFFFFFu)
+        {
+            initialStack = sp;
+        }
+        else if (stack != 0u)
+        {
+            initialStack = stack;
+        }
+
+        scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
         setReturnU32(ctx, sp);
     }
 
@@ -813,7 +681,8 @@ namespace ps2_syscalls
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        // Ends at the runtime kernel pools (kRpcPacketPoolBase).
+        static constexpr uint32_t kDefaultGuestHeapEnd = kRpcPacketPoolBase;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
@@ -853,7 +722,7 @@ namespace ps2_syscalls
     {
         (void)rdram;
 
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        static constexpr uint32_t kDefaultGuestHeapEnd = kRpcPacketPoolBase;
 
         const uint32_t ret = runtime
                                  ? runtime->guestHeapLimit()
@@ -891,38 +760,6 @@ namespace ps2_syscalls
         ctx->cop0_entryhi = 0u;
 
         setReturnS32(ctx, KE_OK);
-    }
-
-    static uint32_t computeBuiltinFindAddressResult(uint8_t *rdram,
-                                                    uint32_t originalStart,
-                                                    uint32_t originalEnd,
-                                                    uint32_t target)
-    {
-        uint32_t start = (originalStart + 3u) & ~0x3u;
-        uint32_t end = originalEnd & ~0x3u;
-        if (start >= end)
-        {
-            return 0u;
-        }
-
-        const uint32_t targetNorm = normalizeKernelAlias(target);
-        for (uint32_t addr = start; addr < end; addr += sizeof(uint32_t))
-        {
-            const uint8_t *entryPtr = getConstMemPtr(rdram, addr);
-            if (!entryPtr)
-            {
-                break;
-            }
-
-            uint32_t entry = 0u;
-            std::memcpy(&entry, entryPtr, sizeof(entry));
-            if (entry == target || normalizeKernelAlias(entry) == targetNorm)
-            {
-                return addr;
-            }
-        }
-
-        return 0u;
     }
 
     struct FindAddressWordSample
@@ -1044,11 +881,28 @@ namespace ps2_syscalls
 #endif
     }
 
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28):
+    // the project's own syscall reference (db-syscalls.md) documents the real
+    // BIOS FindAddress as a single-argument call ("a0=id" -> "$v0=addr"), which
+    // contradicts the 3-register (start,end,target) scan below. A live run
+    // showed a0=0x3 (id-shaped, not pointer-shaped) with a1/a2 holding what
+    // looks like leftover register content, driving a scan toward end=0x80080000.
+    // These externally-linked atomics (no header touched; extern'd from
+    // ps2_runtime.cpp same as ps2x_srd_stat_tick() above) capture what the scan
+    // actually does on each call, so the next watchdog line can confirm or kill
+    // the "this is a multi-hundred-million-word scan, not a quick id lookup"
+    // hypothesis without guessing.
+    std::atomic<uint32_t> g_findAddressCallCount{0u};
+    std::atomic<uint32_t> g_findAddressLastScannedWords{0u};
+    std::atomic<uint32_t> g_findAddressLastResult{0u};
+    std::atomic<uint32_t> g_findAddressLastAborted{0u};
+
     // 0x83 FindAddress:
     // - a0: table start (inclusive)
     // - a1: table end (exclusive)
     // - a2: target address to locate inside the table (word entries)
     // Returns the guest address of the matching word entry, or 0 if not found.
+    // ⚠️ UNVERIFIED against real hardware -- see the diagnostic comment above.
     void FindAddress(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)runtime;
@@ -1090,6 +944,10 @@ namespace ps2_syscalls
                                       0u,
                                       nullptr,
                                       0u);
+            g_findAddressCallCount.fetch_add(1u, std::memory_order_relaxed);
+            g_findAddressLastScannedWords.store(0u, std::memory_order_relaxed);
+            g_findAddressLastResult.store(0u, std::memory_order_relaxed);
+            g_findAddressLastAborted.store(0u, std::memory_order_relaxed);
             setReturnU32(ctx, 0u);
             return;
         }
@@ -1171,6 +1029,11 @@ namespace ps2_syscalls
                                   matches,
                                   matchCount);
 
+        g_findAddressCallCount.fetch_add(1u, std::memory_order_relaxed);
+        g_findAddressLastScannedWords.store(scannedWords, std::memory_order_relaxed);
+        g_findAddressLastResult.store(resultAddr, std::memory_order_relaxed);
+        g_findAddressLastAborted.store(aborted ? 1u : 0u, std::memory_order_relaxed);
+
         setReturnU32(ctx, resultAddr);
     }
 
@@ -1192,7 +1055,9 @@ namespace ps2_syscalls
     // GetThreadTLS (stub): return 0
     void GetThreadTLS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        auto info = ensureCurrentThreadInfo(ctx);
+        EeScheduler &ee = runtime->eeScheduler();
+        ee.bindMainContextForSyscall(*ctx, rdram);
+        GuestThread *info = ee.currentThread();
         if (!info)
         {
             setReturnU32(ctx, 0);
@@ -1219,6 +1084,7 @@ namespace ps2_syscalls
             const uint8_t *srcPtr = getConstMemPtr(rdram, src);
             if (destPtr && srcPtr)
             {
+                ps2TraceGuestRangeWrite(rdram, dest, size, "syscallCopy", ctx);
                 std::memcpy(destPtr, srcPtr, size);
             }
         }
@@ -1249,11 +1115,10 @@ namespace ps2_syscalls
             return;
         }
 
-        int tid = g_currentThreadId;
-        {
-            std::lock_guard<std::mutex> lock(g_exit_handler_mutex);
-            g_exit_handlers[tid].push_back({func, arg});
-        }
+        EeScheduler &ee = runtime->eeScheduler();
+        ee.bindMainContextForSyscall(*ctx, rdram);
+        const int tid = ee.currentThreadId();
+        runtime->addEeExitHandler(tid, func, arg);
 
         setReturnS32(ctx, 0);
     }

@@ -25,6 +25,16 @@ param(
     # naming the functions the host is actually burning CPU in. Not $Profile --
     # that is a PowerShell automatic variable.
     [switch]$HostProfile,
+    # Fight-run workload preset: Cross-only autopress (Start would open the fight
+    # pause menu), quantum 3000, DIAG off. Reaches a live fight at t~140..205, so
+    # pair with -RunSeconds 206 and PS2X_PROFILE_START=145 for a profile.
+    [switch]$Fight,
+    # REAL-fight perf measurement in one command (-Fight is the attract demo).
+    # Pad script perf_fight.txt starts an Original-mode fight; implies
+    # -NoDebugger -HostProfile, RunSeconds 320, RelWithDebInfo exe (unless -Exe
+    # given), then prints `perf_summary.py --fight` (median vbl/s over seconds
+    # with fight-level VU1 load).
+    [switch]$PerfFight,
     # Arm the DR0 hardware watchpoint on the rpc_call saved-$ra slot. Off by
     # default since 2026-07-28 -- it costs ~20% of the run's CPU. Turn it on
     # only when hunting a memory writer, never during a perf measurement.
@@ -35,6 +45,9 @@ param(
     # looked like a result. See the -Watch block below for what each address is.
     [switch]$Watch,
     [switch]$Full,   # show EVERY console line (default: only important lines below)
+    # ps2EntryRunner samples textures with point filtering by default (no bilinear
+    # interpolation). -Bilinear sets PS2X_GS_NEAREST=0 = PCSX2-exact bilinear.
+    [switch]$Bilinear,
     # Auto-stop the runner after N seconds so every diagnostic run is the same
     # length and comparable. 0 = run until closed by hand. 60 is the current
     # standard: steady state is established by t=8s and the early stall lands at
@@ -88,6 +101,26 @@ if ($Repeat -gt 1) {
     if (Test-Path -LiteralPath $analyzer) { & python $analyzer --runs }
     else { Write-Warning "analyze_run.py not found at $analyzer" }
     return
+}
+
+# --- -PerfFight preset ----------------------------------------------------------
+# Every setting a real-fight measurement needs, so none is forgotten by hand.
+# AUTOPRESS must be CLEARED: it fights the pad script and lands in the attract demo.
+if ($PerfFight) {
+    if (-not $PSBoundParameters.ContainsKey('Exe')) {
+        $Exe = "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+    }
+    if ($RunSeconds -le 0) { $RunSeconds = 320 }
+    $NoDebugger = [switch]$true
+    $HostProfile = [switch]$true
+    Remove-Item Env:PS2X_PAD_AUTOPRESS* -ErrorAction SilentlyContinue
+    $env:PS2X_DIAG = '0'
+    $env:PS2X_DET_VBLANK_QUANTUM = '3000'
+    $env:PS2X_PAD_SCRIPT = Join-Path (Split-Path -Parent $PSCommandPath) 'build_scripts\sweeps\perf_fight.txt'
+    $env:PS2X_PROFILE_GATE = '1'
+    $env:PS2X_PROFILE_START = '0'
+    $env:PS2X_P5A = '1'   # [p5a] VU1-thread go/no-go counters (measure only)
+    Write-Host "[launch_recomp] -PerfFight: perf_fight.txt pad script, ${RunSeconds}s, quantum 3000, DIAG=0, profile gate on, P5A counters, exe=$Exe" -ForegroundColor Cyan
 }
 
 # --- Tracers -----------------------------------------------------------------
@@ -156,6 +189,8 @@ $Tracers = @{
     PS2X_DET_VBLANK_QUANTUM = if ($env:PS2X_DET_VBLANK_QUANTUM) { $env:PS2X_DET_VBLANK_QUANTUM } else { 20000 }
 }
 foreach ($k in $Tracers.Keys) { Set-Item -Path "Env:$k" -Value $Tracers[$k] }
+if ($Bilinear) { $env:PS2X_GS_NEAREST = '0' }
+Write-Host "[launch_recomp] texture filter: PS2X_GS_NEAREST=$(if ($env:PS2X_GS_NEAREST) { $env:PS2X_GS_NEAREST } else { 'unset (exe defaults to 1 unless capturing)' })" -ForegroundColor Cyan
 
 # Set outside $Tracers because it is a path, not a 0/1 knob. The runtime
 # truncates this file at open, so each run owns its sink -- appending is how
@@ -219,6 +254,19 @@ if (-not $NoDebugger) {
     # Must clear, not just skip: env vars persist across runs in the same shell.
     Remove-Item Env:PS2X_DEBUGSHM -ErrorAction SilentlyContinue
     Write-Host "[launch_recomp] -NoDebugger: debug shm writer disabled (PS2X_DEBUGSHM unset)" -ForegroundColor DarkGray
+}
+
+if ($Fight) {
+    $env:PS2X_DIAG = '0'
+    $env:PS2X_PAD_AUTOPRESS = '120'
+    $env:PS2X_PAD_AUTOPRESS_BTNS = 'X'
+    $env:PS2X_PAD_AUTOPRESS_HOLD = '20'
+    $env:PS2X_DET_VBLANK_QUANTUM = '3000'
+    if (-not $env:PS2X_PROFILE_START) { $env:PS2X_PROFILE_START = '145' }
+    # Fight arrival time varies run to run; the gate keeps only seconds with
+    # fight-level VU1 load (>= 5 ms/vbl), so menus between fights drop out.
+    if (-not $env:PS2X_PROFILE_GATE) { $env:PS2X_PROFILE_GATE = '1' }
+    Write-Host "[launch_recomp] -Fight: X-only autopress, quantum 3000, DIAG=0, PROFILE_START=$($env:PS2X_PROFILE_START) GATE=$($env:PS2X_PROFILE_GATE)" -ForegroundColor Cyan
 }
 
 # Host CPU sampling profiler (src/lib/Kernel/HostSampler.cpp). Same env-directly
@@ -679,5 +727,11 @@ if (Test-Path $Log) {
         Write-Host '  ############################################################' -ForegroundColor Red
     } else {
         Write-Host "[validity] run passes the validity gate (SREG mirrored$(if ($Watch) { ', watches armed' }), no capped probes)." -ForegroundColor Green
+    }
+
+    if ($PerfFight) {
+        Write-Host ''
+        $summary = Join-Path (Split-Path -Parent $PSCommandPath) 'build_scripts\perf_summary.py'
+        & python $summary --fight $Log
     }
 }

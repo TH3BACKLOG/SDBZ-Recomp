@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <functional>
 #include <vector>
 #include <unordered_map>
@@ -204,20 +205,14 @@ struct GSRegisters
     uint64_t extdata;  // External data
     uint64_t extwrite; // External write
     uint64_t bgcolor;  // Background color
-    // Status. Concurrency contract: the vsync worker thread toggles the FIELD bit
-    // (bit 13) once per tick; guest threads issue write-one-to-clear writes against
-    // the SIGNAL/FINISH status bits (0..1) via the MMIO path; the GIF sets SIGNAL
-    // and FINISH from yet another thread. All three interleave, so this register
-    // must be updated with atomic RMWs only (no load-then-store pairs anywhere).
     std::atomic<uint64_t> csr;
+    std::atomic<uint64_t> vsyncTick;
     uint64_t imr;      // Interrupt mask
     uint64_t busdir;   // Bus direction
     uint64_t siglblid; // Signal label ID
 };
-static_assert(sizeof(GSRegisters) == (19u * sizeof(uint64_t)), "GSRegisters layout changed unexpectedly");
+static_assert(sizeof(GSRegisters) == (20u * sizeof(uint64_t)), "GSRegisters layout changed unexpectedly");
 static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
-// CSR is written by the vsync worker while guest threads concurrently read/write it
-// (MMIO) and the GIF sets SIGNAL/FINISH; a lock-free atomic keeps that path wait-free.
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
 
 // PS2 VIF (VPU Interface) registers
@@ -308,6 +303,7 @@ public:
     uint64_t gifCopyCount() const { return m_gifCopyCount.load(std::memory_order_relaxed); }
     uint64_t gsWriteCount() const { return m_gsWriteCount.load(std::memory_order_relaxed); }
     uint64_t vifWriteCount() const { return m_vifWriteCount.load(std::memory_order_relaxed); }
+    uint64_t getVU0CodeGeneration() const { return m_vu0CodeGeneration.load(std::memory_order_relaxed); }
     uint64_t getVU1CodeGeneration() const { return m_vu1CodeGeneration.load(std::memory_order_relaxed); }
 
     // Read/write memory
@@ -339,6 +335,12 @@ public:
     // The target word is pre-seeded at init so this only ever assigns to an
     // existing map node (no rehash/insert racing the guest read).
     void orIORegister(uint32_t address, uint32_t bits);
+
+    // EE timers advance from the scheduler's emulated EE-cycle clock. The
+    // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
+    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+    [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
+    void resetEeTimers() noexcept;
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
@@ -401,6 +403,7 @@ public:
     std::atomic<uint64_t> m_gifCopyCount{0};
     std::atomic<uint64_t> m_gsWriteCount{0};
     std::atomic<uint64_t> m_vifWriteCount{0};
+    std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
     std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
@@ -460,14 +463,24 @@ public:
 
     bool isAddressInRegion(uint32_t address, const CodeRegion &region);
     void markModified(uint32_t address, uint32_t size);
+    void markVU0CodeModified() { m_vu0CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;
-    void updateEeTimerCounter(unsigned timerIndex);
+    struct EeTimer
+    {
+        uint32_t count = 0;
+        uint32_t mode = 0;
+        uint32_t compare = 0;
+        uint32_t hold = 0;
+        uint64_t clockRemainder = 0;
+    };
+
+    std::array<EeTimer, 4> m_eeTimers{};
+    bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+    void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
-    uint64_t m_timerLastHostNs[4] = {0, 0, 0, 0};
-    uint64_t m_timerFractionNs[4] = {0, 0, 0, 0};
 };
 
 #endif // PS2_MEMORY_H

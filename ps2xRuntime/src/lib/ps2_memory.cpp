@@ -5,15 +5,30 @@
 #include "runtime/ps2_diag.h"
 #include "Kernel/Ipu/ps2_ipu_core.h"
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
+#include <chrono>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include "ThreadNaming.h"
+#include "Kernel/VuCap/VuCapRecorder.h"
+
+void ps2xGsThreadSync(uint32_t reason); // ps2_gif_arbiter.cpp
+bool ps2xGsThreadEnabled();             // ps2_gif_arbiter.cpp
+extern "C" void ps2x_ee_wait_enter();   // ps2_gif_arbiter.cpp (deterministic pacer flag)
+extern "C" void ps2x_ee_wait_leave();
+extern "C" void ps2x_vuw_sync_ee(int reason) noexcept; // defined below ([vuw])
 
 // ---- [chainord] -- Stage 5.11 run 33 ------------------------------------
 // PCSX2 ground truth (2026-08-09, game paused on the memory-card dialog):
@@ -71,6 +86,293 @@ uint32_t resolveSrc(uint32_t pos)
     return 0xFFFFFFFFu;
 }
 }
+// -------------------------------------------------------------------------
+
+// ---- [p5a] -- 10-09 P5 go/no-go counters (docs/perf/P5_VU1_THREAD_DESIGN.md)
+// Measure only, PS2X_P5A=1. Counts the EE observations a VU1 worker thread
+// would have to sync on (S2 VIF1 regs, S4 VPU_STAT readers, S5 GS syncs) and
+// splits each frame into EE time inside VIF1 kicks vs outside them.
+// Slots: 0 vif1 reg reads, 1 vif1 reg writes, 2 D1 kicks, 3 ns inside D1 kicks,
+// 4 ns vblank->vblank, 5 ns last kick end->vblank, 6 vblanks, 7 GS syncs,
+// 8..10 calls of the VPU_STAT readers 0x172278 / 0x1731e0 / 0x1733e0.
+namespace
+{
+constexpr int kP5aSlots = 11;
+std::atomic<uint64_t> g_p5a[kP5aSlots];
+uint64_t g_p5aLastVblNs = 0;     // EE thread only
+uint64_t g_p5aLastKickEndNs = 0; // EE thread only
+
+bool p5aOn()
+{
+    static const bool on = []
+    {
+        const char *e = std::getenv("PS2X_P5A");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+uint64_t p5aNowNs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+}
+
+extern "C" void ps2x_p5a_bump(int slot) noexcept
+{
+    if (p5aOn() && slot >= 0 && slot < kP5aSlots)
+        g_p5a[slot].fetch_add(1u, std::memory_order_relaxed);
+}
+
+extern "C" int ps2x_p5a_enabled() noexcept { return p5aOn() ? 1 : 0; }
+
+// EE thread, at every vblank (ps2xGsThreadVblank entry).
+extern "C" void ps2x_p5a_vblank() noexcept
+{
+    if (!p5aOn())
+        return;
+    const uint64_t now = p5aNowNs();
+    if (g_p5aLastVblNs != 0u)
+    {
+        g_p5a[4].fetch_add(now - g_p5aLastVblNs, std::memory_order_relaxed);
+        if (g_p5aLastKickEndNs > g_p5aLastVblNs)
+            g_p5a[5].fetch_add(now - g_p5aLastKickEndNs, std::memory_order_relaxed);
+        g_p5a[6].fetch_add(1u, std::memory_order_relaxed);
+    }
+    g_p5aLastVblNs = now;
+}
+
+extern "C" void ps2x_p5a_counts(uint64_t *out, int n) noexcept
+{
+    for (int i = 0; i < n && i < kP5aSlots; ++i)
+        out[i] = g_p5a[i].load(std::memory_order_relaxed);
+}
+// -------------------------------------------------------------------------
+
+// ---- [vuw] -- P5b: VIF1 + VU1 + GIF submission on a worker thread ----------
+// docs/perf/P5_VU1_THREAD_DESIGN.md. PS2X_VU1_THREAD=1 (default off). The EE
+// thread still gathers each DMA chain and reports "DMA done" exactly as before;
+// the work that followed (processVIF1Data, the VU1 run, PATH1/2/3 GIF packets,
+// the arbiter drain, the vblank marker) runs on this thread, in kick order.
+// Anything on the EE side that can observe that state calls ps2x_vuw_sync_ee()
+// first, which waits until the worker is idle. State owned by the worker while
+// it is active: vif1_regs, VU1 code/data, m_path3Masked(+Fifo), the arbiter.
+// Reason slots for the stats: 0 other, 1 VIF1/GIF regs, 2 GIF entry points,
+// 3 VU memory / VIF entry points, 4 GS sync, 5 inline fallback, 6 backpressure.
+namespace
+{
+constexpr uint32_t kVuwMaxJobs = 8u;
+constexpr int kVuwReasons = 8;
+
+struct VuWorker
+{
+    std::mutex m;
+    std::condition_variable cvWork;
+    std::condition_variable cvIdle;
+    std::deque<std::function<void()>> jobs;
+    std::atomic<uint32_t> inFlight{0}; // queued + running
+    bool stop = false;
+    std::thread th;
+    bool stats = false;
+    std::atomic<uint64_t> jobsDone{0};
+    std::atomic<uint64_t> busyNs{0};
+    std::atomic<uint64_t> syncCalls[kVuwReasons];
+    std::atomic<uint64_t> syncWaits[kVuwReasons];
+    std::atomic<uint64_t> syncNs[kVuwReasons];
+    std::chrono::steady_clock::time_point lastPrint = std::chrono::steady_clock::now();
+};
+
+VuWorker *g_vuw = nullptr;            // never deleted
+std::atomic<bool> g_vuwActive{false}; // worker running and accepting jobs
+thread_local bool t_vuwIsWorker = false;
+thread_local bool t_vuwKick = false;    // set around processPendingTransfers() from a CHCR store
+std::function<bool()> g_vuwKickPrepare; // ps2_runtime.cpp: false if D/T bits are enabled
+std::mutex g_vuwRetMutex;
+std::vector<std::vector<uint8_t>> g_vuwRetPool; // chain buffers the worker is done with
+
+bool vuwEnvOn()
+{
+    static const bool on = []
+    {
+        const char *e = std::getenv("PS2X_VU1_THREAD");
+        if (!e || !*e || *e == '0')
+            return false;
+        const char *r = std::getenv("PS2X_VU1_RECOMP"); // 2 = verify mode, needs the EE thread
+        if (r && *r == '2')
+            return false;
+        const char *c = std::getenv("PS2X_VUCAP");
+        return !(c && *c && *c != '0');
+    }();
+    return on;
+}
+
+uint64_t vuwNowNs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
+
+void vuwPrint(VuWorker &w)
+{
+    std::printf("[vuw] jobs=%llu busyMs=%.1f", (unsigned long long)w.jobsDone.load(),
+                w.busyNs.load() / 1e6);
+    for (int r = 0; r < kVuwReasons; ++r)
+    {
+        const uint64_t c = w.syncCalls[r].load(std::memory_order_relaxed);
+        if (c)
+            std::printf(" r%d=%llu/%llu/%.1fms", r, (unsigned long long)c,
+                        (unsigned long long)w.syncWaits[r].load(std::memory_order_relaxed),
+                        w.syncNs[r].load(std::memory_order_relaxed) / 1e6);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
+void vuwRun(VuWorker *w)
+{
+    ThreadNaming::SetCurrentThreadName("VuWorker");
+    t_vuwIsWorker = true;
+    std::unique_lock<std::mutex> lock(w->m);
+    for (;;)
+    {
+        w->cvWork.wait(lock, [w] { return w->stop || !w->jobs.empty(); });
+        if (w->jobs.empty() && w->stop)
+            return;
+        std::function<void()> job = std::move(w->jobs.front());
+        w->jobs.pop_front();
+        lock.unlock();
+        const uint64_t t0 = vuwNowNs();
+        try
+        {
+            job();
+        }
+        catch (...)
+        {
+            static std::atomic<int> s_errs{0};
+            if (s_errs.fetch_add(1) < 4)
+                std::fprintf(stderr, "[vuw] job threw (ignored)\n");
+        }
+        job = nullptr; // release captured buffers outside the lock
+        w->busyNs.fetch_add(vuwNowNs() - t0, std::memory_order_relaxed);
+        w->jobsDone.fetch_add(1u, std::memory_order_relaxed);
+        if (w->stats && std::chrono::steady_clock::now() - w->lastPrint >= std::chrono::seconds(2))
+        {
+            w->lastPrint = std::chrono::steady_clock::now();
+            vuwPrint(*w);
+        }
+        lock.lock();
+        w->inFlight.fetch_sub(1u, std::memory_order_acq_rel);
+        w->cvIdle.notify_all();
+    }
+}
+
+VuWorker *vuwStartOnce()
+{
+    static std::mutex startMutex;
+    std::lock_guard<std::mutex> g(startMutex);
+    if (!g_vuw)
+    {
+        VuWorker *w = new VuWorker();
+        for (int i = 0; i < kVuwReasons; ++i)
+        {
+            w->syncCalls[i] = 0;
+            w->syncWaits[i] = 0;
+            w->syncNs[i] = 0;
+        }
+        const char *s = std::getenv("PS2X_GS_THREAD_STATS");
+        w->stats = (s && *s && *s != '0') || p5aOn();
+        w->th = std::thread(vuwRun, w);
+        g_vuw = w;
+        g_vuwActive.store(true, std::memory_order_release);
+        std::printf("[vuw] VIF1+VU1+GIF submit run on a worker thread (PS2X_VU1_THREAD=1)\n");
+    }
+    return g_vuw;
+}
+
+void vuwWaitIdle(VuWorker &w, int reason)
+{
+    w.syncCalls[reason].fetch_add(1u, std::memory_order_relaxed);
+    if (w.inFlight.load(std::memory_order_acquire) == 0u)
+        return;
+    const uint64_t t0 = vuwNowNs();
+    ps2x_ee_wait_enter();
+    {
+        std::unique_lock<std::mutex> lock(w.m);
+        w.cvIdle.wait(lock, [&w] { return w.inFlight.load(std::memory_order_acquire) == 0u; });
+    }
+    ps2x_ee_wait_leave();
+    w.syncWaits[reason].fetch_add(1u, std::memory_order_relaxed);
+    w.syncNs[reason].fetch_add(vuwNowNs() - t0, std::memory_order_relaxed);
+}
+}
+
+// EE side: wait until the worker has finished everything queued. No-op when
+// the worker is not running or on the worker itself.
+extern "C" void ps2x_vuw_sync_ee(int reason) noexcept
+{
+    if (!g_vuwActive.load(std::memory_order_acquire) || t_vuwIsWorker)
+        return;
+    vuwWaitIdle(*g_vuw, (reason >= 0 && reason < kVuwReasons) ? reason : 0);
+}
+
+extern "C" int ps2x_vuw_on_worker() noexcept { return t_vuwIsWorker ? 1 : 0; }
+
+bool ps2xVuwActive() { return g_vuwActive.load(std::memory_order_acquire); }
+
+// Queue a job; runs it inline when the worker is gone (shutdown).
+void ps2xVuwEnqueue(std::function<void()> fn)
+{
+    VuWorker *w = g_vuw;
+    if (!w || !g_vuwActive.load(std::memory_order_acquire))
+    {
+        fn();
+        return;
+    }
+    std::unique_lock<std::mutex> lock(w->m);
+    if (w->stop)
+    {
+        lock.unlock();
+        fn();
+        return;
+    }
+    if (w->inFlight.load(std::memory_order_acquire) >= kVuwMaxJobs && !t_vuwIsWorker)
+    {
+        const uint64_t t0 = vuwNowNs();
+        w->syncCalls[6].fetch_add(1u, std::memory_order_relaxed);
+        ps2x_ee_wait_enter();
+        w->cvIdle.wait(lock, [w] { return w->stop || w->inFlight.load(std::memory_order_acquire) < kVuwMaxJobs; });
+        ps2x_ee_wait_leave();
+        w->syncWaits[6].fetch_add(1u, std::memory_order_relaxed);
+        w->syncNs[6].fetch_add(vuwNowNs() - t0, std::memory_order_relaxed);
+    }
+    w->jobs.push_back(std::move(fn));
+    w->inFlight.fetch_add(1u, std::memory_order_acq_rel);
+    lock.unlock();
+    w->cvWork.notify_one();
+}
+
+// Finish queued work, stop and join. Called before the GS thread stops.
+void ps2xVuwStop()
+{
+    VuWorker *w = g_vuw;
+    if (!w || !g_vuwActive.load(std::memory_order_acquire) || t_vuwIsWorker)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(w->m);
+        w->stop = true;
+    }
+    w->cvWork.notify_one();
+    if (w->th.joinable())
+        w->th.join();
+    g_vuwActive.store(false, std::memory_order_release);
+    if (w->stats)
+        vuwPrint(*w);
+}
+
+void ps2xVuwSetKickPrepare(std::function<bool()> fn) { g_vuwKickPrepare = std::move(fn); }
 // -------------------------------------------------------------------------
 
 namespace
@@ -234,6 +536,31 @@ namespace
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
 
+    // GS runs on its own thread (ps2_gif_arbiter.cpp). SIGLBLID is written by
+    // the GS, so wait for queued packets before the game touches it.
+    //
+    // CSR does NOT wait by default. The GS only sets SIGNAL/FINISH (bits 0-1),
+    // and SDBZ never reads those: its CSR reads are FIELD (bit 13, set by the
+    // scheduler) in 0x102870 / 0x104c00 and the revision byte in 0x171fd8;
+    // its writes clear FINISH (0x102870/0x102a60/0x1030c0) or reset. Waiting
+    // on every CSR read cost ~47 ms per frame (1 read per frame, 09-27 run).
+    // PS2X_GS_THREAD_CSR_SYNC=1 restores the wait.
+    inline void syncGsThreadForPrivReg(uint32_t regOff)
+    {
+        static const bool csrSync = []
+        {
+            const char *v = std::getenv("PS2X_GS_THREAD_CSR_SYNC");
+            return v && v[0] == '1';
+        }();
+        if (regOff == kGsCsrRegOffset)
+        {
+            if (csrSync)
+                ps2xGsThreadSync(1u);
+        }
+        else if (regOff == 0x1080u)
+            ps2xGsThreadSync(2u);
+    }
+
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
     // write-one-to-clear; everything else is a plain merge. Uses compare_exchange
@@ -276,35 +603,89 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    constexpr uint32_t kEeTimerBase[4] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+    constexpr std::array<uint32_t, 4> kEeTimerBases = {
+        0x10000000u,
+        0x10000800u,
+        0x10001000u,
+        0x10001800u,
+    };
+    constexpr uint32_t kEeTimerCountOffset = 0x00u;
     constexpr uint32_t kEeTimerModeOffset = 0x10u;
     constexpr uint32_t kEeTimerCompareOffset = 0x20u;
     constexpr uint32_t kEeTimerHoldOffset = 0x30u;
+    constexpr uint32_t kEeTimerModeClksMask = 0x3u;
+    constexpr uint32_t kEeTimerModeConfigMask = 0x3FFu;
+    constexpr uint32_t kEeTimerModeStatusMask = 0xC00u;
+    constexpr uint32_t kEeTimerModeZret = 1u << 6;
     constexpr uint32_t kEeTimerModeCue = 1u << 7;
-    // BUSCLK-gated tick rate. T0/T1 have a HBLANK clock-select option (MODE.CLKS) that this
-    // model does not distinguish; all four timers use the same CUE-gated rate as the
-    // pre-existing Timer0 fix, which is sufficient to unstick guest CUE-gated wait loops.
-    constexpr uint64_t kEeTimerTicksPerSecond = 15720ull;
-    constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
+    constexpr uint32_t kEeTimerModeCmpe = 1u << 8;
+    constexpr uint32_t kEeTimerModeOvfe = 1u << 9;
+    constexpr uint32_t kEeTimerModeEquf = 1u << 10;
+    constexpr uint32_t kEeTimerModeOvff = 1u << 11;
+    constexpr uint64_t kEeClockHz = 294912000ull;
 
-    inline int eeTimerIndexForAddress(uint32_t address)
+    // Bumped whenever m_ioRegisters is cleared. advanceEeTimers runs on every
+    // accountCycles() and its GIF_STAT unordered_map lookup (hash + probe) was
+    // ~3% of the fight game thread on its own (Part 165 profile); it caches the
+    // node pointer (stable across rehash) and re-finds only after a clear.
+    uint64_t g_ioRegistersGeneration = 0u;
+
+    // EE timer batching. advanceEeTimers runs on every accountCycles() with a
+    // handful of cycles; its per-timer tick math was ~7% of the fight game
+    // thread. Cycles now accumulate in `pending` and the timers only step when
+    // pending reaches `flushAt` (= cyclesUntilNextEeTimerInterrupt() at the
+    // last step, exact: a ceiling of the same tick formula) or when the guest
+    // touches a timer register. The tick math carries its remainder, so one
+    // step of N cycles equals N steps of 1, and an interrupt is raised on the
+    // same accountCycles() call as before. A global (not a member) because the
+    // member layout lives in ps2_memory.h; keyed to the owning PS2Memory.
+    // EeScheduler::accountCycles() repeats the no-step test inline (same
+    // struct, declared there) so the common case skips the call entirely.
+    // gifFqcDirty: GIF_STAT.FQC may be nonzero, so the next accountCycles()
+    // must come through here to clear it (as it did on every call before).
+}
+struct Ps2xEeTimerBatch
+{
+    const PS2Memory *owner = nullptr;
+    uint64_t pending = 0u;
+    uint64_t flushAt = 0u;
+    bool gifFqcDirty = true;
+};
+Ps2xEeTimerBatch g_ps2xEeTimerBatch;
+namespace
+{
+    using EeTimerBatch = Ps2xEeTimerBatch;
+    EeTimerBatch &g_eeTimerBatch = g_ps2xEeTimerBatch;
+
+    constexpr std::array<uint64_t, 4> kEeTimerClockHz = {
+        147456000ull,
+        9216000ull,
+        576000ull,
+        15734ull,
+    };
+
+    inline bool decodeEeTimerRegister(uint32_t address, size_t &timerIndex, uint32_t &offset)
     {
-        for (int i = 0; i < 4; ++i)
+        for (size_t index = 0; index < kEeTimerBases.size(); ++index)
         {
-            const uint32_t base = kEeTimerBase[i];
-            if (address == base || address == base + kEeTimerModeOffset ||
-                address == base + kEeTimerCompareOffset || address == base + kEeTimerHoldOffset)
+            const uint32_t candidateOffset = address - kEeTimerBases[index];
+            if (candidateOffset == kEeTimerCountOffset ||
+                candidateOffset == kEeTimerModeOffset ||
+                candidateOffset == kEeTimerCompareOffset ||
+                (index < 2u && candidateOffset == kEeTimerHoldOffset))
             {
-                return i;
+                timerIndex = index;
+                offset = candidateOffset;
+                return true;
             }
         }
-        return -1;
+        return false;
     }
 
-    inline uint64_t steadyClockNs()
+    constexpr uint64_t ticksUntilMatch(uint32_t count, uint32_t target)
     {
-        using namespace std::chrono;
-        return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+        const uint32_t distance = (target - count) & 0xFFFFu;
+        return distance == 0u ? 0x10000ull : static_cast<uint64_t>(distance);
     }
 
     struct DmaTagView
@@ -343,6 +724,49 @@ namespace
         return nreg == 0u ? 16u : nreg;
     }
 
+    // 10-09 perf: DMA chain gather buffers (chainBuf -> PendingTransfer::chainData)
+    // are reused. A fresh vector per chain grew by reallocation and was freed
+    // back to the OS when the transfer was done: ~4-8% of the fight game thread
+    // in memcpy, page faults and NtFreeVirtualMemory. Per thread, as the queues.
+    thread_local std::vector<std::vector<uint8_t>> t_chainBufPool;
+
+    std::vector<uint8_t> takeChainBuf()
+    {
+        if (t_chainBufPool.empty() && g_vuwActive.load(std::memory_order_relaxed))
+        {
+            // The VU worker hands consumed buffers back here (P5b).
+            std::lock_guard<std::mutex> lock(g_vuwRetMutex);
+            while (!g_vuwRetPool.empty() && t_chainBufPool.size() < 8u)
+            {
+                t_chainBufPool.push_back(std::move(g_vuwRetPool.back()));
+                g_vuwRetPool.pop_back();
+            }
+        }
+        if (t_chainBufPool.empty())
+            return {};
+        std::vector<uint8_t> buf = std::move(t_chainBufPool.back());
+        t_chainBufPool.pop_back();
+        buf.clear();
+        return buf;
+    }
+
+    // Call right before the queue is cleared; every packet in it was consumed.
+    template <typename Queue>
+    void recycleChainBufs(Queue &queue)
+    {
+        if (t_vuwIsWorker)
+        {
+            std::lock_guard<std::mutex> lock(g_vuwRetMutex);
+            for (auto &p : queue)
+                if (p.chainData.capacity() != 0u && g_vuwRetPool.size() < 16u)
+                    g_vuwRetPool.push_back(std::move(p.chainData));
+            return;
+        }
+        for (auto &p : queue)
+            if (p.chainData.capacity() != 0u && t_chainBufPool.size() < 8u)
+                t_chainBufPool.push_back(std::move(p.chainData));
+    }
+
 }
 
 // Helpers for GS VRAM addressing (PSMCT32 path).
@@ -361,6 +785,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    ps2x_vuw_sync_ee(0); // the worker holds jobs that point at this object
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -446,11 +871,7 @@ bool PS2Memory::initialize(size_t ramSize)
     m_path3MaskedFifo.clear();
     m_vif1PendingPath2ImageQwc = 0u;
     m_vif1PendingPath2DirectHl = false;
-    for (int i = 0; i < 4; ++i)
-    {
-        m_timerLastHostNs[i] = 0;
-        m_timerFractionNs[i] = 0;
-    }
+    resetEeTimers();
 
     try
     {
@@ -474,6 +895,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        ++g_ioRegistersGeneration; // invalidates advanceEeTimers' cached GIF_STAT node
 
         // Pre-seed INTC_STAT so the vsync worker's orIORegister() only ever
         // assigns to an existing node — no rehash/insert can race the guest
@@ -503,6 +925,7 @@ bool PS2Memory::initialize(size_t ramSize)
         m_vu1Data = new uint8_t[PS2_VU1_DATA_SIZE];
         std::memset(m_vu1Code, 0, PS2_VU1_CODE_SIZE);
         std::memset(m_vu1Data, 0, PS2_VU1_DATA_SIZE);
+        markVU0CodeModified();
         markVU1CodeModified();
 
         // Initialize VIF registers
@@ -676,40 +1099,165 @@ bool PS2Memory::iopSelfTest()
     return ok;
 }
 
-void PS2Memory::updateEeTimerCounter(unsigned timerIndex)
+void PS2Memory::resetEeTimers() noexcept
 {
-    const uint32_t countAddr = kEeTimerBase[timerIndex];
-    const uint32_t modeAddr = countAddr + kEeTimerModeOffset;
+    m_eeTimers = {};
+    g_eeTimerBatch = EeTimerBatch{this, 0u, 0u, true};
+}
 
-    const uint64_t nowNs = steadyClockNs();
-    if (m_timerLastHostNs[timerIndex] == 0u)
+uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+{
+    // eeCycles == 0: flush the batch only (timer register access).
+    EeTimerBatch &batch = g_eeTimerBatch;
+    if (batch.owner != this)
     {
-        m_timerLastHostNs[timerIndex] = nowNs;
-        return;
+        batch = EeTimerBatch{this, 0u, 0u, true};
+    }
+    if (eeCycles == 0u && batch.pending == 0u)
+    {
+        return 0u;
     }
 
-    const uint32_t mode = m_ioRegisters.count(modeAddr) ? m_ioRegisters[modeAddr] : 0u;
-    if ((mode & kEeTimerModeCue) == 0u)
+    constexpr uint32_t kGifStat = 0x10003020u;
+    constexpr uint32_t kGifFqcMask = 0x1F000000u;
+    static const PS2Memory *s_gifStatOwner = nullptr;
+    static uint64_t s_gifStatGeneration = ~0ull;
+    static uint32_t *s_gifStat = nullptr;
+    if (s_gifStat == nullptr || s_gifStatOwner != this || s_gifStatGeneration != g_ioRegistersGeneration)
     {
-        m_timerLastHostNs[timerIndex] = nowNs;
-        m_timerFractionNs[timerIndex] = 0u;
-        return;
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        s_gifStat = gifStatIt != m_ioRegisters.end() ? &gifStatIt->second : nullptr;
+        s_gifStatOwner = this;
+        s_gifStatGeneration = g_ioRegistersGeneration;
+    }
+    if (eeCycles != 0u)
+    {
+        if (s_gifStat != nullptr)
+            *s_gifStat &= ~kGifFqcMask;
+        batch.gifFqcDirty = false;
     }
 
-    const uint64_t elapsedNs = nowNs - m_timerLastHostNs[timerIndex];
-    m_timerLastHostNs[timerIndex] = nowNs;
-    if (elapsedNs == 0u)
+    batch.pending += eeCycles;
+    if (eeCycles != 0u && batch.pending < batch.flushAt)
     {
-        return;
+        return 0u;
     }
+    eeCycles = batch.pending;
+    batch.pending = 0u;
 
-    const uint64_t scaled = elapsedNs * kEeTimerTicksPerSecond + m_timerFractionNs[timerIndex];
-    const uint64_t ticks = scaled / kNanosecondsPerSecond;
-    m_timerFractionNs[timerIndex] = scaled % kNanosecondsPerSecond;
-    if (ticks != 0u)
+    uint32_t interruptMask = 0u;
+    for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
-        m_ioRegisters[countAddr] = m_ioRegisters[countAddr] + static_cast<uint32_t>(ticks);
+        EeTimer &timer = m_eeTimers[index];
+        if ((timer.mode & kEeTimerModeCue) == 0u)
+        {
+            continue;
+        }
+
+        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+        const uint64_t remainingCycles = eeCycles % kEeClockHz;
+        const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+        const uint64_t ticks = wholeSeconds * clockHz + scaled / kEeClockHz;
+        timer.clockRemainder = scaled % kEeClockHz;
+        if (ticks == 0u)
+        {
+            continue;
+        }
+
+        const uint32_t oldCount = timer.count & 0xFFFFu;
+        const uint32_t compare = timer.compare & 0xFFFFu;
+        const uint64_t compareDistance = ticksUntilMatch(oldCount, compare);
+        const uint64_t overflowDistance = 0x10000ull - oldCount;
+        const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
+        const bool compareReached = ticks >= compareDistance;
+        bool overflowReached = false;
+
+        if (zeroReturn)
+        {
+            overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+            if (compareReached)
+            {
+                const uint64_t remaining = ticks - compareDistance;
+                timer.count = compare == 0u
+                                  ? static_cast<uint32_t>(remaining & 0xFFFFu)
+                                  : static_cast<uint32_t>(remaining % compare);
+            }
+            else
+            {
+                timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+            }
+        }
+        else
+        {
+            overflowReached = ticks >= overflowDistance;
+            timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
+        }
+
+        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+        {
+            timer.mode |= kEeTimerModeEquf;
+            interruptMask |= 1u << index;
+        }
+        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+        {
+            timer.mode |= kEeTimerModeOvff;
+            interruptMask |= 1u << index;
+        }
     }
+    batch.flushAt = cyclesUntilNextEeTimerInterrupt();
+    return interruptMask;
+}
+
+uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    uint64_t nearest = std::numeric_limits<uint64_t>::max();
+    for (const EeTimer &timer : m_eeTimers)
+    {
+        if ((timer.mode & kEeTimerModeCue) == 0u)
+        {
+            continue;
+        }
+
+        const uint32_t count = timer.count & 0xFFFFu;
+        const uint32_t compare = timer.compare & 0xFFFFu;
+        const uint64_t compareDistance = ticksUntilMatch(count, compare);
+        const uint64_t overflowDistance = 0x10000ull - count;
+        uint64_t eventTicks = std::numeric_limits<uint64_t>::max();
+
+        if ((timer.mode & kEeTimerModeCmpe) != 0u &&
+            (timer.mode & kEeTimerModeEquf) == 0u)
+        {
+            eventTicks = compareDistance;
+        }
+        const bool overflowCanOccur = (timer.mode & kEeTimerModeZret) == 0u ||
+                                      overflowDistance <= compareDistance;
+        if (overflowCanOccur &&
+            (timer.mode & kEeTimerModeOvfe) != 0u &&
+            (timer.mode & kEeTimerModeOvff) == 0u)
+        {
+            eventTicks = std::min(eventTicks, overflowDistance);
+        }
+        if (eventTicks == std::numeric_limits<uint64_t>::max())
+        {
+            continue;
+        }
+
+        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+        const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+        const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+        nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+    }
+    // The timers still hold the state of the last batch step; cycles banked
+    // since then shorten every distance by the same amount (same formula, and
+    // pending < nearest or the batch would have stepped).
+    const EeTimerBatch &batch = g_eeTimerBatch;
+    if (batch.owner == this && batch.pending != 0u &&
+        nearest != std::numeric_limits<uint64_t>::max())
+    {
+        nearest = nearest > batch.pending ? nearest - batch.pending : 1u;
+    }
+    return nearest;
 }
 
 bool PS2Memory::isScratchpad(uint32_t address) const
@@ -750,9 +1298,13 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     }
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
+        ps2x_vuw_sync_ee(3);
         return ptr;
     }
-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    const uint8_t *dataPtr = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    if (dataPtr)
+        ps2x_vuw_sync_ee(3);
+    return dataPtr;
 }
 
 uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
@@ -932,10 +1484,32 @@ uint32_t PS2Memory::read32(uint32_t address)
         throw std::runtime_error("Unaligned 32-bit read at address: 0x" + std::to_string(address));
     }
 
+    if (address == 0x1000F000u)
+    {
+        // INTC_STAT: the WaitVSync spin at 0x175210 polls it ~450k times/s,
+        // and the generic path (scratchpad/TLB/VU checks, then
+        // readIORegister's decoders and a hash lookup) was ~15% of the fight
+        // game thread. Same value: readIORegister falls through to the map
+        // node, which initialize() pre-seeds and only its clear() invalidates.
+        static const PS2Memory *s_owner = nullptr;
+        static uint64_t s_generation = ~0ull;
+        static uint32_t *s_node = nullptr;
+        if (s_owner != this || s_generation != g_ioRegistersGeneration)
+        {
+            const auto it = m_ioRegisters.find(address);
+            s_node = it != m_ioRegisters.end() ? &it->second : nullptr;
+            s_owner = this;
+            s_generation = g_ioRegistersGeneration;
+        }
+        if (s_node != nullptr)
+            return *s_node;
+    }
+
     if (isGsPrivReg(address))
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             uint64_t val = gs_regs.csr.load();
@@ -983,6 +1557,7 @@ uint64_t PS2Memory::read64(uint32_t address)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             return gs_regs.csr.load();
@@ -1093,7 +1668,9 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
         {
             (void)vuLimit;
             vuMem[vuOffset] = value;
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1134,7 +1711,9 @@ void PS2Memory::write16(uint32_t address, uint16_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint16_t), vuOffset, vuLimit))
         {
             storeScalar<uint16_t>(vuMem, vuOffset, vuLimit, value, "write16 vu", address);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1160,6 +1739,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1197,7 +1777,9 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint32_t), vuOffset, vuLimit))
         {
             storeScalar<uint32_t>(vuMem, vuOffset, vuLimit, value, "write32 vu", address);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1218,6 +1800,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -1251,7 +1834,9 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         if (uint8_t *vuMem = mapVuMemory(physAddr, sizeof(uint64_t), vuOffset, vuLimit))
         {
             storeScalar<uint64_t>(vuMem, vuOffset, vuLimit, value, "write64 vu", address);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1273,6 +1858,21 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     const bool scratch = isScratchpad(address);
     uint32_t physAddr = translateAddress(address);
 
+    if (!scratch && physAddr == 0x10004000u) // VIF0_FIFO
+    {
+        alignas(16) uint8_t fifoData[16];
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        processVIF0Data(fifoData, sizeof(fifoData));
+        return;
+    }
+    if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
+    {
+        alignas(16) uint8_t fifoData[16];
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        processVIF1Data(fifoData, sizeof(fifoData));
+        return;
+    }
+
     if (scratch)
     {
         inRange(physAddr, sizeof(__m128i), PS2_SCRATCHPAD_SIZE, "write128 scratchpad", address);
@@ -1292,7 +1892,9 @@ void PS2Memory::write128(uint32_t address, __m128i value)
         {
             inRange(vuOffset, sizeof(__m128i), vuLimit, "write128 vu", address);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(vuMem + vuOffset), value);
-            if (vuMem == m_vu1Code)
+            if (vuMem == m_vu0Code)
+                markVU0CodeModified();
+            else if (vuMem == m_vu1Code)
                 markVU1CodeModified();
             return;
         }
@@ -1321,23 +1923,46 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
-    if (const int timerIndex = eeTimerIndexForAddress(address); timerIndex >= 0)
+    if (address == 0x10003020u)
+        g_eeTimerBatch.gifFqcDirty = true;
+    if ((address >= 0x10003C00u && address < 0x10003E00u) || (address >= 0x10003000u && address < 0x10003040u))
+        ps2x_vuw_sync_ee(1); // VIF1 / GIF registers: the worker owns that state
+    size_t timerIndex = 0u;
+    uint32_t timerOffset = 0u;
+    if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
-        const uint32_t countAddr = kEeTimerBase[timerIndex];
-        if (address == countAddr)
+        advanceEeTimers(0u); // bring the timers up to now (no event can be due)
+        struct RecomputeFlushAt
         {
-            m_ioRegisters[address] = value;
-            m_timerLastHostNs[timerIndex] = steadyClockNs();
-            m_timerFractionNs[timerIndex] = 0u;
-            return true;
+            PS2Memory *mem;
+            ~RecomputeFlushAt() { g_eeTimerBatch.flushAt = mem->cyclesUntilNextEeTimerInterrupt(); }
+        } recompute{this};
+        EeTimer &timer = m_eeTimers[timerIndex];
+        switch (timerOffset)
+        {
+        case kEeTimerCountOffset:
+            timer.count = value & 0xFFFFu;
+            timer.clockRemainder = 0u;
+            break;
+        case kEeTimerModeOffset:
+        {
+            const uint32_t previousMode = timer.mode;
+            const uint32_t status = (previousMode & kEeTimerModeStatusMask) & ~(value & kEeTimerModeStatusMask);
+            timer.mode = (value & kEeTimerModeConfigMask) | status;
+            if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
+            {
+                timer.clockRemainder = 0u;
+            }
+            break;
         }
-
-        updateEeTimerCounter(static_cast<unsigned>(timerIndex));
-        m_ioRegisters[address] = value;
-        m_timerLastHostNs[timerIndex] = steadyClockNs();
-        if (address == countAddr + kEeTimerModeOffset)
-        {
-            m_timerFractionNs[timerIndex] = 0u;
+        case kEeTimerCompareOffset:
+            timer.compare = value & 0xFFFFu;
+            break;
+        case kEeTimerHoldOffset:
+            timer.hold = value & 0xFFFFu;
+            break;
+        default:
+            return false;
         }
         return true;
     }
@@ -1350,6 +1975,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         m_ioRegisters[address] = value;
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
@@ -1407,15 +2033,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        ps2x_p5a_bump(1);
 
         switch (address)
         {
         case 0x10003C10u:     // VIF1_FBRST
             if (value & 0x1u) // RST
             {
+                const bool wasPath3Masked = m_path3Masked;
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
                 m_vif1PendingPath2ImageQwc = 0u;
                 m_vif1PendingPath2DirectHl = false;
+                m_path3Masked = false;
+                if (wasPath3Masked)
+                    flushMaskedPath3Packets();
             }
             if (value & 0x8u) // STC
             {
@@ -1572,19 +2203,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
 
                 const uint32_t chBit = (channelBase == 0x1000D000u) ? 8u : 9u;
-                uint32_t dstat = m_ioRegisters.count(0x1000E010u) ? m_ioRegisters[0x1000E010u] : 0u;
-                dstat |= (1u << chBit);
-                const uint32_t st = dstat & 0x3FFu;
-                const uint32_t mk = (dstat >> 16) & 0x3FFu;
-                if ((st & mk) != 0u)
-                    dstat |= (1u << 31);
-                else
-                    dstat &= ~(1u << 31);
-                m_ioRegisters[0x1000E010u] = dstat;
+                {
+                    static std::atomic<uint32_t> s_logged{0u};
+                    if ((s_logged.fetch_or(1u << chBit) & (1u << chBit)) == 0u)
+                        std::fprintf(stderr, "[sprdma] first %s transfer: qwc=%u madr=0x%x sadr=0x%x\n",
+                                     chBit == 8u ? "fromSPR(ch8)" : "toSPR(ch9)", spQwc,
+                                     m_ioRegisters[channelBase + 0x10], sadr);
+                }
 
-                // Signal completion: clear the STR (start) bit and the quadword count.
-                m_ioRegisters[channelBase + 0x00] = value & ~0x100u;
+                // Completion like upstream's tryProcessScratchpadDma (shadowed by this
+                // block): MADR/SADR advance past the transfer, QWC=0, then
+                // completeDmacChannel clears STR, raises D_STAT and queues the cause,
+                // so a DMAC handler the guest enabled (EnableDmac) runs. This block
+                // used to skip the advance and the queue (ps2x_tests PS2Memory SPR).
+                m_ioRegisters[channelBase + 0x10] = (m_ioRegisters[channelBase + 0x10] + spQwc * 16u) & 0x7FFFFFF0u;
+                m_ioRegisters[channelBase + 0x80] = (sadr + spQwc * 16u) & 0x3FF0u;
+                m_ioRegisters[channelBase + 0x00] = value;
                 m_ioRegisters[channelBase + 0x20] = 0u;
+                completeDmacChannel(channelBase, chBit);
                 return true;
             }
 
@@ -1599,8 +2235,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
-                (m_gsVRAM || channelBase == 0x10008000u))
+            if (tryProcessScratchpadDma(channelBase, value))
+            {
+                return true;
+            }
+
+            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
@@ -1634,9 +2274,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuf();
 
-                    auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+                    auto appendData =[&](uint32_t srcAddr, uint32_t qwCount)
                     {
                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
                         uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
@@ -1724,7 +2364,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
                     };
 
-                    auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
+                    auto appendVifTagData = [&](uint32_t localTagAddr)
                     {
                         uint32_t tagPhys = 0u;
                         const bool tagScratch = isScratchpad(localTagAddr);
@@ -1735,10 +2375,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (tagPhys + 16u > localMax)
                             return;
 
-                        // VIF packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
+                        // CHCR.TTE sends the DMAtag's upper 64 bits to the channel before
+                        // the tag payload. VIF chains use those bytes for two VIFcodes.
                         chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
-                        appendData(localTagAddr + 16u, qwCount);
                     };
+
+                    const bool isVifChannel =
+                        channelBase == 0x10009000u || channelBase == 0x10008000u;
+                    const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
@@ -1864,63 +2508,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        if (ps2_diag::enabled())
-                        {
-                            static std::atomic<uint64_t> s_dmaChainCount{0};
-                            const uint64_t n = s_dmaChainCount.fetch_add(1, std::memory_order_relaxed);
-                            if (ps2_diag::should_log(n, 32, 2000))
-                            {
-                                std::ostringstream dataPreview;
-                                if (hasPayload)
-                                {
-                                    try
-                                    {
-                                        const bool dataInSPR = isScratchpad(dataAddr);
-                                        const uint32_t physData = translateAddress(dataAddr);
-                                        const uint8_t *dataBase = dataInSPR ? m_scratchpad : m_rdram;
-                                        const uint32_t dataMax = dataInSPR ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
-                                        const uint64_t data0 = loadScalar<uint64_t>(dataBase, physData, dataMax,
-                                                                                    "dma chain data preview", dataAddr);
-                                        dataPreview << " data0=0x" << std::hex << data0 << std::dec;
-                                    }
-                                    catch (...)
-                                    {
-                                        // Best-effort preview only; never let a bad/unmapped
-                                        // dataAddr affect the probe or the DMA walk itself.
-                                    }
-                                }
-
-                                RUNTIME_LOG("[dma:chain] n=" << n
-                                                             << " chan=0x" << std::hex << channelBase
-                                                             << " tagAddr=0x" << currentTagAddr
-                                                             << " tag=0x" << tag
-                                                             << std::dec
-                                                             << " id=" << id
-                                                             << " qwc=" << tagQwc
-                                                             << " irq=" << irq
-                                                             << " addr=0x" << std::hex << addr
-                                                             << " dataAddr=0x" << dataAddr
-                                                             << std::dec
-                                                             << " end=" << endChain
-                                                             << dataPreview.str()
-                                                             << std::endl);
-                            }
-                        }
-
-                        // On VIF0/VIF1 the DMAtag's upper 64 bits are VIFcodes and are pushed
-                        // into the VIF FIFO ahead of the link's payload -- for EVERY tag id, not
-                        // just the ones whose payload happens to follow the tag. Restricting this
-                        // to id 1/2/5/6/7 dropped the 8-byte VIFcode header off every REF/REFS
-                        // (id 3/4) link, so those payloads entered the stream unframed and
-                        // desynced the parser for the rest of the buffer.
-                        //
-                        // dataAddr is already the right source for every id (tagAddr+16 for
-                        // 1/2/5/6/7, addr for 0/3/4), so the old currentTagAddr+16 special case
-                        // was redundant where it was correct and wrong where it was not.
-                        const bool vifChannel =
-                            (channelBase == 0x10009000u || channelBase == 0x10008000u);
-                        if (vifChannel)
-                            appendCompactVif1TagData(currentTagAddr, 0u);
+                        if (transferTagData)
+                            appendVifTagData(currentTagAddr);
 
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
@@ -1971,7 +2560,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
                 if (autoProcessTransfers)
                 {
+                    const bool p5aKick = channelBase == 0x10009000u && p5aOn();
+                    const uint64_t p5aT0 = p5aKick ? p5aNowNs() : 0u;
+                    t_vuwKick = true;
                     processPendingTransfers();
+                    t_vuwKick = false;
+                    if (p5aKick)
+                    {
+                        g_p5aLastKickEndNs = p5aNowNs();
+                        g_p5a[2].fetch_add(1u, std::memory_order_relaxed);
+                        g_p5a[3].fetch_add(g_p5aLastKickEndNs - p5aT0, std::memory_order_relaxed);
+                    }
                 }
             }
         }
@@ -1993,191 +2592,358 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     return false;
 }
 
+bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+{
+    static constexpr uint32_t kSprFromChannel = 0x1000D000u;
+    static constexpr uint32_t kSprToChannel = 0x1000D400u;
+    if (channelBase != kSprFromChannel && channelBase != kSprToChannel)
+        return false;
+
+    const uint32_t mode = (chcr >> 2u) & 0x3u;
+    if (mode != 0u)
+        return false;
+
+    const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+    const uint32_t byteCount = qwc * 16u;
+    const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
+    const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+
+    uint32_t mainOffset = 0u;
+    try
+    {
+        mainOffset = translateAddress(originalMadr);
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+
+    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+        return false;
+
+    const bool fromScratchpad = channelBase == kSprFromChannel;
+    uint32_t scratchOffset = originalSadr;
+    uint32_t bytesLeft = byteCount;
+    uint32_t copied = 0u;
+    while (bytesLeft != 0u)
+    {
+        const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
+        const uint32_t chunk = std::min(bytesLeft, scratchChunk);
+        if (fromScratchpad)
+        {
+            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+            markModified(mainOffset + copied, chunk);
+        }
+        else
+        {
+            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+        }
+
+        copied += chunk;
+        bytesLeft -= chunk;
+        scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+    }
+
+    m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
+    m_ioRegisters[channelBase + 0x20u] = 0u;
+    m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+    completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
+    return true;
+}
+
+void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+{
+    static constexpr uint32_t kDStat = 0x1000E010u;
+    m_ioRegisters[channelBase] &= ~0x100u;
+
+    uint32_t dstat = m_ioRegisters.count(kDStat) ? m_ioRegisters[kDStat] : 0u;
+    dstat |= 1u << cause;
+    const uint32_t status = dstat & 0x3FFu;
+    const uint32_t mask = (dstat >> 16u) & 0x3FFu;
+    if ((status & mask) != 0u)
+        dstat |= 1u << 31u;
+    else
+        dstat &= ~(1u << 31u);
+    m_ioRegisters[kDStat] = dstat;
+    queueCompletedDmacCause(cause);
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    const bool kick = t_vuwKick;
+    t_vuwKick = false;
     const bool hadGif = !m_pendingGifTransfers.empty();
-    for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
-    {
-        auto &p = m_pendingGifTransfers[idx];
-        if (!p.chainData.empty())
-        {
-            m_seenGifCopy = true;
-            m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-            submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
-        }
-        else if (p.qwc > 0)
-        {
-            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
-            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-            uint32_t srcPhys = 0;
-            try
-            {
-                srcPhys = translateAddress(p.srcAddr);
-            }
-            catch (const std::exception &)
-            {
-                continue;
-            }
-            if (p.fromScratchpad)
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft >= 16)
-                {
-                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
-                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    m_seenGifCopy = true;
-                    m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-            else
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft >= 16)
-                {
-                    if (srcPhys >= PS2_RAM_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    m_seenGifCopy = true;
-                    m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-        }
-    }
-    m_pendingGifTransfers.clear();
-
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
-    for (auto &p : m_pendingVif0Transfers)
-    {
-        if (!p.chainData.empty())
-        {
-            processVIF0Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
-        }
-        else if (p.qwc > 0)
-        {
-            uint32_t srcPhys = 0;
-            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
-            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-            try
-            {
-                srcPhys = translateAddress(p.srcAddr);
-            }
-            catch (const std::exception &)
-            {
-                continue;
-            }
-            if (p.fromScratchpad)
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
-                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF0Data(m_scratchpad + srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-            else
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_RAM_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF0Data(srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-        }
-    }
-    m_pendingVif0Transfers.clear();
-
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
-    for (auto &p : m_pendingVif1Transfers)
+    uint32_t observedGifQwc = 0u;
+    for (const auto &transfer : m_pendingGifTransfers)
     {
-        if (!p.chainData.empty())
-        {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
-        }
-        else if (p.qwc > 0)
-        {
-            uint32_t srcPhys = 0;
-            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
-            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-            try
-            {
-                srcPhys = translateAddress(p.srcAddr);
-            }
-            catch (const std::exception &)
-            {
-                continue;
-            }
-            if (p.fromScratchpad)
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
-                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-            else
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_RAM_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-        }
+        const uint64_t transferQwc = !transfer.chainData.empty()
+                                         ? (transfer.chainData.size() / 16u)
+                                         : transfer.qwc;
+        observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
     }
-    m_pendingVif1Transfers.clear();
+    if (observedGifQwc != 0u)
+    {
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        uint32_t &gifStat = m_ioRegisters[kGifStat];
+        gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        g_eeTimerBatch.gifFqcDirty = true;
+    }
 
-    if (m_gifArbiter)
-        m_gifArbiter->drain();
+    using Vec = std::vector<PendingTransfer>;
+    struct Job
+    {
+        Vec gif, vif0, vif1;
+    };
+
+    // GIF -> VIF0 -> VIF1 drain order, then the arbiter. Runs on the EE thread,
+    // or on the VU worker (PS2X_VU1_THREAD=1) with the vectors moved into a Job.
+    auto runTransfers = [this](Vec &gifT, Vec &vif0T, Vec &vif1T)
+    {
+        for (size_t idx = 0; idx < gifT.size(); ++idx)
+        {
+            auto &p = gifT[idx];
+            if (!p.chainData.empty())
+            {
+                m_seenGifCopy = true;
+                m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
+            }
+            else if (p.qwc > 0)
+            {
+                const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+                uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+                uint32_t srcPhys = 0;
+                try
+                {
+                    srcPhys = translateAddress(p.srcAddr);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                if (p.fromScratchpad)
+                {
+                    uint32_t bytesLeft = sizeBytes;
+                    while (bytesLeft >= 16)
+                    {
+                        if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+                            srcPhys = 0;
+                        uint32_t chunk = bytesLeft;
+                        if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+                            chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                        if (chunk == 0)
+                            break;
+                        m_seenGifCopy = true;
+                        m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                        submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
+                        bytesLeft -= chunk;
+                        srcPhys += chunk;
+                    }
+                }
+                else
+                {
+                    uint32_t bytesLeft = sizeBytes;
+                    while (bytesLeft >= 16)
+                    {
+                        if (srcPhys >= PS2_RAM_SIZE)
+                            srcPhys = 0;
+                        uint32_t chunk = bytesLeft;
+                        if (srcPhys + chunk > PS2_RAM_SIZE)
+                            chunk = PS2_RAM_SIZE - srcPhys;
+                        if (chunk == 0)
+                            break;
+                        m_seenGifCopy = true;
+                        m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                        submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
+                        bytesLeft -= chunk;
+                        srcPhys += chunk;
+                    }
+                }
+            }
+        }
+        recycleChainBufs(gifT);
+        gifT.clear();
+
+        for (auto &p : vif0T)
+        {
+            if (!p.chainData.empty())
+            {
+                processVIF0Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            }
+            else if (p.qwc > 0)
+            {
+                uint32_t srcPhys = 0;
+                const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+                uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+                try
+                {
+                    srcPhys = translateAddress(p.srcAddr);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                if (p.fromScratchpad)
+                {
+                    uint32_t bytesLeft = sizeBytes;
+                    while (bytesLeft > 0)
+                    {
+                        if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+                            srcPhys = 0;
+                        uint32_t chunk = bytesLeft;
+                        if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+                            chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                        if (chunk == 0)
+                            break;
+                        processVIF0Data(m_scratchpad + srcPhys, chunk);
+                        bytesLeft -= chunk;
+                        srcPhys += chunk;
+                    }
+                }
+                else
+                {
+                    uint32_t bytesLeft = sizeBytes;
+                    while (bytesLeft > 0)
+                    {
+                        if (srcPhys >= PS2_RAM_SIZE)
+                            srcPhys = 0;
+                        uint32_t chunk = bytesLeft;
+                        if (srcPhys + chunk > PS2_RAM_SIZE)
+                            chunk = PS2_RAM_SIZE - srcPhys;
+                        if (chunk == 0)
+                            break;
+                        processVIF0Data(srcPhys, chunk);
+                        bytesLeft -= chunk;
+                        srcPhys += chunk;
+                    }
+                }
+            }
+        }
+        recycleChainBufs(vif0T);
+        vif0T.clear();
+
+        for (auto &p : vif1T)
+        {
+            if (!p.chainData.empty())
+            {
+                processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            }
+            else if (p.qwc > 0)
+            {
+                uint32_t srcPhys = 0;
+                const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+                uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+                try
+                {
+                    srcPhys = translateAddress(p.srcAddr);
+                }
+                catch (const std::exception &)
+                {
+                    continue;
+                }
+                if (p.fromScratchpad)
+                {
+                    uint32_t bytesLeft = sizeBytes;
+                    while (bytesLeft > 0)
+                    {
+                        if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+                            srcPhys = 0;
+                        uint32_t chunk = bytesLeft;
+                        if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+                            chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                        if (chunk == 0)
+                            break;
+                        processVIF1Data(m_scratchpad + srcPhys, chunk);
+                        bytesLeft -= chunk;
+                        srcPhys += chunk;
+                    }
+                }
+                else
+                {
+                    uint32_t bytesLeft = sizeBytes;
+                    while (bytesLeft > 0)
+                    {
+                        if (srcPhys >= PS2_RAM_SIZE)
+                            srcPhys = 0;
+                        uint32_t chunk = bytesLeft;
+                        if (srcPhys + chunk > PS2_RAM_SIZE)
+                            chunk = PS2_RAM_SIZE - srcPhys;
+                        if (chunk == 0)
+                            break;
+                        processVIF1Data(srcPhys, chunk);
+                        bytesLeft -= chunk;
+                        srcPhys += chunk;
+                    }
+                }
+            }
+        }
+        recycleChainBufs(vif1T);
+        vif1T.clear();
+
+        if (m_gifArbiter)
+            m_gifArbiter->drain();
+    };
+
+    // P5b: hand the work to the VU worker when nothing the EE could observe is in
+    // it. Only from a DMA CHCR store (t_vuwKick); every other caller runs inline.
+    bool async = false;
+    if (kick && vuwEnvOn() && m_gifArbiter && m_pendingVif0Transfers.empty() &&
+        ps2xGsThreadEnabled() && !ps2_diag::enabled() && !vucap::hot())
+    {
+        // Normal-mode transfers read guest RAM at process time today; snapshot them
+        // now. A range that wraps keeps the inline path.
+        auto snapshot = [this](Vec &v) -> bool
+        {
+            for (auto &p : v)
+            {
+                if (!p.chainData.empty() || p.qwc == 0u)
+                    continue;
+                const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+                uint32_t phys = 0;
+                try
+                {
+                    phys = translateAddress(p.srcAddr);
+                }
+                catch (const std::exception &)
+                {
+                    p.qwc = 0u; // the inline path skips it too
+                    continue;
+                }
+                const uint8_t *base = p.fromScratchpad ? m_scratchpad : m_rdram;
+                const uint64_t limit = p.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                if (bytes64 > limit || static_cast<uint64_t>(phys) + bytes64 > limit)
+                    return false;
+                std::vector<uint8_t> copy = takeChainBuf();
+                copy.assign(base + phys, base + phys + bytes64);
+                p.chainData = std::move(copy);
+                p.qwc = 0u;
+            }
+            return true;
+        };
+        if (snapshot(m_pendingGifTransfers) && snapshot(m_pendingVif1Transfers) &&
+            (!g_vuwKickPrepare || g_vuwKickPrepare()))
+            async = true;
+    }
+
+    if (async)
+    {
+        vuwStartOnce();
+        auto job = std::make_shared<Job>();
+        job->gif = std::move(m_pendingGifTransfers);
+        job->vif1 = std::move(m_pendingVif1Transfers);
+        m_pendingGifTransfers.clear();
+        m_pendingVif1Transfers.clear();
+        ps2xVuwEnqueue([runTransfers, job]() mutable
+                       { runTransfers(job->gif, job->vif0, job->vif1); });
+    }
+    else
+    {
+        ps2x_vuw_sync_ee(5); // finish queued work first: the arbiter and VIF1 state are shared
+        runTransfers(m_pendingGifTransfers, m_pendingVif0Transfers, m_pendingVif1Transfers);
+    }
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -2238,6 +3004,7 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
 
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 {
+    ps2x_vuw_sync_ee(2);
     if (m_path3Masked || m_path3MaskedFifo.empty())
         return;
 
@@ -2264,6 +3031,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+    ps2x_vuw_sync_ee(2); // no-op on the worker itself
 
     // [gifsrc] Stage 5.9. Every GIF path funnels through here, and this is the last
     // point that still holds a live pointer -- GifArbiter::submit memcpy's the payload
@@ -2365,6 +3133,7 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 {
     if (!m_rdram || qwCount == 0)
         return;
+    ps2x_vuw_sync_ee(2);
 
     g_ps2DiagRdramBase = m_rdram;
     g_ps2DiagRdramSize = static_cast<uint32_t>(PS2_RAM_SIZE);
@@ -2400,6 +3169,7 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
 
 void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    ps2x_vuw_sync_ee(2);
     if (m_gifArbiter)
         submitGifPacket(GifPathId::Path3, data, sizeBytes);
     else if (m_gifPacketCallback && data && sizeBytes >= 16)
@@ -2408,6 +3178,7 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    ps2x_vuw_sync_ee(2);
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2600,6 +3371,7 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    ps2x_vuw_sync_ee(2);
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2681,6 +3453,8 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
 void PS2Memory::orIORegister(uint32_t address, uint32_t bits)
 {
     // Assumes the node exists (see initialize() pre-seed for 0x1000F000).
+    if (address == 0x10003020u)
+        g_eeTimerBatch.gifFqcDirty = true;
     m_ioRegisters[address] |= bits;
 }
 
@@ -2691,12 +3465,41 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (address >= 0x10003C00u && address < 0x10003E00u)
+    {
+        ps2x_p5a_bump(0);
+        ps2x_vuw_sync_ee(1);
+    }
+    else if (address == 0x10003020u)
+        ps2x_vuw_sync_ee(1); // GIF_STAT.M3P is m_path3Masked
+    size_t timerIndex = 0u;
+    uint32_t timerOffset = 0u;
+    if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+    {
+        advanceEeTimers(0u); // bring the timers up to now (no event can be due)
+        const EeTimer &timer = m_eeTimers[timerIndex];
+        switch (timerOffset)
+        {
+        case kEeTimerCountOffset:
+            return timer.count & 0xFFFFu;
+        case kEeTimerModeOffset:
+            return timer.mode & (kEeTimerModeConfigMask | kEeTimerModeStatusMask);
+        case kEeTimerCompareOffset:
+            return timer.compare & 0xFFFFu;
+        case kEeTimerHoldOffset:
+            return timer.hold & 0xFFFFu;
+        default:
+            return 0u;
+        }
+    }
+
     if (isGsPrivReg(address))
     {
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        syncGsThreadForPrivReg(regOff);
         if (regOff == kGsCsrRegOffset)
         {
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
@@ -2714,18 +3517,31 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         syncIpuChannels(m_ioRegisters);
         return val;
     }
+
+    if (address == 0x10003020u) // GIF_STAT
+    {
+        // One find per register (was count() + operator[] = two hashes each).
+        const auto valueOr0 = [this](uint32_t reg) -> uint32_t
+        {
+            const auto it = m_ioRegisters.find(reg);
+            return it != m_ioRegisters.end() ? it->second : 0u;
+        };
+        uint32_t stat = valueOr0(address);
+        const uint32_t mode = valueOr0(0x10003010u);
+        const uint32_t ctrl = valueOr0(0x10003000u);
+
+        // M3R and IMT mirror GIF_MODE, PSE mirrors GIF_CTRL, and M3P is the
+        // effective PATH3 mask controlled by the VIF1 MSKPATH3 command.
+        stat = (stat & ~0xFu) |
+               (mode & 0x1u) |
+               (m_path3Masked ? 0x2u : 0u) |
+               (mode & 0x4u) |
+               (ctrl & 0x8u);
+        return stat;
+    }
+
     if (address >= 0x10000000 && address < 0x10010000)
     {
-        if (const int timerIndex = eeTimerIndexForAddress(address); timerIndex >= 0)
-        {
-            if (address == kEeTimerBase[timerIndex])
-            {
-                updateEeTimerCounter(static_cast<unsigned>(timerIndex));
-            }
-            auto timerIt = m_ioRegisters.find(address);
-            return timerIt != m_ioRegisters.end() ? timerIt->second : 0u;
-        }
-
         // IPU channels answer from the engine: their STR bit is real, and a
         // streaming IPU_FROM stays started until the guest clears it.
         if (address >= 0x1000B000u && address < 0x1000B500u &&
@@ -2740,9 +3556,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
-                uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
-                m_ioRegisters[address] = channelStatus;
-                return channelStatus;
+                uint32_t &channelReg = m_ioRegisters[address];
+                channelReg &= ~0x100u;
+                return channelReg;
             }
         }
 

@@ -2,6 +2,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_pipeline_stats.h"
 #include "runtime/ps2_diag.h"
+#include "Kernel/VuCap/VuCapRecorder.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <cstdio>
@@ -27,6 +28,41 @@ namespace ps2diag_chainord
 uint32_t resolveSrc(uint32_t pos);
 }
 
+// 2026-09-22 Part 158 [vumat] -- defined in game_overrides.cpp. Declared here
+// rather than in a header: any .h edit rebuilds all 30,000+ generated runner
+// TUs (30+ hours). extern-between-.cpp is the sanctioned cross-TU pattern.
+extern "C" void ps2x_probe_kv(const char *name, int n,
+                              const char *const *keys, const uint64_t *vals);
+
+namespace
+{
+// Log-spaced sampling, same shape as the [vflip] probe: a cap that fills from
+// the start of the run only ever sees the first instant, which is how the first
+// oracle comparison came out meaningless. Stride doubles every kVumatGrowEvery
+// records, so a bounded number of dumps still spans the whole run.
+//
+// 2026-09-23 Part 159 follow-up: doubling every 4 TAKEN dumps caps dump 23 at
+// MSCAL #251 (worked out by hand from these constants) -- Part 159 confirmed
+// this empirically, 12 of 24 dumps landed at the SAME earliest `progress`
+// value VFLIP ever saw 3D geometry. Doubling every SINGLE dump instead
+// (kVumatGrowEvery=1) pushes dump 23 out past MSCAL #16.7M, so the 24 dumps
+// should actually spread across the run instead of bunching at its start.
+constexpr uint32_t kVumatDumps = 24u;      // MSCALs dumped
+constexpr uint32_t kVumatQuads = 256u;     // quadwords per dump (low 4 KB)
+constexpr uint32_t kVumatGrowEvery = 1u;
+std::atomic<bool> g_vumatArmed{[] {
+    const char *e = std::getenv("PS2X_VUMAT");
+    return e != nullptr && e[0] != 0 && e[0] != '0';
+}()};
+// Plain, not atomic: the VIF1 interpreter is driven from one thread, like the
+// g_mscal counter beside it. A locked RMW on this path is the shape that once
+// cost 19% of guest throughput.
+uint64_t g_vumatSeen = 0;
+uint64_t g_vumatNext = 0;
+uint64_t g_vumatStride = 1;
+uint32_t g_vumatTaken = 0;
+} // namespace
+
 enum VIFCmd : uint8_t
 {
     VIF_NOP = 0x00,
@@ -51,25 +87,6 @@ enum VIFCmd : uint8_t
     VIF_DIRECTHL = 0x51,
 };
 
-namespace
-{
-    constexpr uint8_t kGifFmtImage = 2u;
-
-    uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
-    {
-        if (!data || sizeBytes < 16u)
-            return 0u;
-
-        uint64_t tagLo = 0u;
-        std::memcpy(&tagLo, data, sizeof(tagLo));
-        const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
-        if (flg != kGifFmtImage)
-            return 0u;
-
-        return static_cast<uint32_t>(tagLo & 0x7FFFu);
-    }
-}
-
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -82,10 +99,13 @@ void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF0Data(m_rdram + srcPhys, sizeBytes);
 }
 
+extern "C" void ps2x_vuw_sync_ee(int reason) noexcept; // ps2_memory.cpp, VU worker
+
 void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    ps2x_vuw_sync_ee(3);
 
     uint32_t pos = 0;
     while (pos + 4 <= sizeBytes)
@@ -169,7 +189,10 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
                 if (destAddr + copyBytes > PS2_VU0_CODE_SIZE)
                     copyBytes = PS2_VU0_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
+                {
                     std::memcpy(m_vu0Code + destAddr, data + pos, copyBytes);
+                    markVU0CodeModified();
+                }
             }
 
             pos += mpgBytes;
@@ -323,6 +346,12 @@ namespace
         if (!vif1DumpArmed(sizeBytes))
             return;
 
+        // Only a buffer that actually desynced is worth the one-shot: the clean
+        // warning-screen buffers (264-331 KB) would otherwise claim it long
+        // before the title's bad ones arrive.
+        if (firstBadPos == 0xFFFFFFFFu)
+            return;
+
         const char *path = vif1DumpPath();
 
         // Claim before touching the file so two DMA threads cannot interleave
@@ -354,6 +383,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    ps2x_vuw_sync_ee(3); // no-op on the VU worker itself
+
+    // PS2X_VUCAP recorder (Kernel/VuCap): this buffer, plus MEMSYNC when the EE
+    // wrote VU1 memory since the previous call. Named so it lives to the return.
+    vucap::VifCallScope vucapScope(data, sizeBytes, m_vu1Code, m_vu1Data, vif1_regs);
 
     ps2_pipeline_stats::g_vif1Calls.fetch_add(1, std::memory_order_relaxed);
     ps2_pipeline_stats::g_vif1Bytes.fetch_add(sizeBytes, std::memory_order_relaxed);
@@ -451,41 +485,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
-        {
-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            if (availableQw == 0u)
-            {
-                break;
-            }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            ps2diag_gifpath::g_curSite.store(1u, std::memory_order_relaxed);
-            ps2diag_gifpath::g_curSrc.store(dsSrcAt(pos), std::memory_order_relaxed);
-            submitGifPacket(GifPathId::Path2,
-                            imagePacket.data(),
-                            static_cast<uint32_t>(imagePacket.size()),
-                            true,
-                            m_vif1PendingPath2DirectHl);
-            ps2diag_gifpath::g_curSite.store(0u, std::memory_order_relaxed);
-            ps2diag_gifpath::g_curSrc.store(0xFFFFFFFFu, std::memory_order_relaxed);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
-            continue;
-        }
-
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
@@ -578,9 +577,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
 
-            // Values visible to the VU program for this MSCAL.
-            // DobieStation semantics: ITOP = ITOPS; TOP = current TOPS;
-            // then TOPS/DBF are prepared for the next buffer.
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
             vif1_regs.top = runTop;
@@ -594,6 +590,54 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
             ps2_pipeline_stats::g_mscal.fetch_add(1, std::memory_order_relaxed);
+            if (g_vumatArmed.load(std::memory_order_relaxed) && m_vu1Data != nullptr)
+            {
+                const uint64_t seen = g_vumatSeen++;
+                if (seen == g_vumatNext && g_vumatTaken < kVumatDumps)
+                {
+                    const uint32_t dump = g_vumatTaken++;
+                    if ((g_vumatTaken % kVumatGrowEvery) == 0u &&
+                        g_vumatStride < (1ull << 40))
+                    {
+                        g_vumatStride *= 2ull;
+                    }
+                    g_vumatNext = seen + g_vumatStride;
+                    // Raw bit patterns, not floats: the reader decodes them, so
+                    // no host rounding or printf format can alter what VU1 saw.
+                    static const char *const mk[] = {
+                        "dump", "mscal", "pc", "top", "itop", "q", "w0", "w1", "w2", "w3"};
+                    for (uint32_t qi = 0; qi < kVumatQuads; ++qi)
+                    {
+                        uint32_t w[4];
+                        std::memcpy(w, m_vu1Data + qi * 16u, sizeof(w));
+                        if ((w[0] | w[1] | w[2] | w[3]) == 0u)
+                        {
+                            continue; // untouched memory carries nothing
+                        }
+                        const uint64_t mv[] = {
+                            static_cast<uint64_t>(dump),
+                            static_cast<uint64_t>(seen),
+                            static_cast<uint64_t>(startPC),
+                            static_cast<uint64_t>(runTop),
+                            static_cast<uint64_t>(runItop),
+                            static_cast<uint64_t>(qi),
+                            static_cast<uint64_t>(w[0]),
+                            static_cast<uint64_t>(w[1]),
+                            static_cast<uint64_t>(w[2]),
+                            static_cast<uint64_t>(w[3])};
+                        ps2x_probe_kv("VUMAT", 10, mk, mv);
+                    }
+                }
+                else if (g_vumatTaken >= kVumatDumps && seen == g_vumatNext)
+                {
+                    // A saturated probe and a probe that never fired look
+                    // identical in the output, so say so explicitly.
+                    RUNTIME_LOG("[cap] tag=vumat limit=" << kVumatDumps
+                                                         << " -- disarming");
+                    g_vumatNext = ~0ull;
+                    g_vumatArmed.store(false, std::memory_order_relaxed);
+                }
+            }
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
@@ -646,8 +690,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MPG)
         {
             uint32_t destAddr = (uint32_t)imm * 8u;
-            // VIF MPG semantics: NUM==0 means 256 instructions (2048 bytes).
-            // MPG payload is instruction-packed and should not be QW-aligned.
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
@@ -682,21 +724,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
                 ps2diag_gifpath::g_curSite.store(directHl ? 8u : 2u, std::memory_order_relaxed);
-                ps2diag_gifpath::g_curSrc.store(dsSrcAt(pos), std::memory_order_relaxed);
+                // Only the [drawpath] capture ring reads g_curSrc; resolveSrc scans a
+                // 1024-entry ring (~1% of the fight game thread), so not with diag off.
+                ps2diag_gifpath::g_curSrc.store(ps2_diag::enabled() ? dsSrcAt(pos) : 0xFFFFFFFFu,
+                                                std::memory_order_relaxed);
                 submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
                 ps2diag_gifpath::g_curSite.store(0u, std::memory_order_relaxed);
                 ps2diag_gifpath::g_curSrc.store(0xFFFFFFFFu, std::memory_order_relaxed);
 
-                const uint32_t imageQw = gifImageQwcFromTag(data + pos, qwCount * 16u);
-                if (imageQw != 0u)
-                {
-                    const uint32_t inlineImageQw = (qwCount > 0u) ? (qwCount - 1u) : 0u;
-                    if (imageQw > inlineImageQw)
-                    {
-                        m_vif1PendingPath2ImageQwc = imageQw - inlineImageQw;
-                        m_vif1PendingPath2DirectHl = directHl;
-                    }
-                }
+                // No VIF-level image carry-over: a DIRECT command's own count
+                // decides its length. An IMAGE tag whose pixels spill into the
+                // next DIRECT is continued by the GS (m_pendingImageBytes).
+                // Guessing here read pixel data as a tag at the SDBZ title and
+                // swallowed real VIF commands as pixels.
             }
 
             pos += qwCount * 16;

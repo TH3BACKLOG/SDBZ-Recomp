@@ -45,7 +45,7 @@ namespace
     bool mcservTraceEnabled()
     {
         const char *e = std::getenv("PS2X_MCSERV_TRACE");
-        return e && e[0] != '\0' && e[0] != '0';
+        return !(e && e[0] == '0'); // default ON (save-detection probe)
     }
 
     // ---- IOP heap service backing store (SIF RPC sid 0x80000003) ------------
@@ -280,7 +280,7 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
     if (traceMcserv && (sid == IOP_SID_MCSERV || sid == IOP_SID_MCSERV_LEGACY))
     {
         static std::atomic<uint32_t> s_mcservRpcLogs{0u};
-        if (s_mcservRpcLogs.fetch_add(1u, std::memory_order_relaxed) < 96u)
+        if (s_mcservRpcLogs.fetch_add(1u, std::memory_order_relaxed) < 3000u)
         {
             std::fprintf(stderr,
                          "[iop:mcserv-route] sid=0x%08X rpc=0x%X send=0x%08X/%u recv=0x%08X/%u\n",

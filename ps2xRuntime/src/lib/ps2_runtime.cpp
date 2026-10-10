@@ -1,27 +1,31 @@
 #include "ps2_runtime.h"
 #include "runtime/ps2_pipeline_stats.h"
 #include "ps2_dispatch_history.h"
-#include "ps2_scheduler.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_gs_gpu.h"
-#include "runtime/ps2_iop_cpu.h"
+#include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
+#include "Kernel/VuCap/VuCapRecorder.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Stubs/Pad.h"
 #include "Kernel/Syscalls/Thread.h"
+#include "Kernel/Syscalls/Interrupt.h"
 #include "ps2_host_backend.h"
+#include "ps2_iop_host.h"
+#include "ps2x/iop/iop_subsystem.h"
 #include "runtime/ps2_diag.h"
 #include "runtime/ps2_guestwatch.h"
 #include "recomp_debug_ipc.h"
 #include "recomp_debug_writer.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <fstream>
 #include <algorithm>
 #include <array>
@@ -35,6 +39,18 @@
 #include <sstream>
 #include <vector>
 
+// ps2_spu2_out.cpp (SPU2 device -> raylib audio stream)
+void ps2xSpu2OutputStart();
+void ps2xSpu2OutputStop();
+
+// GS thread, ps2_gif_arbiter.cpp.
+bool ps2xGsThreadEnabled();
+extern "C" int ps2x_vuw_on_worker() noexcept;          // ps2_memory.cpp, VU worker
+void ps2xVuwSetKickPrepare(std::function<bool()> fn);  // ps2_memory.cpp
+void ps2xGsThreadSubmit(GS *gs, const uint8_t *data, uint32_t sizeBytes);
+void ps2xGsThreadSync(uint32_t reason);
+void ps2xGsThreadStop();
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -44,13 +60,42 @@ namespace ps2_stubs
 // rather than in a header because a header change forces all ~30,000 runner TUs
 // to recompile. No-ops unless PS2X_PROFILE is set.
 extern "C" void ps2x_host_sampler_start(void);
+extern "C" void ps2x_host_sampler_gate(int open);
 extern "C" void ps2x_host_sampler_stop(void);
+
+// Detached host-side FMV player (src/lib/Kernel/Fmv/FmvHost.cpp). Declared here
+// for the same header-cost reason as above. Fully inert unless PS2X_FMV=host.
+//
+// _install is called from run() rather than through PS2_REGISTER_GAME_OVERRIDE on
+// purpose, and it does two jobs at once:
+//   1. applyMatching runs inside loadELF, which main.cpp calls BEFORE run(), so a
+//      replaceFunction issued here deterministically wins over game_overrides.cpp
+//      (whose skipfmv override owns the same four addresses). Cross-TU static-init
+//      order is unspecified, so the macro would have been a coin flip.
+//   2. ps2_runtime is a STATIC lib with no /WHOLEARCHIVE, so a TU reachable only
+//      via static-initializer self-registration is silently dropped at link time.
+//      These references are the anchor that keeps it.
+extern "C" void ps2x_fmv_host_install(PS2Runtime *runtime);
+extern "C" void ps2x_fmv_host_draw(void);
+extern "C" void ps2x_fmv_host_shutdown(void);
 
 // Stage 5.12: emulates padman's per-vsync IOP->EE pad-state push straight into
 // the guest libpad buffer. Defined in ps2_pad.cpp; declared here for the same
 // header-cost reason as above. Must be called on the thread that polls raylib
 // input, i.e. right after EndDrawing().
 extern "C" void ps2x_pad_push_frame(uint8_t *rdram);
+extern "C" void ps2x_pad_script_set_tick(uint64_t tick); // ps2_pad.cpp, PS2X_PAD_SCRIPT clock
+extern "C" void ps2x_gs_present_begin(); // ps2_gif_arbiter.cpp
+extern "C" void ps2x_gs_present_end();
+extern "C" int ps2x_gs_thread_latches();
+
+// Defined in game_overrides.cpp. Emits [frametrace:calls] for any traced slot
+// whose call count moved since the previous watchdog second -- the first time a
+// slot goes non-zero is the event worth having. Declared here rather than in a
+// header: ps2_runtime.h reaches ~4,520 generated TUs and a header edit is a 30h
+// rebuild. A linkage-specification is only valid at namespace scope, so it lives
+// here and not at the watchdog call site.
+extern "C" void ps2x_dump_frametrace_calls();
 
 namespace
 {
@@ -58,6 +103,19 @@ namespace
     // here so the ps2_watch value trap below can tag each hit with the calling
     // chain.
     std::string formatDispatchHistory();
+}
+
+// [journal] Ordered address-range guest-store journal. DEFINED in
+// Kernel/Diag/trace_calls.cpp; declared here rather than in a header for the
+// same reason as everything else on this page -- a .h edit rebuilds every
+// generated runner TU (30+ hours). extern-between-.cpp is the sanctioned
+// cross-TU pattern in this project. These three declarations must stay in sync
+// with that file.
+namespace ps2_journal
+{
+    extern std::atomic<bool> g_armed;
+    std::size_t install(const char *spec);
+    void onStore(uint32_t addr, uint32_t size, uint64_t lo, uint64_t hi, uint32_t pc) noexcept;
 }
 
 namespace ps2_watch
@@ -74,9 +132,20 @@ namespace ps2_watch
     // destination address is not known in advance (e.g. a clobbered $ra slot
     // on a stack frame whose address moves run-to-run).
     //
-    // Accuracy note: ctx->pc is set at function entry / midasm hooks /
-    // control-flow points, NOT per instruction. A hit therefore names the
-    // writing FUNCTION (usually the basic block), not the exact store.
+    // Accuracy note -- CORRECTED 2026-09-21 (Part 154), MEASURED:
+    // ctx->pc IS assigned per instruction by the current codegen. A generated
+    // body has MORE ctx->pc assignments than instructions (e.g.
+    // ADX_Init_0x11f268.cpp: 126 assignments / 96 instructions). The previous
+    // text here -- "set at function entry / midasm hooks / control-flow
+    // points, NOT per instruction" -- was stale and understated what a hit
+    // tells you.
+    //
+    // Branch DELAY SLOTS were checked specifically, since that is where a
+    // per-instruction pc would plausibly go stale. It does not: over a
+    // 300-file sample of output/, all 1050 delay-slot stores have a ctx->pc
+    // assignment in the 5 preceding lines, and in all 1050 the value assigned
+    // is the STORE's own address (branch_pc carries the branch separately).
+    // A hit therefore names the storing INSTRUCTION, exactly.
     std::atomic<uint32_t> g_trapValue{0};
     std::atomic<uint32_t> g_trapAddrLo{0};
     std::atomic<uint32_t> g_trapAddrHi{0xFFFFFFFFu};
@@ -120,6 +189,15 @@ namespace ps2_watch
                           << std::dec << std::endl;
                 break;
             }
+        }
+
+        // [journal] Ordered address-range store journal (PS2X_JOURNAL). Must
+        // run BEFORE the watch-registry bail below, or arming the journal
+        // alone -- with no PS2X_WATCH -- would record nothing.
+        // Implementation: Kernel/Diag/trace_calls.cpp.
+        if (ps2_journal::g_armed.load(std::memory_order_relaxed))
+        {
+            ps2_journal::onStore(addr, size, lo, hi, pc);
         }
 
         // Bail before the mutex when no address-keyed watch is registered --
@@ -311,7 +389,10 @@ namespace
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // Guest heap ends where the runtime's kernel pools begin (Helpers/State.h,
+    // kRpcPacketPoolBase). SDBZ's crt0 asks InitHeap(-1) = "up to the main
+    // stack"; the old 0x01F00000 cap withheld ~1 MB and starved fight loading.
+    constexpr uint32_t kGuestHeapHardLimit = 0x01F8C000u;
 
     // -----------------------------------------------------------------------
     // Async callback stack pool: [kAsyncCallbackStackFloor, kAsyncCallbackStackTop)
@@ -367,28 +448,242 @@ namespace
 // ps2_runtime resolves it without depending on the overrides TU.
 std::atomic<uint32_t> g_sdbzCb13C4F8InFlight{0u};
 
+// Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28):
+// declared (not defined) here, defined with external linkage in
+// Kernel/Syscalls/System.cpp -- same extern-between-.cpp-without-a-header
+// rule as everything else on this page. Must sit outside the anonymous
+// namespace below, or these would silently bind to a same-named-but-distinct
+// (anonymous namespace)::ps2_syscalls instead of the real one.
+namespace ps2_syscalls
+{
+    extern std::atomic<uint32_t> g_findAddressCallCount;
+    extern std::atomic<uint32_t> g_findAddressLastScannedWords;
+    extern std::atomic<uint32_t> g_findAddressLastResult;
+    extern std::atomic<uint32_t> g_findAddressLastAborted;
+
+    // faCalls stayed pinned at 0 for a full 200s run despite sysNum sampling
+    // 0x83 repeatedly -- dispatchSyscallOverride() intercepts syscall 0x83
+    // before the real FindAddress() below is ever reached. These identify
+    // which of its exit branches fires (1=kernel-query HLE, 2=reentrancy
+    // decline, 3=no-function KE_ERROR, 4=real scheduler invoke).
+    extern std::atomic<uint32_t> g_syscallOverrideCallCount;
+    extern std::atomic<uint32_t> g_syscallOverrideLastHandler;
+    extern std::atomic<uint32_t> g_syscallOverrideLastBranch;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch-trace ring storage, keyed by GUEST THREAD rather than by host
+// thread.
+//
+// 2026-09-22 -- this was a single `thread_local DispatchHistory
+// g_dispatchHistory;` justified with "EeScheduler runs all guest threads
+// cooperatively on a single game thread, so a plain thread_local is
+// equivalent to the current execution context's history". That reasoning is
+// inverted: running every fiber on ONE host thread is exactly why one
+// thread_local is NOT per-fiber. Every guest thread shared a single 64-entry
+// ring, so each trace= dump was contaminated with the PCs of whichever other
+// fibers happened to be interleaved, and a recycled tid inherited the dead
+// thread's PCs.
+//
+// ps2_dispatch_history.h still documents the contract that dropped: "Owned
+// per-fiber by FiberContext (fresh per fiber, gone at teardown); host workers
+// / non-fiber callers use a per-OS-thread fallback." Phase 3d retired
+// FiberContext and never replaced the per-fiber ownership. That is precisely
+// what SchedulerRecoveryIsolation/R1 and /R2 were written to catch.
+//
+// This is not only a test concern. formatDispatchHistory() is what the
+// [ee:zero-pc-dormant] dump and the watchdog print to answer "what did THIS
+// thread execute before it died". A shared ring makes that answer WRONG
+// rather than merely noisy -- it attributes another fiber's PCs to the thread
+// under investigation.
+//
+// Fixed table + linear scan, not a map: pushDispatchPc() is called from
+// lookupFunction(), the universal dispatch choke point, so this has to stay
+// allocation-free and the returned slot pointer must never be invalidated.
+// The scan is off the hot path -- the cached {tid, slot} pair absorbs every
+// dispatch that is not a context switch, leaving one cross-TU call plus one
+// compare in the common case, next to the unconditional `lock xadd` on
+// g_globalDispatchNext that the same function already pays. That is a cost
+// ARGUMENT, not a measurement; if a later profile disagrees, the cache is the
+// thing to attack.
+//
+// Declared extern rather than through a header: ps2x_guest_current_thread_id()
+// is defined in Kernel/EeScheduler.cpp, and ee_scheduler.h must not grow a
+// dependency here (see the extern-between-.cpp rule used throughout this file).
+extern "C" int ps2x_guest_current_thread_id();
+
+namespace
+{
+    // 32 live guest threads is far above anything SDBZ has been observed to
+    // hold; overflow is a documented, counted fallback rather than a silent
+    // one, because a diagnostic that degrades quietly is the exact failure
+    // mode this whole change exists to remove.
+    constexpr uint32_t kDispatchHistorySlots = 32u;
+
+    struct DispatchHistorySlot
+    {
+        int tid = 0; // 0 == free
+        DispatchHistory hist;
+    };
+
+    thread_local DispatchHistorySlot g_dispatchHistorySlots[kDispatchHistorySlots];
+
+    bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open())
+        {
+            return false;
+        }
+
+        static const std::array<uint32_t, 256> table = []
+        {
+            std::array<uint32_t, 256> values{};
+            for (uint32_t i = 0; i < values.size(); ++i)
+            {
+                uint32_t value = i;
+                for (uint32_t bit = 0; bit < 8; ++bit)
+                {
+                    value = (value & 1u) ? (0xEDB88320u ^ (value >> 1u)) : (value >> 1u);
+                }
+                values[i] = value;
+            }
+            return values;
+        }();
+
+        uint32_t crc = 0xFFFFFFFFu;
+        std::array<uint8_t, 16 * 1024> buffer{};
+        while (file.good())
+        {
+            file.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize count = file.gcount();
+            for (std::streamsize i = 0; i < count; ++i)
+            {
+                crc = table[(crc ^ buffer[static_cast<size_t>(i)]) & 0xFFu] ^ (crc >> 8u);
+            }
+        }
+        if (file.bad())
+        {
+            return false;
+        }
+        crcOut = ~crc;
+        return true;
+    }
+
+    // Used when no guest thread is current: host workers, the watchdog, and
+    // anything dispatching before the scheduler is bound. This is the
+    // "per-OS-thread fallback" the header describes.
+    thread_local DispatchHistory g_dispatchHistoryHost;
+
+    thread_local int g_dispatchHistoryCachedTid = 0;
+    thread_local DispatchHistory *g_dispatchHistoryCached = nullptr;
+
+    std::atomic<uint32_t> g_dispatchHistoryOverflow{0u};
+
+    DispatchHistory *dispatchHistorySlotFor(int tid)
+    {
+        DispatchHistorySlot *freeSlot = nullptr;
+        for (uint32_t i = 0u; i < kDispatchHistorySlots; ++i)
+        {
+            DispatchHistorySlot &s = g_dispatchHistorySlots[i];
+            if (s.tid == tid)
+            {
+                return &s.hist;
+            }
+            if (freeSlot == nullptr && s.tid == 0)
+            {
+                freeSlot = &s;
+            }
+        }
+        if (freeSlot == nullptr)
+        {
+            // Table full. Say so ONCE -- this is off the hot path (cache miss
+            // plus full scan), and a trace that silently shares the host slot
+            // would reintroduce the very contamination being fixed.
+            const uint32_t n = g_dispatchHistoryOverflow.fetch_add(1u, std::memory_order_relaxed);
+            if (n == 0u)
+            {
+                std::cerr << "[dispatchring] slot table full (" << kDispatchHistorySlots
+                          << " guest threads); further traces share the host fallback"
+                          << std::endl;
+            }
+            return &g_dispatchHistoryHost;
+        }
+        freeSlot->tid = tid;
+        freeSlot->hist = DispatchHistory{};
+        return &freeSlot->hist;
+    }
+}
+
+// Global scope so Kernel/EeScheduler.cpp can reach these; the storage above
+// stays TU-private.
+extern "C" void ps2x_dispatch_history_reset(int tid)
+{
+    if (tid <= 0)
+    {
+        return;
+    }
+    for (uint32_t i = 0u; i < kDispatchHistorySlots; ++i)
+    {
+        DispatchHistorySlot &s = g_dispatchHistorySlots[i];
+        if (s.tid != tid)
+        {
+            continue;
+        }
+        s.hist = DispatchHistory{};
+        s.tid = 0;
+    }
+    // The cache may still point at the slot just released.
+    g_dispatchHistoryCachedTid = 0;
+    g_dispatchHistoryCached = nullptr;
+}
+
+extern "C" void ps2x_dispatch_history_reset_all()
+{
+    for (uint32_t i = 0u; i < kDispatchHistorySlots; ++i)
+    {
+        g_dispatchHistorySlots[i].tid = 0;
+        g_dispatchHistorySlots[i].hist = DispatchHistory{};
+    }
+    g_dispatchHistoryHost = DispatchHistory{};
+    g_dispatchHistoryCachedTid = 0;
+    g_dispatchHistoryCached = nullptr;
+}
+
 namespace
 {
     constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000080u;
     constexpr uint32_t EXCEPTION_VECTOR_TLB_REFILL = 0x80000000u;
     constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00200u;
 
-    // Fiber-owned when running inside a fiber; per-OS-thread fallback otherwise
-    // (borrowed host workers, executor between fibers, direct non-fiber callers).
+    // Resolves to the ring owned by the CURRENTLY RUNNING GUEST THREAD -- see
+    // the storage block above this anonymous namespace for why a plain
+    // thread_local was wrong. tid <= 0 means no guest thread is current (host
+    // worker, watchdog, pre-bind dispatch) and uses the per-OS-thread fallback.
     DispatchHistory &currentDispatchHistory()
     {
-        return ps2sched::current_dispatch_history();
+        const int tid = ps2x_guest_current_thread_id();
+        if (tid == g_dispatchHistoryCachedTid && g_dispatchHistoryCached != nullptr)
+        {
+            return *g_dispatchHistoryCached;
+        }
+        DispatchHistory *h = (tid <= 0) ? &g_dispatchHistoryHost
+                                        : dispatchHistorySlotFor(tid);
+        g_dispatchHistoryCachedTid = tid;
+        g_dispatchHistoryCached = h;
+        return *h;
     }
 
-    // ps2sched's guest clock: one tick per 128 guest back-edges. Defined in
-    // ps2_scheduler.cpp and declared here rather than in ps2_scheduler.h,
+    // Guest clock: one tick per 128 guest back-edges. Defined in
+    // Kernel/EeScheduler.cpp (Phase 3d ported this off the retired
+    // ps2_scheduler.cpp) and declared here rather than in ee_scheduler.h,
     // because editing that header would force a full rebuild of the ~30,000
     // generated runner translation units (§3 prohibition). Used by the watchdog
     // to report whether the guest is executing at all.
     extern "C" uint64_t ps2x_guest_progress();
 
     // Same no-header rule. ps2x_guest_busy_ns/ps2x_guest_resumes are defined in
-    // ps2_scheduler.cpp (executor resume bracket); ps2x_vblank_ticks in
+    // Kernel/EeScheduler.cpp (function-dispatch bracket); ps2x_vblank_ticks in
     // Kernel/Syscalls/Interrupt.cpp (vblank delivery point). Together with
     // ps2x_guest_progress they let the watchdog separate "the guest executes
     // slowly" from "the guest is idle waiting" -- see the watchdog comment.
@@ -396,10 +691,10 @@ namespace
     extern "C" uint64_t ps2x_guest_resumes();
     extern "C" uint64_t ps2x_vblank_ticks();
 
-    // Same no-header rule. Defined in ps2_scheduler.cpp. Returns 1 when no guest
-    // thread is runnable (run queue empty AND no running fiber). [thsync] uses it
-    // to separate "the worker is not runnable" from "the worker is runnable but
-    // never scheduled" -- those are different bugs with different fixes.
+    // Same no-header rule. Defined in Kernel/EeScheduler.cpp. Returns 1 when no
+    // guest thread is running or ready. [thsync] uses it to separate "the
+    // worker is not runnable" from "the worker is runnable but never
+    // scheduled" -- those are different bugs with different fixes.
     extern "C" int ps2x_guest_idle();
 
     // Vblank tick provenance (stage 5.17). vbl/s alone cannot distinguish "the
@@ -409,18 +704,19 @@ namespace
     extern "C" void ps2x_vblank_tick_sources(uint64_t *quantum, uint64_t *idle,
                                              uint64_t *stall);
 
-    // Same no-header rule. Defined in ps2_scheduler.cpp, where they have existed
-    // since the EIE gate went in but were never printed anywhere -- so the one
-    // question they answer has never been asked of a run.
+    // Same no-header rule. Defined in Kernel/EeScheduler.cpp -- the EIE gate
+    // moved there from ps2_scheduler.cpp's yield_point() in Phase 3d, now
+    // enforced inside EeScheduler::checkpointDue() (the successor call site).
     //
-    // yield_point() step 2b refuses to surrender the guest slot while the guest
-    // holds interrupts disabled, and only gives up after kIntrDisableYieldEscape
-    // (4096) samples == ~512K guest back-edges. Every escape is therefore a
-    // stretch where no fiber could be scheduled no matter what was Ready. On a
-    // healthy run intrEsc reads 0; any non-zero value means a critical section
-    // ran long enough that the gate stopped protecting and started stalling.
-    // intrStray > 0 would mean EIE is being cleared by something other than the
-    // section that set it -- the one way this single-bit model under-protects.
+    // The gate refuses to report a checkpoint due while the guest holds
+    // interrupts disabled, and only gives up after kIntrDisableYieldEscape
+    // (4096) samples. Every escape is therefore a stretch where no interrupt
+    // could be delivered and no other thread could be scheduled no matter what
+    // was Ready. On a healthy run intrEsc reads 0; any non-zero value means a
+    // critical section ran long enough that the gate stopped protecting and
+    // started stalling. intrStray > 0 would mean EIE is being cleared by
+    // something other than the section that set it -- the one way this
+    // single-bit model under-protects.
     extern "C" uint64_t ps2x_guest_intr_disable_escapes();
     extern "C" uint64_t ps2x_guest_intr_disable_sections();
     extern "C" uint64_t ps2x_guest_intr_disable_stray();
@@ -429,6 +725,20 @@ namespace
     // extern-between-.cpp rule as above -- no header, no 30h rebuild.
     extern "C" void ps2x_probe_kv(const char *name, int n,
                                   const char *const *keys, const uint64_t *vals);
+
+    // 2026-09-06 part 87 -- host-side EE scheduler counters, defined in
+    // Kernel/EeScheduler.cpp. Same extern-between-.cpp rule as above.
+    extern "C" void ps2x_sched_diag(uint64_t *out, int n);
+
+    // 10-09 60fps P0 -- per-second cost counters behind the [budget] line:
+    // guest thread-transfer throws (Kernel/EeScheduler.cpp), VU1 host time
+    // (vu/ps2_vu1_core.cpp), raster workload classes (ps2_gs_rasterizer.cpp).
+    extern "C" void ps2x_budget_xfer(uint64_t *out, int n);
+    extern "C" void ps2x_budget_vu1(uint64_t *out, int n);
+    extern "C" void ps2x_budget_raster(uint64_t *out, int n);
+    // 10-09 P5a go/no-go counters (ps2_memory.cpp), PS2X_P5A=1.
+    extern "C" void ps2x_p5a_counts(uint64_t *out, int n) noexcept;
+    extern "C" int ps2x_p5a_enabled() noexcept;
 
     // Periodic SRD histogram dump, also defined in game_overrides.cpp. The
     // watchdog is the only thing in the process guaranteed to keep ticking when
@@ -445,8 +755,46 @@ namespace
     // value observed before a freeze names the deepest function reached.
     std::atomic<uint32_t> g_lastDispatchPc{0u};
 
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-27):
+    // g_lastDispatchPc only advances on the NEXT table-dispatched call, so a
+    // syscall that never returns (a blocking primitive that mis-binds under
+    // EeScheduler's blockCurrent instead of cleanly resuming) freezes it at
+    // the SYSCALL TRAMPOLINE's address forever -- never at the syscall itself.
+    // handleSyscall stores here before dispatching and clears back to the
+    // sentinel after a normal return, so a watchdog that finds this still set
+    // has its answer directly: which EE syscall number (encoded the same way
+    // as the Dispatcher.cpp switch -- negative "i" variants are
+    // static_cast<uint32_t>(-N)) was entered, and the guest PC ($ctx->pc,
+    // i.e. approximately the syscall instruction's own address) that issued
+    // it. If dispatch instead unwinds via an exception rather than returning,
+    // this stays set too -- also the correct diagnostic outcome.
+    constexpr uint32_t kNoSyscallInFlight = 0xFFFFFFFFu;
+    std::atomic<uint32_t> g_syscallInFlightNumber{kNoSyscallInFlight};
+    std::atomic<uint32_t> g_syscallInFlightPc{0u};
+
+    // Diagnostic-only (session-3 EeScheduler-stall investigation, 2026-08-28):
+    // the 2026-08-28 run showed sysNum toggling 0x83/sentinel every watchdog
+    // sample rather than staying pinned non-returning -- FindAddress (0x83)
+    // is a synchronous bounded scan that always returns, so a stall pinned at
+    // its call site means the guest is RE-ISSUING it from the same PC in a
+    // tight retry loop, not blocked inside one call. These capture the a0
+    // (table start) / a1 (table end) / a2 (target) args at the same point
+    // sysNum is stored, so a frozen watchdog can show whether it's polling
+    // the same table/target every time (waiting on someone else to write it)
+    // or thrashing across different targets.
+    std::atomic<uint32_t> g_syscallInFlightA0{0u};
+    std::atomic<uint32_t> g_syscallInFlightA1{0u};
+    std::atomic<uint32_t> g_syscallInFlightA2{0u};
+
+    // 2026-08-28: sysA0/A1/A2 came back pinned (a0=0x3 a1=0x80080000 a2=0x17ee80)
+    // on the FindAddress(0x83) call sitting at the frozen PC -- that's a ~2GB
+    // scan range, not a small table. Capturing $ra (reg 31) here to find the
+    // actual guest call site and check whether a1 is legitimate or a
+    // mis-passed/uninitialized register.
+    std::atomic<uint32_t> g_syscallInFlightRa{0u};
+
     // Cross-thread snapshot ring (diagnostic-only, PS2_PC_WATCHDOG). The per-thread
-    // DispatchHistory above is fiber/OS-thread-owned, so the watchdog (its own OS
+    // DispatchHistory above is thread_local, so the watchdog (its own OS
     // thread) reads its own empty history. This global ring keeps the last N
     // table-dispatched PCs written by ANY thread so the watchdog can print the
     // guest's actual spin loop body. Racy by design (approximate ordering is fine
@@ -771,6 +1119,7 @@ namespace
         ctx->vu0_mac_flags = 0;
         ctx->vu0_status = 0;
         ctx->vu0_q = 1.0f;
+        ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(0x3F800000));
         ctx->vu0_vpu_stat = 0;
         ctx->vu0_vpu_stat2 = 0;
     }
@@ -792,11 +1141,16 @@ namespace
         state.q = ctx->vu0_q;
         state.p = ctx->vu0_p;
         state.i = ctx->vu0_i;
+        alignas(16) uint32_t rWords[4]{};
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(rWords), _mm_castps_si128(ctx->vu0_r));
+        state.r = 0x3F800000u | (rWords[0] & 0x007FFFFFu);
         state.pc = ctx->vu0_pc;
         state.mac = ctx->vu0_mac_flags;
         state.clip = ctx->vu0_clip_flags;
         state.status = ctx->vu0_status;
         state.itop = ctx->vu0_itop;
+        state.dBitEnabled = (ctx->vu0_fbrst & (1u << 2)) != 0u;
+        state.tBitEnabled = (ctx->vu0_fbrst & (1u << 3)) != 0u;
 
         state.vf[0][0] = 0.0f;
         state.vf[0][1] = 0.0f;
@@ -820,6 +1174,7 @@ namespace
         ctx->vu0_q = state.q;
         ctx->vu0_p = state.p;
         ctx->vu0_i = state.i;
+        ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(state.r)));
         ctx->vu0_mac_flags = state.mac;
         ctx->vu0_clip_flags = state.clip;
         ctx->vu0_clip_flags2 = state.clip;
@@ -827,7 +1182,7 @@ namespace
         ctx->vu0_itop = state.itop;
         ctx->vu0_pc = state.pc;
         ctx->vu0_tpc = state.pc;
-        ctx->vu0_vpu_stat = 0;
+        ctx->vu0_vpu_stat = (ctx->vu0_vpu_stat & 0xFF00u) | (state.stoppedByD ? (1u << 1) : 0u) | (state.stoppedByT ? (1u << 2) : 0u);
         ctx->vu0_vpu_stat2 = 0;
 
         ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
@@ -931,6 +1286,55 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2026-09-22 [journal] -- cross-TU read of the current thread's dispatch ring.
+//
+// WHY THIS EXISTS. The store journal records the STORING pc. For the open
+// question -- who tore down the object at 0x61a5c0 at t~1277 s -- the storing
+// pc is 0x3d1d94, which we already knew before arming anything. The answer we
+// need is the CALLER, and that lives in the per-thread dispatch ring that
+// pushDispatchPc() maintains.
+//
+// formatDispatchHistory() cannot be reused: it lives in the anonymous
+// namespace above (internal linkage) and returns a std::string, which does not
+// fit ps2x_probe_kv's uint64_t value array. Returning raw PCs instead keeps the
+// record in the structured JSONL sink rather than adding another std::cerr
+// line -- the plan's WP1/§10 rule, and the same discipline that just took the
+// three uncapped [semwatch] probes out of EeScheduler.cpp.
+//
+// Non-static and declared extern in Kernel/Diag/trace_calls.cpp: the sanctioned
+// cross-.cpp pattern here, because any header edit rebuilds 30,000+ runner TUs.
+//
+// COST: none on the hot path. This is called only from emitRecord(), which
+// runs on a journal MATCH -- rare by construction. The miss path in onStore()
+// is untouched.
+//
+// LIMIT, stated because a silent one would be worse: this reads the ring that
+// dispatchGuestBranch() feeds. A callee reached by a direct call or a tail `j`
+// that bypasses the dispatch table will not appear (the recorded tracer
+// blind-spot class). Absence of a caller here is therefore NOT evidence of no
+// caller.
+std::size_t ps2xDispatchHistoryTail(uint32_t *out, std::size_t n) noexcept
+{
+    if (out == nullptr || n == 0u)
+    {
+        return 0u;
+    }
+
+    const DispatchHistory &h = currentDispatchHistory();
+    const std::size_t ringSize = h.pcs.size();
+    const std::size_t have = h.wrapped ? ringSize : static_cast<std::size_t>(h.next);
+    const std::size_t take = (have < n) ? have : n;
+
+    // Most recent first: index 0 is the immediately-preceding dispatch.
+    for (std::size_t i = 0; i < take; ++i)
+    {
+        const std::size_t idx = (static_cast<std::size_t>(h.next) + ringSize - 1u - i) % ringSize;
+        out[i] = h.pcs[idx];
+    }
+    return take;
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -944,11 +1348,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
-    const uint64_t currentTick = ps2_syscalls::GetCurrentVSyncTick();
+    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        if (!ps2x_gs_thread_latches()) // GS thread latches at its vblank marker
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -1037,10 +1442,20 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
 PS2Runtime::PS2Runtime()
 {
-    std::memset(&m_cpuContext, 0, sizeof(m_cpuContext));
+    m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
+    m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+
+    m_eeScheduler = std::make_unique<EeScheduler>(*this);
+
+    // Assign rather than memset: R5900Context's constructor zeroes itself and
+    // then applies the COP0 reset values, which a memset here would discard.
+    m_cpuContext = R5900Context{};
 
     // R0 is always zero in MIPS
     m_cpuContext.r[0] = _mm_set1_epi32(0);
+    m_cpuContext.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+    m_cpuContext.vu0_q = 1.0f;
+    m_cpuContext.vu0_r = _mm_castsi128_ps(_mm_set1_epi32(0x3F800000));
 
     // Boot Status: interrupts enabled, kernel mode, BEV clear (post-BIOS).
     //
@@ -1085,23 +1500,6 @@ PS2Runtime::PS2Runtime()
     // member initializer here; loadELF() re-arms it for the pool's next load
     // (see the layout comment at kAsyncCallbackStackFloor).
 
-    // Claim the reserved main-thread identity (tid 1 — see State.h's
-    // g_nextThreadId starting at 2, and run()'s create_fiber(1, 1, ...) for the
-    // guest boot fiber, both of which reserve this same id) for the host thread
-    // that constructs this runtime. g_currentThreadId == -1 here means this
-    // host thread has never been assigned a guest identity: it is neither a
-    // running guest fiber (which carries its own tid, set by the scheduler on
-    // its own dedicated executor thread — a different OS thread from this one)
-    // nor a borrowed IRQ/alarm/RPC worker (those self-assign -1 as the first
-    // statement of their thread function, before any PS2Runtime is reachable).
-    // ensureCurrentThreadInfo() lazily creates tid 1's ThreadInfo (THS_RUN,
-    // wakeupCount 0) the first time a syscall needs it, and the guest boot
-    // fiber (also tid 1, but on the separate executor thread) later finds and
-    // reuses that same g_threads entry — so tid 1 never has two ThreadInfos.
-    if (g_currentThreadId == -1)
-    {
-        g_currentThreadId = 1;
-    }
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -1126,6 +1524,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        ps2xGsThreadStop();
         // Fiber pool is cleaned up by scheduler_shutdown() in run().
 #if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
@@ -1133,6 +1532,7 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
+            ps2xSpu2OutputStop();
             CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
         }
@@ -1161,6 +1561,69 @@ PS2Runtime::~PS2Runtime()
     }
 }
 
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    const auto result = m_iopSubsystem->loadModule(path, arguments, argumentSize);
+    static std::atomic<uint32_t> s_loadLogs{0u};
+    if (s_loadLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
+    {
+        std::cerr << "[iop:load] path='" << std::string(path) << "' handled=" << result.handled
+                  << " moduleId=" << result.moduleId << " start=" << result.startResult << std::endl;
+    }
+    return result;
+}
+
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
+}
+
+bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->stopModule(moduleId, result);
+}
+
+ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const
+{
+    return m_iopSubsystem->selectRpcAbi(request);
+}
+
+bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
+{
+    return m_iopSubsystem->canBindRpc(sid);
+}
+
+ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
+{
+    auto scope = m_iopHost->enterCall(ctx, rdram);
+    request.callToken = scope.token();
+    return m_iopSubsystem->handleRpc(request);
+}
+
+void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
+{
+    auto scope = m_iopHost->enterCall(nullptr, rdram);
+    m_iopSubsystem->onSifTransfer(transfer);
+}
+
+void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+{
+    m_iopSubsystem->runEeCycles(eeCycles);
+}
+
+void PS2Runtime::resetIop()
+{
+    m_iopSubsystem->reset();
+}
+
+ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
+{
+    return m_iopSubsystem->debugSnapshot();
+}
+
 namespace
 {
     // Counts nonzero bytes in a buffer. Called once per MSCAL (~30/frame) over
@@ -1185,6 +1648,36 @@ void PS2Runtime::probeVu1MemoryOccupancy()
                                 countNonzeroBytes(m_memory.getVU1Data(), PS2_VU1_DATA_SIZE));
 }
 
+uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
+{
+    return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
+}
+
+bool PS2Runtime::freeIopMemory(uint32_t address)
+{
+    return m_iopSubsystem && m_iopSubsystem->freeMemory(address);
+}
+
+bool PS2Runtime::readIopMemory(uint32_t address, void *destination, size_t size) const
+{
+    return m_iopSubsystem && m_iopSubsystem->readMemory(address, destination, size);
+}
+
+bool PS2Runtime::writeIopMemory(uint32_t address, const void *source, size_t size)
+{
+    return m_iopSubsystem && m_iopSubsystem->writeMemory(address, source, size);
+}
+
+bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
+{
+    return m_iopSubsystem && m_iopSubsystem->zeroMemory(address, size);
+}
+
+bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+{
+    return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
+}
+
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
@@ -1199,26 +1692,106 @@ bool PS2Runtime::syncCoreSubsystems()
         return true;
     }
 
-    m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs(), this);
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    {
+                                        if (ps2xGsThreadEnabled())
+                                            ps2xGsThreadSubmit(&m_gs, data, size);
+                                        else
+                                            m_gs.processGIFPacket(data, size);
+                                    });
     m_memory.setGifArbiter(&m_gifArbiter);
+    vucap::setStateSource(&m_vu1.state());
+    // P5b: a VU1 run queued on the VU worker must not touch the EE context. The
+    // kick (EE thread) checks FBRST D/T here, and clears the stop bits the run
+    // would clear; it returns false to keep that kick inline.
+    ps2xVuwSetKickPrepare([this]() -> bool
+                          {
+                              R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                              if (!cpuContext)
+                                  cpuContext = &m_cpuContext;
+                              if ((cpuContext->vu0_fbrst & ((1u << 10) | (1u << 11))) != 0u)
+                                  return false;
+                              cpuContext->vu0_vpu_stat &= ~0x0600u;
+                              return true; });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
                                      ps2_pipeline_stats::g_lastMscalPC.store(startPC, std::memory_order_relaxed);
-                                     probeVu1MemoryOccupancy();
+                                     if (ps2x_vuw_on_worker())
+                                     {
+                                         // D/T bits were clear at kick time (see above).
+                                         m_vu1.state().dBitEnabled = false;
+                                         m_vu1.state().tBitEnabled = false;
+                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                         return;
+                                     }
+                                     // 32 KB byte scan per MSCAL was 2.5% of the fight game thread (10-09 profile); stats-only.
+                                     if (ps2_diag::enabled())
+                                         probeVu1MemoryOccupancy();
+                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     if (!cpuContext)
+                                     {
+                                         cpuContext = &m_cpuContext;
+                                     }
+                                     m_vu1.state().dBitEnabled =
+                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled =
+                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool vucapOn = vucap::hot();
+                                     const uint64_t vucapCycles = m_vu1.state().cycles;
+                                     if (vucapOn)
+                                         vucap::runStart(startPC >> 3, top, itop, m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                         m_vu1.state(), cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536); });
+                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                     if (vucapOn)
+                                         vucap::runEnd(m_vu1.state(), m_vu1.state().cycles - vucapCycles >= 65536u,
+                                                       cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
+                                     cpuContext->vu0_vpu_stat =
+                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      ps2_pipeline_stats::g_vu1Runs.fetch_add(1, std::memory_order_relaxed);
+                                     if (ps2x_vuw_on_worker())
+                                     {
+                                         m_vu1.state().dBitEnabled = false;
+                                         m_vu1.state().tBitEnabled = false;
+                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                      m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                      m_gs, &m_memory, top, itop, 65536);
+                                         return;
+                                     }
+                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     if (!cpuContext)
+                                     {
+                                         cpuContext = &m_cpuContext;
+                                     }
+                                     m_vu1.state().dBitEnabled =
+                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled =
+                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool vucapOn = vucap::hot();
+                                     const uint64_t vucapCycles = m_vu1.state().cycles;
+                                     if (vucapOn)
+                                         vucap::runStart(m_vu1.state().pc >> 3, top, itop, m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                         m_vu1.state(), cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                m_gs, &m_memory, top, itop, 65536); });
-    m_iop.init(rdram);
-    m_iop.reset();
+                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                  m_gs, &m_memory, top, itop, 65536);
+                                     if (vucapOn)
+                                         vucap::runEnd(m_vu1.state(), m_vu1.state().cycles - vucapCycles >= 65536u,
+                                                       cpuContext->vu0_vpu_stat, cpuContext->vu0_fbrst);
+                                     cpuContext->vu0_vpu_stat =
+                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    resetIop();
     m_vu0.reset();
     m_vu1.reset();
 
@@ -1250,6 +1823,8 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        if (IsAudioDeviceReady())
+            ps2xSpu2OutputStart();
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -1333,6 +1908,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
 
     m_cpuContext.pc = header.entry;
+    m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
 
     uint32_t maxLoadedRdramEnd = kGuestHeapDefaultBase;
     uint32_t moduleBase = std::numeric_limits<uint32_t>::max();
@@ -1498,7 +2074,30 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
 
     m_loadedModules.push_back(module);
 
-    ps2_game_overrides::applyMatching(*this, elfPath, m_cpuContext.pc);
+    uint32_t elfCrc32 = 0u;
+    const bool elfCrc32Valid = computeFileCrc32(elfPath, elfCrc32);
+    if (!elfCrc32Valid)
+    {
+        std::cerr << "[ps2xIOP] failed to compute ELF CRC32 for '" << elfPath << "'" << std::endl;
+    }
+    ps2x::iop::GameIdentity identity;
+    identity.elfName = module.name;
+    identity.entryPoint = m_cpuContext.pc;
+    identity.crc32 = elfCrc32;
+    std::string romError;
+    if (!m_romDevice.configure(identity, &romError))
+    {
+        std::cerr << "[ROM0] failed to configure profile: " << romError << std::endl;
+        return false;
+    }
+
+    m_iopSubsystem->reset();
+
+    ps2_game_overrides::applyMatching(*this,
+                                      elfPath,
+                                      m_cpuContext.pc,
+                                      elfCrc32,
+                                      elfCrc32Valid);
 
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
@@ -1637,6 +2236,26 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
+    // 2026-08-30 part 32 -- catch-all: the scheduler-loop and dispatchGuestBranch
+    // probes (and three step-loop probes added the same day in SIF.cpp,
+    // GS.cpp, and Syscalls/Helpers/Runtime.h) all recorded ZERO hits for
+    // 0x178a08 despite it appearing every second in the watchdog's global
+    // dispatch ring, which only pushDispatchPc() (called right above,
+    // unconditionally, from every lookupFunction() caller) can feed. This is
+    // the one place every call site funnels through, so it WILL fire if any
+    // of them do; it can't show $ra/$sp/$a0 (no ctx here), but paired with
+    // the five site-tagged probes it pins down which caller is responsible
+    // by elimination.
+    if (address == 0x178a08u)
+    {
+        static std::atomic<uint32_t> s_fillZ18LookupLogs{0u};
+        const uint32_t n = s_fillZ18LookupLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 32u)
+        {
+            std::cerr << "[semwatch:fillz18-lookup] #" << n << std::endl;
+        }
+    }
+
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(address, slot))
     {
@@ -1755,6 +2374,10 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     const uint32_t gp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0));
     const uint32_t a0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0));
     const uint32_t a1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0));
+    const uint32_t a2 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[6], 0));
+    const uint32_t a3 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[7], 0));
+    const uint32_t s0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[16], 0));
+    const uint32_t s1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[17], 0));
     const uint32_t v0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[2], 0));
     const uint32_t v1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[3], 0));
 
@@ -1859,6 +2482,27 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         readGuestU32Offset(a0, 0x08u, a0Word8) &&
         readGuestU32Offset(a0, 0x0cu, a0WordC);
 
+    uint32_t s0Word0 = 0u;
+    uint32_t s0Word4 = 0u;
+    uint32_t s0Word8 = 0u;
+    uint32_t s0WordC = 0u;
+    const bool s0Readable =
+        readGuestU32Offset(s0, 0x00u, s0Word0) &&
+        readGuestU32Offset(s0, 0x04u, s0Word4) &&
+        readGuestU32Offset(s0, 0x08u, s0Word8) &&
+        readGuestU32Offset(s0, 0x0cu, s0WordC);
+
+    uint32_t recordWord0 = 0u;
+    uint32_t recordWord4 = 0u;
+    uint32_t recordWord8 = 0u;
+    uint32_t recordWordC = 0u;
+    const bool recordReadable =
+        s0Readable && s0Word4 != 0u &&
+        readGuestU32Offset(s0Word4, 0x00u, recordWord0) &&
+        readGuestU32Offset(s0Word4, 0x04u, recordWord4) &&
+        readGuestU32Offset(s0Word4, 0x08u, recordWord8) &&
+        readGuestU32Offset(s0Word4, 0x0cu, recordWordC);
+
     uint32_t vtableSlot0 = 0u;
     uint32_t vtableSlot4 = 0u;
     uint32_t vtableSlot8 = 0u;
@@ -1883,6 +2527,10 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " gp=0x" << gp
             << " a0=0x" << a0
             << " a1=0x" << a1
+            << " a2=0x" << a2
+            << " a3=0x" << a3
+            << " s0=0x" << s0
+            << " s1=0x" << s1
             << " v0=0x" << v0
             << " v1=0x" << v1
             << " a0Readable=" << (a0Readable ? "yes" : "no")
@@ -1890,6 +2538,16 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " a0[4]=0x" << a0Word4
             << " a0[8]=0x" << a0Word8
             << " a0[c]=0x" << a0WordC
+            << " s0Readable=" << (s0Readable ? "yes" : "no")
+            << " s0[0]=0x" << s0Word0
+            << " s0[4]=0x" << s0Word4
+            << " s0[8]=0x" << s0Word8
+            << " s0[c]=0x" << s0WordC
+            << " recordReadable=" << (recordReadable ? "yes" : "no")
+            << " record[0]=0x" << recordWord0
+            << " record[4]=0x" << recordWord4
+            << " record[8]=0x" << recordWord8
+            << " record[c]=0x" << recordWordC
             << " vtableReadable=" << (vtableReadable ? "yes" : "no")
             << " vtbl[0]=0x" << vtableSlot0
             << " vtbl[4]=0x" << vtableSlot4
@@ -1966,6 +2624,92 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+// Defined in Kernel/EeScheduler.cpp. Declared here (namespace scope -- a
+// linkage-specification is not permitted at block scope) so the one chokepoint
+// that sees real function entries can feed the cold-resume witness table.
+extern "C" void ps2x_witness_true_entry(uint32_t entryPc, uint32_t sp);
+
+// 2026-09-10 -- zero-pc UNWIND ring.
+//
+// dispatchGuestBranch() returns false the instant a callee leaves ctx->pc == 0
+// (see the `isStopRequested() || ctx->pc == 0u` check at the bottom of this
+// function). That false then propagates up through EVERY enclosing generated
+// frame -- each one does `if (!runtime->dispatchGuestBranch(...)) { return; }`
+// -- so by the time EeScheduler prints [ee:zero-pc-dormant] the frame that
+// actually returned to $ra == 0 has already unwound. Its own g_eeDispatchRing
+// cannot help: that ring only records SCHEDULER-LOOP dispatches, and an
+// intra-function `jal` reached through this path never round-trips back to the
+// scheduler. That is why parts 37-46 could never name the culprit address.
+//
+// Record the unwind here instead. Within one unwind the pushes run
+// innermost-first, so the FIRST entry of the final burst names the guest
+// function that returned to zero; every later entry in that burst is just the
+// propagation walking outwards.
+//
+// Unconditional, no I/O and no allocation on the hot path -- the same contract
+// as the scheduler's g_eeDispatchRing. Printed only from the terminal SUSPECT
+// branch in EeScheduler.cpp, which calls ps2x_dump_zero_pc_unwind() below.
+namespace
+{
+    struct Ps2xZeroPcRec
+    {
+        uint32_t targetPc;
+        uint32_t sourcePc;
+        uint32_t ra;        // $ra AFTER the callee returned (== 0 on the unwind)
+        uint32_t sp;        // $sp AFTER the callee returned
+        // raAtEntry/spAtEntry were removed 2026-09-10 -- capturing them cost a
+        // measured 19% on the dispatch hot path and the question they answered
+        // is now settled statically. See the note in dispatchGuestBranch.
+        uint32_t kind;
+    };
+
+    constexpr uint32_t kPs2xZeroPcRingSize = 64u;
+    Ps2xZeroPcRec g_ps2xZeroPcRing[kPs2xZeroPcRingSize] = {};
+    std::atomic<uint32_t> g_ps2xZeroPcRingPos{0u};
+    std::atomic<uint64_t> g_ps2xZeroPcTotal{0u};
+}
+
+// Declared extern (not in a header -- headers are included by ~4,520 generated
+// TUs and touching one costs a full rebuild) at its single call site in
+// EeScheduler.cpp.
+void ps2x_dump_zero_pc_unwind()
+{
+    const uint64_t total = g_ps2xZeroPcTotal.load(std::memory_order_relaxed);
+    const uint32_t pos = g_ps2xZeroPcRingPos.load(std::memory_order_relaxed);
+    const uint32_t have = (total < kPs2xZeroPcRingSize)
+                              ? static_cast<uint32_t>(total)
+                              : kPs2xZeroPcRingSize;
+
+    std::cerr << "[ee:zero-pc-unwind]   dispatchGuestBranch unwind ring ("
+              << std::dec << have << " of " << total
+              << " total, OLDEST FIRST -- the first line of the LAST burst is the"
+                 " function that returned to $ra==0):"
+              << std::endl;
+
+    if (have == 0u)
+    {
+        std::cerr << "[ee:zero-pc-unwind]     <empty -- pc never reached 0 inside "
+                     "dispatchGuestBranch, so the zero was produced by a top-level "
+                     "scheduler dispatch, not by an unwind>"
+                  << std::endl;
+        return;
+    }
+
+    for (uint32_t n = 0; n < have; ++n)
+    {
+        const uint32_t idx = (pos + kPs2xZeroPcRingSize - have + n) % kPs2xZeroPcRingSize;
+        const Ps2xZeroPcRec &r = g_ps2xZeroPcRing[idx];
+        std::cerr << "[ee:zero-pc-unwind]     #" << std::dec << n
+                  << " target=0x" << std::hex << r.targetPc
+                  << " from=0x" << r.sourcePc
+                  << " kind=" << describeGuestBranchKind(
+                         static_cast<PS2Runtime::GuestBranchKind>(r.kind))
+                  << " raAfter=0x" << r.ra
+                  << " spAfter=0x" << r.sp
+                  << std::dec << std::endl;
+    }
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1977,14 +2721,21 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
-    if (kind == GuestBranchKind::Return)
+    // Every inter-function transfer is also a deterministic EE safe point.
+    // Backward edges inside generated functions use eeCheckpointDue(), while
+    // this charge bounds straight-line call chains that have no local loop.
+    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    {
+        return false;
+    }
+
+    if (!isCall)
     {
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
         }
 
-        // Prevent nested dispatch.
         ctx->pc = targetPc;
         return false;
     }
@@ -2004,7 +2755,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
-            return true;
+            // if you need the app to keep open to open debug pannel change this to false
+            return false;
         }
 
         return false;
@@ -2012,20 +2764,118 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+
+    // 2026-09-01 part 45 -- witness this as a TRUE entry. Only for calls: a call
+    // target is by construction a function's entry point, so the prologue is
+    // about to run. Jumps and returns can land mid-function and must never be
+    // witnessed as entries or the table would vouch for the very resumes it
+    // exists to convict.
+    if (isCall)
+    {
+        ps2x_witness_true_entry(targetPc, GPR_U32(ctx, 29));
+    }
+
+    // 2026-08-30 part 31 -- [semwatch:fillz18entry] in EeScheduler.cpp never
+    // fired (0 hits across a full 200s run) even though the watchdog's
+    // global dispatch ring showed 0x178a08 repeatedly: that probe was gated
+    // on the SCHEDULER's own while-loop re-dispatching ctx->pc == 0x178a08,
+    // but mem_fill_z_18 is a widely-shared helper (callers=19) almost
+    // certainly reached through THIS inline dispatchGuestBranch path
+    // instead -- a nested C++ call that never round-trips back through the
+    // scheduler loop. This is the call site lookupFunction()'s pushDispatchPc
+    // actually feeds the ring from (ps2_runtime.cpp:1730), so it is also the
+    // right place to read $ra/$sp/$a0 on entry, plus sourcePc/kind which the
+    // scheduler-loop probe could never see directly. Capped; unconditional
+    // read only.
+    if (targetPc == 0x178a08u)
+    {
+        static std::atomic<uint32_t> s_fillZ18DispatchLogs{0u};
+        const uint32_t n = s_fillZ18DispatchLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 32u)
+        {
+            std::cerr << "[semwatch:fillz18dispatch] #" << n
+                      << " sourcePc=0x" << std::hex << sourcePc
+                      << " kind=" << describeGuestBranchKind(kind)
+                      << " ra=0x" << GPR_U32(ctx, 31)
+                      << " sp=0x" << GPR_U32(ctx, 29)
+                      << " a0=0x" << GPR_U32(ctx, 4)
+                      << std::dec
+                      << std::endl;
+        }
+    }
+
+    // 2026-09-10 -- the entry snapshot that used to live here (two unconditional
+    // GPR reads feeding raAtEntry/spAtEntry in the ring below) is GONE, and must
+    // not come back. It was written off as "nearly free"; measured, it cost 19%
+    // of guest throughput (progress/s 105k -> 85k, CAppLogoMain t=168 -> t=198)
+    // and the run then timed out ~8 game ticks short of the failure it existed
+    // to observe. This function is on every inter-function transfer.
+    //
+    // It is also no longer needed. It was there to split "the callee was ENTERED
+    // with $ra == 0" from "the saved slot was clobbered", and static reading of
+    // the call site settled that: 0x1C2ED4's generated code does
+    // SET_GPR_U32(ctx, 31, 0x1C2EDCu) before dispatching, so sub_00398D40 was
+    // entered with a correct $ra and the slot is overwritten in between. The
+    // frame-trace slots added for 0x398D40 in game_overrides.cpp carry the
+    // entry/exit comparison now, paid only by that one function.
+    // 2026-09-27 -- see the pc==entryPc block below. One register read into a
+    // local; unlike the removed 09-10 snapshot it never touches shared memory.
+    const uint32_t spAtEntry = GPR_U32(ctx, 29);
+
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
     {
-        return false;
-    }
-
-    if (!isCall)
-    {
+        // 2026-09-10 -- see the Ps2xZeroPcRec block above this function. This is
+        // the ONLY place a zero pc turns into a silent unwind, so it is the only
+        // place that can still see which function produced it. targetPc is that
+        // function: it was just called, and it returned leaving ctx->pc == 0.
+        if (ctx->pc == 0u)
+        {
+            const uint32_t slot =
+                g_ps2xZeroPcRingPos.fetch_add(1u, std::memory_order_relaxed) %
+                kPs2xZeroPcRingSize;
+            Ps2xZeroPcRec &r = g_ps2xZeroPcRing[slot];
+            r.targetPc = targetPc;
+            r.sourcePc = sourcePc;
+            r.ra = GPR_U32(ctx, 31);
+            r.sp = GPR_U32(ctx, 29);
+            r.kind = static_cast<uint32_t>(kind);
+            g_ps2xZeroPcTotal.fetch_add(1u, std::memory_order_relaxed);
+        }
         return false;
     }
 
     if (ctx->pc == entryPc)
     {
+        // 2026-09-27 -- recursive-preemption stack drift (the t=5 boot crash,
+        // ex-"rung 4.7"). pc == entryPc normally means an HLE/stub target that
+        // returned without writing pc. But on RECURSION it is ambiguous: F ->
+        // G -> F where the inner dispatch of F hits a checkpoint leaves
+        // ctx->pc == F while unwinding, and this outer F-dispatch used to read
+        // that as "F returned" and continue the caller with F's and G's
+        // frames still pushed. Measured: sp 0x110 low (= 0x1c2af0's 0x50 +
+        // 0x2ae0e0's 0xc0), the next epilogue reloads $ra from a stale slot,
+        // pc -> 0. A real return restores $sp; a pending inner call does not.
+        // So only treat it as a return when $sp is back where it started;
+        // otherwise keep unwinding and let the scheduler resume the pending
+        // call to F with the exact $sp/$ra the inner jal left.
+        if (GPR_U32(ctx, 29) != spAtEntry)
+        {
+            static std::atomic<uint32_t> s_recursivePreemptLogs{0u};
+            const uint32_t n = s_recursivePreemptLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 16u)
+            {
+                std::cerr << "[dispatch:recursive-preempt] #" << std::dec << n
+                          << " target=0x" << std::hex << targetPc
+                          << " from=0x" << sourcePc
+                          << " spAtEntry=0x" << spAtEntry
+                          << " spNow=0x" << GPR_U32(ctx, 29)
+                          << " ra=0x" << GPR_U32(ctx, 31)
+                          << std::dec << std::endl;
+            }
+            return false;
+        }
         ctx->pc = fallthroughPc;
     }
 
@@ -2090,13 +2940,22 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
 
+    g_syscallInFlightNumber.store(syscallId, std::memory_order_relaxed);
+    g_syscallInFlightPc.store(ctx->pc, std::memory_order_relaxed);
+    g_syscallInFlightA0.store(getRegU32(ctx, 4), std::memory_order_relaxed);
+    g_syscallInFlightA1.store(getRegU32(ctx, 5), std::memory_order_relaxed);
+    g_syscallInFlightA2.store(getRegU32(ctx, 6), std::memory_order_relaxed);
+    g_syscallInFlightRa.store(getRegU32(ctx, 31), std::memory_order_relaxed);
+
     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
+        g_syscallInFlightNumber.store(kNoSyscallInFlight, std::memory_order_relaxed);
         return;
     }
 
     // God help you
     ps2_syscalls::TODO(rdram, ctx, this, encodedSyscallId);
+    g_syscallInFlightNumber.store(kNoSyscallInFlight, std::memory_order_relaxed);
 }
 
 void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
@@ -2653,109 +3512,6 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
     return m_asyncCallbackStack.carve(allocSize, normalizedAlignment);
 }
 
-void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
-{
-    uint32_t lastPc = std::numeric_limits<uint32_t>::max();
-    uint32_t samePcCount = 0;
-    constexpr uint32_t kSamePcYieldInterval = 0x4000u;
-
-    while (!isStopRequested())
-    {
-        // Cooperative scheduling point. The recompiler emits the
-        // shouldPreemptGuestExecution() hook only at INTRA-function back-edges;
-        // a guest loop that spins ACROSS function dispatches (call/return
-        // chains, recover-pc storms) has its back-edge HERE, not inside any
-        // recompiled function, so without this call such a loop never reaches
-        // yield_point() and holds the guest token forever, starving host
-        // workers (interrupt worker VBlank/INTC delivery) parked in
-        // async_guest_begin(). The fast path is a counter test, so this is as
-        // cheap as the emitted per-back-edge checks. The return value is
-        // irrelevant: whether or not we yielded, ctx->pc is a clean
-        // function-boundary resume point.
-        (void)shouldPreemptGuestExecution();
-
-        const uint32_t pc = ctx->pc;
-
-        if (pc == lastPc)
-        {
-            ++samePcCount;
-            if ((samePcCount % kSamePcYieldInterval) == 0u)
-            {
-                PS2_IF_AGRESSIVE_LOGS({
-                    RUNTIME_LOG("CPU is doing some work at PC 0x" << std::hex << pc << ". PC not updating.");
-                });
-                std::this_thread::yield();
-            }
-        }
-        else
-        {
-            samePcCount = 0;
-            lastPc = pc;
-        }
-
-        m_debugPc.store(pc, std::memory_order_relaxed);
-        m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), std::memory_order_relaxed);
-        m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
-        m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
-
-        // RecompDebugger IPC: publish this thread's pc/gpr/hi/lo into the
-        // shared-memory RecompDebugState once per outer dispatch-loop
-        // iteration, and service any armed breakpoint for this thread.
-        // Restored 2026-07-14 (writer was fully stripped when the repo was
-        // flattened; see recomp_debug_writer.h/.cpp). No-ops on non-Windows
-        // and when RecompDebugger isn't attached (Init() never called or the
-        // shm couldn't be opened).
-        {
-            uint32_t dbg_gpr[32];
-            for (int i = 0; i < 32; ++i)
-                dbg_gpr[i] = static_cast<uint32_t>(_mm_cvtsi128_si64(ctx->r[i]));
-            RecompDbg::Update(g_currentThreadId, pc, dbg_gpr,
-                               static_cast<uint32_t>(ctx->hi),
-                               static_cast<uint32_t>(ctx->lo),
-                               ctx->insn_count,
-                               rdram, PS2_RAM_SIZE);
-            if (RecompDbg::CheckBreakpoint(g_currentThreadId, pc & 0x1FFFFFFFu, dbg_gpr))
-            {
-                // Breakpoint/step handling may have edited dbg_gpr (a debugger-armed
-                // register write); mirror only the low 32-bit lane back into the live
-                // 128-bit MMI register so the other lanes are left untouched.
-                for (int i = 1; i < 32; ++i)
-                    ctx->r[i] = _mm_insert_epi32(ctx->r[i], static_cast<int>(dbg_gpr[i]), 0);
-            }
-        }
-
-        RecompiledFunction fn = lookupFunction(pc);
-        const uint32_t dispatchedPc = pc;
-        const uint32_t dispatchedRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
-        fn(rdram, ctx, this);
-
-        if (ctx->pc == 0u)
-        {
-            const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
-            const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));
-            const uint32_t gp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0));
-            PS2_IF_AGRESSIVE_LOGS({
-                std::cerr << "[dispatch:pc-zero] from=0x" << std::hex << dispatchedPc
-                          << " fromRa=0x" << dispatchedRa
-                          << " ra=0x" << ra
-                          << " sp=0x" << sp
-                          << " gp=0x" << gp
-                          << " trace=" << formatDispatchHistory()
-                          << std::dec << std::endl;
-            });
-
-            // PC=0 means this guest thread returned (usually via jr $ra with RA=0).
-            // Do not request a global runtime stop here: other guest threads may still run.
-            break;
-        }
-    }
-}
-
-bool PS2Runtime::shouldPreemptGuestExecution()
-{
-    return ps2sched::yield_point();
-}
-
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
@@ -2908,6 +3664,7 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
+    ps2xGsThreadSync(5u); // the native chains below call m_gs directly
     if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
@@ -2926,7 +3683,10 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
 void PS2Runtime::requestStop()
 {
     m_stopRequested.store(true, std::memory_order_relaxed);
-    ps2_syscalls::notifyRuntimeStop();
+    if (m_eeScheduler)
+    {
+        m_eeScheduler->requestStop();
+    }
 }
 
 void PS2Runtime::requestStopFlagOnly()
@@ -2939,6 +3699,146 @@ bool PS2Runtime::isStopRequested() const
     return m_stopRequested.load(std::memory_order_relaxed);
 }
 
+EeScheduler &PS2Runtime::eeScheduler()
+{
+    return *m_eeScheduler;
+}
+
+const EeScheduler &PS2Runtime::eeScheduler() const
+{
+    return *m_eeScheduler;
+}
+
+void PS2Runtime::postEeEvent(EeEvent event)
+{
+    m_eeScheduler->postEvent(event);
+}
+
+bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
+{
+    return m_eeScheduler->checkpointDue(cycles);
+}
+
+[[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
+{
+    const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
+    const uint64_t waitTicks = std::max<uint64_t>(1u, ticks);
+    m_eeScheduler->waitVSync(currentTick + waitTicks - 1u,
+                             0,
+                             [resumePc](R5900Context &context)
+                             {
+                                 context.pc = resumePc;
+                             });
+}
+
+void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)
+{
+    std::lock_guard lock(m_eeKernelStateMutex);
+    m_eeExitHandlers[threadId].push_back({function, argument});
+}
+
+std::vector<PS2Runtime::EeExitHandlerRegistration> PS2Runtime::takeEeExitHandlers(int threadId)
+{
+    std::lock_guard lock(m_eeKernelStateMutex);
+    auto it = m_eeExitHandlers.find(threadId);
+    if (it == m_eeExitHandlers.end())
+    {
+        return {};
+    }
+    auto handlers = std::move(it->second);
+    m_eeExitHandlers.erase(it);
+    return handlers;
+}
+
+void PS2Runtime::removeEeExitHandlers(int threadId)
+{
+    std::lock_guard lock(m_eeKernelStateMutex);
+    m_eeExitHandlers.erase(threadId);
+}
+
+bool PS2Runtime::findEeSyscallOverride(uint32_t syscallNumber, uint32_t &handler) const
+{
+    std::lock_guard lock(m_eeKernelStateMutex);
+    const auto it = m_eeSyscallOverrides.find(syscallNumber);
+    if (it == m_eeSyscallOverrides.end())
+    {
+        return false;
+    }
+    handler = it->second;
+    return true;
+}
+
+void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, uint32_t handler)
+{
+    constexpr uint32_t kTableBase = 0x80011F80u & 0x1FFFFFFFu;
+    constexpr uint32_t kMirrorLimit = 0x00080000u;
+    const int64_t offset = static_cast<int64_t>(static_cast<int32_t>(syscallNumber)) * 4;
+    const int64_t address = static_cast<int64_t>(kTableBase) + offset;
+
+    std::lock_guard lock(m_eeKernelStateMutex);
+    if (handler == 0u)
+    {
+        m_eeSyscallOverrides.erase(syscallNumber);
+    }
+    else
+    {
+        m_eeSyscallOverrides[syscallNumber] = handler;
+    }
+    if (!rdram || address < 0 || address + 4 > kMirrorLimit)
+    {
+        return;
+    }
+    const uint32_t guestAddress = static_cast<uint32_t>(address);
+    std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
+    if (handler == 0u)
+    {
+        m_eeSyscallMirrorAddresses.erase(guestAddress);
+    }
+    else
+    {
+        m_eeSyscallMirrorAddresses.insert(guestAddress);
+    }
+}
+
+void PS2Runtime::initializeEeKernelState(uint8_t *rdram)
+{
+    if (!rdram)
+    {
+        return;
+    }
+    constexpr uint32_t kTableGuestBase = 0x80011F80u;
+    constexpr uint32_t kTableBase = kTableGuestBase & 0x1FFFFFFFu;
+    constexpr uint32_t kMirrorLimit = 0x00080000u;
+    constexpr uint32_t kProbeBase = 0x000002F0u;
+
+    std::lock_guard lock(m_eeKernelStateMutex);
+    for (const uint32_t address : m_eeSyscallMirrorAddresses)
+    {
+        const uint32_t zero = 0u;
+        std::memcpy(rdram + address, &zero, sizeof(zero));
+    }
+    m_eeSyscallMirrorAddresses.clear();
+    const uint32_t high = kTableGuestBase >> 16;
+    const uint32_t low = kTableGuestBase & 0xFFFFu;
+    std::memcpy(rdram + kProbeBase, &high, sizeof(high));
+    std::memcpy(rdram + kProbeBase + 8u, &low, sizeof(low));
+    m_eeSyscallMirrorAddresses.insert(kProbeBase);
+    m_eeSyscallMirrorAddresses.insert(kProbeBase + 8u);
+
+    for (const auto &[syscallNumber, handler] : m_eeSyscallOverrides)
+    {
+        const int64_t offset = static_cast<int64_t>(static_cast<int32_t>(syscallNumber)) * 4;
+        const int64_t address = static_cast<int64_t>(kTableBase) + offset;
+        if (address < 0 || address + 4 > kMirrorLimit)
+        {
+            continue;
+        }
+        const uint32_t guestAddress = static_cast<uint32_t>(address);
+        std::memcpy(rdram + guestAddress, &handler, sizeof(handler));
+        m_eeSyscallMirrorAddresses.insert(guestAddress);
+    }
+}
+
 void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 {
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
@@ -2948,11 +3848,10 @@ void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
-    ps2_syscalls::resetSoundDriverRpcState();
+    resetIop();
     ps2_stubs::resetAudioStubState();
-    ps2_stubs::resetGsSyncVCallbackState();
     ps2_stubs::resetMpegStubState();
-    ps2_syscalls::initializeGuestKernelState(m_memory.getRDRAM());
+    initializeEeKernelState(m_memory.getRDRAM());
     m_cpuContext.r[4] = _mm_setzero_si128();
     m_cpuContext.r[5] = _mm_setzero_si128();
     // Bootstrap $sp at top of RAM, as the hardware loader does; the guest's
@@ -2980,6 +3879,12 @@ void PS2Runtime::run()
     // Started here so the profile window covers the whole guest run, including
     // the 4.4s stall at t=2-6s that the watchdog sees but cannot explain.
     ps2x_host_sampler_start();
+
+    // Must be before gameThread is spawned below, and is after loadELF's
+    // applyMatching by construction (main.cpp loads the ELF before calling run()).
+    ps2x_fmv_host_install(this);
+
+    std::atomic<bool> gameThreadFinished{false};
 
     // Ground-truth dump of every function address actually registered by the
     // recompiler, so RecompDebugger (a separate process with no PS2Runtime
@@ -3038,6 +3943,24 @@ void PS2Runtime::run()
 
         RUNTIME_LOG("[trapval] armed value=0x" << std::hex << value
                                                << " range=[0x" << lo << ",0x" << hi << ")" << std::dec);
+    }
+
+    // [journal] env hook: PS2X_JOURNAL=LO:HI[:LABEL][,...] arms the ordered
+    // address-range store journal (Kernel/Diag/trace_calls.cpp). Unlike
+    // PS2X_WATCH -- which POLLS once per frame and therefore cannot see a
+    // value written and overwritten inside one frame -- this records EVERY
+    // store to the range, in order, with the guest PC, to the structured
+    // JSONL sink as probe=JOURNAL. Unset => zero behavioural change and the
+    // per-store residual cost stays exactly one relaxed bool load.
+    //
+    // g_writeWatchActive is the gate ps2TraceGuestWrite() actually tests, so
+    // arming the journal must raise it too -- otherwise onGuestWrite() is
+    // never reached and the journal silently records nothing.
+    if (const std::size_t armed = ps2_journal::install(std::getenv("PS2X_JOURNAL")))
+    {
+        ps2_watch::g_writeWatchActive.store(true, std::memory_order_relaxed);
+        ps2_diag::set_enabled(true);
+        RUNTIME_LOG("[journal] armed " << armed << " range(s) from PS2X_JOURNAL");
     }
 
     // [frametrace] env hook: PS2X_FRAMETRACE=1 arms the bounded call-frame ring
@@ -3117,33 +4040,72 @@ void PS2Runtime::run()
         }
     }
 
-    // Optional R3000A IOP-core self-test (env PS2_IOP_CPU_SELFTEST=1): runs a
-    // hand-assembled program in (still-zeroed) IOP RAM before the guest starts.
-    if (const char *st = std::getenv("PS2_IOP_CPU_SELFTEST"); st && *st && *st != '0')
-    {
-        IopCpu iopCpu(&m_memory);
-        iopCpu.selfTest();
-    }
-
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
-    // Initialize the fiber/pool scheduler.
-    ps2sched::scheduler_init();
-    ps2sched::scheduler_set_stop_callback(+[](void* p) { static_cast<PS2Runtime*>(p)->requestStopFlagOnly(); }, this);
-
-    // Create the main guest fiber (tid=1).
-    uint8_t *rdram = m_memory.getRDRAM();
-    {
-        const uint32_t entry = m_cpuContext.pc;
-        const uint32_t sp    = static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0));
-        const uint32_t gp    = static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0));
-        ps2sched::create_fiber(1, 1, entry, sp, gp, 0u, this, rdram);
-    }
-
+    // SDBZ: EeScheduler's own VBlank re-arm loop is deliberately inert (see
+    // EeScheduler.cpp's reset()) - Interrupt.cpp's interruptWorkerMain() is the
+    // sole source of EeEventType::VBlankStart/End via postEvent(). That worker
+    // only ever started from unit tests (EnsureVSyncWorkerRunning had no
+    // production call site), so the guest's first genuine VSync-wait blocked
+    // EeScheduler::waitForEvent() forever with nothing left to wake it -
+    // session 5's boot freeze. Must start before gameThread so the worker
+    // exists before the guest can reach that wait.
     ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
+
+    // EeScheduler (Phase 3d, replacing ps2sched's fiber pool) runs all guest
+    // threads cooperatively on this single game thread; multi-guest-thread
+    // concurrency is now internal to EeScheduler::run(), not real OS fibers.
+    std::thread gameThread([&]()
+    {
+        ThreadNaming::SetCurrentThreadName("GameThread");
+        // EE/VU float semantics (2026-09-16). The EE FPU and both VUs round
+        // toward zero with denormals flushed; the host defaults to
+        // round-to-nearest. Nothing in the runtime set MXCSR before this, so
+        // every guest float op ran in the wrong mode. Confirmed against PCSX2
+        // on SDBZ's projection matrix at EE 0x509010 - see the comment over
+        // Ps2ApplyGuestFpMode() in ps2_runtime_macros.h for the words.
+        //
+        // EeScheduler runs ALL guest threads cooperatively on this one OS
+        // thread (see the comment above), and the interrupt worker posts
+        // events rather than touching guest context, so this single call
+        // covers all guest execution.
+        //
+        // PS2X_GUEST_FP=0 restores host rounding for A/B comparison.
+        {
+            const char *fpEnv = std::getenv("PS2X_GUEST_FP");
+            if (fpEnv != nullptr && fpEnv[0] == '0')
+            {
+                RUNTIME_LOG("[fp] guest FP mode DISABLED by PS2X_GUEST_FP=0"
+                            " - host round-to-nearest" << std::endl);
+            }
+            else
+            {
+                const unsigned int csr = Ps2ApplyGuestFpMode();
+                RUNTIME_LOG("[fp] guest FP mode: MXCSR=0x" << std::hex << csr
+                            << std::dec << " (RZ+FTZ+DAZ)" << std::endl);
+            }
+        }
+        try
+        {
+            m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
+            m_eeScheduler->run();
+            uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
+            RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
+                      << " RA=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)) << std::dec << std::endl);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "Error during program execution: " << e.what() << std::endl;
+        }
+        catch (...)
+        {
+            std::cerr << "Error during program execution: unknown exception" << std::endl;
+        }
+        gameThreadFinished.store(true, std::memory_order_release);
+    });
 
     // Optional PC watchdog (enable with env PS2_PC_WATCHDOG=1): logs the guest PC
     // once a second so an external observer can tell whether execution is
@@ -3195,6 +4157,8 @@ void PS2Runtime::run()
                 //            the bottleneck and gif/s merely follows it.
                 uint64_t prevBusyNs = 0, prevResumes = 0, prevVbl = 0;
                 uint64_t prevVblQ = 0, prevVblI = 0, prevVblS = 0;
+                uint64_t prevBudgetXfer[6] = {}, prevBudgetVu1[5] = {}, prevBudgetRaster[10] = {};
+                uint64_t prevP5a[11] = {};
                 // Stage 5.7. Every rate field above measures the *render* loop,
                 // and they all read healthy while the screen stays black -- so
                 // none of them can answer the question that is actually open:
@@ -4876,6 +5840,8 @@ void PS2Runtime::run()
                     {
                         uint32_t req = 0u, inWork = 0u, gateLo = 0u, gateHi = 0u;
                         uint32_t tickLo = 0u, tickHi = 0u, boost = 0u;
+                        uint32_t rgate = 0xDEADBEEFu, rg724 = 0u, rg72C = 0u;
+                        uint32_t mreq = 0u, mtid = 0u, wAtid = 0u, wBex = 0u, wBtid = 0u;
                         bool memOk = true;
                         try
                         {
@@ -4886,10 +5852,103 @@ void PS2Runtime::run()
                             tickLo = m_memory.read32(0x00441960u); // 64-bit worker tick counter
                             tickHi = m_memory.read32(0x00441964u);
                             boost  = m_memory.read32(0x004418F0u); // priority handed to the boost
+
+                            // Part 111 / PCSX2 oracle 2026-09-11. rgate is THE
+                            // word: RenderDispatch 0x1712d0 loads it at 0x1712dc
+                            // (lw $v1,-10568($gp); $gp=0x503070 => 0x500728) and
+                            // only takes the branch that resumes the SofDec
+                            // workers when it equals 1. On real PCSX2 it reads 1
+                            // for the whole time SofDec is live and drops to 0,
+                            // together with 0x500724 and 0x50072C, the instant
+                            // SofDec is torn down -- so it is the subsystem's
+                            // initialised latch, written by exactly two sites
+                            // (0x113f28 and 0x113fd8, both sw -10568($gp)).
+                            // 0xDEADBEEF on the line means the read threw, not 0.
+                            rgate  = m_memory.read32(0x00500728u); // RenderDispatch gate
+                            rg724  = m_memory.read32(0x00500724u); // moves with it on the oracle
+                            rg72C  = m_memory.read32(0x0050072Cu);
+
+                            // sub_11FC40, called every pass by the frame thread
+                            // sub_11E8D0: lw [0x44193C] (0x11fc50), and if it is 1
+                            // it Refers then WakeupThreads tid [0x441988]. The
+                            // oracle has [0x441988]=1 -- the MAIN thread -- and
+                            // main sits asleep at 0x174bc8 between frames, while
+                            // our th1 spins at 0x102994 and never sleeps.
+                            // NB mreq is a ONE-SHOT: 0x11fca4 does sw $zero,0($s1)
+                            // in a beql delay slot once the wake lands, so 0 is the
+                            // normal steady-state reading and only mtid is stable.
+                            mreq   = m_memory.read32(0x0044193Cu); // main-wake request latch
+                            mtid   = m_memory.read32(0x00441988u); // tid it wakes (oracle: 1)
+
+                            // Worker identity, so the thread table below can be
+                            // read without guessing which row is worker A.
+                            wAtid  = m_memory.read32(0x0044198Cu); // worker A tid (oracle: 14)
+                            wBex   = m_memory.read32(0x004418E8u); // worker B exists (oracle: 0)
+                            wBtid  = m_memory.read32(0x00441990u); // worker B tid  (oracle: 0)
                         }
                         catch (const std::exception &)
                         {
                             memOk = false;
+                        }
+
+                        // ---- FIX B: un-poison savepri (2026-09-12) --------------------
+                        // ROOT CAUSE (TRACE + CHGPRI probes, oracle A/B):
+                        //   sub_11E598 (CRI enter, CHGPRI ra=0x11e5dc) saves the CURRENT
+                        //   priority of the calling thread into the SINGLE global
+                        //   [0x449210], guarded by the nest count [0x441920]:
+                        //       if (!nest) { me = GetThreadId();
+                        //                    [0x449210] = ChangeThreadPriority(me, [0x4418F0]);
+                        //                    [0x449214] = me; }
+                        //   sub_11E620 (CRI exit, ra=0x11e670) restores [0x449210].
+                        //   noop_sub_e690 @0x11E690 boosts worker A from OUTSIDE that
+                        //   bracket (ChangeThreadPriority(tid, [0x4418F0]), CHGPRI
+                        //   ra=0x11e6e8 -- fires only twice in a 300 s run). If the worker
+                        //   enters the CRI section during that window it reads old==1 and
+                        //   saves the BOOST value as its "original"; every later exit then
+                        //   restores 1 and the worker is pinned at priority 1 forever.
+                        //   Measured: thid 1/4/5 restore 0x18/0x10/0x12 correctly,
+                        //   thid 6 restores 0x1 4,025 times.
+                        //   That starves main (pri 24), which is still inside sub_155630
+                        //   holding g36=1 after `0x155648 jal 0x1555A0(entry,1)`, so the
+                        //   clear at 0x15565c never runs -> BAIL C forever -> the worker
+                        //   never SleepThreads -> main never runs. Self-sustaining livelock.
+                        // ORACLE: [0x449210]=0x19(25) and [0x441908]=0x19. OURS: 0x1.
+                        // [0x441908] is the game's OWN authoritative original for worker A
+                        // -- it is the value 0x11E778 passes to noop_sub_e690 as a1, the
+                        // priority the join itself restores. So this writes back the
+                        // game's number, not one we invented.
+                        // Fires ONLY in the exact poisoned state. Set PS2X_FIX_SAVEPRI=0
+                        // to disable and reproduce the wall (this is the A/B switch).
+                        static const bool s_savepriFixOn = [] {
+                            const char *e = std::getenv("PS2X_FIX_SAVEPRI");
+                            return !(e && *e == '0');
+                        }();
+                        static uint32_t s_savepriFixes = 0u;
+                        if (s_savepriFixOn && memOk)
+                        {
+                            try
+                            {
+                                const uint32_t savePri = m_memory.read32(0x00449210u);
+                                const uint32_t saveTid = m_memory.read32(0x00449214u);
+                                const uint32_t trueA = m_memory.read32(0x00441908u);
+                                if (boost != 0u && savePri == boost &&
+                                    wAtid != 0u && saveTid == wAtid &&
+                                    trueA != 0u && trueA != boost)
+                                {
+                                    m_memory.write32(0x00449210u, trueA);
+                                    ++s_savepriFixes;
+                                    std::cerr << "[savepri:fix] t=" << std::dec << (t + 1)
+                                              << "s n=" << s_savepriFixes
+                                              << " tid=" << saveTid
+                                              << " was=" << savePri
+                                              << " now=" << trueA
+                                              << " boost=" << boost
+                                              << std::endl;
+                                }
+                            }
+                            catch (const std::exception &)
+                            {
+                            }
                         }
 
                         const uint64_t tick =
@@ -4907,6 +5966,9 @@ void PS2Runtime::run()
                             std::cerr << "[thsync] armed req@0x441924 inWork@0x441934"
                                          " gate@0x4419D8 tick@0x441960 boost@0x4418F0"
                                          " spinner=sub_11E690 acker=sub_11EAC8"
+                                         " rgate@0x500728(bound to lw at 0x1712dc)"
+                                         " mreq@0x44193C mtid@0x441988(sub_11FC40)"
+                                         " wA@0x44198C wBex@0x4418E8 wB@0x441990"
                                       << std::endl;
                         }
 
@@ -4921,8 +5983,15 @@ void PS2Runtime::run()
                                   << " tick=" << tick
                                   << " dTick=" << dTick
                                   << " boost=" << boost
-                                  << " idle=" << ps2x_guest_idle()
-                                  << " tokW=" << ps2sched::host_token_waiters();
+                                  << " rgate=" << rgate
+                                  << " g724=" << rg724
+                                  << " g72C=" << rg72C
+                                  << " mreq=" << mreq
+                                  << " mtid=" << mtid
+                                  << " wA=" << wAtid
+                                  << " wBex=" << wBex
+                                  << " wB=" << wBtid
+                                  << " idle=" << ps2x_guest_idle();
 
                         if (s_havePrev && req != s_prevReq)
                         {
@@ -4954,6 +6023,32 @@ void PS2Runtime::run()
                             }
                         }
 
+                        // Pre-committed, written before the run so a later reading
+                        // cannot be fitted to it. The workers are created SUSPENDED
+                        // by design (sub_11F0C8) and re-suspended on every pass by
+                        // sub_11E8D0, so the per-frame resume inside RenderDispatch
+                        // is not an optimisation -- it is the only thing that ever
+                        // runs them. rgate != 1 therefore means the workers can
+                        // never run again, whatever the thread table says.
+                        if (memOk)
+                        {
+                            if (rgate != 1u)
+                            {
+                                std::cerr << " VERDICT=RENDER-GATE-CLOSED"
+                                             "(rgate!=1 so RenderDispatch 0x1712d0 takes"
+                                             " the sub_1721E0 branch and NEVER resumes the"
+                                             " SofDec workers; PCSX2 reads 1 here --"
+                                             " fix 0x113f28/0x113fd8, not the scheduler)";
+                            }
+                            else if (dTick == 0ull && s_havePrev)
+                            {
+                                std::cerr << " VERDICT=GATE-OPEN-BUT-DEAD"
+                                             "(rgate==1 yet the worker did not tick;"
+                                             " the resume is reaching ResumeThread and"
+                                             " failing -- next lane is Thread.cpp)";
+                            }
+                        }
+
                         // Thread table. getThreadDebugSnapshot() already exists for
                         // the RecompDebugger and returns exactly these fields, but
                         // its only caller sits inside the RecompDbg block, which is
@@ -4963,7 +6058,7 @@ void PS2Runtime::run()
                         // scheduled"; currentPriority checks whether the guest's
                         // boost actually outranks the spinner.
                         const std::vector<ps2_syscalls::ThreadDebugSnapshot> th =
-                            ps2_syscalls::getThreadDebugSnapshot();
+                            ps2_syscalls::getThreadDebugSnapshot(this);
                         std::cerr << " nTh=" << th.size();
                         for (const ps2_syscalls::ThreadDebugSnapshot &s : th)
                         {
@@ -5154,6 +6249,18 @@ void PS2Runtime::run()
                                       << " h2a=0x" << rd(kHook13bb20Arg)
                                       << " n=0x" << rd(kCallCount)
                                       << " obj=0x" << rd(kObj) << std::dec;
+                            // 2026-09-02 part 51. The acker (sub_11EAC8, cblist L6)
+                            // only reaches its SleepThread when cblist_run(6) returns 0.
+                            // Its single entry sub_154FA8 returns 0 iff [gate+16]==1,
+                            // where get_data_ptr (0x14e4d0) is the constant 0x45F678;
+                            // sub_155210 short-circuits to 0 iff [0x45F674]!=1. The
+                            // 2026-09-02 05:33 run had the acker spinning 183k/s with
+                            // dTick tracking tick exactly, i.e. the return was never 0 --
+                            // these two words say which gate is holding it open.
+                            constexpr uint32_t kPumpEnable = 0x0045F674u;
+                            constexpr uint32_t kPumpIdle   = 0x0045F688u;
+                            std::cerr << " pmpEn=0x" << std::hex << rd(kPumpEnable)
+                                      << " pmpIdle=0x" << rd(kPumpIdle) << std::dec;
                             std::cerr << " s:";
                             for (uint32_t i = 0; i < 8u; ++i)
                             {
@@ -5162,11 +6269,541 @@ void PS2Runtime::run()
                             }
                             std::cerr << std::endl;
                         }
+
+                        // 2026-09-04 part 61. PCSX2 decoded the movie pump's return value end to
+                        // end. sub_155210 returns "still busy" (non-zero) from exactly one place:
+                        //
+                        //     s1 = 0;
+                        //     if ([0x460F04] != 1)          // f_1556f8, the top-level done flag
+                        //         s1 = (f_1651d8() == 0);   // 0 == some stream handle still busy
+                        //     if (s1) return 1;             // <- our runtime, 49.4M times running
+                        //
+                        // f_1651d8 (0x1651d8) walks EIGHT HANDLE POINTERS at 0x461164 -- a table
+                        // distinct from the inline stream objects at base+0x6C that [pump] already
+                        // prints. For each non-null handle it calls f_1651b0 (0x1651b0):
+                        //
+                        //     st = [h+72]; if ((st - 1) unsigned < 4) return ([h+68] == 0);
+                        //     else return 1;
+                        //
+                        // so a handle is BUSY iff its state is one of 1..4 and its pending count
+                        // [h+68] is non-zero. One busy handle makes f_1651d8 return 0, which keeps
+                        // the pump reporting work forever.
+                        //
+                        // Measured on PCSX2 2026-09-04 with the stream idle: the single live handle
+                        // was 0x01B12CC0 with st=4 (active) and pd=0 (drained), so f_1651b0 returned
+                        // 1, f_1651d8 returned 1, and the pump returned 0. That is the state we never
+                        // reach. This line says which of the two exits we are failing and, when it is
+                        // a handle, which handle and how much it still thinks is outstanding.
+                        //
+                        // 0x460F58 is written by sif_is_bound (0x15b560) on every accepted handle, so
+                        // it names whichever handle f_1651d8 looked at last.
+                        {
+                            constexpr uint32_t kDoneFlag  = 0x00460F04u; // get_data_ptr() + 6284
+                            constexpr uint32_t kHandleTbl = 0x00461164u; // 8 x uint32_t handle ptrs
+                            constexpr uint32_t kCurHandle = 0x00460F58u; // last handle sif_is_bound saw
+                        
+                            std::cerr << "[sofdec] t=" << std::dec << (t + 1) << "s"
+                                      << " done=0x" << std::hex << rd(kDoneFlag)
+                                      << " cur=0x" << rd(kCurHandle) << std::dec;
+                        
+                            uint32_t live = 0u;
+                            uint32_t busy = 0u;
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                const uint32_t h = rd(kHandleTbl + i * 4u);
+                                if (h == 0u)
+                                    continue;
+                                ++live;
+                                const uint32_t st = rd(h + 72u);
+                                const uint32_t pd = rd(h + 68u);
+                                // Mirrors f_1651b0 exactly, including the unsigned wrap that makes
+                                // st==0 fall out of the active range rather than into it.
+                                const bool hBusy = ((st - 1u) < 4u) && (pd != 0u);
+                                if (hBusy)
+                                    ++busy;
+                                std::cerr << " h" << i << "=0x" << std::hex << h << std::dec
+                                          << " st" << i << "=" << st
+                                          << " pd" << i << "=" << pd
+                                          << (hBusy ? "*" : "");
+                            }
+                            // live=0 with done!=1 would mean the table was never populated, which is
+                            // a different failure from a handle that never drains -- do not conflate
+                            // them. busy=0 and done!=1 means f_1651d8 returns 1 and the pump should
+                            // already be returning 0; if that ever prints while the wall is up, the
+                            // gate is not here and this whole line is the wrong instrument.
+                                // 2026-09-04 part 61b. Measured: the handle is stuck at st=1 pd=1 from
+                        // t=126s to the end of the run. sub_165300 (0x165300) is the ONLY clear of
+                        // [h+68] (the `sw $zero,68($s1)` at 0x165338), and its own two guards --
+                        // state in 1..4, pending != 0 -- BOTH PASS for st=1/pd=1. So the servicer is
+                        // never being called at all.
+                        //
+                        // Its live caller chain is the pump itself: sub_155210's reset loop calls
+                        // sub_155320(obj) for all 8 inline objects, and sub_155320 tail-reaches
+                        // wrap_sif_is_bound_h (0x165250) -> sub_165300 with a0 = [obj+60]. Three
+                        // guards stand in the way:
+                        //
+                        //     [obj+0]    == 1      -- known GOOD: [pump] s: prints "1 0 0 0 0 0 0 0"
+                        //     [obj+96]   != 1      -- f_155520 (0x155520 = `lw $v0,96($a0)`)
+                        //     [0x45F69C] != 1      -- f_1555e8 (0x1555e8 = [get_data_ptr()+36])
+                        //
+                        // The first is already proven, so the bail is one of the other two and these
+                        // four words say which. o0h should read 0x1b12cc0 -- if it does not, the
+                        // object and the handle table disagree and that is a different bug again.
+                        // (sub_1652A8, the other sweep over 0x461164, is UNREACHABLE in the static
+                        // image, so this chain is the only way the handle can ever be serviced.)
+                        constexpr uint32_t kObj0 = 0x0045F678u + 0x6Cu;
+                        std::cerr << " o0st=" << rd(kObj0)
+                                  << " o0lock=" << rd(kObj0 + 96u)
+                                  << " o0flag=" << rd(kObj0 + 100u)
+                                  << " o0h=0x" << std::hex << rd(kObj0 + 60u) << std::dec
+                                  << " g36=" << rd(0x0045F678u + 36u);
+
+                        // 2026-09-04 part 63 -- the class-6 callback slot.
+                        //
+                        // HWWATCH named the writer of g36: wrap_get_data_ptr_p
+                        // (0x1555a0), called twice by 0x155630, which is a plain
+                        // bracket:
+                        //     f_1555a0(obj, 1);   // g36 = 1
+                        //     sub_154950();       // == run_callbacks(6)
+                        //     f_1555a0(obj, 0);   // g36 = 0
+                        // The last set (vbl 1030) has NO matching clear anywhere in
+                        // the rest of the run, so run_callbacks(6) never returned.
+                        //
+                        // run_callbacks is a single-slot dispatcher (0x13c448):
+                        //     tbl = 0x54EBA0;  fnp = [tbl + class*8];
+                        //     if (fnp == 0) return 0;
+                        //     jalr fnp (a0 = [tbl + class*8 + 4]);   // ra = 0x13c478
+                        // so class 6 lives at 0x54EBD0 (fn) / 0x54EBD4 (arg).
+                        //
+                        // 0x13c478 is exactly the `ra` the part-58/60 work recorded
+                        // for the park spinner sub_11E690 with target a0=6, which
+                        // makes "the class-6 callback IS sub_11E690" the obvious
+                        // reading -- but that is INFERENCE from a matching return
+                        // address, and [feedback_tail_jump_hides_the_caller] plus
+                        // [feedback_register_snapshot_is_not_an_argument] both say
+                        // an ra match is not an identity. Print the slot itself.
+                        //
+                        // Reading it:
+                        //   cb6=0x11e690 -> confirmed. The SofDec render wall and the
+                        //     sub_11E690 park-spinner thread are ONE bug: the spinner
+                        //     stops returning, g36 stays 1 forever, guard 3 of
+                        //     sub_155320 bails, sub_165300 never clears [h+68], the
+                        //     stream handle freezes and the renderer dies ~17s later.
+                        //   cb6=<something else> -> the ra match was a coincidence and
+                        //     the hang is in a different class-6 callback; disassemble
+                        //     whatever this prints.
+                        //   cb6=0x0 -> the slot is EMPTY, so run_callbacks(6) returns
+                        //     immediately and cannot be where we are stuck. In that
+                        //     case the bracket was torn (the clear was skipped, not
+                        //     blocked) and the question becomes what unwound past it.
+                        constexpr uint32_t kCbTable = 0x0054EBA0u;
+                        std::cerr << " cb6=0x" << std::hex << rd(kCbTable + 6u * 8u)
+                                  << " cb6a=0x" << rd(kCbTable + 6u * 8u + 4u) << std::dec;
+                        // ---- part 64: the class-6 worker thread -------------------------
+                        // ANSWERED: cb6 read back 0x11e778 == noop_wrapper___, a 2-insn
+                        // thunk that tail-jumps into 0x11e690.  So the class-6 callback IS
+                        // the park spinner; the earlier ra match was real, not coincidence.
+                        //
+                        //   0x11e778:  a0 = [0x44198C]   (a thread id)
+                        //              a1 = [0x441908]
+                        //              j  0x11e690
+                        //
+                        //   sub_11E690(tid, x):
+                        //       [0x441924] = 1                      ; "worker busy"
+                        //       loop { sub_11ED28(tid);
+                        //              thread_resume_if_suspended(tid); }
+                        //       until [0x441924] == 0, or 0x0BEBC1FF iterations.
+                        //
+                        // sub_11F0C8 CreateThread()s entry 0x11eac8, stack 0x445210, and
+                        // stores the new tid at 0x44198C -- the very word the thunk loads.
+                        // So the thing being waited on is the sub_11EAC8 worker thread.
+                        // Its loop body is:
+                        //
+                        //       [0x441960]++                        ; per-iteration tick
+                        //       [0x441934] = 1
+                        //       dispatch5(6)                        ; 6 slots @ 0x54EB10
+                        //       [0x441934] = 0
+                        //       if ([0x441924] == 1) [0x441924] = 0 ; <-- WAKE
+                        //       ...
+                        //       if ([0x4419D8] == 0) loop
+                        //
+                        // The clear is reached on EVERY iteration, so a single worker
+                        // iteration is enough to release the spinner.
+                        //
+                        // Reading key for w6tick (the counter at 0x441960):
+                        //   w6tick RISING while g36=1 -> the worker IS running and the
+                        //     clear is being skipped.  Suspect dispatch5(6) not returning;
+                        //     wdisp stuck at 1 confirms that.
+                        //   w6tick FROZEN while g36=1 -> the worker thread is never
+                        //     scheduled.  That is a scheduler bug, not a SofDec bug, and
+                        //     wtid names the thread to chase.
+                        constexpr uint32_t kWork = 0x00441900u;
+                        std::cerr << " w6tick=" << rd(kWork + 0x60u)
+                                  << " wbusy=" << rd(kWork + 0x24u)
+                                  << " wdisp=" << rd(kWork + 0x34u)
+                                  << " wexit=" << rd(kWork + 0xD8u)
+                                  << " wtid=" << rd(kWork + 0x8Cu);
+                        // ---- part 65 (09-04): the PRIORITY LATCH.
+                        // Measured, oracle-discriminated: PCSX2 holds [0x449210]
+                        // == 0x18 (a real un-boosted priority); our run holds 1.
+                        // Mechanism, all decoded:
+                        //   sub_11E598 CriLock   boosts caller to [0x4418F0] (=1)
+                        //                        and saves ChangeThreadPriority's
+                        //                        RETURN (the CURRENT priority) at
+                        //                        [0x449210]; nest count [0x441920].
+                        //   sub_11E620 CriUnlock restores [0x449210] on 1->0.
+                        // If the park spinner sub_11E690 has ALREADY boosted th6 to
+                        // 1 (its jal at 0x11e6e0, seen once at seq 0x14e3), the very
+                        // next CriLock captures 1 as the "original" and every later
+                        // unlock restores 1.  th6 is then pinned at priority 1 -- the
+                        // highest -- and starves main (24) forever.
+                        // savepri==1 with nest small is that latch, live.
+                        // d5fn/d5arg are the class-6 dispatch5 slot 0; the oracle has
+                        // fn=0x154fa8 arg=0x4bd7d0, so a mismatch is a separate bug.
+                        // g688/g674 are that handler's two early-bail gates
+                        // (0x154ff0 reads [0x45F688]; 0x155210 reads [0x45F674]).
+                        // The worker skips its SleepThread iff dispatch5(6) returns
+                        // NON-ZERO (bne $s0,$zero,0x11ebbc), which is why w6tick can
+                        // run at 181k/s while the sleep counters stay flat.
+                        std::cerr << " savepri=" << rd(0x00449210u)
+                                  << " savetid=" << rd(0x00449214u)
+                                  << " nest=" << rd(kWork + 0x20u)
+                                  << " d5fn=0x" << std::hex << rd(0x0054EB10u)
+                                  << " d5arg=0x" << rd(0x0054EB18u) << std::dec
+                                  << " g688=" << rd(0x0045F688u)
+                                  << " g674=" << rd(0x0045F674u)
+                                  << " origpri=" << rd(0x00441908u)
+                                  // ---- part 67 (09-04): is g36 a LATCH, or just
+                                  // toggling too fast to catch outside its bracket?
+                                  // g36's ONLY setter (0x1555a0) is reached from
+                                  // exactly two STRAIGHT-LINE brackets --
+                                  // 0x14e92c/0x14e940 in sub_14E8B0 and
+                                  // 0x155648/0x15565c in sub_155630 -- and each wraps
+                                  // `jal 0x154950`, which is run_class(6) via
+                                  // 0x13c448.  So g36 is a re-entrancy guard held
+                                  // across a NESTED class-6 dispatch; the 0x1553a4
+                                  // bail on g36==1 is CORRECT for the nested pass.
+                                  //
+                                  //   d6n  = [0x45EFE0] -- run_class(6)'s dispatch
+                                  //          counter, bumped once per call at
+                                  //          0x13c5b0 ($a0 = 0x45EFC8 + cls*4).
+                                  //   d6in = [0x45F000] -- run_class(6)'s in-callback
+                                  //          flag, set 0x13c55c / cleared 0x13c568
+                                  //          ($s1 = 0x45EFE8 + cls*4).
+                                  //   d5n  = [0x45EFDC] -- same counter for class 5,
+                                  //          which no server loop drives (its thunk
+                                  //          0x13c6d0 is called only from the CRI
+                                  //          lock band 0x11e320..0x11e524).
+                                  //
+                                  // Reading key, against w6tick ([0x441960] = the
+                                  // outer sub_11EAC8 loop count):
+                                  //   d6n ~= 2x w6tick -> nesting happens every pass,
+                                  //     so g36 IS toggling and is INNOCENT; the outer
+                                  //     pass runs with g36=0 and the block is further
+                                  //     down the chain (re-audit 0x155320 -> 0x165300).
+                                  //   d6n ~= 1x w6tick -> the bracket is never entered,
+                                  //     so g36 was set once and never cleared: it IS
+                                  //     latched, and a thread is parked inside
+                                  //     0x154950.  h92 then says which bracket.
+                                  << " d6n=" << rd(0x0045EFE0u)
+                                  << " d6in=" << rd(0x0045F000u)
+                                  << " d5n=" << rd(0x0045EFDCu)
+                                  // slot stride is 12 (fn,arg,pad) per 0x13c4f8's
+                                  // `addiu $s0,$s0,0xc`, and the dispatcher loads the
+                                  // arg from +4 -- the existing d5arg reads +8, the
+                                  // pad, so carry both rather than lose continuity.
+                                  << " d5arg4=0x" << std::hex << rd(0x0054EB14u) << std::dec
+                                  // ---- part 65f (09-04): the decision point.
+                                  // dispatch5(6)'s handler 0x154fa8 -> 0x155210
+                                  // proceeds only if 0x1548a0 (tail j to 0x13c880)
+                                  // returns 1, with a0 = 0x45F678+0x58 = 0x45F6D0.
+                                  //   0x13c880:  fn = [0x54EBF8]
+                                  //              if (fn) return fn(a0);
+                                  //              lock; old = *a0; *a0 = 1; unlock;
+                                  //              return (old == 0);
+                                  // i.e. a HOOKABLE test-and-set.  With no hook it
+                                  // acquires whenever the flag reads 0, the handler
+                                  // does full decode work and returns non-zero, and
+                                  // the worker skips its SleepThread -- our 186k/s.
+                                  // Hardware sleeps at ~10/s with g688/g674 IDENTICAL
+                                  // to ours, so the divergence must be here.
+                                  // tshook==0 while PCSX2 holds a pointer is the
+                                  // finding; tsflag says which way the fallback went.
+                                  << " tshook=0x" << std::hex << rd(0x0054EBF8u)
+                                  << std::dec << " tsflag=" << rd(0x0045F6D0u);
+
+                        // ---- part 65g (09-04): THE TERMINUS.
+                        // dispatch5(6)'s handler returns s1, and s1 is set only
+                        // here (0x1552c4..0x1552d8):
+                        //   v0 = 0x1556f8()            ; = [0x460F04] "done"
+                        //   if (v0 == 1) skip          ; done -> s1 keeps 0
+                        //   v0 = 0x1651d8()
+                        //   s1 = (v0 != 1)
+                        // s1 == 0 -> handler returns 0 -> worker SLEEPS.
+                        // 0x1651d8 walks EIGHT u32 slots at 0x461164:
+                        //   for i in 0..7:
+                        //     h = slot[i]
+                        //     if (0x15b560(h) != 0) continue
+                        //     if (0x1651b0(h) == 0) return 0     <-- incomplete
+                        //   return 1
+                        // So it returns 1 -- and the worker sleeps -- only when ALL
+                        // EIGHT report complete. One stuck slot spins forever, which
+                        // is our 186k/s. Hardware sleeps at ~10/s, so on hardware all
+                        // eight settle. Dump them and diff slot-for-slot.
+                        {
+                            std::cerr << " sl=[";
+                            for (uint32_t i = 0; i < 8u; ++i)
+                            {
+                                std::cerr << (i ? "," : "") << "0x" << std::hex
+                                          << rd(0x00461164u + i * 4u) << std::dec;
+                            }
+                            std::cerr << "]";
+
+                            // ---- part 65h (09-04): the two words that decide it.
+                            // Both predicates read the SAME field, [h+72]:
+                            //   0x15b560: h==0 || [h+72]==0 -> COMPLETE, skip
+                            //   0x1651b0: [h+72] in 1..4 && [h+68] != 0
+                            //                              -> INCOMPLETE -> spin
+                            // Oracle, worker ASLEEP: h44=1, h48=0. Deref `cur`
+                            // rather than a literal so this survives a different
+                            // allocation; cur has been 0x1B12CC0 on both sides.
+                            const uint32_t h = rd(0x00460F58u);
+                            std::cerr << " h=0x" << std::hex << h << std::dec;
+                            if (h >= 0x100000u && h < 0x02000000u)
+                            {
+                                // ---- part 66 (09-04): the command word decides everything.
+                                //
+                                // Verified chain, all static:
+                                //   0x1651b0  slot incomplete iff [h+72] in 1..4 && [h+68] != 0
+                                //   0x165300  pump: gates on the same pair, CLEARS [h+68] on
+                                //             entry, then [h+72] = handler(h) via the jump
+                                //             table at 0x4BF510 indexed by state.
+                                //   state 1 -> 0x165458:
+                                //         v1 = [h+76]                  // command word
+                                //         if (v1 < 2)  return [h+72];  // STAY 1
+                                //         if (v1 < 5)  return 2;       // advance
+                                //         if (v1 == 6) return 2;       // advance
+                                //         return [h+72];               // STAY 1
+                                //
+                                // So state 1 leaves idle ONLY for command in {2,3,4,6}.
+                                // 0x166998 is one such setter: `[h+76] = 4; return 0`.
+                                //
+                                // Ours is pinned at h48=1 with h44=1 for the whole run while
+                                // the oracle sits at h48=0 (terminal). If h4c reads 0 or 1,
+                                // the command was NEVER ISSUED and this is a movie-gate /
+                                // SVM problem, not a scheduler or stream-pump problem --
+                                // the pump is behaving exactly as written.
+                                //
+                                // h40 is printed only to pin the diff: oracle reads 0x4000.
+                                // h92 = [h+92], the bracket-C mirror. set_g36
+                                // (0x1555a0) writes it at 0x1555c0 ONLY when its
+                                // $a0 != 0, and bracket A (0x14e92c/0x14e940)
+                                // passes $a0 = 0 while bracket C (0x155648/
+                                // 0x15565c) passes the handle -- so h92 names
+                                // WHICH g36 bracket is currently open.
+                                std::cerr << " h40=0x" << std::hex << rd(h + 64u) << std::dec
+                                          << " h44=" << rd(h + 68u)
+                                          << " h48=" << rd(h + 72u)
+                                          << " h4c=" << rd(h + 76u)
+                                          << " h92=" << rd(h + 92u);
+                            }
+                        }
+
+                        // ---- part 65d (09-04): WHERE IS MAIN PARKED?
+                        // The park spinner sub_11E690(tid, origPri) is
+                        //   0x11e6e0  jal 0x174b30      boost th6 to [0x4418F0]=1
+                        //   0x11e6f0..0x11e714          spin: wake+resume th6 until
+                        //                               [0x441924] clears (<=0x0BEBC1FF)
+                        //   0x11e744  j   0x174b30      TAIL JUMP: restore th6 to $s5
+                        // $s5 comes from its only two callers (0x11e778 / 0x11e7a0,
+                        // both tail `j`), which load a1 from [0x441908] / [0x44190C]
+                        // -- STATIC cells, oracle says [0x441908]=0x19 (25). So the
+                        // restore target cannot itself be poisoned; origpri proves it.
+                        // The tail `j` is also why the part-64 CHGPRI count never saw
+                        // a restore from the spinner: ra is the spinner's own caller,
+                        // not 0x11e6e8.  [feedback_tail_jump_hides_the_caller]
+                        //
+                        // Working hypothesis to kill or confirm: main never reaches
+                        // 0x11e744, because th6 (pinned at 1) never yields, so main
+                        // is starved INSIDE the spin loop and the restore never runs.
+                        // mainpc in [0x11e6f0,0x11e714] confirms it.  Anything else
+                        // -- especially mainpc past 0x11e744 -- kills it, and the
+                        // poison must then come from CriUnlock overriding a restore
+                        // that did happen.
+                        {
+                            const auto snap = eeScheduler().snapshot();
+                            std::cerr << " run=" << snap.runningThreadId;
+                            for (const auto &th : snap.threads)
+                            {
+                                if (th.id != 1 && th.id != 6)
+                                    continue;
+                                std::cerr << " t" << th.id << "[pc=0x" << std::hex
+                                          << th.pc << std::dec
+                                          << " pri=" << th.currentPriority
+                                          << " ini=" << th.initialPriority
+                                          << " st=" << static_cast<int>(th.status)
+                                          << " sus=" << th.suspendCount
+                                          << " wk=" << th.wakeupCount << "]";
+                            }
+                        }
+                    std::cerr << " live=" << live << " busy=" << busy
+                                      << (cbOk ? "" : " MEM-UNREADABLE") << std::endl;
+                        }
                     }
 
                     // Coverage is scanned every tick for the inline cov= fields,
                     // but only written to the structured sink every 10s -- the
                     // summary is what the watchdog line needs, and the sink is
+                    // -----------------------------------------------------------
+                    // [WATCH] 1 Hz structured sampler, PS2X_TRACE_WATCH-driven.
+                    //
+                    // Every wide std::cerr sampler in this file -- [sofdec],
+                    // [pump], [cblist], and the [watchdog] line right below,
+                    // whose own comment admits it orders fields defensively
+                    // because "long lines get clipped somewhere between here and
+                    // the log" -- shares one defect: the data path is a console
+                    // line. On 2026-09-04 that cost a session its headline when a
+                    // pasted [sofdec] line was clipped at terminal width and
+                    // w6tick=13296567 was read as 18.
+                    //
+                    // This block writes the same kind of time series into the
+                    // structured sink instead, where a record cannot be clipped,
+                    // cannot be re-encoded, and cannot be glued to its neighbour
+                    // by a line-oriented parser. Field list comes from the SAME
+                    // PS2X_TRACE_WATCH syntax the [trace] tracer uses
+                    // (Kernel/Diag/trace_calls.cpp), so a field set is defined
+                    // once and read by both. Query with analyze_run.py --onset.
+                    //
+                    // Silent unless PS2X_TRACE_WATCH is set.
+                    // -----------------------------------------------------------
+                    {
+                        // `name=0xADDR` reads [ADDR]; `name=*0xPTR+0xOFF`
+                        // reads [[PTR]+OFF] (one dereference, for fields
+                        // behind a $gp-held object pointer).
+                        struct WatchSpec
+                        {
+                            std::string name;
+                            uint32_t addr;
+                            bool deref = false;
+                            uint32_t off = 0u;
+                        };
+                        static std::vector<WatchSpec> s_watchSpecs;
+                        static bool s_watchParsed = false;
+                        if (!s_watchParsed)
+                        {
+                            s_watchParsed = true;
+                            const char *raw = std::getenv("PS2X_TRACE_WATCH");
+                            if (raw != nullptr && raw[0] != '\0')
+                            {
+                                std::string cur;
+                                for (const char *p = raw;; ++p)
+                                {
+                                    if (*p == ',' || *p == '\0')
+                                    {
+                                        const std::size_t eq = cur.find('=');
+                                        if (eq != std::string::npos && eq != 0u)
+                                        {
+                                            char *end = nullptr;
+                                            std::string valText = cur.substr(eq + 1);
+                                            const bool deref = !valText.empty() && valText[0] == '*';
+                                            if (deref)
+                                                valText.erase(0, 1);
+                                            const unsigned long long a =
+                                                std::strtoull(valText.c_str(), &end, 0);
+                                            unsigned long long off = 0u;
+                                            bool ok = end != valText.c_str();
+                                            if (ok && deref && *end == '+')
+                                            {
+                                                const char *offText = end + 1;
+                                                off = std::strtoull(offText, &end, 0);
+                                                ok = end != offText;
+                                            }
+                                            if (ok && *end == '\0')
+                                            {
+                                                s_watchSpecs.push_back(
+                                                    WatchSpec{cur.substr(0, eq),
+                                                              static_cast<uint32_t>(a), deref,
+                                                              static_cast<uint32_t>(off)});
+                                            }
+                                        }
+                                        cur.clear();
+                                        if (*p == '\0')
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    cur.push_back(*p);
+                                }
+                                std::cerr << "[WATCH] armed " << s_watchSpecs.size()
+                                          << " field(s) at 1 Hz -> probe sink"
+                                          << std::endl;
+                            }
+                        }
+
+                        if (!s_watchSpecs.empty())
+                        {
+                            // +2 for t and a readability flag. A sample where the
+                            // guest memory was unreadable must be distinguishable
+                            // from one that legitimately read zero -- otherwise a
+                            // transient failure looks like a field going to 0,
+                            // which is exactly the shape of the event we hunt.
+                            std::vector<const char *> keys;
+                            std::vector<uint64_t> vals;
+                            keys.reserve(s_watchSpecs.size() + 2u);
+                            vals.reserve(s_watchSpecs.size() + 2u);
+
+                            uint32_t unreadable = 0u;
+                            keys.push_back("t");
+                            vals.push_back(static_cast<uint64_t>(t) + 1u);
+                            for (const WatchSpec &w : s_watchSpecs)
+                            {
+                                uint32_t v = 0u;
+                                try
+                                {
+                                    v = m_memory.read32(w.addr);
+                                    if (w.deref)
+                                        v = v != 0u ? m_memory.read32(v + w.off) : 0u;
+                                }
+                                catch (const std::exception &)
+                                {
+                                    ++unreadable;
+                                }
+                                keys.push_back(w.name.c_str());
+                                vals.push_back(v);
+                            }
+                            keys.push_back("unreadable");
+                            vals.push_back(unreadable);
+
+                            // 2026-09-06 part 87 -- host-side scheduler state.
+                            // The SofDec stall kills every event-driven probe
+                            // (DISPATCH emits from sleepCurrent, so it goes
+                            // silent exactly when th6 stops sleeping) while
+                            // this wall-clock sampler keeps going. slpfast
+                            // climbing with slpblk flat means SleepThread is
+                            // returning without parking; wk6acc is how many
+                            // unbounded ++wakeupCount bumps main's 0x11E690
+                            // spin landed on th6 to make that possible.
+                            {
+                                static const char *const schedKeys[] = {
+                                    "slpfast", "slpblk", "wk6acc", "wk6rdy",
+                                    "wk6cnt", "wk6slp", "wk1acc", "wk1rdy"};
+                                constexpr int kSchedN =
+                                    static_cast<int>(sizeof(schedKeys) / sizeof(schedKeys[0]));
+                                uint64_t schedVals[kSchedN] = {};
+                                ps2x_sched_diag(schedVals, kSchedN);
+                                for (int i = 0; i < kSchedN; ++i)
+                                {
+                                    keys.push_back(schedKeys[i]);
+                                    vals.push_back(schedVals[i]);
+                                }
+                            }
+
+                            ps2x_probe_kv("WATCH", static_cast<int>(keys.size()),
+                                          keys.data(), vals.data());
+                        }
+                    }
+
                     // for analyze_run.py afterwards.
                     const CoverageSummary cov =
                         scanCoverage((static_cast<uint32_t>(t) % 10u) == 9u, 1u, false);
@@ -5184,6 +6821,71 @@ void PS2Runtime::run()
                     // feeds VIF1 by DMA, so both read 0 by design and neither ever
                     // discriminated anything; gifTot is just the running sum of
                     // gif/s.
+                    // 2026-09-10 -- frametrace call counters, emitted just
+                    // BEFORE the watchdog line so the `t=` immediately after it
+                    // timestamps the transition. Defined in game_overrides.cpp;
+                    // declared here rather than in a header because ps2_runtime.h
+                    // is included by ~4,520 generated TUs (30h rebuild).
+                    // Self-silencing: prints nothing on a second where no traced
+                    // slot's count moved.
+                    ps2x_dump_frametrace_calls();
+                    {
+                        // 10-09 60fps P0: per-second deltas of the cost counters,
+                        // plus per-vblank figures (vblank = the frame budget, 16.7
+                        // ms at 60). Reads of other threads' counters are racy by
+                        // design; this is a statistic, not a gate.
+                        uint64_t bx[6], bv[5], br[10];
+                        ps2x_budget_xfer(bx, 6);
+                        ps2x_budget_vu1(bv, 5);
+                        ps2x_budget_raster(br, 10);
+                        uint64_t dx[6], dv[5], dr[10];
+                        for (int i = 0; i < 6; ++i) { dx[i] = bx[i] - prevBudgetXfer[i]; prevBudgetXfer[i] = bx[i]; }
+                        for (int i = 0; i < 5; ++i) { dv[i] = bv[i] - prevBudgetVu1[i]; prevBudgetVu1[i] = bv[i]; }
+                        for (int i = 0; i < 10; ++i) { dr[i] = br[i] - prevBudgetRaster[i]; prevBudgetRaster[i] = br[i]; }
+                        const uint64_t nv = dVbl != 0 ? dVbl : 1;
+                        const uint64_t xferTotal = dx[0] + dx[1] + dx[2] + dx[3] + dx[4];
+                        const uint64_t rastPx = dr[0] + dr[1] + dr[2] + dr[3] + dr[4] + dr[5];
+                        // Fight seconds spend 8-30 ms/vbl in VU1, menus ~0: this
+                        // opens the PS2X_PROFILE_GATE sample filter.
+                        ps2x_host_sampler_gate(dv[0] / 1000 / nv >= 5000u ? 1 : 0);
+                        std::cerr << "[budget] t=" << (t + 1) << " vbl/s=" << dVbl
+                                  << " xfer/s=" << xferTotal << " (exit/resched/pushInv/pushSeq/block="
+                                  << dx[0] << "/" << dx[1] << "/" << dx[2] << "/" << dx[3] << "/" << dx[4] << ")"
+                                  << " res/s=" << dResumes
+                                  << " xfer/vbl=" << (xferTotal / nv)
+                                  << " unwindUs/vbl=" << (dx[5] / 1000 / nv)
+                                  << " vu1Us/vbl=" << (dv[0] / 1000 / nv)
+                                  << " vu1RecompUs/vbl=" << (dv[3] / 1000 / nv)
+                                  << " vu1KickUs/vbl=" << (dv[2] / 1000 / nv)
+                                  << " vu1Runs/vbl=" << (dv[1] / nv)
+                                  << " rastKpx/vbl=" << (rastPx / 1000 / nv)
+                                  << " (triFlat/triTex/triLin/sprFlat/sprTex/sprLin Kpx/vbl="
+                                  << (dr[0] / 1000 / nv) << "/" << (dr[1] / 1000 / nv) << "/" << (dr[2] / 1000 / nv) << "/"
+                                  << (dr[3] / 1000 / nv) << "/" << (dr[4] / 1000 / nv) << "/" << (dr[5] / 1000 / nv) << ")"
+                                  << " tris/vbl=" << (dr[6] / nv) << " sprites/vbl=" << (dr[7] / nv)
+                                  << " abeKpx/vbl=" << (dr[8] / 1000 / nv) << " zKpx/vbl=" << (dr[9] / 1000 / nv)
+                                  << " gifCopies/vbl=" << (dGif / nv)
+                                  << std::endl;
+                        if (ps2x_p5a_enabled())
+                        {
+                            // P5 design S2/S4/S5 counts per second, and per vblank
+                            // the EE time inside VIF1 kicks vs the whole frame.
+                            uint64_t p[11], d[11];
+                            ps2x_p5a_counts(p, 11);
+                            for (int i = 0; i < 11; ++i) { d[i] = p[i] - prevP5a[i]; prevP5a[i] = p[i]; }
+                            const uint64_t nf = d[6] != 0 ? d[6] : 1;
+                            std::cerr << "[p5a] t=" << (t + 1) << " vbl/s=" << dVbl
+                                      << " vif1Rd/s=" << d[0] << " vif1Wr/s=" << d[1]
+                                      << " vpuStat/s=" << (d[8] + d[9] + d[10])
+                                      << " (172278/1731e0/1733e0=" << d[8] << "/" << d[9] << "/" << d[10] << ")"
+                                      << " gsSync/s=" << d[7] << " d1Kicks/s=" << d[2]
+                                      << " frameUs=" << (d[4] / 1000 / nf)
+                                      << " kickUs/vbl=" << (d[3] / 1000 / nf)
+                                      << " outsideUs/vbl=" << ((d[4] > d[3] ? d[4] - d[3] : 0) / 1000 / nf)
+                                      << " postKickUs/vbl=" << (d[5] / 1000 / nf)
+                                      << std::endl;
+                        }
+                    }
                     std::cerr << "[watchdog] t=" << (++t) << "s"
                               // cov=<distinct>/<game band>. A game-band count
                               // that never rises is the Stage 5.7 answer.
@@ -5217,7 +6919,67 @@ void PS2Runtime::run()
                               // callback that entered and never returned.
                               << " cb=0x"
                               << g_sdbzCb13C4F8InFlight.load(std::memory_order_relaxed)
+                              // 0xffffffff unless a syscall dispatch is in flight
+                              // right now; a value that's still set once the
+                              // syscall should long since have returned names
+                              // the EE syscall number (Dispatcher.cpp encoding)
+                              // and the guest PC that issued it -- see the
+                              // g_syscallInFlightNumber comment above for why
+                              // this survives where lastCall alone cannot.
+                              << " sysNum=0x"
+                              << g_syscallInFlightNumber.load(std::memory_order_relaxed)
+                              << " sysPc=0x"
+                              << g_syscallInFlightPc.load(std::memory_order_relaxed)
+                              << " sysA0=0x"
+                              << g_syscallInFlightA0.load(std::memory_order_relaxed)
+                              << " sysA1=0x"
+                              << g_syscallInFlightA1.load(std::memory_order_relaxed)
+                              << " sysA2=0x"
+                              << g_syscallInFlightA2.load(std::memory_order_relaxed)
+                              << " sysRa=0x"
+                              << g_syscallInFlightRa.load(std::memory_order_relaxed)
+                              // Diagnostic-only (2026-08-28): last-call result of
+                              // syscall 0x83 FindAddress, whose 3-register scan
+                              // semantics contradict the project's own
+                              // db-syscalls.md ("a0=id" single-arg signature) --
+                              // see the comment above the extern block near the
+                              // top of this file. faScan names the actual word
+                              // count of the last scan (huge if the "~2GB range"
+                              // hypothesis is right, small/zero if it is not);
+                              // faResult is the guest address it returned (0 =
+                              // not found, every call so far per the AGRESSIVE_LOGS
+                              // -gated detail log being off by default).
+                              << " faResult=0x"
+                              << ps2_syscalls::g_findAddressLastResult.load(std::memory_order_relaxed)
                               << std::dec
+                              << " faScan=" << ps2_syscalls::g_findAddressLastScannedWords.load(std::memory_order_relaxed)
+                              << " faCalls=" << ps2_syscalls::g_findAddressCallCount.load(std::memory_order_relaxed)
+                              << " faAborted=" << ps2_syscalls::g_findAddressLastAborted.load(std::memory_order_relaxed)
+                              // Diagnostic-only (2026-08-28, continued): faCalls
+                              // above stayed 0 for a full 200s run -- these show
+                              // whether dispatchSyscallOverride() is intercepting
+                              // syscall 0x83 before the real FindAddress ever
+                              // runs, which guest handler address it registered,
+                              // and which of that function's branches fires.
+                              << " soCalls=" << ps2_syscalls::g_syscallOverrideCallCount.load(std::memory_order_relaxed)
+                              << " soHandler=0x" << std::hex << ps2_syscalls::g_syscallOverrideLastHandler.load(std::memory_order_relaxed) << std::dec
+                              << " soBranch=" << ps2_syscalls::g_syscallOverrideLastBranch.load(std::memory_order_relaxed)
+                              // Diagnostic-only (2026-08-29): EeScheduler.cpp's
+                              // checkpointDue() has a branch (line ~637) that sets
+                              // m_checkpointPending=true whenever eeCycle >=
+                              // nextEventCycle, and that flag is only ever cleared
+                              // by processPendingEvents() recomputing the SAME
+                              // comparison -- so if nextEventCycle is never
+                              // advanced past a fresh eeCycle after being consumed,
+                              // every checkpointDue() call anywhere (including every
+                              // guest loop's cooperative-preemption check) returns
+                              // true forever, starving all guest progress. These
+                              // two fields, read via the existing public
+                              // EeScheduler::snapshot() (no header change needed),
+                              // show directly whether nextEventCycle is frozen
+                              // while eeCycle keeps climbing.
+                              << " eeCyc=" << eeScheduler().snapshot().eeCycle
+                              << " nextDl=" << eeScheduler().snapshot().nextEventCycle
                               << " trace=" << formatGlobalDispatchHistory() << std::endl;
                 }
 
@@ -5286,7 +7048,7 @@ void PS2Runtime::run()
     }
 
     uint64_t tick = 0;
-    while (!isStopRequested())
+    while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
@@ -5301,7 +7063,7 @@ void PS2Runtime::run()
                 const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
                 const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
-                const int activeThreads = g_activeThreads.load(std::memory_order_relaxed);
+                const auto eeSnapshot = m_eeScheduler->snapshot();
 
                 RUNTIME_LOG("[run:tick] tick=" << tick
                                                << " pc=0x" << std::hex << dbgPc
@@ -5311,12 +7073,13 @@ void PS2Runtime::run()
                                                << " dispfb1=0x" << gs.dispfb1
                                                << " display1=0x" << gs.display1
                                                << std::dec
-                                               << " activeThreads=" << activeThreads
+                                               << " activeThreads=" << eeSnapshot.threads.size()
                                                << " dma=" << curDma
                                                << " gif=" << curGif
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+
             }
         });
 
@@ -5397,7 +7160,9 @@ void PS2Runtime::run()
 
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+        ps2x_gs_present_begin(); // GS thread steps aside so we get the GS lock
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+        ps2x_gs_present_end();
 
         // [STEP 6] Frame recorder: separately env-gated via PS2X_REC (not
         // PS2X_DIAG). Dumps a PNG only when the presented frame's hash
@@ -5467,6 +7232,55 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+
+        // After the guest blit so the movie covers it, before the debug panel so
+        // the panel still draws on top. No-op unless PS2X_FMV=host and a movie is
+        // actually playing.
+        ps2x_fmv_host_draw();
+
+        // Host FPS overlay (10-10): drawn on the window after the guest frame was
+        // uploaded, so it never touches the GS framebuffer / VRAM hashes. F3 toggles
+        // (F1 is the debug panel); PS2X_FPS=1 starts it on. Off = one bool test.
+        {
+            static bool s_fpsShow = ps2_diag::env_int("PS2X_FPS", 0) != 0;
+            static uint32_t s_fpsFrames = 0u;
+            static uint64_t s_fpsTick0 = 0u;
+            static double s_fpsT0 = 0.0;
+            static char s_fpsText[64] = "game - vbl/s";
+            if (IsKeyPressed(KEY_F3))
+            {
+                s_fpsShow = !s_fpsShow;
+                s_fpsFrames = 0u;
+                s_fpsT0 = GetTime();
+                s_fpsTick0 = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+            }
+            if (s_fpsShow)
+            {
+                ++s_fpsFrames;
+                const double now = GetTime();
+                if (s_fpsT0 == 0.0)
+                {
+                    s_fpsT0 = now;
+                    s_fpsTick0 = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+                }
+                else if (now - s_fpsT0 >= 1.0)
+                {
+                    const uint64_t tick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
+                    const double dt = now - s_fpsT0;
+                    // The window loop re-presents the latched frame at the monitor
+                    // rate (60) whatever the guest does, so "frames presented"
+                    // says nothing about speed. Guest vblanks/s do: 60 = full speed.
+                    const double vbl = static_cast<double>(tick - s_fpsTick0) / dt;
+                    std::snprintf(s_fpsText, sizeof(s_fpsText), "game %.0f vbl/s = %.0f%% speed", vbl, vbl * (100.0 / 60.0));
+                    s_fpsT0 = now;
+                    s_fpsTick0 = tick;
+                    s_fpsFrames = 0u;
+                }
+                DrawText(s_fpsText, 11, 11, 20, BLACK);
+                DrawText(s_fpsText, 10, 10, 20, YELLOW);
+            }
+        }
+
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
@@ -5475,6 +7289,7 @@ void PS2Runtime::run()
 
         // EndDrawing() has just run raylib's PollInputEvents(), so host key /
         // gamepad state is fresh on this thread. Push it to the guest now.
+        ps2x_pad_script_set_tick(m_memory.gs().vsyncTick.load(std::memory_order_acquire));
         ps2x_pad_push_frame(m_memory.getRDRAM());
 
         // RecompDebugger IPC: once-per-video-frame extended telemetry (GS
@@ -5514,7 +7329,7 @@ void PS2Runtime::run()
             const uint64_t nextSeq = logSnap.empty() ? 1 : (logSnap.back().seq + 1);
             RecompDbg::UpdateExtended(dbgGs, dbgPad, dbgLogs.data(), logCount, nextSeq);
 
-            const std::vector<ps2_syscalls::ThreadDebugSnapshot> threadSnap = ps2_syscalls::getThreadDebugSnapshot();
+            const std::vector<ps2_syscalls::ThreadDebugSnapshot> threadSnap = ps2_syscalls::getThreadDebugSnapshot(this);
             const uint32_t threadCount = static_cast<uint32_t>(
                 std::min<size_t>(threadSnap.size(), kDbgMaxThreads));
             std::array<DbgThreadInfo, kDbgMaxThreads> dbgThreads{};
@@ -5542,15 +7357,17 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    ps2_syscalls::stopInterruptWorker();
 
     if (watchdogThread.joinable())
     {
         watchdogThread.join();
     }
 
-    // Signal all guest fibers to stop and join the pool threads.
-    ps2sched::scheduler_shutdown();
-    ps2sched::scheduler_set_stop_callback(nullptr, nullptr);
+    if (gameThread.joinable())
+    {
+        gameThread.join();
+    }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {
@@ -5562,7 +7379,15 @@ void PS2Runtime::run()
     // launch_recomp.ps1's auto-stop can Kill() before this point is reached.
     ps2x_host_sampler_stop();
 
+    // Before UnloadTexture/CloseWindow below, and before ~PS2Runtime's
+    // CloseAudioDevice(): a player thread still touching the AudioStream or the
+    // GL texture after either of those is a use-after-free. WindowShouldClose()
+    // can break the present loop mid-movie, so this must be safe from Playing.
+    ps2x_fmv_host_shutdown();
+
     RecompDbg::Shutdown();
     UnloadTexture(frameTex);
     CloseWindow();
+
+    RUNTIME_LOG("[run] exiting loop");
 }

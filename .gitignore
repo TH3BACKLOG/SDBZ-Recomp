@@ -17,6 +17,12 @@ ps2xRuntime/include/ps2_recompiled_functions.h
 ps2xRuntime/include/ps2_recompiled_stubs.h
 ps2xRuntime/outputbuild-*/
 
+# Android/IDE build artifacts (upstream PR #179)
+android/app/.cxx/
+android/local.properties
+android/.gradle/
+.idea/
+
 # ---------------------------------------------------------------------------
 # RECOMPILED GAME CODE — must never be committed.
 #
@@ -30,6 +36,11 @@ ps2xRuntime/outputbuild-*/
 # ps2xRecomp/src/runner/main.cpp is a DIFFERENT tree (the recompiler tool's own
 # entrypoint, upstream-authored) and is deliberately still tracked.
 ps2xRuntime/src/runner/*
+
+# Same for the VU1 micro programs: build_scripts/vu1_recomp.py translates the
+# game's VU1 microcode (dumped from its micro memory) into C++ and embeds the
+# code bytes in the lookup table. Game code; regenerate locally.
+ps2xRuntime/src/lib/Kernel/Vu1Recomp/generated/*
 
 # Auto-generated from a regex scan of game_overrides.cpp on every build; 4.2 MB
 # of declarations naming every guest function. Regenerated, never hand-edited.
@@ -48,6 +59,12 @@ config.toml
 build_scripts/*
 !build_scripts/recomp_mcp_server.py
 !build_scripts/funcmap/
+!build_scripts/make_irx_pack.py
+!build_scripts/copilot_packs/
+build_scripts/copilot_packs/*
+!build_scripts/copilot_packs/manifest_*.csv
+!build_scripts/copilot_packs/reply_*.csv
+!build_scripts/sweeps/
 STUDIO_BUG_LOG.md
 
 # Local tooling, dumps, and workspace clutter (not part of the recomp source tree)
@@ -57,7 +74,7 @@ node_modules/
 package.json
 package-lock.json
 third_party/
-tools/
+/tools/
 output/
 run_logs/
 graphify-out/
@@ -68,6 +85,8 @@ ELF/
 *.txt
 !README*.txt
 !CHANGELOG*.txt
+!CMakeLists.txt
+!build_scripts/sweeps/*.txt
 desktop.ini
 *.7z
 ghidra_*/
@@ -129,6 +148,11 @@ _ClaudeMemory/
 # build_scripts/* excluded above. Authored tools only; dumps/logs stay out.
 !build_scripts/*.py
 !build_scripts/*.ps1
+# Stage B opcode conformance: the tools are tracked; out/ (test ELF, generated C++, results) is not.
+!build_scripts/conformance/
+build_scripts/conformance/*
+!build_scripts/conformance/*.py
+!build_scripts/conformance/*.ps1
 
 # ghidra_scripts/ is swept up by `ghidra_*/`, so re-admit the dir explicitly.
 !ghidra_scripts/
@@ -150,3 +174,45 @@ ida_scripts/idapy_ps2/*
 # PCSX2 dump (build_scripts/gsdump_parse.py --emit-replay) and runs to megabytes.
 gsdump/*
 gsdump_replay*.bmp
+
+# Game-derived / local-only (added 2026-09-24): recovered guest bodies are
+# transliterated retail code; textures/meshes are extracted game assets.
+# (11 older recovered/*.cpp are already tracked -- ignore rules don't touch them.)
+ps2xRuntime/src/lib/Kernel/recovered/sub_*.cpp
+# Same for the sqrt(|x|) overrides (2026-10-05): copies of 3 generated game bodies.
+ps2xRuntime/src/lib/Kernel/FpuFixes/
+SDBZ?Textures/
+meshdump/
+_backup_recovered_*/
+_quarantine_stale_output_*/
+build.testonly/
+ps2x_rec/
+output_scratch_*/
+config.scratch_*.toml
+cheatengine-mcp/
+x64dbg/
+__pycache__/
+imgui.ini
+
+# Folder reorg 2026-10-08 (move log: docs/REORG_2026-10-08.md). Local-only homes
+# for tools, installers, art, game files, dumps and old backups -- never tracked.
+installers/
+art/
+game_files/
+dumps/
+archive/
+recomp_scratch/
+docs/important_text_files/
+docs/session_summaries/
+docs/solutions_log/
+docs/claude_memory_old/
+build_scripts/funcmap/_bak/
+build_scripts/logs/
+build_scripts/data/
+analysis/*
+!analysis/sofdec/
+# GS feature matrix + census (feature-not-scene plan 10-08b): tools + baseline tracked; results go to Logs/gsfeature/.
+!build_scripts/gsfeature/
+build_scripts/gsfeature/*
+!build_scripts/gsfeature/*.py
+!build_scripts/gsfeature/baseline.json

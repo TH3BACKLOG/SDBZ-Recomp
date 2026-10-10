@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "Dispatcher.h"
 #include "System.h"
+#include "RPC.h"
 
 namespace ps2_syscalls
 {
@@ -267,27 +268,9 @@ namespace ps2_syscalls
         case 0x64:
             FlushCache(rdram, ctx, runtime);
             return true;
-        case 0x68:
         case static_cast<uint32_t>(-0x68):
-        {
-            // EE kernel syscall 0x68: fired every frame by the GS field-flip
-            // routine fn_104F20 @ 0x104ff8 with $a0=0. The guest DISCARDS the
-            // return (label_105000 does an unconditional `b 0x105010`), so this
-            // is cosmetic — a no-op returning 0 just removes the repeating
-            // [Syscall TODO] v1=0xffffff98 warning so ARKD transfer diagnostics
-            // read cleanly. Not the boot blocker; its per-frame firing is a
-            // sign of life, not a stall.
-            {
-                static std::atomic<uint32_t> s_sys68Logs{0u};
-                if (s_sys68Logs.fetch_add(1u, std::memory_order_relaxed) < 8u)
-                {
-                    std::cerr << "[syscall:0x68] a0=0x" << std::hex << getRegU32(ctx, 4)
-                              << " -> 0 (no-op, result discarded)" << std::dec << std::endl;
-                }
-            }
-            setReturnU32(ctx, 0u);
+            iFlushCache(rdram, ctx, runtime);
             return true;
-        }
         case 0x6B:
         case static_cast<uint32_t>(-0x6B):
         {
@@ -380,6 +363,19 @@ namespace ps2_syscalls
                 {
                     std::cerr << "[syscall:0x7A] a0=0x" << std::hex << getRegU32(ctx, 4)
                               << " -> 0xFFFFFFFF (complete)" << std::dec << std::endl;
+                }
+            }
+            {
+                const uint32_t reg = getRegU32(ctx, 4);
+                if (reg == 0x80000000u || reg == 0x80000001u)
+                {
+                    // SDBZ builds SIF cmd packets and DMAs them to this IOP-side buffer.
+                    const uint32_t buf = sdbzSifIopCmdBuffer(runtime);
+                    if (buf != 0u)
+                    {
+                        setReturnU32(ctx, buf);
+                        return true;
+                    }
                 }
             }
             setReturnU32(ctx, 0xFFFFFFFFu);

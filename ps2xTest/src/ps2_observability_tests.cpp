@@ -6,10 +6,45 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "runtime/ps2_gs_rasterizer.h"
 
+#include <atomic>
+#include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// [journal] ordered address-range guest-store journal, implemented in
+// ps2xRuntime/src/lib/Kernel/Diag/trace_calls.cpp. Declared here rather than
+// pulled from a header because that file has none -- a .h on the recompiled
+// include graph costs a 30+ hour rebuild, so extern-between-.cpp is the
+// project convention.
+//
+// ⚠ `Record` is defined in BOTH places and the definitions must stay byte
+// identical. A divergence is an ODR violation that links silently and
+// misreports at runtime; /Zs cannot catch it.
+namespace ps2_journal
+{
+    struct Record
+    {
+        uint64_t ord = 0;
+        uint64_t val = 0;
+        uint32_t addr = 0;
+        uint32_t size = 0;
+        uint32_t pc = 0;
+        uint32_t range = 0;
+    };
+
+    extern std::atomic<bool> g_armed;
+    std::size_t install(const char *spec);
+    void onStore(uint32_t addr, uint32_t size, uint64_t lo, uint64_t hi, uint32_t pc) noexcept;
+    std::size_t rangeCount();
+    uint32_t hits(std::size_t i);
+    uint32_t pcHits();
+    std::size_t recordCount();
+    bool recordAt(std::size_t i, Record &out);
+    void reset();
+}
 
 // Regression coverage for the opt-in "runtime observability" diagnostics
 // layer: the should_log throttle, the poll-based guest-memory watch probe
@@ -886,6 +921,156 @@ void register_ps2_observability_tests()
 
             ps2_diag::set_enabled_for_test(false);
             ps2_log::clear_runtime_log_entries();
+        });
+
+        // ------------------------------------------------------------------
+        // [journal] ordered address-range store journal.
+        // Implementation: ps2xRuntime/src/lib/Kernel/Diag/trace_calls.cpp.
+        // Declared here rather than via a header for the same reason as the
+        // runtime side: a .h edit rebuilds every generated runner TU.
+        // ------------------------------------------------------------------
+
+        tc.Run("journal: rejects an inverted range instead of silently matching nothing", [](TestCase &t)
+        {
+            ps2_journal::reset();
+
+            // hi <= lo must be REFUSED. A range that quietly matched nothing
+            // would be read later as "no stores happened" -- the exact false
+            // negative the journal exists to prevent.
+            const std::size_t armed = ps2_journal::install("0x2000:0x2000:empty,0x3000:0x2FFF:inverted");
+            t.Equals(armed, static_cast<std::size_t>(0), "neither an empty nor an inverted range should arm");
+            t.IsFalse(ps2_journal::g_armed.load(std::memory_order_relaxed),
+                      "the journal must stay disarmed when every supplied range was rejected");
+
+            ps2_journal::reset();
+        });
+
+        tc.Run("journal: a wide store STRADDLING the range boundary is recorded", [](TestCase &t)
+        {
+            ps2_journal::reset();
+            t.Equals(ps2_journal::install("0x4004:0x4008:tail"), static_cast<std::size_t>(1), "one range should arm");
+
+            // An 8-byte store at 0x4000 covers [0x4000,0x4008) and so touches
+            // the watched word at 0x4004. Dropping it would hide exactly the
+            // wide-store writers a field-ownership hunt is looking for.
+            ps2_journal::onStore(0x4000u, 8u, 0x1122334455667788ull, 0ull, 0x00100200u);
+            t.Equals(ps2_journal::hits(0), 1u, "a 64-bit store overlapping the range must be journalled");
+
+            // ... and a store that ends exactly at lo must NOT be, because the
+            // range is half-open [lo,hi).
+            ps2_journal::onStore(0x4000u, 4u, 0xAAAAAAAAull, 0ull, 0x00100204u);
+            t.Equals(ps2_journal::hits(0), 1u, "a store ending exactly at lo is outside a half-open range");
+
+            ps2_journal::reset();
+        });
+
+        tc.Run("journal: records an intra-frame transient that the 60Hz poll watch provably misses", [](TestCase &t)
+        {
+            // THE point of this file. PS2X_WATCH polls once per frame from the
+            // render loop, so it can only ever report the NET change across a
+            // frame. A field set and cleared between two polls is invisible to
+            // it -- which is precisely the use-after-teardown shape we need to
+            // see (teardown zeroes a pointer, something re-attaches, both in
+            // one frame). The journal is store-ordered and misses neither.
+            ps2_journal::reset();
+            ps2_watch::clearWatches();
+            ps2_diag::set_enabled_for_test(true);
+            ps2_log::clear_runtime_log_entries();
+
+            std::vector<uint8_t> rdram(64 * 1024, 0);
+
+            ps2_watch::addWatch(0x5000, 4, "pollWatch");
+            t.Equals(ps2_journal::install("0x5000:0x5004:journalWatch"), static_cast<std::size_t>(1), "one range should arm");
+
+            ps2_watch::pollWatches(rdram.data()); // seed the watch at value 0
+            ps2_log::clear_runtime_log_entries();
+
+            R5900Context ctx{};
+
+            // Both stores go through ps2TraceGuestWrite ONLY. That is the real
+            // guest path -- WRITE32 -> ps2TraceGuestWrite -> onGuestWrite ->
+            // ps2_journal::onStore -- so this exercises the wiring the game run
+            // will use. Calling ps2_journal::onStore() here as well would record
+            // each store twice.
+
+            // Store #1: 0 -> 0xABCD, from one PC.
+            ctx.pc = 0x003D1A7Cu;
+            writeLE32(rdram, 0x5000, 0xABCDu);
+            ps2TraceGuestWrite(rdram.data(), 0x5000, 4, 0xABCDu, 0, "WRITE32", &ctx);
+
+            // Store #2: 0xABCD -> 0, from a different PC, SAME frame.
+            ctx.pc = 0x003D1D94u;
+            writeLE32(rdram, 0x5000, 0u);
+            ps2TraceGuestWrite(rdram.data(), 0x5000, 4, 0u, 0, "WRITE32", &ctx);
+
+            ps2_watch::pollWatches(rdram.data()); // one frame boundary
+
+            // The poll watch sees 0 -> 0: no net change, so NOTHING is logged.
+            t.Equals(collectTagged("[watch]").size(), static_cast<size_t>(0),
+                     "the poll-based watch must report nothing: the value is unchanged across the frame boundary");
+
+            // The journal saw both stores, in order, with distinct writer PCs.
+            t.Equals(ps2_journal::hits(0), 2u, "the journal must record BOTH intra-frame stores");
+            t.Equals(ps2_journal::recordCount(), static_cast<std::size_t>(2), "both stores should reach the inspection ring");
+
+            ps2_journal::Record first{};
+            ps2_journal::Record second{};
+            t.IsTrue(ps2_journal::recordAt(0, first), "record 0 should be readable");
+            t.IsTrue(ps2_journal::recordAt(1, second), "record 1 should be readable");
+
+            t.IsTrue(first.ord < second.ord, "ord must impose a total order on stores");
+            t.Equals(first.val, static_cast<uint64_t>(0xABCDu), "the first record should carry the value that was written first");
+            t.Equals(second.val, static_cast<uint64_t>(0u), "the second record should carry the clearing write");
+            t.Equals(first.pc, 0x003D1A7Cu, "the first record should name the PC that set the field");
+            t.Equals(second.pc, 0x003D1D94u, "the second record should name the PC that cleared it");
+
+            ps2_journal::reset();
+            ps2_watch::clearWatches();
+            ps2_diag::set_enabled_for_test(false);
+            ps2_log::clear_runtime_log_entries();
+        });
+
+        tc.Run("journal: PC arming catches a field write at an address not known in advance", [](TestCase &t)
+        {
+            // Range arming needs the target address up front, which is useless
+            // for a heap object -- and the [hole] probe prints only
+            // target/source/ra, never the object. PC arming needs nothing
+            // known in advance: it follows the storing INSTRUCTION into
+            // whatever object it writes.
+            ps2_journal::reset();
+
+            _putenv_s("PS2X_JOURNAL_PC", "0x3d1a7c,0x3d1d94");
+            const std::size_t armed = ps2_journal::install(nullptr);
+            _putenv_s("PS2X_JOURNAL_PC", "");
+
+            t.Equals(armed, static_cast<std::size_t>(2), "two PCs should arm even with no range spec at all");
+            t.IsTrue(ps2_journal::g_armed.load(std::memory_order_relaxed),
+                     "a PC-only spec must still arm the journal");
+
+            // Two different heap objects, neither address known when arming.
+            const uint32_t objA = 0x00A12340u;
+            const uint32_t objB = 0x00B54780u;
+            constexpr uint32_t kDispatcherOffset = 0x4F0u;
+
+            ps2_journal::onStore(objA + kDispatcherOffset, 4u, 0x8899AABBull, 0ull, 0x003D1A7Cu); // attach
+            ps2_journal::onStore(objB + kDispatcherOffset, 4u, 0ull, 0ull, 0x003D1D94u);          // teardown
+            ps2_journal::onStore(objA + kDispatcherOffset, 4u, 0ull, 0ull, 0x00401234u);          // unlisted PC
+
+            t.Equals(ps2_journal::pcHits(), 2u, "only the two listed PCs should be journalled");
+            t.Equals(ps2_journal::recordCount(), static_cast<std::size_t>(2), "both matches should reach the ring");
+
+            ps2_journal::Record a{};
+            ps2_journal::Record b{};
+            t.IsTrue(ps2_journal::recordAt(0, a), "record 0 should be readable");
+            t.IsTrue(ps2_journal::recordAt(1, b), "record 1 should be readable");
+
+            // The object base is recoverable from the logged address, which is
+            // the whole point: we learn WHICH object without knowing it first.
+            t.Equals(a.addr - kDispatcherOffset, objA, "record 0 should resolve back to object A");
+            t.Equals(b.addr - kDispatcherOffset, objB, "record 1 should resolve back to object B");
+            t.IsTrue(a.ord < b.ord, "ord must order the two writes");
+
+            ps2_journal::reset();
         });
     });
 }

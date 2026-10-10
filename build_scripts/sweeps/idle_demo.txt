@@ -1,0 +1,10 @@
+# idle_demo.txt - leave the game alone on the title so the attract Demo loops (IOP heap leak check, 10-06).
+# Run (external PowerShell window):
+#   $env:PS2X_PAD_SCRIPT = "F:\SDBZ Recomp\build_scripts\sweeps\idle_demo.txt"; $env:PS2X_DIAG = "0"; $env:PS2X_DET_VBLANK_QUANTUM = "3000"
+#   & "F:\SDBZ Recomp\launch_recomp.ps1" -Determinism 1 -RunSeconds 2400 -NoDebugger -NoArchive -Log "F:\SDBZ Recomp\Logs\idle_demo.txt" -Exe "F:\SDBZ Recomp\build\ps2xRuntime\RelWithDebInfo\ps2EntryRunner.exe"
+#   Remove-Item Env:PS2X_PAD_SCRIPT, Env:PS2X_DIAG, Env:PS2X_DET_VBLANK_QUANTUM
+# Verify: the log has one `PS2RNA: sceSifAllocIopHeap(99904) ret=0x...` line per Demo and NO `E01112903`.
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+log idle: waiting for attract demos
+wait ticks=400000

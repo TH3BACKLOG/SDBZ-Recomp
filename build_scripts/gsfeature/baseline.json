@@ -1,0 +1,386 @@
+{
+ "fan_quad_subpixel": [
+  "MATCH",
+  0
+ ],
+ "fan_ngon_gouraud": [
+  "MATCH",
+  0
+ ],
+ "strip_gouraud_subpixel": [
+  "MATCH",
+  0
+ ],
+ "tex_t4_nearest_stq": [
+  "MATCH",
+  0
+ ],
+ "tex_t4_nearest_uv": [
+  "MATCH",
+  0
+ ],
+ "tex_t4_bilinear_stq": [
+  "NEAR",
+  0
+ ],
+ "tex_t4_bilinear_uv": [
+  "MATCH",
+  0
+ ],
+ "tex_t8_nearest_stq": [
+  "DIFF",
+  3
+ ],
+ "tex_t8_nearest_uv": [
+  "MATCH",
+  0
+ ],
+ "tex_t8_bilinear_stq": [
+  "DIFF",
+  2
+ ],
+ "tex_t8_bilinear_uv": [
+  "MATCH",
+  0
+ ],
+ "tex_ct32_nearest_stq": [
+  "DIFF",
+  1
+ ],
+ "tex_ct32_nearest_uv": [
+  "MATCH",
+  0
+ ],
+ "tex_ct32_bilinear_stq": [
+  "DIFF",
+  4
+ ],
+ "tex_ct32_bilinear_uv": [
+  "MATCH",
+  0
+ ],
+ "tex_t8_bilinear_stq_clamp": [
+  "DIFF",
+  2
+ ],
+ "tex_t8_bilinear_stq_repeat_wrap": [
+  "DIFF",
+  12
+ ],
+ "blend_cs_cd_as_cd": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_cs_as_cs": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_0_as_cd": [
+  "MATCH",
+  0
+ ],
+ "blend_fix": [
+  "MATCH",
+  0
+ ],
+ "atest_greater64_keep": [
+  "MATCH",
+  0
+ ],
+ "atest_notequal0_keep": [
+  "MATCH",
+  0
+ ],
+ "atest_afail_fb_only": [
+  "MATCH",
+  0
+ ],
+ "atest_afail_rgb_only": [
+  "MATCH",
+  0
+ ],
+ "ztest_gequal": [
+  "MATCH",
+  0
+ ],
+ "pabe": [
+  "MATCH",
+  0
+ ],
+ "tfx_highlight": [
+  "DIFF",
+  2
+ ],
+ "tfx_modulate_tcc0": [
+  "MATCH",
+  0
+ ],
+ "control_skip_draw": [
+  "DIFF",
+  1751
+ ],
+ "sprite_t4_nearest_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t4_bilinear_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_nearest_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_bilinear_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_ct32_nearest_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_ct32_bilinear_uv_scaled": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_nearest_uv_1to1": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_bilinear_uv_halftexel": [
+  "MATCH",
+  0
+ ],
+ "sprite_t8_bilinear_stq": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_0_as_cd_colclamp0": [
+  "MATCH",
+  0
+ ],
+ "blend_cs_cd_as_cd_colclamp0": [
+  "MATCH",
+  0
+ ],
+ "combo_fighter_t8_bilinear": [
+  "MATCH",
+  0
+ ],
+ "combo_fighter_ct32_nearest": [
+  "NEAR",
+  0
+ ],
+ "combo_fan_t4_bilinear": [
+  "DIFF",
+  2
+ ],
+ "combo_hud_sprite_stq": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_ct24_texa_blend": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_ct16_texa_aem_blend": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_ct16_texa_noaem_bilinear": [
+  "NEAR",
+  0
+ ],
+ "unseen_tfx_decal": [
+  "MATCH",
+  0
+ ],
+ "unseen_tfx_highlight2_blend": [
+  "DIFF",
+  2
+ ],
+ "unseen_tfx_modulate_tcc0_blend": [
+  "DIFF",
+  1
+ ],
+ "unseen_clamp_region_clamp_bilinear": [
+  "DIFF",
+  1
+ ],
+ "unseen_clamp_region_repeat_nearest": [
+  "MATCH",
+  0
+ ],
+ "unseen_fog_gouraud_tex": [
+  "DIFF",
+  1
+ ],
+ "unseen_tex_t8h": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_t4hl": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex_t4hh": [
+  "DIFF",
+  1
+ ],
+ "unseen_clut_ct16_t8": [
+  "DIFF",
+  1
+ ],
+ "unseen_clut_csm2_t8": [
+  "MATCH",
+  0
+ ],
+ "unseen_fba_then_dst_alpha": [
+  "DIFF",
+  3
+ ],
+ "unseen_date_datm0": [
+  "MATCH",
+  0
+ ],
+ "unseen_afail_zb_only": [
+  "MATCH",
+  0
+ ],
+ "unseen_z24_gequal": [
+  "MATCH",
+  0
+ ],
+ "unseen_z16_gequal": [
+  "MATCH",
+  0
+ ],
+ "unseen_linestrip_gouraud": [
+  "MATCH",
+  0
+ ],
+ "unseen_scanmsk_even": [
+  "MATCH",
+  0
+ ],
+ "unseen_tex2_clut_switch": [
+  "DIFF",
+  2
+ ],
+ "unseen2_blend_cd_cs_as_cs": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_0_cs_fix_cd": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_cs_cd_ad_cs": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_cd_0_as_0": [
+  "MATCH",
+  0
+ ],
+ "unseen2_blend_cs_0_fix_0": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_never_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_less_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_lequal_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_atest_equal_keep": [
+  "MATCH",
+  0
+ ],
+ "unseen2_ztest_never_and_greater": [
+  "MATCH",
+  0
+ ],
+ "unseen2_fbmsk_partial": [
+  "MATCH",
+  0
+ ],
+ "unseen2_zmsk": [
+  "MATCH",
+  0
+ ],
+ "unseen2_context2": [
+  "NEAR",
+  0
+ ],
+ "unseen2_prmode": [
+  "MATCH",
+  0
+ ],
+ "unseen2_points": [
+  "MATCH",
+  0
+ ],
+ "unseen2_line_list_flat": [
+  "MATCH",
+  0
+ ],
+ "unseen2_local_to_local_copy": [
+  "MATCH",
+  0
+ ],
+ "unseen3_t4_csa_slots": [
+  "MATCH",
+  0
+ ],
+ "unseen3_frame_ct16": [
+  "NEAR",
+  0
+ ],
+ "unseen3_frame_ct16_dither": [
+  "NEAR",
+  0
+ ],
+ "unseen3_frame_ct16s_dither": [
+  "NEAR",
+  0
+ ],
+ "unseen3_frame_ct24_blend_ad": [
+  "MATCH",
+  0
+ ],
+ "unseen3_tex_ct16s": [
+  "DIFF",
+  1
+ ],
+ "unseen3_z16s_gequal": [
+  "MATCH",
+  0
+ ],
+ "unseen3_mipmap_fixed_lod1": [
+  "DIFF",
+  2774
+ ],
+ "unseen3_t4hl_t4hh_shared_plane": [
+  "MATCH",
+  0
+ ],
+ "unseen3_upload_oversized_then_next": [
+  "MATCH",
+  0
+ ],
+ "unseen3_alias_t8h_t4hl_ct32": [
+  "MATCH",
+  0
+ ],
+ "tex1_t4_2texel_tri_bilinear": [
+  "MATCH",
+  0
+ ]
+}

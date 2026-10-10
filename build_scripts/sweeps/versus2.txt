@@ -1,0 +1,92 @@
+# versus2.txt - walk-away Versus sweep with a scripted 2nd controller: P1 Goku vs a new P2 fighter and
+# a new stage every loop, so the captures cover every fighter + stage.
+# Run:  .\build_scripts\gfx_tour.ps1 -Name vs1 -Script build_scripts\sweeps\versus.txt -Seconds 3600 -Every 90
+# Needs the 10-05 runtime build (poke [ptr]+off). pad=2 plugs in controller 2 (built 10-04, first use here).
+#
+# VERIFIED sweep3 (10-05): main menu = left column Original / Z Survivor / Training (modes 1/2/4), right
+#   column Dragon Summoning / Customize / Options (5/6/7); R from Original -> Dragon Summoning.
+# H: Versus = the "V" panel right of Z Survivor -> park on Original, D, R -> mode 3.
+# H: char select cursor starts on Goku (orig1: p1=1 before any D); P2 cursor is pad 2; cursors and the
+#    stage cursor remember their place, so one R per loop = the next fighter / stage.
+# H: after a Versus fight a result menu appears; D then X = 2nd option (Character Select).
+# One-hit kills: VERIFIED 0x1cb094 fighter array 0x5ADFB0 (2 x 0x1CD0); fighter1 health obj ptr 0x5B14C0,
+#   health at +12. H: fighter1 = P2 (the 'poke [..]' log line prints old= health).
+
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+poke 0x5C7942 0
+poke 0x5C7943 0
+poke 0x5C7944 0
+log unlock + 1 round 45s + stage select on
+wait ticks=120
+
+label menu
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press R hold=6 gap=30
+log menu path D R (expect mode=3)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=600
+goto vs_ok if mode=3
+log NOT VERSUS - backing out, trying pad 2 Start first
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60 pad=2
+goto menu 2
+label vs_ok
+log in Versus char select
+
+label charsel
+wait ticks=150
+press X hold=10 gap=60
+log P1 confirmed
+press R hold=6 gap=30 pad=2
+press X hold=10 gap=90 pad=2
+log P2 confirmed
+wait ticks=120
+# VERIFIED vs1 frames: handicap panel -> X -> 'Battle Stage Setting' panel (default RANDOM, arrows L/R) -> X = fight.
+press X hold=10 gap=120
+log handicap done, stage panel
+wait ticks=100
+press R hold=6 gap=100
+log stage picked (H: cursor remembers its place, one R per loop = next stage)
+press X hold=10 gap=60
+press X hold=10 gap=60 pad=2 until app=CAppFightMain timeout=900
+
+label mash
+repeat 2
+  press R hold=12 gap=2
+  press Q hold=4 gap=6
+  press Q hold=4 gap=6
+  press T hold=4 gap=6
+end
+goto nopoke if app!=CAppFightMain
+poke [0x5B14C0]+12 1 w=4
+label nopoke
+# D then X: if the result menu lives inside CAppFightMain, this picks its 2nd option (H: Character Select).
+press D hold=6 gap=10
+press X hold=6 gap=20
+goto mash if app=CAppFightMain
+
+log left fight
+label result
+wait ticks=200
+press D hold=6 gap=30
+press X hold=10 gap=200
+goto charsel if app=CAppSelectMain
+goto mash if app=CAppFightMain
+goto menu if app=CAppMenuMain
+goto result 6
+log stuck after result - pause routine
+press S hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+goto menu

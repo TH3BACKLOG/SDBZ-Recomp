@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
+#include "runtime/ee_scheduler.h"
 #include "Stubs/DMA.h"
 #include "Syscalls/Interrupt.h"
 #include "runtime/ps2_gs_gpu.h"
@@ -45,6 +46,14 @@ namespace
         TestEnv() : rdram(PS2_RAM_SIZE, 0u)
         {
         }
+
+        // Mirrors SchedFixture: the retired ps2_syscalls::notifyRuntimeStop()
+        // reset process-global scheduler state that no longer exists. Stopping
+        // is now per-runtime, so it belongs in this destructor.
+        ~TestEnv()
+        {
+            runtime.requestStop();
+        }
     };
 
     std::atomic<uint32_t> g_vblankStartHits{0u};
@@ -55,6 +64,55 @@ namespace
     std::atomic<uint32_t> g_dmacSendLastChcr{0u};
     std::atomic<uint32_t> g_pendingIntcHits{0u};
     std::atomic<uint32_t> g_pendingIntcLastCause{0xFFFFFFFFu};
+    constexpr uint32_t kIdleVSyncWaitPc = 0x00160000u;
+    constexpr uint32_t kVSyncWaitPc = 0x00160100u;
+    constexpr uint32_t kVSyncResumePc = 0x00160110u;
+    constexpr uint32_t kIrqWaitPc = 0x00160200u;
+    constexpr uint32_t kIrqResumePc = 0x00160210u;
+    constexpr uint32_t kIntcHandlerPc = 0x00160220u;
+    constexpr uint32_t kIrqStackWaitPc = 0x00160230u;
+    constexpr uint32_t kIrqStackResumePc = 0x00160240u;
+    constexpr uint32_t kIrqStackHandlerPc = 0x00160250u;
+    constexpr uint32_t kIrqRegistrationSp = 0x001E0000u;
+    constexpr uint32_t kIrqRegistrationGuardAddr = kIrqRegistrationSp - 16u;
+    constexpr uint32_t kISemaWaitPc = 0x00160300u;
+    constexpr uint32_t kISemaResumePc = 0x00160310u;
+    constexpr uint32_t kISemaDriverPc = 0x00160320u;
+    constexpr uint32_t kISemaHandlerPc = 0x00160330u;
+    constexpr uint32_t kEventWaitPc = 0x00160400u;
+    constexpr uint32_t kEventResumePc = 0x00160410u;
+    constexpr uint32_t kEventProducerPc = 0x00160420u;
+    constexpr uint32_t kTimer2WaitPc = 0x00160500u;
+    constexpr uint32_t kTimer2ResumePc = 0x00160510u;
+    constexpr uint32_t kTimer2HandlerPc = 0x00160520u;
+    constexpr uint32_t kInvocationQueuePc = 0x00160530u;
+    constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
+    constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
+
+    constexpr uint32_t kTimer2Count = 0x10001000u;
+    constexpr uint32_t kTimer2Mode = 0x10001010u;
+    constexpr uint32_t kTimer2Compare = 0x10001020u;
+    constexpr uint32_t kTimerModeBusClockDiv256 = 2u;
+    constexpr uint32_t kTimerModeCue = 1u << 7u;
+    constexpr uint32_t kTimerModeCmpe = 1u << 8u;
+    constexpr uint32_t kTimerModeEquf = 1u << 10u;
+
+    constexpr uint32_t kVSyncFlagAddr = 0x1800u;
+    constexpr uint32_t kVSyncTickAddr = 0x1810u;
+    constexpr uint32_t kEventResultAddr = 0x1820u;
+
+    std::vector<int> g_dispatchTrace;
+    int g_testSemaphoreId = 0;
+    int g_testEventFlagId = 0;
+    int32_t g_resumedResult = 0;
+    uint32_t g_vsyncFlag = 0;
+    uint64_t g_vsyncTick = 0;
+    uint64_t g_vsyncCsr = 0;
+    std::atomic<bool> g_timer2Resumed{false};
+    uint32_t g_irqObservedSp = 0u;
+    uint32_t g_invocationQueueRuns = 0u;
+    uint32_t g_invocationQueueSp = 0u;
+    bool g_invocationQueueSpChanged = false;
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -127,7 +185,6 @@ namespace
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
-        notifyRuntimeStop();
         // Defensive cleanup: reset the global INTC handler tables, enable masks,
         // and pending latch so each test starts from a known INTC state.
         resetInterruptHandlerState();
@@ -195,6 +252,78 @@ namespace
 
         ctx->pc = 0u;
     }
+
+    void schedulerTimer2Handler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(2);
+        PS2Memory &memory = runtime->memory();
+        memory.writeIORegister(kTimer2Mode, memory.readIORegister(kTimer2Mode) | kTimerModeEquf);
+        runtime->eeScheduler().signalSemaphore(g_testSemaphoreId, true);
+        ctx->pc = 0u;
+    }
+
+    void schedulerTimer2Wait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
+        scheduler.addIrqHandler(false, 11u, kTimer2HandlerPc, true, 0u, 0u, 0u);
+
+        PS2Memory &memory = runtime->memory();
+        memory.writeIORegister(kTimer2Count, 0u);
+        memory.writeIORegister(kTimer2Compare, 8u);
+        memory.writeIORegister(kTimer2Mode,
+                               kTimerModeBusClockDiv256 | kTimerModeCue | kTimerModeCmpe | kTimerModeEquf);
+
+        ctx->pc = kTimer2ResumePc;
+        scheduler.waitSemaphore(g_testSemaphoreId);
+    }
+
+    void schedulerTimer2Resume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(3);
+        g_resumedResult = getRegS32(*ctx, 2);
+        g_timer2Resumed.store(true, std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerInvocationQueueHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t sp = getRegU32(ctx, 29);
+        if (g_invocationQueueSp == 0u)
+        {
+            g_invocationQueueSp = sp;
+        }
+        else if (g_invocationQueueSp != sp)
+        {
+            g_invocationQueueSpChanged = true;
+        }
+        ++g_invocationQueueRuns;
+        ctx->pc = 0u;
+    }
+
+    void schedulerQueueManyInvocations(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        constexpr uint32_t kInvocationCount = 96u;
+        EeScheduler &scheduler = runtime->eeScheduler();
+        for (uint32_t i = 0u; i < kInvocationCount; ++i)
+        {
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::Interrupt;
+            invocation.tag = i;
+            invocation.context.pc = kInvocationQueueHandlerPc;
+            setRegU32(invocation.context, 31, 0u);
+            scheduler.queueInvocation(std::move(invocation));
+        }
+        ctx->pc = kInvocationQueueResumePc;
+    }
+
+    void schedulerInvocationQueueResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
 }
 
 void register_ps2_runtime_interrupt_tests()
@@ -203,7 +332,6 @@ void register_ps2_runtime_interrupt_tests()
     {
         tc.Run("SetVSyncFlag updates guest flag and monotonic tick", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kFlagAddr = 0x1000u;
@@ -241,7 +369,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("VSync worker updates GS CSR FIELD bit for MMIO polling loops", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -302,7 +429,6 @@ void register_ps2_runtime_interrupt_tests()
         // is asserted when at least two ticks were observed.
         tc.Run("Disjoint-bit GS CSR writers (SIGNAL vs FINISH vs vsync FIELD) never lose word-level updates", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -323,7 +449,7 @@ void register_ps2_runtime_interrupt_tests()
             setRegU32(ctx, 4, kFlagAddr);
             setRegU32(ctx, 5, kTickAddr);
             t.IsTrue(callSyscall(0x73u, env.rdram.data(), &ctx, &env.runtime), "SetVSyncFlag syscall should dispatch");
-            const uint64_t tickBefore = GetCurrentVSyncTick();
+            const uint64_t tickBefore = GetCurrentVSyncTick(&env.runtime);
 
             std::atomic<uint32_t> setAnomaliesA{0u}, clearAnomaliesA{0u};
             std::atomic<uint32_t> setAnomaliesB{0u}, clearAnomaliesB{0u};
@@ -376,7 +502,7 @@ void register_ps2_runtime_interrupt_tests()
 
             racerA.join();
             racerB.join();
-            const uint64_t ticksElapsed = GetCurrentVSyncTick() - tickBefore;
+            const uint64_t ticksElapsed = GetCurrentVSyncTick(&env.runtime) - tickBefore;
 
             t.Equals(setAnomaliesA.load(), 0u, "racer A: SIGNAL set must never be lost to a concurrent whole-word CSR RMW");
             t.Equals(clearAnomaliesA.load(), 0u, "racer A: SIGNAL W1C-clear must never be lost to a concurrent whole-word CSR RMW");
@@ -394,7 +520,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("INTC VBLANK handlers respect EnableIntc and DisableIntc masks", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             g_vblankStartHits.store(0u, std::memory_order_relaxed);
@@ -478,7 +603,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("sceDmaSend dispatches completed VIF1 DMAC handler with latched END tag", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -527,7 +651,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("MMIO VIF1 chain completion dispatches DMAC handler after CHCR store", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -574,7 +697,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("native GIF DMA MMIO kick dispatches completed DMAC handler", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
 
@@ -626,7 +748,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("negative interrupt-safe EE syscall ids dispatch", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kEventParamAddr = 0x1200u;
@@ -693,7 +814,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("WaitEventFlag blocks and wakes when SetEventFlag publishes bits", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kParamAddr = 0x1200u;
@@ -781,7 +901,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("PollEventFlag WEF_CLEAR clears only matched bits", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             constexpr uint32_t kParamAddr = 0x1400u;
@@ -839,16 +958,19 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("WaitVSyncTick returns when runtime stop is requested", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
 
             std::atomic<bool> waiterDone{false};
             std::atomic<bool> waiterThrew{false};
+            // WaitVSyncTick now takes the calling guest context; this TestEnv
+            // has no ctx member, so the waiter thread supplies its own.
+            R5900Context waiterCtx{};
+            std::memset(&waiterCtx, 0, sizeof(waiterCtx));
             std::thread waiter([&]()
             {
                 try
                 {
-                    WaitVSyncTick(env.rdram.data(), &env.runtime);
+                    WaitVSyncTick(env.rdram.data(), &waiterCtx, &env.runtime);
                 }
                 catch (...)
                 {
@@ -897,7 +1019,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("raisePendingIntc delivers to a registered handler on the next drain tick", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);
@@ -944,7 +1065,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("undelivered pending cause survives the age window then drops", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);
@@ -984,7 +1104,6 @@ void register_ps2_runtime_interrupt_tests()
 
         tc.Run("pending cause persists across the raise-vs-registration race", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);
@@ -1035,9 +1154,54 @@ void register_ps2_runtime_interrupt_tests()
             cleanupRuntime(env);
         });
 
+        tc.Run("EE Timer2 compare IRQ wakes a DelayThread-style semaphore wait", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+            env.runtime.registerFunction(kTimer2WaitPc, schedulerTimer2Wait);
+            env.runtime.registerFunction(kTimer2ResumePc, schedulerTimer2Resume);
+            env.runtime.registerFunction(kTimer2HandlerPc, schedulerTimer2Handler);
+
+            g_dispatchTrace.clear();
+            g_resumedResult = -1;
+            g_timer2Resumed.store(false, std::memory_order_release);
+            R5900Context mainContext{};
+            mainContext.pc = kTimer2WaitPc;
+            std::atomic<bool> schedulerThrew{false};
+            std::thread gameThread([&]()
+            {
+                try
+                {
+                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+                    env.runtime.eeScheduler().run();
+                }
+                catch (...)
+                {
+                    schedulerThrew.store(true, std::memory_order_release);
+                }
+            });
+
+            const bool resumed = waitUntil([]()
+            {
+                return g_timer2Resumed.load(std::memory_order_acquire);
+            }, std::chrono::milliseconds(150));
+            if (!resumed)
+            {
+                env.runtime.requestStop();
+            }
+            gameThread.join();
+
+            t.IsTrue(resumed, "Timer2 compare should dispatch INTC_TIM2 and wake the semaphore waiter");
+            t.IsFalse(schedulerThrew.load(std::memory_order_acquire), "Timer2 IRQ path should not throw");
+            const std::vector<int> expected{1, 2, 3};
+            t.IsTrue(g_dispatchTrace == expected,
+                     "Timer2 flow should run wait, interrupt handler, then the resumed thread");
+            t.Equals(g_resumedResult, g_testSemaphoreId,
+                     "the Timer2 handler should hand the semaphore directly to the waiter");
+        });
+
         tc.Run("vblank causes are excluded from the pending latch", [](TestCase &t)
         {
-            notifyRuntimeStop();
             TestEnv env;
             stopInterruptWorker();
             interrupt_state::g_pending_intc_causes.store(0u);

@@ -1,0 +1,135 @@
+# discover.txt - first unattended sweep: map the scene graph from the main menu.
+# Run:  .\build_scripts\gfx_tour.ps1 -Name sweep1 -Script build_scripts\sweeps\discover.txt -Seconds 1800
+# Syntax: see the PS2X_PAD_SCRIPT comment in ps2xRuntime/src/lib/ps2_pad.cpp.
+# Ticks are guest vsyncs (60/s guest time; the game runs ~15-20/s real time).
+# Assumptions this run tests (H): the main menu is CAppMenuMain; X advances, O backs out;
+# U x8 parks the cursor on the top entry. Every [scene] line lands in gsdump\<name>\run_log.txt.
+
+# Boot: warning screen (83 s timer), logos, title. X advances every prompt.
+press X hold=10 gap=50 until app=CAppMenuMain timeout=9000
+press S hold=10 gap=50 until app=CAppMenuMain timeout=3000
+
+# One block per main menu entry k: park on top, k x Down, X in, X X deeper, dwell, O back out.
+# "repeat 0" inserts nothing, so every block has the same shape.
+
+# --- entry 0 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 0
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+# --- entry 1 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 1
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+# --- entry 2 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 2
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+# --- entry 3 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 3
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+# --- entry 4 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 4
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+# --- entry 5 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 5
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+# --- entry 6 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 6
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+# --- entry 7 ---
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 8
+  press U hold=6 gap=6
+end
+repeat 7
+  press D hold=6 gap=6
+end
+press X hold=10 gap=290
+press X hold=10 gap=290
+press X hold=10 gap=290
+wait ticks=900
+press O hold=10 gap=50 until app=CAppMenuMain timeout=1500
+
+log discover done

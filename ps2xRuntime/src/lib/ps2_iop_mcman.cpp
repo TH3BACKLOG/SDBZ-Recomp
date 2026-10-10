@@ -54,7 +54,7 @@ namespace
     bool mcservTraceEnabled()
     {
         const char *env = std::getenv("PS2X_MCSERV_TRACE");
-        return env && env[0] != '\0' && env[0] != '0';
+        return !(env && env[0] == '0'); // default ON (save-detection probe)
     }
 
     bool readGuestU32(const uint8_t *rdram, uint32_t addr, uint32_t &out)

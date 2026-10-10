@@ -3,45 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 
-inline std::unordered_map<int, FILE *> g_fileDescriptors;
-inline int g_nextFd = 3; // Start after stdin, stdout, stderr
-
-struct ThreadInfo
-{
-    uint32_t entry = 0;
-    uint32_t stack = 0;
-    uint32_t stackSize = 0;
-    uint32_t gp = 0;
-    uint32_t priority = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t arg = 0;
-    bool started = false;
-    bool ownsStack = false;
-    uint32_t tlsBase = 0;
-
-    // Thread Status
-    int status = 0x10; // THS_DORMANT
-    int waitType = 0;  // TSW_NONE
-    int waitId = 0;
-    int wakeupCount = 0;
-    int currentPriority = 0;
-    int suspendCount = 0;
-    std::atomic<uint32_t> currentPc{0};
-
-    std::mutex m;
-    std::atomic<bool> forceRelease{false};
-    std::atomic<bool> terminated{false};
-    // Set true when StartThread mints this thread's g_activeThreads token
-    // (fetch_add). Cleared by exactly ONE consumer via exchange(true->false):
-    // on_fiber_exit for a normal exit, ExitDeleteThread when it removes its own
-    // g_threads entry, notifyRuntimeStop when it reaps residual guest threads,
-    // or StartThread's own create_fiber failure path. Whoever wins the exchange
-    // performs the single matching fetch_sub: one token per started thread,
-    // exactly one decrement.
-    std::atomic<bool> activeCounted{false};
-};
-
 // Thread status
 #define THS_RUN 0x01
 #define THS_READY 0x02
@@ -59,7 +20,6 @@ struct ThreadInfo
 // Common kernel-like error codes used by thread/event/alarm syscalls.
 constexpr int KE_OK = 0;
 constexpr int KE_ERROR = -1;
-constexpr int KE_NO_MEMORY = -400;
 constexpr int KE_ILLEGAL_PRIORITY = -403;
 constexpr int KE_ILLEGAL_MODE = -405;
 constexpr int KE_ILLEGAL_THID = -406;
@@ -145,6 +105,24 @@ struct ee_thread_status_t
     uint32_t wakeupCount; // 0x2C
 };
 
+// PS2SDK EE kernel.h t_ee_thread. CreateThread consumes this full 0x24-byte
+// descriptor; it is not the attr-first IOP thread descriptor.
+struct ee_thread_t
+{
+    int status;
+    uint32_t func;
+    uint32_t stack;
+    int stack_size;
+    uint32_t gp_reg;
+    int initial_priority;
+    int current_priority;
+    uint32_t attr;
+    uint32_t option;
+};
+
+static_assert(sizeof(ee_thread_t) == 0x24u);
+static_assert(sizeof(ee_thread_status_t) == 0x30u);
+
 struct ee_sema_t
 {
     int count;
@@ -155,47 +133,7 @@ struct ee_sema_t
     uint32_t option;
 };
 
-struct SemaInfo
-{
-    int count = 0;
-    int maxCount = 0;
-    int initCount = 0;
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    // Wait list of blocked guest threads. Each entry is {tid, generation token}
-    // where the token was captured via ps2sched::current_fiber_token() at push
-    // time. Protected by m; never hold m across a scheduling yield.
-    std::vector<std::pair<int, ps2sched::FiberToken>> waitList;
-};
-
-struct EventFlagInfo
-{
-    uint32_t attr = 0;
-    uint32_t option = 0;
-    uint32_t initBits = 0;
-    uint32_t bits = 0;
-    int waiters = 0;
-    bool deleted = false;
-    std::mutex m;
-    // See SemaInfo::waitList.
-    std::vector<std::pair<int, ps2sched::FiberToken>> waitList;
-};
-
-struct AlarmInfo
-{
-    int id = 0;
-    uint16_t ticks = 0;
-    uint32_t handler = 0;
-    uint32_t commonArg = 0;
-    uint32_t gp = 0;
-    uint32_t sp = 0;
-    uint8_t *rdram = nullptr;
-    PS2Runtime *runtime = nullptr;
-    std::chrono::steady_clock::time_point dueAt;
-};
+static_assert(sizeof(ee_sema_t) == 0x18u);
 
 struct io_stat_t
 {
@@ -214,52 +152,6 @@ static constexpr uint32_t kFioSoIfDir = 0x0020;
 static constexpr uint32_t kFioSoIROth = 0x0004;
 static constexpr uint32_t kFioSoIWOth = 0x0002;
 static constexpr uint32_t kFioSoIXOth = 0x0001;
-
-inline std::unordered_map<int, std::shared_ptr<ThreadInfo>> g_threads;
-inline int g_nextThreadId = 2; // Reserve 1 for the main thread
-extern thread_local int g_currentThreadId;
-inline std::mutex g_thread_map_mutex;
-
-inline std::unordered_map<int, std::shared_ptr<SemaInfo>> g_semas;
-inline int g_nextSemaId = 1;
-inline std::mutex g_sema_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<EventFlagInfo>> g_eventFlags;
-inline int g_nextEventFlagId = 1;
-inline std::mutex g_event_flag_map_mutex;
-inline std::unordered_map<int, std::shared_ptr<AlarmInfo>> g_alarms;
-inline int g_nextAlarmId = 1;
-inline std::mutex g_alarm_mutex;
-inline std::condition_variable g_alarm_cv;
-// Stop mechanism. g_alarm_thread is joinable so stopAlarmWorker() can join it
-// before rdram/runtime are destroyed.
-inline std::thread g_alarm_thread;
-inline std::atomic<bool> g_alarm_stop_flag{false};
-// Plain resettable flag (not once-only) so stopAlarmWorker() can clear it and
-// allow ensureAlarmWorkerRunning() to restart the thread in a subsequent
-// scheduler cycle (e.g. repeated init/shutdown in the test suite).
-// Protected by g_alarm_mutex.
-inline bool g_alarm_worker_running{false};
-inline std::atomic<int> g_activeThreads{0};
-
-// Mint/consume pair for ThreadInfo::activeCounted (see the field comment
-// above). MINT bumps g_activeThreads FIRST, then publishes the token with
-// release, so a consumer observing activeCounted==true is guaranteed to also
-// see the matching +1. CONSUME is the sole arbiter for a given token: the
-// exchange(false) only the winner of the true->false transition performs the
-// matching fetch_sub, so concurrent consumers (e.g. on_fiber_exit racing
-// notifyRuntimeStop over the same shared_ptr) can never double-decrement.
-static inline void mintActiveToken(const std::shared_ptr<ThreadInfo> &info)
-{
-    g_activeThreads.fetch_add(1, std::memory_order_relaxed);
-    info->activeCounted.store(true, std::memory_order_release);
-}
-static inline void consumeActiveToken(const std::shared_ptr<ThreadInfo> &info)
-{
-    if (info && info->activeCounted.exchange(false, std::memory_order_acq_rel))
-        g_activeThreads.fetch_sub(1, std::memory_order_release);
-}
-
-inline std::mutex g_fd_mutex;
 
 struct RpcServerState
 {
@@ -295,29 +187,23 @@ struct SifRpcDebugEvent
     uint32_t endParam = 0;
     uint32_t semaId = 0;
     uint32_t flags = 0;
+    uint32_t sendPreviewSize = 0;
+    uint32_t recvPreviewSize = 0;
+    uint8_t sendPreview[16]{};
+    uint8_t recvPreview[16]{};
     int32_t result = 0;
 };
 
 static constexpr size_t kSifRpcDebugHistoryCount = 256u;
+static constexpr size_t kSifRpcDebugPreviewBytes = 16u;
 static constexpr uint32_t kSifRpcDebugFlagNowait = 1u << 0;
 static constexpr uint32_t kSifRpcDebugFlagHandledByHle = 1u << 1;
 static constexpr uint32_t kSifRpcDebugFlagCallback = 1u << 2;
 static constexpr uint32_t kSifRpcDebugFlagMissingClient = 1u << 3;
 static constexpr uint32_t kSifRpcDebugFlagServerDispatch = 1u << 4;
-static constexpr uint32_t kSifRpcDebugFlagDtx = 1u << 5;
-
-struct SoundDriverRpcState
-{
-    uintptr_t ownerRuntime = 0;
-    bool initialized = false;
-    uint32_t storageBaseAddr = 0;
-    uint32_t storageSize = 0;
-    uint32_t statusAddr = 0;
-    uint32_t addrTableAddr = 0;
-    uint32_t hdBaseAddr = 0;
-    uint32_t sqBaseAddr = 0;
-    uint32_t dataBaseAddr = 0;
-};
+static constexpr uint32_t kSifRpcDebugFlagUnhandled = 1u << 6;
+static constexpr uint32_t kSifRpcDebugFlagFallbackCopy = 1u << 7;
+static constexpr uint32_t kSifRpcDebugFlagFallbackZero = 1u << 8;
 
 inline std::unordered_map<uint32_t, RpcServerState> g_rpc_servers;
 inline std::unordered_map<uint32_t, RpcClientState> g_rpc_clients;
@@ -330,155 +216,10 @@ inline uint32_t g_rpc_next_id = 1;
 inline uint32_t g_rpc_packet_index = 0;
 inline uint32_t g_rpc_server_index = 0;
 inline uint32_t g_rpc_active_queue = 0;
-inline SoundDriverRpcState g_soundDriverRpcState;
-inline PS2SoundDriverCompatLayout g_soundDriverCompatLayout;
-inline PS2DtxCompatLayout g_dtxCompatLayout;
-inline std::mutex g_dtx_rpc_mutex;
-inline std::unordered_map<uint32_t, uint32_t> g_dtx_remote_by_id;
-inline uint32_t g_dtx_next_urpc_obj = 0u;
-
-struct DtxTransferState
-{
-    uint32_t dtxId = 0;
-    uint32_t remoteHandle = 0;
-    uint32_t eeWorkAddr = 0;
-    uint32_t iopWorkAddr = 0;
-    uint32_t wkSize = 0;
-};
-
-inline std::unordered_map<uint32_t, DtxTransferState> g_dtx_transfer_by_id;
-
-struct DtxSjxState
-{
-    uint32_t handle = 0;
-    uint32_t srcSjHandle = 0;
-    uint32_t dstSjHandle = 0;
-    uint32_t line = 0;
-    uint32_t eeObjAddr = 0;
-    uint16_t xid = 0;
-};
-
-inline std::unordered_map<uint32_t, DtxSjxState> g_dtx_sjx_by_handle;
-
-struct DtxPs2RnaState
-{
-    uint32_t handle = 0;
-    uint32_t maxChannels = 0;
-    uint32_t sjHandle0 = 0;
-    uint32_t sjHandle1 = 0;
-    uint32_t channelCount = 0;
-    uint32_t sampleFreq = 0;
-    uint32_t volume = 0;
-    bool playEnabled = false;
-};
-
-inline std::unordered_map<uint32_t, DtxPs2RnaState> g_dtx_ps2rna_by_handle;
-
-struct DtxSjrmtState
-{
-    uint32_t handle = 0;
-    uint32_t mode = 0;
-    uint32_t wkAddr = 0;
-    uint32_t wkSize = 0;
-    uint32_t readPos = 0;
-    uint32_t writePos = 0;
-    uint32_t roomBytes = 0;
-    uint32_t dataBytes = 0;
-    uint32_t uuid0 = 0;
-    uint32_t uuid1 = 0;
-    uint32_t uuid2 = 0;
-    uint32_t uuid3 = 0;
-};
-
-inline std::unordered_map<uint32_t, DtxSjrmtState> g_dtx_sjrmt_by_handle;
-
-static uint32_t dtxNormalizeSjrmtCapacity(uint32_t requestedBytes)
-{
-    if (requestedBytes == 0u || requestedBytes > 0x01000000u)
-    {
-        return 0x4000u;
-    }
-    return requestedBytes;
-}
-
-static uint32_t dtxAllocUrpcHandleLocked()
-{
-    const PS2DtxCompatLayout &layout = g_dtxCompatLayout;
-    if (!layout.hasUrpcObjectRange())
-    {
-        return 0u;
-    }
-
-    if (g_dtx_next_urpc_obj < layout.urpcObjBase || g_dtx_next_urpc_obj >= layout.urpcObjLimit)
-    {
-        g_dtx_next_urpc_obj = layout.urpcObjBase;
-    }
-
-    for (uint32_t i = 0; i < 4096u; ++i)
-    {
-        uint32_t candidate = g_dtx_next_urpc_obj;
-        g_dtx_next_urpc_obj += layout.urpcObjStride;
-        if (g_dtx_next_urpc_obj < layout.urpcObjBase || g_dtx_next_urpc_obj >= layout.urpcObjLimit)
-        {
-            g_dtx_next_urpc_obj = layout.urpcObjBase;
-        }
-
-        if (candidate < layout.urpcObjBase || candidate >= layout.urpcObjLimit)
-        {
-            continue;
-        }
-
-        if (g_dtx_sjrmt_by_handle.find(candidate) != g_dtx_sjrmt_by_handle.end())
-        {
-            continue;
-        }
-
-        if (g_dtx_sjx_by_handle.find(candidate) != g_dtx_sjx_by_handle.end())
-        {
-            continue;
-        }
-
-        if (g_dtx_ps2rna_by_handle.find(candidate) != g_dtx_ps2rna_by_handle.end())
-        {
-            continue;
-        }
-
-        bool inUseByDtxRemote = false;
-        for (const auto &entry : g_dtx_remote_by_id)
-        {
-            if (entry.second == candidate)
-            {
-                inUseByDtxRemote = true;
-                break;
-            }
-        }
-
-        if (!inUseByDtxRemote)
-        {
-            return candidate;
-        }
-    }
-
-    return layout.urpcObjBase;
-}
-
-struct ExitHandlerEntry
-{
-    uint32_t func = 0;
-    uint32_t arg = 0;
-};
-
-inline std::mutex g_exit_handler_mutex;
-inline std::unordered_map<int, std::vector<ExitHandlerEntry>> g_exit_handlers;
-
 inline std::mutex g_bootmode_mutex;
 inline bool g_bootmode_initialized = false;
 inline uint32_t g_bootmode_pool_offset = 0;
 inline std::unordered_map<uint8_t, uint32_t> g_bootmode_addresses;
-
-inline std::mutex g_syscall_override_mutex;
-inline std::unordered_map<uint32_t, uint32_t> g_syscall_overrides;
-inline std::unordered_set<uint32_t> g_syscall_mirror_addrs;
 
 static constexpr uint32_t kGuestSyscallTableGuestBase = 0x80011F80u;
 static constexpr uint32_t kGuestSyscallTablePhysBase = kGuestSyscallTableGuestBase & 0x1FFFFFFFu;
@@ -501,21 +242,26 @@ inline std::filesystem::path g_host_cwd;
 inline std::filesystem::path g_cdrom_cwd;
 inline std::string g_ps2_cwd_device = "host0";
 
+// Runtime kernel pools, packed just below the main-stack reservation
+// (0x01FBFFF0). The guest heap ends at kRpcPacketPoolBase (kGuestHeapHardLimit
+// in ps2_runtime.cpp must match). Was 0x01F00000, which capped the heap ~1 MB
+// short of what games ask for with InitHeap(-1).
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
+static constexpr uint32_t kRpcPacketPoolBase = 0x01F8C000;
 static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
+static constexpr uint32_t kRpcServerPoolBase = 0x01F9C000;
 static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcServerStride = 0x80;
 static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
 
-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
+static constexpr uint32_t kTlsPoolBase = 0x01FAC000;
 static constexpr uint32_t kTlsPoolBytes = 0x00010000;
 static constexpr uint32_t kTlsBlockSize = 0x100;
 static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
 
-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
+static constexpr uint32_t kBootModePoolBase = 0x01FBC000;
+static_assert(kBootModePoolBase + 0x1000u <= 0x01FBFFF0u, "kernel pools overlap the main-stack reservation");
 static constexpr uint32_t kBootModePoolBytes = 0x00001000;
 
 static constexpr uint32_t kSifRpcModeNowait = 0x01;

@@ -1,0 +1,26 @@
+addr,old_name,proposed_name,confidence,evidence
+0x0,sub_0,UNKNOWN,UNKNOWN,UNKNOWN
+0x6C,sub_6C,irx_padman_WaitClearEvent,medium,WaitEventFlag-shaped call with pattern|0x1000; on 0x1000 result re-signals flag and exits thread; else ClearEventFlag(ef;~bits)
+0xE4,sub_E4,irx_padman_CountAliveThreads,medium,status-struct offset 8 & 0x10 (THS_DORMANT) tested via iReferThreadStatus-shaped import on thread ids at +16/+20; returns 0-2 alive count
+0x164,sub_164,irx_padman_DeleteThreadsAndEventFlag,low,teardown import applied to the two thread ids status-checked by 0xE4 plus the event-flag id signalled in 0x8E0
+0x1A8,sub_1A8,irx_padman_PadThreadsAllDormant,medium,ReferThreadStatus offset 8 & 0x10 over six ids a1[99..105]; true only if none running; gates deletion at 0x2D8
+0x2D8,sub_2D8,irx_padman_DeletePadThreads,medium,same teardown import on the six ids a1[99..105]; invoked in 0xA10 only after 0x1A8 confirms all dormant (DeleteThread precondition)
+0x340,sub_340,UNKNOWN,UNKNOWN,UNKNOWN
+0x360,sub_360,irx_padman_SendPadDataToEE,high,padman: SIFDMA faild / SIFCMD PANIC printf strings; SB_STAT reg 0xBD000040; builds 128-byte-per-pad SIF DMA descriptors with EE dest alternating +128 on odd frame count
+0x870,sub_870,irx_padman_ShiftBufferPrependFF,high,copies 32-byte buffer then writes 0xFF at [0] and shifts the original bytes into [1..31]
+0x8CC,sub_8CC,irx_padman_VblankStartHandler,low,sets flag dword_8040=1 that the vblank handler at 0x8E0 clears; returns 1 keep-handler convention; start-vs-end assignment inferred
+0x8E0,sub_8E0,irx_padman_VblankEndHandler,low,padman: VBLANK OVERLAP printf; increments frame counter dword_801C; iSetEventFlag bits 1/8; clears the flag set by 0x8CC; start-vs-end assignment inferred
+0x9CC,sub_9CC,UNKNOWN,UNKNOWN,UNKNOWN
+0xA10,sub_A10,irx_padman_MainUpdateThread,medium,noreturn loop over 2 ports x 4 slots of 452-byte pad structs; per-pad close/teardown state machine via 0x1A8/0x2D8; calls SendPadData (0x360) every cycle
+0xD54,sub_D54,irx_padman_CmdReadData,medium,SIO2 command under live pad id at +193; injects actuator bytes into TX+3.. per align table at +374 (0xFF=skip); waits ef bit 0x100; RX copied to +296
+0xF30,sub_F30,irx_padman_CmdReadDataIdZero,low,same TX builder sub_5918 as 0xD54 but id argument fixed 0 and no actuator injection; near-identical body otherwise
+0x10FC,sub_10FC,UNKNOWN,UNKNOWN,UNKNOWN
+0x1268,sub_1268,UNKNOWN,UNKNOWN,UNKNOWN
+0x13D0,sub_13D0,irx_padman_CmdSetMainMode,medium,config-mode cmd (RX id 0xF3 checked); TX[3..4] loaded from struct byte pair +362/+363 matching pad cmd 0x44 (mode;lock) two-parameter shape; export padSetMainMode exists
+0x1558,sub_1558,irx_padman_CmdSetActAlign,medium,TX[3..8] = six bytes from align table at +374; the same table drives actuator injection in 0xD54 with 0xFF sentinel; matches pad cmd 0x4D / export padSetActAlign
+0x16E8,sub_16E8,irx_padman_CmdQueryModel,medium,config-mode cmd; stores RX[3..7] to +194..198 with numModes/numActuators/numActComb fields clamped to 4; layout matches pad cmd 0x45 response
+0x18CC,sub_18CC,irx_padman_CmdQueryAct,low,config-mode indexed cmd: TX[3]=index arg; stores RX[5..8] into 4-byte bank at +200+4idx; matches pad cmd 0x46 two-bank shape; near-identical to 0x1A80
+0x1A80,sub_1A80,irx_padman_CmdQueryComb,low,near-identical to 0x18CC but stores to +216+4idx; builder sub_5DB4 directly follows 0x46 builder sub_5D20 so 0x47 assignment is inferred
+0x1C34,sub_1C34,irx_padman_CmdQueryMode,medium,config-mode indexed cmd; stores big-endian word RX[5]<<8|RX[6] into word table at +232+2*idx sized by the numModes clamp (<=4) from 0x16E8; matches pad cmd 0x4C mode table
+0x1DD8,sub_1DD8,UNKNOWN,UNKNOWN,UNKNOWN
+0x1F5C,sub_1F5C,irx_padman_CmdQueryButtonMask,medium,checks RX[8]==0x5A then copies RX[3..6] to +244..247 else zeroes them; 4-byte mask matches pad cmd 0x41 / export padGetButtonMask

@@ -4,6 +4,8 @@
 #include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_diag.h"
 #include "ps2_log.h"
+#include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -14,8 +16,65 @@
 #include <iostream>
 #include <set>
 #include <sstream>
+#include <thread>
+#include <intrin.h>
+#include "ThreadNaming.h"
 
 using namespace GSInternal;
+
+// Per-pixel VRAM access without std::function (perf 09-27). GS::ReadVram /
+// WriteVram go through std::function tables declared in ps2_gs_gpu.h (which we
+// cannot edit); every pixel paid for that indirection twice or three times.
+namespace GSMem
+{
+const u16 *FastPageTable32(bool z); // ps2_gs_memory.cpp (declared here: no header change)
+}
+
+// Same PSM -> GSMem mapping as GS::GS(); unknown PSMs map to the Null access.
+namespace
+{
+using RasterReadFn = u32 (*)(u8 *, u32, u32, u32, u32);
+using RasterWriteFn = void (*)(u8 *, u32, u32, u32, u32, u32);
+struct RasterVramFns
+{
+    RasterReadFn read[64];
+    RasterWriteFn write[64];
+    RasterVramFns()
+    {
+        using namespace GSMem;
+        for (int i = 0; i < 64; ++i)
+        {
+            read[i] = ReadPixelNull;
+            write[i] = WritePixelNull;
+        }
+        read[GS_PSM_CT32] = ReadPixelCT32;   write[GS_PSM_CT32] = WritePixelCT32;
+        read[GS_PSM_CT24] = ReadPixelCT24;   write[GS_PSM_CT24] = WritePixelCT24;
+        read[GS_PSM_CT16] = ReadPixelCT16;   write[GS_PSM_CT16] = WritePixelCT16;
+        read[GS_PSM_CT16S] = ReadPixelCT16S; write[GS_PSM_CT16S] = WritePixelCT16S;
+        read[GS_PSM_T8] = ReadPixelP8;       write[GS_PSM_T8] = WritePixelP8;
+        read[GS_PSM_T8H] = ReadPixelP8H;     write[GS_PSM_T8H] = WritePixelP8H;
+        read[GS_PSM_T4] = ReadPixelP4;       write[GS_PSM_T4] = WritePixelP4;
+        read[GS_PSM_T4HH] = ReadPixelP4HH;   write[GS_PSM_T4HH] = WritePixelP4HH;
+        read[GS_PSM_T4HL] = ReadPixelP4HL;   write[GS_PSM_T4HL] = WritePixelP4HL;
+        read[GS_PSM_Z32] = ReadPixelZ32;     write[GS_PSM_Z32] = WritePixelZ32;
+        read[GS_PSM_Z24] = ReadPixelZ24;     write[GS_PSM_Z24] = WritePixelZ24;
+        read[GS_PSM_Z16] = ReadPixelZ16;     write[GS_PSM_Z16] = WritePixelZ16;
+        read[GS_PSM_Z16S] = ReadPixelZ16S;   write[GS_PSM_Z16S] = WritePixelZ16S;
+    }
+};
+const RasterVramFns g_rasterVram;
+
+// Call sites pass gs->m_vram (private; GSRasterizer is a friend, this is not).
+inline u32 rasterReadVram(u8 *vram, u32 psm, u32 base, u32 bw, u32 x, u32 y)
+{
+    return g_rasterVram.read[psm & 0x3Fu](vram, base, bw, x, y);
+}
+
+inline void rasterWriteVram(u8 *vram, u32 psm, u32 base, u32 bw, u32 x, u32 y, u32 value)
+{
+    g_rasterVram.write[psm & 0x3Fu](vram, base, bw, x, y, value);
+}
+}
 
 // [drawpath] run 32: origin path of the GIF packet currently being dispatched.
 // Defined in ps2_gif_arbiter.cpp; declared here rather than in a header so no
@@ -1219,6 +1278,26 @@ namespace
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
     }
 
+    // CLAMP_1/2 WMS/WMT: 0 REPEAT, 1 CLAMP, 2 REGION_CLAMP, 3 REGION_REPEAT.
+    // sampleTexture used to clamp unconditionally, so scrolling REPEAT strips
+    // (menu clouds) sampled the edge texel instead of wrapping. Same formulas
+    // as gs/gs_cpu_backend.cpp wrapTextureCoordinate.
+    int wrapTexCoord(int coord, int size, unsigned mode, int regMin, int regMax)
+    {
+        switch (mode & 0x3u)
+        {
+        case 0:
+            return static_cast<int>(static_cast<uint32_t>(coord) & static_cast<uint32_t>(size - 1));
+        case 1:
+            return std::min(std::max(coord, 0), size - 1);
+        case 2:
+            return std::min(std::max(coord, regMin), regMax);
+        default:
+            return static_cast<int>((static_cast<uint32_t>(coord) & static_cast<uint32_t>(regMin)) |
+                                    static_cast<uint32_t>(regMax));
+        }
+    }
+
     u16 Rgba8888ToRgba5551(u32 c)
     {
         uint32_t r = ((c >> 0)  & 0xFF) >> 3;
@@ -1274,6 +1353,33 @@ namespace
         return (texel & 0x00FFFFFFu) | (static_cast<uint32_t>(a) << 24);
     }
 
+    // Palette index from a T8/T4 texel read. T8H/T4HL/T4HH alias CT32 words (the
+    // page cache returns the whole word): index = bits 24-31 / 24-27 / 28-31.
+    // The old code used the low byte for all of them (gsfeature unseen_tex_t8h/t4hl/t4hh).
+    uint8_t paletteIndex(uint32_t psm, uint32_t out)
+    {
+        switch (psm)
+        {
+        case GS_PSM_T8H:
+            return static_cast<uint8_t>(out >> 24);
+        case GS_PSM_T4HL:
+            return static_cast<uint8_t>((out >> 24) & 0xFu);
+        case GS_PSM_T4HH:
+            return static_cast<uint8_t>(out >> 28);
+        default:
+            return static_cast<uint8_t>(out);
+        }
+    }
+
+    // Raw CLUT cache entry -> 8888. CT16/CT16S entries widen 5551 and take their
+    // alpha from TEXA (PCSX2 GSClut Expand16); they used to go out raw.
+    uint32_t clutEntryToRgba(const GSTexaReg &texa, uint32_t cpsm, uint32_t raw)
+    {
+        if (cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S)
+            return applyTexa(texa, GS_PSM_CT16, Rgba5551ToRgba8888(static_cast<u16>(raw)));
+        return raw;
+    }
+
     std::atomic<uint32_t> s_debugPrimitiveCount{0};
     std::atomic<uint32_t> s_debugPixelCount{0};
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
@@ -1313,25 +1419,176 @@ namespace
     {
         bool writeFramebuffer;
         bool preserveDestinationAlpha;
+        bool writeZ;
     };
 
     AlphaTestResult classifyAlphaTest(uint64_t testReg, uint8_t alpha)
     {
         const bool pass = passesAlphaTest(testReg, alpha);
         if (pass)
-            return {true, false};
+            return {true, false, true};
 
-        // TEST.AFAIL controls what happens when the alpha comparison fails.
+        // TEST.AFAIL controls what happens when the alpha comparison fails
+        // (PCSX2 TestAlpha). FB_ONLY and RGB_ONLY used to write Z too, and
+        // ZB_ONLY wrote nothing (gsfeature unseen_afail_zb_only).
         switch (static_cast<uint8_t>((testReg >> 12) & 0x3u))
         {
         case 1: // FB_ONLY
-            return {true, false};
-        case 3: // RGB_ONLY
-            return {true, true};
-        case 0: // KEEP
+            return {true, false, false};
         case 2: // ZB_ONLY
+            return {false, false, true};
+        case 3: // RGB_ONLY
+            return {true, true, false};
+        case 0: // KEEP
         default:
-            return {false, false};
+            return {false, false, false};
+        }
+    }
+
+    // TEST.DATE: PCSX2 TestDestAlpha. Only 32- and 16-bit frames (CT24 has no
+    // alpha); `dstRgba` is the frame pixel widened to 8888 (16-bit A -> 0x80).
+    bool failsDestAlphaTest(uint64_t testReg, uint32_t fpsm, uint32_t dstRgba)
+    {
+        if (((testReg >> 14) & 1u) == 0u || fpsm == GS_PSM_CT24)
+            return false;
+        const bool msb = (dstRgba & 0x80000000u) != 0u;
+        const bool datm = ((testReg >> 15) & 1u) != 0u;
+        return msb != datm;
+    }
+
+    // SCANMSK 2 = skip even lines, 3 = skip odd lines (PCSX2 GSRasterizer).
+    bool scanMasked(uint64_t scanmsk, int y)
+    {
+        return (scanmsk & 2u) != 0u && static_cast<uint64_t>(y & 1) == (scanmsk & 1u);
+    }
+
+    // PRIM.FGE fog, PCSX2 GSDrawScanline: f16 = F << 7 (interpolated, truncated),
+    // c = fogcol + ((c - fogcol) * 2 * f16 >> 16) (lerp16<0> = mul16hs, floors).
+    void applyFog(uint64_t fogcol, int f16, uint8_t &r, uint8_t &g, uint8_t &b)
+    {
+        auto ch = [&](uint8_t c, int sh)
+        {
+            const int fc = static_cast<int>((fogcol >> sh) & 0xFFu);
+            return static_cast<uint8_t>(fc + ((((static_cast<int>(c) - fc) * 2) * f16) >> 16));
+        };
+        r = ch(r, 0);
+        g = ch(g, 8);
+        b = ch(b, 16);
+    }
+
+    int fogF16(float f)
+    {
+        return static_cast<int>(f * 128.0f);
+    }
+
+    // PCSX2 WriteFrame: DTHE adds DIMX[y&3][x&3] (signed 3 bits) to RGB of a
+    // 16-bit frame after blending, then COLCLAMP saturates or wraps. Dithering
+    // was not implemented (gsfeature unseen3_frame_ct16_dither).
+    void finishColour(bool dither, uint64_t dimx, bool clamp, int x, int y, int ir, int ig, int ib,
+                      uint8_t &r, uint8_t &g, uint8_t &b)
+    {
+        if (dither)
+        {
+            const int v = static_cast<int>((dimx >> (4 * (((y & 3) << 2) | (x & 3)))) & 7u);
+            const int dm = v >= 4 ? v - 8 : v;
+            ir += dm;
+            ig += dm;
+            ib += dm;
+        }
+        if (clamp)
+        {
+            r = clampU8(ir);
+            g = clampU8(ig);
+            b = clampU8(ib);
+        }
+        else
+        {
+            r = static_cast<uint8_t>(ir & 0xFF);
+            g = static_cast<uint8_t>(ig & 0xFF);
+            b = static_cast<uint8_t>(ib & 0xFF);
+        }
+    }
+
+    // PCSX2 GSRasterizer::DrawEdgeLine (non-AA): DDA on the major axis, the
+    // "diamond exit" rule for the first/last pixel, and a fixed-point decision
+    // value for the minor axis. plot(x, y, t), t = 0..1 along v0->v1 for the
+    // attributes. x/y are pixel coordinates with XYOFFSET already removed.
+    // Replaces a Bresenham walk from truncated endpoints (gsfeature
+    // unseen_linestrip_gouraud: ~700 px off).
+    template <typename Plot>
+    void walkLinePcsx2(float x0, float y0, float x1, float y1, Plot &&plot)
+    {
+        const float dxF = x1 - x0;
+        const float dyF = y1 - y0;
+        if (dxF == 0.0f && dyF == 0.0f)
+            return;
+        const bool stepX = std::fabs(dxF) >= std::fabs(dyF);
+        const bool posX = dxF >= 0.0f;
+        const bool posY = dyF >= 0.0f;
+        const int dxi = posX ? 1 : -1;
+        const int dyi = posY ? 1 : -1;
+
+        float rx0 = std::floor(x0 + 0.5f), ry0 = std::floor(y0 + 0.5f);
+        float rx1 = std::floor(x1 + 0.5f), ry1 = std::floor(y1 + 0.5f);
+
+        auto testEndpoint = [&](float dx, float dy) -> bool
+        {
+            const float dist = std::fabs(dx) + std::fabs(dy);
+            if (dist < 0.5f)
+                return false;
+            if (stepX)
+                return (posX ? (dx > 0.0f) : (dx < 0.0f)) && (dist > 0.5f || dy >= 0.0f);
+            return (posY ? (dy > 0.0f) : (dy < 0.0f)) && (dist > 0.5f || dx >= 0.0f);
+        };
+        if (testEndpoint(x0 - rx0, y0 - ry0)) // first pixel not covered
+        {
+            rx0 += stepX ? static_cast<float>(dxi) : 0.0f;
+            ry0 += stepX ? 0.0f : static_cast<float>(dyi);
+        }
+        if (!testEndpoint(x1 - rx1, y1 - ry1)) // last pixel not covered
+        {
+            rx1 -= stepX ? static_cast<float>(dxi) : 0.0f;
+            ry1 -= stepX ? 0.0f : static_cast<float>(dyi);
+        }
+        if ((stepX ? (dxi * (rx1 - rx0)) : (dyi * (ry1 - ry0))) < 0.0f)
+            return;
+
+        const int rxi1 = static_cast<int>(rx1), ryi1 = static_cast<int>(ry1);
+        const float major = std::fabs(stepX ? dxF : dyF);
+        const bool posD = stepX ? posY : posX;
+        const int scaleD = static_cast<int>(2 * 16 * 16 * major);
+        const int dD = static_cast<int>(2 * 16 * 16 * (stepX ? dyF : dxF));
+        int D = static_cast<int>(scaleD * (stepX ? (y0 - ry0) : (x0 - rx0)));
+        int xi = static_cast<int>(rx0), yi = static_cast<int>(ry0);
+
+        const float prestep = stepX ? dxi * (rx0 - x0) : dyi * (ry0 - y0);
+        float along = prestep; // distance from v0 on the major axis
+        D += static_cast<int>(dD * prestep);
+        auto stepDependent = [&](int sign)
+        {
+            D -= scaleD * sign;
+            (stepX ? yi : xi) += sign;
+        };
+        while (D >= scaleD / 2)
+            stepDependent(1);
+        while (D < -scaleD / 2)
+            stepDependent(-1);
+
+        for (;;)
+        {
+            plot(xi, yi, along / major);
+            if (stepX ? (xi == rxi1) : (yi == ryi1))
+                break;
+            along += 1.0f;
+            D += dD;
+            (stepX ? xi : yi) += stepX ? dxi : dyi;
+            if (posD)
+            {
+                if (D >= scaleD / 2)
+                    stepDependent(1);
+            }
+            else if (D < -scaleD / 2)
+                stepDependent(-1);
         }
     }
 
@@ -1429,21 +1686,421 @@ namespace
 
     bool tex1UsesLinearFilter(uint64_t tex1)
     {
+        // 10-09: PS2X_GS_NEAREST=1 forces point sampling everywhere (both
+        // rasterisers go through here): for manual play. Off in the library
+        // (gs_bench / oracle gates stay exact); ps2EntryRunner's main() sets it
+        // to 1 when unset and no capture var is present, so =0 means bilinear.
+        static const bool forceNearest = []
+        {
+            const char *e = std::getenv("PS2X_GS_NEAREST");
+            return e != nullptr && *e == '1';
+        }();
+        if (forceNearest)
+            return false;
         const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5) & 0x1u);
         const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6) & 0x7u);
         return mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
     }
 
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+    // drawSprite sets this around sampleTexture: the coordinate it passes is
+    // s/t (texel / size, q = 1) even when PRIM.FST=1 (sampleTexture's
+    // signature is in a header, so no extra parameter).
+    thread_local bool t_sampleAsStq = false;
+
+    // Texel coordinate -> 16.16 fixed, as PCSX2 GSDrawScanline does it
+    // (VectorI(s / q): cvttps truncates; out of range / NaN -> INT32_MIN).
+    int texFixed16(float texF)
     {
-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        const float f = texF * 65536.0f;
+        return (f > -2147483648.0f && f < 2147483648.0f) ? static_cast<int>(f) : INT32_MIN;
+    }
+
+    // PCSX2 GSDrawScanline LTF (gsfeature matrix tex_*_bilinear_stq DIFF'd up to
+    // 20 levels with float weights): coordinate 16.16 minus 0x8000, weight = top
+    // 4 bits of the fraction, lerp16_4 = a + ((b - a) * f >> 4) (arithmetic
+    // shift), horizontal (c00->c10) then vertical. c10 = (u1,v0), c01 = (u0,v1).
+    struct BilinearTap
+    {
+        int u0, v0, fu, fv;
+    };
+
+    BilinearTap bilinearTap(float texUf, float texVf)
+    {
+        const int u = texFixed16(texUf) - 0x8000;
+        const int v = texFixed16(texVf) - 0x8000;
+        return {u >> 16, v >> 16, (u & 0xFFFF) >> 12, (v & 0xFFFF) >> 12};
+    }
+
+    // PCSX2 DrawSprite coverage: per axis ceil(min) <= x < ceil(max), done in the
+    // GS's 12.4 fixed point (XYOFFSET keeps its fraction). Truncating instead
+    // shifted every sub-pixel sprite by one pixel (gsfeature sprite_*_scaled).
+    // Inclusive bounds out; false = empty (PCSX2 draws nothing; old code drew 1 px).
+    bool spriteCoverage(float ax, float ay, float bx, float by, int64_t ofx16, int64_t ofy16,
+                        int &x0, int &y0, int &x1, int &y1)
+    {
+        auto ceil16 = [](int64_t v) { return static_cast<int>((v + 15) >> 4); }; // >> floors negatives
+        const int64_t X0 = static_cast<int64_t>(std::lround(ax * 16.0f)) - ofx16;
+        const int64_t Y0 = static_cast<int64_t>(std::lround(ay * 16.0f)) - ofy16;
+        const int64_t X1 = static_cast<int64_t>(std::lround(bx * 16.0f)) - ofx16;
+        const int64_t Y1 = static_cast<int64_t>(std::lround(by * 16.0f)) - ofy16;
+        x0 = ceil16(std::min(X0, X1));
+        y0 = ceil16(std::min(Y0, Y1));
+        x1 = ceil16(std::max(X0, X1)) - 1;
+        y1 = ceil16(std::max(Y0, Y1)) - 1;
+        return x0 <= x1 && y0 <= y1;
+    }
+
+    // PCSX2-exact triangle texture coordinates: GSRasterizer::DrawTriangle (plane
+    // gradients from the y-sorted vertices, each section anchored at its own start
+    // vertex) + GSDrawScanline AVX2 (8 lanes: lane j of a group = scan + dscan*(j-skip),
+    // later groups add dscan*8; FST / constant-q prims step in integers after a per-row
+    // truncation, with the bilinear half-texel taken off the vertices). Barycentric
+    // weights picked a different texel at exact texel boundaries (gsfeature tex_*
+    // residue; ATST flips in combo_fan_t4_bilinear). u/v out: 16.16, -0x8000 applied
+    // when linear (what the samplers' fixed path expects).
+    struct TriTexInterp
+    {
+        bool fixedMode = false, ltf = false, flatTop = false;
+        float x[3] = {}, y[3] = {}, a[3][3] = {};
+        float dscan[3] = {}, dedge[3] = {};
+        int anchorFlat = 0, splitRow = 0;
+        int rowY = INT32_MIN, base = 0, group = 0;
+        float lanesF[8][3] = {}, stepF[3] = {};
+        int lanesI[8][2] = {}, stepI[2] = {};
+
+        static int cvtt(float f) { return (f > -2147483648.0f && f < 2147483648.0f) ? static_cast<int>(f) : INT32_MIN; }
+
+        bool setup(const GSVertex &v0, const GSVertex &v1, const GSVertex &v2, float ofx, float ofy,
+                   bool fst, int tw, int th, bool linear)
+        {
+            static const uint8_t kYSort[8][3] = {{0, 1, 2}, {1, 0, 2}, {0, 0, 0}, {1, 2, 0},
+                                                  {0, 2, 1}, {0, 0, 0}, {2, 0, 1}, {2, 1, 0}};
+            const GSVertex *in[3] = {&v0, &v1, &v2};
+            const bool qEq = !fst && v0.q == v1.q && v1.q == v2.q;
+            fixedMode = fst || qEq;
+            ltf = linear;
+            const float W = static_cast<float>(0x10000 << tw), H = static_cast<float>(0x10000 << th);
+            float px[3], py[3], at[3][3];
+            for (int i = 0; i < 3; ++i)
+            {
+                const GSVertex &v = *in[i];
+                px[i] = v.x - ofx;
+                py[i] = v.y - ofy;
+                if (fst)
+                {
+                    at[i][0] = static_cast<float>(static_cast<int>(v.u) << 12);
+                    at[i][1] = static_cast<float>(static_cast<int>(v.v) << 12);
+                    at[i][2] = 1.0f;
+                }
+                else if (qEq && v.q != 1.0f) // PCSX2 q_div: (st / q) * size
+                {
+                    at[i][0] = (v.s / v.q) * W;
+                    at[i][1] = (v.t / v.q) * H;
+                    at[i][2] = 1.0f;
+                }
+                else
+                {
+                    at[i][0] = v.s * W;
+                    at[i][1] = v.t * H;
+                    at[i][2] = v.q;
+                }
+                if (fixedMode && linear)
+                {
+                    at[i][0] -= 32768.0f;
+                    at[i][1] -= 32768.0f;
+                }
+            }
+            const int m1s = (py[0] > py[1] ? 1 : 0) | (py[0] > py[2] ? 2 : 0) | (py[1] > py[2] ? 4 : 0);
+            for (int i = 0; i < 3; ++i)
+            {
+                const int k = kYSort[m1s][i];
+                x[i] = px[k];
+                y[i] = py[k];
+                a[i][0] = at[k][0];
+                a[i][1] = at[k][1];
+                a[i][2] = at[k][2];
+            }
+            const int m1 = (y[0] == y[1] ? 1 : 0) | (y[0] == y[2] ? 2 : 0) | (y[1] == y[2] ? 4 : 0);
+            if (m1 == 7)
+                return false;
+            const float dv0x = x[1] - x[0], dv0y = y[1] - y[0], dv1x = x[2] - x[0], dv1y = y[2] - y[0];
+            const float cross = dv0y * dv1x - dv0x * dv1y;
+            if (cross == 0.0f)
+                return false;
+            const int m2 = std::signbit(cross) ? 1 : 0;
+            const float c0 = dv0x / cross, c1 = dv0y / cross, c2 = dv1x / cross, c3 = dv1y / cross;
+            for (int k = 0; k < 3; ++k)
+            {
+                const float d0 = a[1][k] - a[0][k], d1 = a[2][k] - a[0][k];
+                dscan[k] = d1 * c1 - d0 * c3;
+                dedge[k] = d0 * c2 - d1 * c0;
+            }
+            flatTop = (m1 & 1) != 0;
+            anchorFlat = 1 - m2;
+            splitRow = static_cast<int>(std::ceil(y[1]));
+            rowY = INT32_MIN;
+            return true;
+        }
+
+        // First covered pixel of row `row` (PCSX2's l.x: ceil(left edge) clipped to the scissor).
+        void beginRow(int row, int left)
+        {
+            const int anc = flatTop ? anchorFlat : (row < splitRow ? 0 : 1);
+            const float dy = static_cast<float>(row) - y[anc];
+            const float prestep = static_cast<float>(left) - x[anc];
+            const int skip = left & 7;
+            rowY = row;
+            base = left - skip;
+            group = 0;
+            for (int k = 0; k < 3; ++k)
+            {
+                const float scan = (a[anc][k] + dedge[k] * dy) + dscan[k] * prestep;
+                if (fixedMode && k < 2)
+                {
+                    const int vt = cvtt(scan);
+                    for (int j = 0; j < 8; ++j)
+                        lanesI[j][k] = static_cast<int>(static_cast<uint32_t>(vt) +
+                                                        static_cast<uint32_t>(cvtt(dscan[k] * static_cast<float>(j - skip))));
+                    stepI[k] = cvtt(dscan[k] * 8.0f);
+                }
+                else
+                {
+                    for (int j = 0; j < 8; ++j)
+                        lanesF[j][k] = scan + dscan[k] * static_cast<float>(j - skip);
+                    stepF[k] = dscan[k] * 8.0f;
+                }
+            }
+        }
+
+        void at(int px, int &u, int &v)
+        {
+            const int g = (px - base) >> 3;
+            while (group < g)
+            {
+                for (int j = 0; j < 8; ++j)
+                {
+                    if (fixedMode)
+                    {
+                        lanesI[j][0] = static_cast<int>(static_cast<uint32_t>(lanesI[j][0]) + static_cast<uint32_t>(stepI[0]));
+                        lanesI[j][1] = static_cast<int>(static_cast<uint32_t>(lanesI[j][1]) + static_cast<uint32_t>(stepI[1]));
+                    }
+                    else
+                    {
+                        lanesF[j][0] += stepF[0];
+                        lanesF[j][1] += stepF[1];
+                        lanesF[j][2] += stepF[2];
+                    }
+                }
+                ++group;
+            }
+            const int j = (px - base) & 7;
+            if (fixedMode)
+            {
+                u = lanesI[j][0];
+                v = lanesI[j][1];
+                return;
+            }
+            u = cvtt(lanesF[j][0] / lanesF[j][2]);
+            v = cvtt(lanesF[j][1] / lanesF[j][2]);
+            if (ltf)
+            {
+                u = static_cast<int>(static_cast<uint32_t>(u) - 0x8000u);
+                v = static_cast<int>(static_cast<uint32_t>(v) - 0x8000u);
+            }
+        }
+    };
+
+    // drawTriangle hands sampleTexture a ready 16.16 coordinate through this (the
+    // member's signature lives in a header).
+    struct FixedUv
+    {
+        bool on = false;
+        int u = 0, v = 0;
+    };
+    thread_local FixedUv t_fixedUv;
+
+    uint32_t bilinearFilter(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, int fu, int fv)
+    {
+        uint32_t out = 0;
+        for (int sh = 0; sh < 32; sh += 8)
+        {
+            const int a00 = static_cast<int>((c00 >> sh) & 0xFFu), a10 = static_cast<int>((c10 >> sh) & 0xFFu);
+            const int a01 = static_cast<int>((c01 >> sh) & 0xFFu), a11 = static_cast<int>((c11 >> sh) & 0xFFu);
+            const int top = a00 + (((a10 - a00) * fu) >> 4);
+            const int bottom = a01 + (((a11 - a01) * fu) >> 4);
+            const int c = top + (((bottom - top) * fv) >> 4);
+            out |= static_cast<uint32_t>(c & 0xFF) << sh;
+        }
+        return out;
     }
 }
 
+// Perf (10-09): x-span of one triangle row. A pixel is inside when every
+// e[i]+bias[i] >= 0, with e[i] advancing by -edy[i]*16 per pixel. The inside set
+// is convex, so it is contiguous within a row; returns false for an empty row,
+// else [xs,xe] within [minX,maxX]. Integer-exact: the same pixels the old
+// test-every-pixel loop kept, minus the walk over the empty part of the bbox.
+static inline bool triRowSpan(const int64_t e0[3], const int64_t edy[3], const int64_t bias[3],
+                              int minX, int maxX, int &xs, int &xe)
+{
+    int64_t lo = minX, hi = maxX;
+    for (int i = 0; i < 3; ++i)
+    {
+        const int64_t v = e0[i] + bias[i]; // value at x == minX
+        const int64_t c = -edy[i] * 16;    // change per pixel
+        if (c == 0)
+        {
+            if (v < 0)
+                return false;
+        }
+        else if (c > 0)
+        {
+            if (v < 0)
+                lo = std::max<int64_t>(lo, minX + (-v + c - 1) / c);
+        }
+        else
+        {
+            if (v < 0)
+                return false;
+            hi = std::min<int64_t>(hi, minX + v / (-c));
+        }
+    }
+    if (lo > hi)
+        return false;
+    xs = static_cast<int>(lo);
+    xe = static_cast<int>(hi);
+    return true;
+}
+
+// Time the GS thread spends waiting on the raster workers (printed by
+// PS2X_GS_THREAD_STATS=1 in ps2_gif_arbiter.cpp).
+#include <chrono>
+std::atomic<uint64_t> g_gsmtWaitDoneNs{0};
+std::atomic<uint64_t> g_gsmtWaitDoneCalls{0};
+// [reason][0]=calls [1]=ns. 1 vram ptr, 2 clut slot, 3 self-sampling, 4 prim
+// hazard, 5 syncRect read, 6 syncRect write, 7 ring full, 8+ external flush
+// (set by the ps2_gs_gpu.cpp caller), 0 unknown.
+std::atomic<uint64_t> g_gsmtWaitByReason[16][2];
+int g_gsmtWaitReason = 0;
+// 10-09 P6 stats: TSC ticks each raster worker spends in runJob / the upload
+// barrier (idle spinning excluded), and ticks the producer spends in submit().
+std::atomic<uint64_t> g_gsmtBusyTsc[16];
+std::atomic<uint64_t> g_gsmtBarrierTsc[16]; // part of Busy spent in the upload barrier (waiting + applying)
+std::atomic<uint64_t> g_gsmtJobs[16];
+std::atomic<uint64_t> g_gsmtSubmitTsc{0};
+std::atomic<uint64_t> g_gsmtSubmitCalls{0};
+std::atomic<uint64_t> g_gsmtApplyTsc{0};   // deferred-upload apply (one worker, others wait)
+std::atomic<uint64_t> g_gsmtUpDirect{0};   // large uploads written by the producer (no hazard)
+std::atomic<uint64_t> g_gsmtUpDeferred{0}; // large uploads queued behind draws (hazard)
+
+// 10-09 60fps P0: raster workload classes per worker, summed by
+// ps2x_budget_raster() for the [budget] line. Every worker owns distinct rows,
+// so the sum over workers is the true pixel count. Plain adds (one writer per
+// slot); the reader is racy by design (stats only).
+//   v: 0 triFlat 1 triTex 2 triTexLinear 3 sprFlat 4 sprTex 5 sprTexLinear
+//      6 tris (worker 0) 7 sprites (worker 0) 8 abe px 9 z-tested px
+struct alignas(64) BudgetRasterSlot
+{
+    uint64_t v[10];
+};
+static BudgetRasterSlot g_budgetRaster[16];
+
+static inline void budgetRasterSpan(int worker, bool sprite, bool tme, bool lin, bool abe, bool zt, int n)
+{
+    if (n <= 0)
+        return;
+    uint64_t *v = g_budgetRaster[worker & 15].v;
+    const uint64_t px = static_cast<uint64_t>(n);
+    v[(sprite ? 3 : 0) + (tme ? (lin ? 2 : 1) : 0)] += px;
+    if (abe)
+        v[8] += px;
+    if (zt)
+        v[9] += px;
+}
+
+extern "C" void ps2x_budget_raster(uint64_t *out, int n)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        uint64_t s = 0;
+        if (i < 10)
+            for (const BudgetRasterSlot &slot : g_budgetRaster)
+                s += slot.v[i];
+        out[i] = s;
+    }
+}
+
+#include "ps2_gs_raster_mt.inl"
+
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    if (gsmt::threadCount() > 0)
+    {
+        // Threaded path (ps2_gs_raster_mt.inl). The GS state this function and
+        // drawSprite change is updated here, on the GS thread, as before.
+        const auto &ctx = gs->activeContext();
+        if (gs->m_hasPreferredDisplaySource && ctx.frame.fbp == gs->m_preferredDisplayDestFbp)
+            gs->m_hasPreferredDisplaySource = false;
+
+        const auto prim = gs->m_registers.prim;
+        if (prim.prim == GS_PRIM_SPRITE)
+        {
+            // drawSprite's display-copy detection, same tests.
+            const GSVertex &v0 = gs->m_vtxQueue[0];
+            const GSVertex &v1 = gs->m_vtxQueue[1];
+            const int ofx = ctx.xyoffset.ofx >> 4;
+            const int ofy = ctx.xyoffset.ofy >> 4;
+            int x0 = static_cast<int>(v0.x) - ofx;
+            int y0 = static_cast<int>(v0.y) - ofy;
+            int x1 = static_cast<int>(v1.x) - ofx;
+            int y1 = static_cast<int>(v1.y) - ofy;
+            if (x0 > x1)
+                std::swap(x0, x1);
+            if (y0 > y1)
+                std::swap(y0, y1);
+            const int ux0 = x0;
+            const int uy0 = y0;
+            const int ux1 = ux0 + std::max(1, x1 - x0) - 1;
+            const int uy1 = uy0 + std::max(1, y1 - y0) - 1;
+            const bool outside = ux1 < static_cast<int>(ctx.scissor.x0) || ux0 > static_cast<int>(ctx.scissor.x1) ||
+                                 uy1 < static_cast<int>(ctx.scissor.y0) || uy0 > static_cast<int>(ctx.scissor.y1);
+            const uint64_t alphaReg = ctx.alpha.data;
+            const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
+            const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
+            if (!outside && prim.tme && prim.abe && prim.fst && prim.ctxt &&
+                ctx.frame.fbp != ctx.tex0.tbp0 && alphaMode == 0x64u &&
+                (alphaFix == 0x60u || alphaFix == 0x80u) &&
+                ux0 <= 0 && uy0 <= 0 && ux1 >= 639 && uy1 >= 447)
+            {
+                GSFrameReg copy{};
+                copy.fbp = ctx.tex0.tbp0;
+                copy.fbw = ctx.tex0.tbw;
+                copy.psm = ctx.tex0.psm;
+                gs->m_preferredDisplaySourceFrame = std::move(copy);
+                gs->m_preferredDisplayDestFbp = ctx.frame.fbp;
+                gs->m_hasPreferredDisplaySource = true;
+            }
+        }
+
+        gsmt::Job job;
+        job.v[0] = gs->m_vtxQueue[0];
+        job.v[1] = gs->m_vtxQueue[1];
+        job.v[2] = gs->m_vtxQueue[2];
+        job.ctx = ctx;
+        job.prim = prim;
+        job.pabe = gs->m_registers.pabe;
+        job.colclamp = gs->m_registers.colclamp;
+        job.fogcol = gs->m_registers.fogcol.data;
+        job.dthe = gs->m_registers.dthe.data;
+        job.dimx = gs->m_registers.dimx.data;
+        job.scanmsk = gs->m_registers.scanmsk.data;
+        job.texa = gs->m_registers.texa;
+        job.vram = gs->m_vram;
+        job.clut = nullptr;
+        gsmt::submit(job, gs->m_clut_cache.data(), gs);
+        return;
+    }
+
     const auto &ctx = gs->activeContext();
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
@@ -1558,6 +2215,145 @@ void GSRasterizer::drawPrimitive(GS *gs)
 
     const auto prim = gs->m_registers.prim;
 
+    // 2026-10-01 probe (v2): Krillin "stretched triangle" artifact. v1 flagged
+    // ordinary off-screen geometry in a 512x448 render target, so it filled its
+    // cap in one frame. Now: a triangle is "stretched" only if its longest edge
+    // exceeds 1200 px AND its bbox overlaps the scissor (i.e. it is visible).
+    // Capped per vsync and in total; logs vsync tick, tbp0 and psm.
+    if (prim.prim == GS_PRIM_TRIANGLE || prim.prim == GS_PRIM_TRISTRIP || prim.prim == GS_PRIM_TRIFAN)
+    {
+        static int s_runaway = 0;
+        static uint64_t s_runTick = ~0ull;
+        static int s_runInTick = 0;
+        if (s_runaway < 200)
+        {
+            const float ox = static_cast<float>(ctx.xyoffset.ofx >> 4);
+            const float oy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+            float bx0 = 1.0e9f, bx1 = -1.0e9f, by0 = 1.0e9f, by1 = -1.0e9f, maxEdge = 0.0f;
+            for (int i = 0; i < 3; ++i)
+            {
+                const GSVertex &q = gs->m_vtxQueue[i];
+                const GSVertex &n = gs->m_vtxQueue[(i + 1) % 3];
+                const float qx = q.x - ox, qy = q.y - oy;
+                bx0 = std::min(bx0, qx);
+                bx1 = std::max(bx1, qx);
+                by0 = std::min(by0, qy);
+                by1 = std::max(by1, qy);
+                maxEdge = std::max(maxEdge, std::hypot(q.x - n.x, q.y - n.y));
+            }
+            const bool visible = bx1 >= static_cast<float>(ctx.scissor.x0) && bx0 <= static_cast<float>(ctx.scissor.x1) &&
+                                 by1 >= static_cast<float>(ctx.scissor.y0) && by0 <= static_cast<float>(ctx.scissor.y1);
+            if (maxEdge > 1200.0f && visible)
+            {
+                const uint64_t tk = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+                if (tk != s_runTick)
+                {
+                    s_runTick = tk;
+                    s_runInTick = 0;
+                }
+                if (s_runInTick < 5)
+                {
+                    ++s_runInTick;
+                    ++s_runaway;
+                    std::cerr << "[runaway] tick=" << tk << " prim=" << static_cast<int>(prim.prim)
+                              << " edge=" << maxEdge
+                              << " ofs=(" << ox << "," << oy << ")"
+                              << " scis=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-("
+                              << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")"
+                              << " tme=" << static_cast<int>(prim.tme)
+                              << " tbp0=0x" << std::hex << ctx.tex0.tbp0 << std::dec
+                              << " psm=" << static_cast<int>(ctx.tex0.psm)
+                              << " v0=(" << gs->m_vtxQueue[0].x << "," << gs->m_vtxQueue[0].y << "," << gs->m_vtxQueue[0].z << ")"
+                              << " v1=(" << gs->m_vtxQueue[1].x << "," << gs->m_vtxQueue[1].y << "," << gs->m_vtxQueue[1].z << ")"
+                              << " v2=(" << gs->m_vtxQueue[2].x << "," << gs->m_vtxQueue[2].y << "," << gs->m_vtxQueue[2].z << ")"
+                              << " fbp=" << ctx.frame.fbp << std::endl;
+                }
+            }
+        }
+    }
+
+    // 2026-10-01 probe: main-menu bottom clouds missing. Log wide draws that
+    // reach the bottom strip (y1 >= 380), for 30 draws on every 30th vsync.
+    if (prim.prim == GS_PRIM_SPRITE || prim.prim == GS_PRIM_TRIANGLE ||
+        prim.prim == GS_PRIM_TRISTRIP || prim.prim == GS_PRIM_TRIFAN)
+    {
+        const int nv = (prim.prim == GS_PRIM_SPRITE) ? 2 : 3;
+        const float ox = static_cast<float>(ctx.xyoffset.ofx >> 4);
+        const float oy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+        float bx0 = 1.0e9f, bx1 = -1.0e9f, by0 = 1.0e9f, by1 = -1.0e9f;
+        for (int i = 0; i < nv; ++i)
+        {
+            const GSVertex &q = gs->m_vtxQueue[i];
+            bx0 = std::min(bx0, q.x - ox);
+            bx1 = std::max(bx1, q.x - ox);
+            by0 = std::min(by0, q.y - oy);
+            by1 = std::max(by1, q.y - oy);
+        }
+        if (by1 >= 380.0f && by0 < 460.0f && (bx1 - bx0) >= 40.0f)
+        {
+            static int s_botTotal = 0;
+            static uint64_t s_botTick = ~0ull;
+            static int s_botInTick = 0;
+            if (s_botTotal < 4000)
+            {
+                const uint64_t tk = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+                if (tk != s_botTick)
+                {
+                    s_botTick = tk;
+                    s_botInTick = 0;
+                }
+                if ((tk % 30ull) == 0ull && s_botInTick < 30)
+                {
+                    ++s_botInTick;
+                    ++s_botTotal;
+                    std::cerr << "[botdraw] tick=" << tk << " prim=" << static_cast<int>(prim.prim)
+                              << " bbox=(" << bx0 << "," << by0 << ")-(" << bx1 << "," << by1 << ")"
+                              << " fbp=" << ctx.frame.fbp
+                              << " tme=" << static_cast<int>(prim.tme)
+                              << " abe=" << static_cast<int>(prim.abe)
+                              << " fst=" << static_cast<int>(prim.fst)
+                              << " tbp0=" << ctx.tex0.tbp0
+                              << " psm=" << static_cast<int>(ctx.tex0.psm)
+                              << " tw=" << static_cast<int>(ctx.tex0.tw)
+                              << " th=" << static_cast<int>(ctx.tex0.th)
+                              << " cbp=" << ctx.tex0.cbp
+                              << " ate=" << static_cast<int>(ctx.test.ate)
+                              << " atst=" << static_cast<int>(ctx.test.atst)
+                              << " aref=" << static_cast<int>(ctx.test.aref)
+                              << " zte=" << static_cast<int>(ctx.test.zte)
+                              << " ztst=" << static_cast<int>(ctx.test.ztst)
+                              << " abcd=" << static_cast<int>(ctx.alpha.a) << static_cast<int>(ctx.alpha.b)
+                              << static_cast<int>(ctx.alpha.c) << static_cast<int>(ctx.alpha.d)
+                              << " uv0=(" << (gs->m_vtxQueue[0].u >> 4) << "," << (gs->m_vtxQueue[0].v >> 4) << ")"
+                              << " uv1=(" << (gs->m_vtxQueue[1].u >> 4) << "," << (gs->m_vtxQueue[1].v >> 4) << ")"
+                              << " rgba0=" << static_cast<int>(gs->m_vtxQueue[0].r) << ","
+                              << static_cast<int>(gs->m_vtxQueue[0].g) << ","
+                              << static_cast<int>(gs->m_vtxQueue[0].b) << ","
+                              << static_cast<int>(gs->m_vtxQueue[0].a)
+                              << " wms=" << static_cast<int>(ctx.clamp.wms)
+                              << " wmt=" << static_cast<int>(ctx.clamp.wmt)
+                              << " minu=" << static_cast<int>(ctx.clamp.minu)
+                              << " maxu=" << static_cast<int>(ctx.clamp.maxu)
+                              << " minv=" << static_cast<int>(ctx.clamp.minv)
+                              << " maxv=" << static_cast<int>(ctx.clamp.maxv)
+                              << " cld=" << static_cast<int>(ctx.tex0.cld)
+                              << " csa=" << static_cast<int>(ctx.tex0.csa)
+                              << " csm=" << static_cast<int>(ctx.tex0.csm)
+                              << " tbw=" << static_cast<int>(ctx.tex0.tbw)
+                              << " stq0=(" << gs->m_vtxQueue[0].s << "," << gs->m_vtxQueue[0].t << "," << gs->m_vtxQueue[0].q << ")"
+                              << " stq1=(" << gs->m_vtxQueue[1].s << "," << gs->m_vtxQueue[1].t << "," << gs->m_vtxQueue[1].q << ")"
+                              << " scis=(" << ctx.scissor.x0 << "," << ctx.scissor.y0 << ")-("
+                              << ctx.scissor.x1 << "," << ctx.scissor.y1 << ")"
+                              << " ofx=" << (ctx.xyoffset.ofx >> 4) << " ofy=" << (ctx.xyoffset.ofy >> 4)
+                              << " rawx=(" << gs->m_vtxQueue[0].x << "," << gs->m_vtxQueue[1].x << ")"
+                              << " fbw=" << static_cast<int>(ctx.frame.fbw)
+                              << " fpsm=" << static_cast<int>(ctx.frame.psm)
+                              << std::endl;
+                }
+            }
+        }
+    }
+
     switch (prim.prim)
     {
     case GS_PRIM_SPRITE:
@@ -1576,9 +2372,13 @@ void GSRasterizer::drawPrimitive(GS *gs)
     {
         const GSVertex &v = gs->m_vtxQueue[0];
         const auto &ctx = gs->activeContext();
-        int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
-        int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        writePixel(gs, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a);
+        // PCSX2 DrawPoint: p = int(v - offset + 0.5) (truncating).
+        int px = static_cast<int>(v.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f + 0.5f);
+        int py = static_cast<int>(v.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f + 0.5f);
+        uint8_t pr = v.r, pg = v.g, pb = v.b;
+        if (gs->m_registers.prim.fge)
+            applyFog(gs->m_registers.fogcol.data, v.fog << 7, pr, pg, pb);
+        writePixel(gs, px, py, static_cast<u32>(v.z), pr, pg, pb, v.a);
         break;
     }
     default:
@@ -1594,6 +2394,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         return;
 
     const auto &ctx = gs->activeContext();
+    const bool diagOn = ps2_diag::enabled(); // hoisted: 7 probe gates per pixel below
 
     const auto prim = gs->m_registers.prim;
     const auto pabe = gs->m_registers.pabe;
@@ -1608,7 +2409,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // [glyphfate] (0)/(1). Must sit BEFORE the scissor return -- a scissor kill
     // is one of the fates being measured, and counting after the return would
     // make it indistinguishable from "never happened".
-    if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+    if (diagOn && ps2diag_fbstat::t_glyphDraw)
     {
         using namespace ps2diag_fbstat;
         g_gfIn.fetch_add(1, std::memory_order_relaxed);
@@ -1628,7 +2429,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // site purely because prim/alpha/a are unambiguously in scope here; these
     // three describe the box DRAW, not the outcome of any one store, so
     // sampling them before the scissor return costs nothing and loses nothing.
-    if (ps2_diag::enabled() && ps2diag_fbstat::t_boxDraw)
+    if (diagOn && ps2diag_fbstat::t_boxDraw)
     {
         using namespace ps2diag_fbstat;
         g_boAbe.store(static_cast<uint32_t>(prim.abe), std::memory_order_relaxed);
@@ -1651,7 +2452,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     // returns below, which are the two places a red pixel can vanish without
     // touching any existing probe.
     ps2diag_fbstat::t_redPixel = false;
-    if (ps2_diag::enabled() && prim.tme)
+    if (diagOn && prim.tme)
     {
         using namespace ps2diag_fbstat;
 
@@ -1705,13 +2506,16 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
+    if (scanMasked(gs->m_registers.scanmsk.data, y))
+        return;
+
     const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test.data, a);
 
-    if (!alphaTest.writeFramebuffer)
+    if (!alphaTest.writeFramebuffer && !alphaTest.writeZ)
     {
         if (ps2diag_fbstat::t_redPixel)
             ps2diag_fbstat::g_trKillAte.fetch_add(1, std::memory_order_relaxed);
-        if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+        if (diagOn && ps2diag_fbstat::t_glyphDraw)
             ps2diag_fbstat::g_gfAte.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1730,12 +2534,13 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
 
     // small optimization, avoid reading the framebuffer for simple draws
     // TODO: only one address lookup for rmw
-    const bool frmw = (ctx.frame.fbmsk != 0) || alphaBlendEnabled || destinationAlpha;
+    const bool dateOn = ((ctx.test.data >> 14) & 1u) != 0u;
+    const bool frmw = (ctx.frame.fbmsk != 0) || alphaBlendEnabled || destinationAlpha || dateOn;
 
     u32 fbrgba = 0;
     if (frmw)
     {
-        fbrgba = gs->ReadVram(fpsm, fbp, fbw, x, y);
+        fbrgba = rasterReadVram(gs->m_vram, fpsm, fbp, fbw, x, y);
 
         if (bitsPerPixel(fpsm) == 16)
         {
@@ -1756,10 +2561,10 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         zpass = true;
         break;
     case 2:
-        zpass = z >= gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z >= rasterReadVram(gs->m_vram, zpsm, zbp, fbw, x, y);
         break;
     case 3:
-        zpass = z > gs->ReadVram(zpsm, zbp, fbw, x, y);
+        zpass = z > rasterReadVram(gs->m_vram, zpsm, zbp, fbw, x, y);
         break;
     }
 
@@ -1767,14 +2572,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
     {
         if (ps2diag_fbstat::t_redPixel)
             ps2diag_fbstat::g_trKillZ.fetch_add(1, std::memory_order_relaxed);
-        if (ps2_diag::enabled() && ps2diag_fbstat::t_glyphDraw)
+        if (diagOn && ps2diag_fbstat::t_glyphDraw)
             ps2diag_fbstat::g_gfZ.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    if (dateOn && failsDestAlphaTest(ctx.test.data, fpsm, fbrgba))
+        return;
 
     if (ps2diag_fbstat::t_redPixel)
         ps2diag_fbstat::g_trDstRgb.store(fbrgba & 0x00FFFFFFu, std::memory_order_relaxed);
 
+    int ir = r, ig = g, ib = b; // unclamped until finishColour (blend, then dither)
     if (prim.abe)
     {
         uint8_t dr = fbrgba & 0xFF;
@@ -1799,27 +2607,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
                     return cd;
                 return 0;
             };
-            int cAlpha = (csel == 0) ? a : (csel == 1) ? da
+            // CT24 has no alpha: C=Ad multiplies by 1.0 (PCSX2 skips the modulate).
+            int cAlpha = (csel == 0) ? a : (csel == 1) ? (fpsm == GS_PSM_CT24 ? 128 : da)
                                                        : fix;
 
-            int br = ((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr);
-            int bg = ((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg);
-            int bb = ((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db);
-
-            if (colclamp.clamp)
-            {
-                r = clampU8(br);
-                g = clampU8(bg);
-                b = clampU8(bb);
-            }
-            else
-            {
-                r &= 0xFF;
-                g &= 0xFF;
-                b &= 0xFF;
-            }
+            ir = ((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr);
+            ig = ((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg);
+            ib = ((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db);
         }
     }
+    finishColour((gs->m_registers.dthe.data & 1u) != 0u && bitsPerPixel(fpsm) == 16, gs->m_registers.dimx.data,
+                 colclamp.clamp, x, y, ir, ig, ib, r, g, b);
 
     u32 fbmask = frame.fbmsk;
     bool zmask = zbuf.zmsk;
@@ -1849,7 +2647,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         pixel = Rgba8888ToRgba5551(pixel);
     }
 
-    if (ps2_diag::enabled())
+    if (diagOn)
     {
         // Per-frame pixel aggregates consumed by the [gs:frame] probe. The old
         // 1-in-2,000,000 sampled probe was useless here: a full-screen clear is
@@ -1879,7 +2677,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
                                     std::memory_order_relaxed);
     }
 
-    if (ps2_diag::enabled())
+    if (diagOn)
     {
         // Classify the value we are actually about to store. RGB is the
         // low 24 bits for CT32 (see pack32 above); for 16bpp the value
@@ -2296,11 +3094,12 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, int z, uint8_t r, uint8_t g,
         }
     }
 
-    gs->WriteVram(fpsm, fbp, fbw, x, y, pixel);
+    if (alphaTest.writeFramebuffer)
+        rasterWriteVram(gs->m_vram, fpsm, fbp, fbw, x, y, pixel);
 
-    if (!zmask)
+    if (!zmask && alphaTest.writeZ)
     {
-        gs->WriteVram(zpsm, zbp, fbw, x, y, z);
+        rasterWriteVram(gs->m_vram, zpsm, zbp, fbw, x, y, z);
     }
 }
 
@@ -2310,12 +3109,14 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
     const auto tex = ctx.tex0;
     const auto prim = gs->m_registers.prim;
     const auto texa = gs->m_registers.texa;
+    // Hoisted: samplePoint runs per texel (4x under bilinear).
+    const bool diagOn = ps2_diag::enabled();
 
     int texW = 1 << tex.tw;
     int texH = 1 << tex.th;
 
     float texUf, texVf;
-    if (prim.fst)
+    if (prim.fst && !t_sampleAsStq)
     {
         texUf = static_cast<float>(u) / 16.0f;
         texVf = static_cast<float>(v) / 16.0f;
@@ -2329,8 +3130,10 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
 
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
     {
-        sampleU = clampInt(sampleU, 0, texW - 1);
-        sampleV = clampInt(sampleV, 0, texH - 1);
+        sampleU = wrapTexCoord(sampleU, texW, static_cast<unsigned>(ctx.clamp.wms),
+                               static_cast<int>(ctx.clamp.minu), static_cast<int>(ctx.clamp.maxu));
+        sampleV = wrapTexCoord(sampleV, texH, static_cast<unsigned>(ctx.clamp.wmt),
+                               static_cast<int>(ctx.clamp.minv), static_cast<int>(ctx.clamp.maxv));
 
         u32 out = gs->ReadTexturePageCache(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 
@@ -2352,6 +3155,13 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         case GS_PSM_T4HL:
         case GS_PSM_T4HH:
             ps2diag_fbstat::t_lastTexIndex = out;
+
+            // Perf (09-27): everything below up to the CLUT lookup is probe
+            // bookkeeping -- several locked RMWs per texel, 4x under bilinear.
+            // Skip it entirely when the diag gate is off.
+            if (!diagOn)
+                return clutEntryToRgba(texa, tex.cpsm,
+                                       gs->ReadClutCache(tex.cpsm, paletteIndex(tex.psm, out), tex.csa));
 
             // [boxtex] -- Stage 5.11 run 22. Every paletted format, not just
             // T8: if suspect #16 is live the box may be arriving as T4, and
@@ -2418,7 +3228,7 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
                 if ((n & 63u) == 0u)
                 {
                     g_tfChk.fetch_add(1, std::memory_order_relaxed);
-                    const u32 direct = gs->ReadVram(tex.psm, tex.tbp0, tex.tbw,
+                    const u32 direct = rasterReadVram(gs->m_vram, tex.psm, tex.tbp0, tex.tbw,
                                                     static_cast<u32>(sampleU),
                                                     static_cast<u32>(sampleV)) & 0xFu;
                     if (direct != (out & 0xFu))
@@ -2433,8 +3243,8 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
             }
 
             const u32 texelOut =
-                applyTexa(texa, tex.psm,
-                          gs->ReadClutCache(tex.cpsm, static_cast<u8>(out), tex.csa));
+                clutEntryToRgba(texa, tex.cpsm,
+                                gs->ReadClutCache(tex.cpsm, paletteIndex(tex.psm, out), tex.csa));
 
             // (3) THE CLUT LOOKUP, measured on the sampler's own result --
             // this is the value the pixel loop receives, not a host-side
@@ -2456,50 +3266,25 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         return 0xFFFF00FFu;
     };
 
-    if (!tex1UsesLinearFilter(ctx.tex1.data))
+    if (t_fixedUv.on) // drawTriangle's PCSX2-exact 16.16 coordinate (TriTexInterp)
     {
-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        const int fu = t_fixedUv.u, fv = t_fixedUv.v;
+        if (!tex1UsesLinearFilter(ctx.tex1.data))
+            return samplePoint(fu >> 16, fv >> 16);
+        return bilinearFilter(samplePoint(fu >> 16, fv >> 16), samplePoint((fu >> 16) + 1, fv >> 16),
+                              samplePoint(fu >> 16, (fv >> 16) + 1), samplePoint((fu >> 16) + 1, (fv >> 16) + 1),
+                              (fu & 0xFFFF) >> 12, (fv & 0xFFFF) >> 12);
     }
 
-    const float sampleU = texUf - 0.5f;
-    const float sampleV = texVf - 0.5f;
-    const int u0 = static_cast<int>(std::floor(sampleU));
-    const int v0 = static_cast<int>(std::floor(sampleV));
-    const int u1 = u0 + 1;
-    const int v1 = v0 + 1;
-    const float fx = sampleU - static_cast<float>(u0);
-    const float fy = sampleV - static_cast<float>(v0);
+    if (!tex1UsesLinearFilter(ctx.tex1.data))
+    {
+        return samplePoint(texFixed16(texUf) >> 16, texFixed16(texVf) >> 16); // PCSX2: 16.16 >> 16 (floor)
+    }
 
-    const uint32_t c00 = samplePoint(u0, v0);
-    const uint32_t c10 = samplePoint(u1, v0);
-    const uint32_t c01 = samplePoint(u0, v1);
-    const uint32_t c11 = samplePoint(u1, v1);
-
-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
-                                  static_cast<uint8_t>(c10 & 0xFFu),
-                                  static_cast<uint8_t>(c01 & 0xFFu),
-                                  static_cast<uint8_t>(c11 & 0xFFu),
-                                  fx, fy);
-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
-                                  fx, fy);
-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
-                                  fx, fy);
-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
-                                  fx, fy);
-
-    return static_cast<uint32_t>(r) |
-           (static_cast<uint32_t>(g) << 8) |
-           (static_cast<uint32_t>(b) << 16) |
-           (static_cast<uint32_t>(a) << 24);
+    const BilinearTap tap = bilinearTap(texUf, texVf);
+    return bilinearFilter(samplePoint(tap.u0, tap.v0), samplePoint(tap.u0 + 1, tap.v0),
+                          samplePoint(tap.u0, tap.v0 + 1), samplePoint(tap.u0 + 1, tap.v0 + 1),
+                          tap.fu, tap.fv);
 }
 
 void GSRasterizer::drawSprite(GS *gs)
@@ -2510,30 +3295,21 @@ void GSRasterizer::drawSprite(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
     u32 z1 = static_cast<u32>(v1.z);
 
-    if (x0 > x1)
-        std::swap(x0, x1);
-    if (y0 > y1)
-        std::swap(y0, y1);
-
-    const int unclippedX0 = x0;
-    const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
-    const int unclippedX1 = unclippedX0 + spanX - 1;
-    const int unclippedY1 = unclippedY0 + spanY - 1;
+    int unclippedX0, unclippedY0, unclippedX1, unclippedY1;
+    if (!spriteCoverage(v0.x, v0.y, v1.x, v1.y, ctx.xyoffset.ofx, ctx.xyoffset.ofy,
+                        unclippedX0, unclippedY0, unclippedX1, unclippedY1))
+        return;
+    const int spanX = unclippedX1 - unclippedX0 + 1; // read by the [uvspan]/[boxtex] probes
+    const int spanY = unclippedY1 - unclippedY0 + 1;
 
     // If the sprite rectangle is fully outside scissor, nothing should render.
-    if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
-        unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
+    // SCISSOR fields are unsigned 64-bit bitfields: compare as int, or a sprite
+    // whose left/top edge is negative converts to a huge value and is culled
+    // (main-menu bottom cloud strip at x=-18.5 vanished, 2026-10-02).
+    if (unclippedX1 < static_cast<int>(ctx.scissor.x0) || unclippedX0 > static_cast<int>(ctx.scissor.x1) ||
+        unclippedY1 < static_cast<int>(ctx.scissor.y0) || unclippedY0 > static_cast<int>(ctx.scissor.y1))
     {
         // maybe a log here idk ?
         return;
@@ -2624,10 +3400,12 @@ void GSRasterizer::drawSprite(GS *gs)
         float u0f, v0f, u1f, v1f;
         if (prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            // Keep the 4 fraction bits: games send u0=0.5 so texel centres
+            // land on pixels; truncating to whole texels shifted every sprite.
+            u0f = static_cast<float>(v0.u) / 16.0f;
+            v0f = static_cast<float>(v0.v) / 16.0f;
+            u1f = static_cast<float>(v1.u) / 16.0f;
+            v1f = static_cast<float>(v1.v) / 16.0f;
         }
         else
         {
@@ -2639,12 +3417,17 @@ void GSRasterizer::drawSprite(GS *gs)
             v1f = (v1.t / q1) * static_cast<float>(texH);
         }
 
-        float spriteW = static_cast<float>(spanX);
-        float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
+        // GS evaluates sprite attributes at INTEGER pixel coordinates, linearly
+        // from v0's exact (sub-pixel) position to v1's, independent of vertex
+        // order: U(x) = U0 + (x - X0) * (U1 - U0) / (X1 - X0).
+        const float ofxF = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+        const float ofyF = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+        const float vx0 = v0.x - ofxF;
+        const float vy0 = v0.y - ofyF;
+        const float spanXf = (v1.x - ofxF) - vx0;
+        const float spanYf = (v1.y - ofyF) - vy0;
+        const float duDx = (spanXf != 0.0f) ? (u1f - u0f) / spanXf : 0.0f;
+        const float dvDy = (spanYf != 0.0f) ? (v1f - v0f) / spanYf : 0.0f;
 
         // [uvspan] -- Stage 5.11 run 23. Reading table at the counters above.
         // Gate is SHAPE ONLY -- psm/tbw/tw/th, no address. The dump says the
@@ -2840,29 +3623,21 @@ void GSRasterizer::drawSprite(GS *gs)
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
-            float texVf = v0f + (v1f - v0f) * ty;
+            float texVf = v0f + (static_cast<float>(y) - vy0) * dvDy;
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
-                float texUf = u0f + (u1f - u0f) * tx;
-                uint32_t texel = 0xFFFF00FFu;
-                if (prim.fst)
-                {
-                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
-                    const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = sampleTexture(gs, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
-                }
-                else
-                {
-                    texel = sampleTexture(gs,
-                                          texUf / static_cast<float>(texW),
-                                          texVf / static_cast<float>(texH),
-                                          1.0f, 0u, 0u);
-                }
+                float texUf = u0f + (static_cast<float>(x) - vx0) * duDx;
+                // FST and STQ alike: PCSX2 steps sprite U/V in 16.16 texels.
+                // Rounding FST to 1/16 texel here broke scaled sprites
+                // (gsfeature sprite_*_uv_scaled). t_sampleAsStq makes
+                // sampleTexture take the s/t branch even when PRIM.FST=1.
+                t_sampleAsStq = true;
+                const uint32_t texel = sampleTexture(gs,
+                                                     texUf / static_cast<float>(texW),
+                                                     texVf / static_cast<float>(texH),
+                                                     1.0f, 0u, 0u);
+                t_sampleAsStq = false;
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -2877,7 +3652,10 @@ void GSRasterizer::drawSprite(GS *gs)
                     ps2diag_fbstat::g_bxTexel.store(texel, std::memory_order_relaxed);
 
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                writePixel(gs, x, y, z1, color.r, color.g, color.b, color.a);
+                uint8_t fr = color.r, fg = color.g, fb = color.b;
+                if (prim.fge) // PCSX2: a sprite's fog is v1's
+                    applyFog(gs->m_registers.fogcol.data, v1.fog << 7, fr, fg, fb);
+                writePixel(gs, x, y, z1, fr, fg, fb, color.a);
             }
         }
 
@@ -2887,10 +3665,136 @@ void GSRasterizer::drawSprite(GS *gs)
     }
     else
     {
+        if (prim.fge) // PCSX2: a sprite's fog is v1's
+            applyFog(gs->m_registers.fogcol.data, v1.fog << 7, r, g, b);
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
                 writePixel(gs, x, y, z1, r, g, b, a);
     }
+}
+
+// [meshdump] PS2X_MESHDUMP=<path> -- ad-hoc 3D-asset capture (2026-09-18).
+//
+// Dumps every triangle drawTriangle() submits to a Wavefront OBJ: position
+// (screen-space, post-VU1/post-projection -- one frozen pose/camera angle,
+// correct topology and UV, not a re-posable rest-pose rig) plus a
+// perspective-correct UV computed with the exact same math sampleTexture()
+// uses (fst ? raw u,v/16 : s,t divided by fabsQ(q), scaled by texture size).
+// A comment line notes the bound texture (tbp0/psm/tw/th) whenever it
+// changes, to pair the dump with the existing `SDBZ Textures/*.tm2` files.
+//
+// The file is TRUNCATED and rewritten every time the vsync tick advances, so
+// it always holds only the most-recently-completed (or in-progress) frame's
+// geometry, not the whole run -- there's no target-screen detection, so the
+// user starts the game with this set, waits for the desired character/screen
+// to be on-screen, then kills the process and opens whatever's on disk.
+//
+// Entirely opt-in: nothing is written unless PS2X_MESHDUMP names an output
+// file, so a normal run pays one getenv.
+namespace ps2diag_meshdump
+{
+inline const char *outPath()
+{
+    static const char *path = []() -> const char * {
+        const char *p = std::getenv("PS2X_MESHDUMP");
+        std::cerr << "[meshdump] env PS2X_MESHDUMP=" << (p ? p : "(unset)") << std::endl;
+        return p;
+    }();
+    return path;
+}
+
+inline void noteTriangleSeen()
+{
+    static std::atomic<uint64_t> count{0};
+    uint64_t n = ++count;
+    if (n <= 5 || (n % 2000) == 0)
+        std::cerr << "[meshdump] drawTriangle hit #" << n << std::endl;
+}
+
+struct State
+{
+    std::ofstream file;
+    uint64_t lastTick = ~0ull;
+    uint32_t nextIndex = 1;
+    uint32_t lastTbp0 = 0xFFFFFFFFu;
+    bool lastTexValid = false;
+};
+
+inline State &state()
+{
+    static State s;
+    return s;
+}
+
+inline void dumpTriangle(uint64_t tick, const GSVertex &v0, const GSVertex &v1, const GSVertex &v2,
+                          const GSContext &ctx, bool textured, bool fst)
+{
+    noteTriangleSeen();
+    const char *path = outPath();
+    if (!path || path[0] == '\0')
+        return;
+
+    State &s = state();
+    if (tick != s.lastTick)
+    {
+        s.file.close();
+        s.file.open(path, std::ios::out | std::ios::trunc);
+        s.lastTick = tick;
+        s.nextIndex = 1;
+        s.lastTexValid = false;
+    }
+    if (!s.file.is_open())
+        return;
+
+    if (textured)
+    {
+        uint32_t tbp0 = static_cast<uint32_t>(ctx.tex0.tbp0);
+        if (!s.lastTexValid || tbp0 != s.lastTbp0)
+        {
+            s.file << "# tex tbp0=0x" << std::hex << tbp0
+                   << " psm=0x" << static_cast<uint32_t>(ctx.tex0.psm) << std::dec
+                   << " tw=" << (1u << ctx.tex0.tw)
+                   << " th=" << (1u << ctx.tex0.th) << "\n";
+            s.lastTbp0 = tbp0;
+            s.lastTexValid = true;
+        }
+    }
+
+    const int texW = 1 << ctx.tex0.tw;
+    const int texH = 1 << ctx.tex0.th;
+    auto texelUV = [&](const GSVertex &v) -> std::pair<float, float>
+    {
+        if (!textured)
+            return { 0.0f, 0.0f };
+        float texUf, texVf;
+        if (fst)
+        {
+            texUf = static_cast<float>(v.u) / 16.0f;
+            texVf = static_cast<float>(v.v) / 16.0f;
+        }
+        else
+        {
+            const float invQ = 1.0f / fabsQ(v.q);
+            texUf = v.s * invQ * static_cast<float>(texW);
+            texVf = v.t * invQ * static_cast<float>(texH);
+        }
+        return { texUf / static_cast<float>(texW), 1.0f - texVf / static_cast<float>(texH) };
+    };
+
+    const GSVertex *verts[3] = { &v0, &v1, &v2 };
+    for (const GSVertex *v : verts)
+        s.file << "v " << v->x << ' ' << v->y << ' ' << v->z << "\n";
+    for (const GSVertex *v : verts)
+    {
+        const auto [u, vv] = texelUV(*v);
+        s.file << "vt " << u << ' ' << vv << "\n";
+    }
+    s.file << "f " << s.nextIndex << "/" << s.nextIndex << ' '
+           << (s.nextIndex + 1) << "/" << (s.nextIndex + 1) << ' '
+           << (s.nextIndex + 2) << "/" << (s.nextIndex + 2) << "\n";
+    s.nextIndex += 3;
+    s.file.flush();
+}
 }
 
 void GSRasterizer::drawTriangle(GS *gs)
@@ -2902,47 +3806,91 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    // Perf (09-27): only pay for the hit counter / vsync-tick query when a dump
+    // is requested or the diag gate is on.
+    if (ps2_diag::enabled() || ps2diag_meshdump::outPath())
+    {
+        const uint64_t meshdumpTick = gs->m_runtime ? gs->m_runtime->eeScheduler().currentVSyncTick() : 0ull;
+        ps2diag_meshdump::dumpTriangle(meshdumpTick, v0, v1, v2, ctx, prim.tme != 0, prim.fst != 0);
+    }
 
-    float fx0 = v0.x - static_cast<float>(ofx);
-    float fy0 = v0.y - static_cast<float>(ofy);
-    float fx1 = v1.x - static_cast<float>(ofx);
-    float fy1 = v1.y - static_cast<float>(ofy);
-    float fx2 = v2.x - static_cast<float>(ofx);
-    float fy2 = v2.y - static_cast<float>(ofy);
+    // GS samples pixels at INTEGER coordinates (not x+0.5) with a top-left fill
+    // rule: a pixel is in if ceil(left) <= x < ceil(right), same for y. Done in
+    // the GS's own 1/16-pixel fixed point so ties (vertex exactly on a pixel)
+    // resolve exactly; XYOFFSET keeps its fraction bits.
+    const int64_t ofx16 = static_cast<int64_t>(ctx.xyoffset.ofx);
+    const int64_t ofy16 = static_cast<int64_t>(ctx.xyoffset.ofy);
+    const int64_t X[3] = {static_cast<int64_t>(std::lround(v0.x * 16.0f)) - ofx16,
+                          static_cast<int64_t>(std::lround(v1.x * 16.0f)) - ofx16,
+                          static_cast<int64_t>(std::lround(v2.x * 16.0f)) - ofx16};
+    const int64_t Y[3] = {static_cast<int64_t>(std::lround(v0.y * 16.0f)) - ofy16,
+                          static_cast<int64_t>(std::lround(v1.y * 16.0f)) - ofy16,
+                          static_cast<int64_t>(std::lround(v2.y * 16.0f)) - ofy16};
 
-    int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-    int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-    int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-    int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
+    // Twice the signed area; orient so the inside of every edge is positive.
+    int64_t area2 = (X[1] - X[0]) * (Y[2] - Y[0]) - (Y[1] - Y[0]) * (X[2] - X[0]);
+    if (area2 == 0)
+        return;
+    const int64_t sgn = (area2 < 0) ? -1 : 1;
+    area2 *= sgn;
 
-    minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-    maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-    minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-    maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
+    // Edge i is opposite vertex i: A = vertex (i+1)%3, B = vertex (i+2)%3.
+    // E_i(P) = sgn * ((Bx-Ax)(Py-Ay) - (By-Ay)(Px-Ax)); E_i(vertex i) = area2.
+    int64_t edx[3], edy[3], bias[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        const int a = (i + 1) % 3, b = (i + 2) % 3;
+        edx[i] = sgn * (X[b] - X[a]);
+        edy[i] = sgn * (Y[b] - Y[a]);
+        // Left edge (inside to its right: edy < 0) or top edge (horizontal,
+        // inside below: edx > 0) includes pixels exactly on it; others don't.
+        const bool topLeft = (edy[i] < 0) || (edy[i] == 0 && edx[i] > 0);
+        bias[i] = topLeft ? 0 : -1;
+    }
 
-    float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-    if (std::fabs(denom) < 0.001f)
+    auto ceil16 = [](int64_t v) -> int { return static_cast<int>((v >= 0) ? (v + 15) / 16 : -((-v) / 16)); };
+    int minX = ceil16(std::min({X[0], X[1], X[2]}));
+    int maxX = ceil16(std::max({X[0], X[1], X[2]})) - 1;
+    int minY = ceil16(std::min({Y[0], Y[1], Y[2]}));
+    int maxY = ceil16(std::max({Y[0], Y[1], Y[2]})) - 1;
+
+    minX = std::max(minX, static_cast<int>(ctx.scissor.x0));
+    maxX = std::min(maxX, static_cast<int>(ctx.scissor.x1));
+    minY = std::max(minY, static_cast<int>(ctx.scissor.y0));
+    maxY = std::min(maxY, static_cast<int>(ctx.scissor.y1));
+    if (minX > maxX || minY > maxY)
         return;
 
-    const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-    const float invAbsDenom = 1.0f / std::fabs(denom);
-    constexpr float kEdgeEpsilon = 1.0e-4f;
+    const float invArea = 1.0f / static_cast<float>(area2);
+
+    TriTexInterp triTex;
+    const bool triTexOn = prim.tme &&
+                          triTex.setup(v0, v1, v2, static_cast<float>(ctx.xyoffset.ofx) / 16.0f,
+                                       static_cast<float>(ctx.xyoffset.ofy) / 16.0f, prim.fst != 0,
+                                       static_cast<int>(ctx.tex0.tw), static_cast<int>(ctx.tex0.th),
+                                       tex1UsesLinearFilter(ctx.tex1.data));
 
     for (int y = minY; y <= maxY; ++y)
     {
-        float py = static_cast<float>(y) + 0.5f;
-        for (int x = minX; x <= maxX; ++x)
+        const int64_t py = static_cast<int64_t>(y) * 16;
+        const int64_t px0 = static_cast<int64_t>(minX) * 16;
+        bool rowStarted = false;
+        int64_t e[3];
+        for (int i = 0; i < 3; ++i)
         {
-            float px = static_cast<float>(x) + 0.5f;
-
-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-            float w2 = 1.0f - w0 - w1;
-
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
-                continue;
+            const int a = (i + 1) % 3;
+            e[i] = edx[i] * (py - Y[a]) - edy[i] * (px0 - X[a]);
+        }
+        int xs, xe;
+        if (!triRowSpan(e, edy, bias, minX, maxX, xs, xe))
+            continue;
+        for (int i = 0; i < 3; ++i)
+            e[i] -= edy[i] * 16 * (xs - minX);
+        for (int x = xs; x <= xe; ++x, e[0] -= edy[0] * 16, e[1] -= edy[1] * 16, e[2] -= edy[2] * 16)
+        {
+            const float w0 = static_cast<float>(e[0]) * invArea;
+            const float w1 = static_cast<float>(e[1]) * invArea;
+            const float w2 = 1.0f - w0 - w1;
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
 
@@ -2976,20 +3924,31 @@ void GSRasterizer::drawTriangle(GS *gs)
                 }
                 else
                 {
-                    const float invQ0 = 1.0f / fabsQ(v0.q);
-                    const float invQ1 = 1.0f / fabsQ(v1.q);
-                    const float invQ2 = 1.0f / fabsQ(v2.q);
-                    const float sOverQ = (v0.s * invQ0) * w0 + (v1.s * invQ1) * w1 + (v2.s * invQ2) * w2;
-                    const float tOverQ = (v0.t * invQ0) * w0 + (v1.t * invQ1) * w1 + (v2.t * invQ2) * w2;
-                    const float invQ = invQ0 * w0 + invQ1 * w1 + invQ2 * w2;
-                    iq = (std::fabs(invQ) > 1.0e-8f) ? (1.0f / invQ) : 1.0f;
-                    is = sOverQ * iq;
-                    it = tOverQ * iq;
+                    // The GS interpolates S, T and Q LINEARLY in screen space and
+                    // divides per pixel: u = (sum wi*si) / (sum wi*qi). Pre-dividing
+                    // each vertex by its own q here cancelled exactly against
+                    // sampleTexture()'s divide and left affine (PS1-style) texture
+                    // mapping -- invisible on 2D content where q == 1, smeared on 3D.
+                    // sampleTexture() does the one divide, guarded by fabsQ().
+                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
                     iu = 0;
                     iv = 0;
                 }
 
+                if (triTexOn)
+                {
+                    if (!rowStarted)
+                    {
+                        triTex.beginRow(y, x);
+                        rowStarted = true;
+                    }
+                    t_fixedUv.on = true;
+                    triTex.at(x, t_fixedUv.u, t_fixedUv.v);
+                }
                 uint32_t texel = sampleTexture(gs, is, it, iq, iu, iv);
+                t_fixedUv.on = false;
 
                 ps2diag_fbstat::t_lastTexel = texel;
 
@@ -3011,6 +3970,8 @@ void GSRasterizer::drawTriangle(GS *gs)
                 a = color.a;
             }
 
+            if (prim.fge)
+                applyFog(gs->m_registers.fogcol.data, fogF16(v0.fog * w0 + v1.fog * w1 + v2.fog * w2), r, g, b);
             writePixel(gs, x, y, static_cast<u32>(z + 0.5), r, g, b, a);
         }
     }
@@ -3024,28 +3985,11 @@ void GSRasterizer::drawLine(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
+    const float ofxF = static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+    const float ofyF = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
 
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
-
-    int dx = std::abs(x1 - x0);
-    int dy = -std::abs(y1 - y0);
-    int sx = (x0 < x1) ? 1 : -1;
-    int sy = (y0 < y1) ? 1 : -1;
-    int err = dx + dy;
-
-    int totalSteps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
-    if (totalSteps == 0)
-        totalSteps = 1;
-    int step = 0;
-
-    for (;;)
+    walkLinePcsx2(v0.x - ofxF, v0.y - ofyF, v1.x - ofxF, v1.y - ofyF, [&](int x0, int y0, float t)
     {
-        float t = static_cast<float>(step) / static_cast<float>(totalSteps);
         uint8_t r, g, b, a;
         if (prim.iip)
         {
@@ -3064,22 +4008,8 @@ void GSRasterizer::drawLine(GS *gs)
 
         double z = (v0.z + (v1.z - v0.z) * t);
 
+        if (prim.fge)
+            applyFog(gs->m_registers.fogcol.data, fogF16(v0.fog + (v1.fog - v0.fog) * t), r, g, b);
         writePixel(gs, x0, y0, static_cast<u32>(z), r, g, b, a);
-
-        if (x0 == x1 && y0 == y1)
-            break;
-
-        int e2 = 2 * err;
-        if (e2 >= dy)
-        {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx)
-        {
-            err += dx;
-            y0 += sy;
-        }
-        ++step;
-    }
+    });
 }

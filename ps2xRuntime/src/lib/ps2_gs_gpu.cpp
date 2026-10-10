@@ -8,6 +8,7 @@
 #include "runtime/ps2_pipeline_stats.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +16,25 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <array>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+// Threaded rasterizer (ps2_gs_raster_mt.inl): wait for, or tell it about, VRAM
+// accesses made outside it. Declared here, not in a header.
+void ps2xGsRasterFlush();
+extern int g_gsmtWaitReason; // stats only (ps2_gs_rasterizer.cpp)
+void ps2xGsRasterReset();
+void ps2xGsRasterSyncRect(uint32_t baseBlock, uint32_t bw, uint32_t psm,
+                          uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool write);
+void ps2xGsRasterClutChanged();
+bool ps2xGsRasterDeferUpload(uint8_t *vram, uint32_t baseBlock, uint32_t bw, uint32_t psm,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             void (*apply)(void *), void *ctx);
+
+// Texture page cache slots (defined next to GS::ReadTexturePageCache).
+static void texPageCacheNewPrimitive();
 
 // Defined in ps2_gs_rasterizer.cpp -- see the [fbdest] block in the present
 // probe below. Declared here rather than in a header so a diagnostic counter
@@ -517,6 +536,117 @@ namespace
         char buf[64];
         std::snprintf(buf, sizeof(buf), "/%s_0x%04x.%s", prefix, id, ext);
         return std::string(gsDumpDir()) + buf;
+    }
+
+    // ---------------------------------------------------------------------
+    // [gscap] -- live GIF stream capture for the offline replay.
+    //
+    // PS2X_GSCAP="<tick>,<frames>,<path>" writes <path>.vram (VRAM at the
+    // start) and <path>.gsr (every packet handed to processGIFPacket for
+    // <frames> vsync ticks), the same container ps2x_gs_bench.exe replays
+    // from a PCSX2 dump. Transfer 0 is a synthetic A+D packet restoring the
+    // GS registers, as gsdump_parse.py --init-state does, so bench transfer
+    // indices line up the same way. Opt-in: a normal run pays one getenv.
+    //
+    // Not captured: the CLUT buffer (the replay reloads it from VRAM on the
+    // TEX0 write) and a primitive whose vertices straddle the start.
+    // ---------------------------------------------------------------------
+    struct GsCap
+    {
+        bool wanted = false;
+        bool active = false;
+        bool done = false;
+        uint64_t startTick = 0;
+        uint64_t frames = 1;
+        uint64_t beginTick = 0;
+        uint64_t every = 0; // PS2X_GSCAP_EVERY=N: re-arm N ticks after each capture starts
+        std::string base;
+        std::string path;
+        std::vector<uint8_t> regs;
+        std::vector<uint32_t> index; // {offset, size, path} per transfer
+        std::vector<uint8_t> payload;
+    };
+
+    constexpr size_t kGsCapMaxPayload = 256u * 1024u * 1024u;
+
+    GsCap &gsCap()
+    {
+        static GsCap cap = [] {
+            GsCap c;
+            if (const char *spec = std::getenv("PS2X_GSCAP"))
+            {
+                unsigned long long tick = 0ull, frames = 0ull;
+                char out[512] = {};
+                if (std::sscanf(spec, "%llu,%llu,%511[^\n]", &tick, &frames, out) == 3 && frames != 0ull && out[0])
+                {
+                    c.wanted = true;
+                    c.startTick = tick;
+                    c.frames = frames;
+                    c.base = out;
+                    c.path = out;
+                    if (const char *ev = std::getenv("PS2X_GSCAP_EVERY"))
+                        c.every = std::strtoull(ev, nullptr, 10);
+                    std::cerr << "[gscap] armed tick=" << tick << " frames=" << frames << " every=" << c.every
+                              << " path=" << c.path << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[gscap] bad PS2X_GSCAP (want \"<tick>,<frames>,<path>\"): " << spec << std::endl;
+                }
+            }
+            return c;
+        }();
+        return cap;
+    }
+
+    void gsCapAppend(GsCap &cap, const uint8_t *data, uint32_t sizeBytes)
+    {
+        cap.index.push_back(static_cast<uint32_t>(cap.payload.size()));
+        cap.index.push_back(sizeBytes);
+        cap.index.push_back(0u);
+        cap.payload.insert(cap.payload.end(), data, data + sizeBytes);
+    }
+
+    bool gsCapWriteVram(const GsCap &cap, const uint8_t *vram, uint32_t vramSize)
+    {
+        std::FILE *f = std::fopen((cap.path + ".vram").c_str(), "wb");
+        if (!f)
+            return false;
+        const bool ok = std::fwrite(vram, 1, vramSize, f) == vramSize;
+        std::fclose(f);
+        return ok;
+    }
+
+    void gsCapFinish(GsCap &cap, uint64_t endTick)
+    {
+        cap.active = false;
+        cap.done = true;
+        const std::string out = cap.path + ".gsr";
+        std::FILE *f = std::fopen(out.c_str(), "wb");
+        if (!f)
+        {
+            std::cerr << "[gscap] cannot write " << out << std::endl;
+            return;
+        }
+        const uint32_t fields[5] = {1u, static_cast<uint32_t>(cap.index.size() / 3u),
+                                    static_cast<uint32_t>(cap.regs.size()),
+                                    static_cast<uint32_t>(cap.payload.size()), 0u};
+        std::fwrite("GSR1", 1, 4, f);
+        std::fwrite(fields, sizeof(uint32_t), 5, f);
+        std::fwrite(cap.regs.data(), 1, cap.regs.size(), f);
+        std::fwrite(cap.index.data(), sizeof(uint32_t), cap.index.size(), f);
+        std::fwrite(cap.payload.data(), 1, cap.payload.size(), f);
+        std::fclose(f);
+        std::cerr << "[gscap] wrote " << out << " transfers=" << fields[1] << " bytes=" << fields[3]
+                  << " ticks=" << cap.beginTick << ".." << endTick << std::endl;
+        cap.index = {};
+        cap.payload = {};
+        if (cap.every != 0ull)
+        {
+            // Periodic mode: files are <path>_t<tick>.gsr/.vram.
+            cap.done = false;
+            cap.startTick = cap.beginTick + cap.every;
+        }
     }
 
     // Uncompressed 32-bit TGA, top-left origin. Input is the host RGBA buffer
@@ -1024,10 +1154,42 @@ namespace
         return false;
     }
 
+// 2026-09-22 Part 158 [vflip] -- defined in game_overrides.cpp. Declared here
+// rather than in a header: any .h edit rebuilds all 30,000+ generated runner
+// TUs (30+ hours). extern-between-.cpp is the sanctioned cross-TU pattern.
+extern "C" void ps2x_probe_kv(const char *name, int n,
+                              const char *const *keys, const uint64_t *vals);
+
     std::atomic<uint32_t> s_debugGifPacketCount{0};
     std::atomic<uint32_t> s_debugGsRegisterCount{0};
     std::atomic<uint32_t> s_debugGsPackedVertexCount{0};
     std::atomic<uint32_t> s_debugGsVertexKickCount{0};
+
+    // 2026-09-22 Part 158 [vflip] -- see the block in GS::vertexKick.
+    // Plain (non-atomic) counters: vertexKick is only ever entered from the
+    // single GIF-consumer thread, same as m_vtxCount which it already ++'s
+    // unguarded. A locked RMW here would sit on a 3.5M-hit/frame path, which
+    // is exactly the shape that once cost 19% of guest throughput.
+    // v2: one cap per bucket, but sampled with a GROWING stride so the records
+    // span the WHOLE run instead of its first instant. v1 filled from the start
+    // and therefore never saw the fight -- the defect that made the first
+    // comparison against the PCSX2 oracle meaningless.
+    constexpr uint32_t kVflipCap = 1536u;
+    constexpr uint32_t kVflipGrowEvery = 32u; // double the stride every N taken
+    std::atomic<bool> s_vflipArmed{[] {
+        const char *e = std::getenv("PS2X_VFLIP");
+        return e != nullptr && e[0] != 0 && e[0] != '0';
+    }()};
+    struct VflipBucket
+    {
+        uint64_t seen = 0;   // primitives of this kind seen so far
+        uint64_t next = 0;   // index of the next one to record
+        uint64_t stride = 1; // gap to the one after that
+        uint32_t taken = 0;  // records emitted
+    };
+    // Plain (non-atomic): vertexKick is only ever entered from the single
+    // GIF-consumer thread, same as m_vtxCount which it already ++'s unguarded.
+    VflipBucket s_vflipBucket[3];
     std::atomic<uint32_t> s_debugCopyRegCount{0};
     std::atomic<uint32_t> s_debugTexaWriteCount{0};
     std::atomic<uint32_t> s_debugCvFontUploadCount{0};
@@ -1106,6 +1268,324 @@ namespace
     }
 
     // -----------------------------------------------------------------------
+    // [texmiss] "drawn but never uploaded" texture log, read by
+    // build_scripts/texmiss.py. Opt-in:
+    //
+    //     PS2X_TEXMISS_LOG=<path>
+    //
+    // Streams every Draw / Transfer / Present history event for the WHOLE run,
+    // one JSON line each, flushed once per GIF packet drain. Independent of
+    // PS2X_GSHISTORY_DUMP below, which keeps its one-shot draws-only behaviour.
+    //
+    // While active:
+    //   - GifTag / Register events are not recorded (recordDebugEventUnlocked),
+    //     so the 512-entry ring only holds events this log uses.
+    //   - Draw entries carry XYOFFSET in regValue and CLAMP in gifSizeBytes (low
+    //     32 bits) / gifNloop (high 32 bits). Those fields are unused on Draw rows
+    //     (the F1 panel prints them only for GifTag / Register rows). The vertex
+    //     bbox is raw primitive space (XYZ / 16), so the checker needs XYOFFSET to
+    //     find framebuffer pixels, and CLAMP to narrow the texels a draw reads.
+    //   - Ring overflow is never silent: a "LOSS" line counts dropped events.
+    //   - If something else paused history (F1 panel), it is resumed and a
+    //     "PAUSED" line is written: events recorded while paused are lost.
+    // -----------------------------------------------------------------------
+    static bool g_texmissInitialized = false;
+    static std::FILE *g_texmissFile = nullptr;
+    static bool g_texmissPauseReported = false;
+    static uint64_t g_texmissLostEvents = 0;
+    static std::chrono::steady_clock::time_point g_texmissStart;
+
+    inline bool texmissActive()
+    {
+        return g_texmissFile != nullptr;
+    }
+
+    double texmissSeconds()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_texmissStart).count();
+    }
+
+    // Size cap + repeat filter. A 33-minute manual play wrote 39.5 GB (disk full,
+    // 10-10): every draw of every frame was logged although build_scripts/texmiss.py
+    // only keys on (a) the first read of each texture/CLUT key, (b) a write rect not
+    // already covered by an earlier rect of the same (psm,bp,bw), (c) the first
+    // occurrence of each distinct transfer. Rows that cannot change a verdict are
+    // not written. PS2X_TEXMISS_MAX_MB=<n> closes the log at n MB (default 4096,
+    // 0 = unlimited). The "draws" column of the report counts logged draws only.
+    static uint64_t g_texmissCapBytes = 4096ull << 20;
+    static uint64_t g_texmissBatches = 0;
+    static uint64_t g_texmissFiltered = 0;
+    static std::unordered_set<uint64_t> g_texmissReadSeen;
+    static std::unordered_set<uint64_t> g_texmissXferSeen;
+    static std::unordered_map<uint64_t, std::vector<std::array<int32_t, 4>>> g_texmissCovered;
+
+    inline void texmissMix(uint64_t &h, uint64_t v)
+    {
+        h = (h ^ v) * 1099511628211ull;
+    }
+
+    static bool g_texmissLogAll = false; // PS2X_TEXMISS_ALL=1: no repeat filter (texmiss.py --scene needs it)
+
+    bool texmissKeepDraw(const GSDebugHistoryEntry &e)
+    {
+        if (g_texmissLogAll)
+        {
+            return true;
+        }
+        bool keep = false;
+        if (e.prim.tme)
+        {
+            uint64_t h = 1469598103934665603ull;
+            texmissMix(h, e.tex0.tbp0);
+            texmissMix(h, e.tex0.tbw);
+            texmissMix(h, e.tex0.psm);
+            texmissMix(h, e.tex0.tw);
+            texmissMix(h, e.tex0.th);
+            texmissMix(h, e.tex0.cbp);
+            texmissMix(h, e.tex0.cpsm);
+            texmissMix(h, e.tex0.csm);
+            texmissMix(h, e.gifSizeBytes); // CLAMP low/high words (see header comment)
+            texmissMix(h, e.gifNloop);
+            keep = g_texmissReadSeen.insert(h).second;
+        }
+        if ((static_cast<uint32_t>(e.frame.fbmsk) & 0xFFFFFFFFu) != 0xFFFFFFFFu)
+        {
+            // Same clip as texmiss.py draw(): bbox - XYOFFSET, inside the scissor.
+            const int32_t ofx = static_cast<int32_t>((e.regValue & 0xFFFFull) >> 4);
+            const int32_t ofy = static_cast<int32_t>(((e.regValue >> 32) & 0xFFFFull) >> 4);
+            const int32_t x0 = std::max({static_cast<int32_t>(e.xMin) - ofx, static_cast<int32_t>(e.scissor.x0), 0});
+            const int32_t y0 = std::max({static_cast<int32_t>(e.yMin) - ofy, static_cast<int32_t>(e.scissor.y0), 0});
+            const int32_t x1 = std::min(static_cast<int32_t>(e.xMax) - ofx, static_cast<int32_t>(e.scissor.x1));
+            const int32_t y1 = std::min(static_cast<int32_t>(e.yMax) - ofy, static_cast<int32_t>(e.scissor.y1));
+            if (x1 >= x0 && y1 >= y0)
+            {
+                const uint64_t k = (static_cast<uint64_t>(e.frame.psm) << 40) |
+                                   (static_cast<uint64_t>(e.frame.fbp) << 8) |
+                                   static_cast<uint64_t>(e.frame.fbw);
+                std::vector<std::array<int32_t, 4>> &list = g_texmissCovered[k];
+                bool inside = false;
+                for (const std::array<int32_t, 4> &r : list)
+                {
+                    if (r[0] <= x0 && r[1] <= y0 && x1 <= r[2] && y1 <= r[3])
+                    {
+                        inside = true;
+                        break;
+                    }
+                }
+                if (!inside)
+                {
+                    keep = true;
+                    list.push_back({x0, y0, x1, y1});
+                    if (list.size() > 24)
+                    {
+                        list.erase(list.begin());
+                    }
+                }
+            }
+        }
+        if (!keep)
+        {
+            ++g_texmissFiltered;
+        }
+        return keep;
+    }
+
+    bool texmissKeepTransfer(const GSDebugHistoryEntry &e)
+    {
+        if (g_texmissLogAll)
+        {
+            return true;
+        }
+        uint64_t h = 1469598103934665603ull;
+        texmissMix(h, e.trxdir & 3u);
+        texmissMix(h, e.bitbltbuf.sbp);
+        texmissMix(h, e.bitbltbuf.sbw);
+        texmissMix(h, e.bitbltbuf.spsm);
+        texmissMix(h, e.trxpos.ssax);
+        texmissMix(h, e.trxpos.ssay);
+        texmissMix(h, e.bitbltbuf.dbp);
+        texmissMix(h, e.bitbltbuf.dbw);
+        texmissMix(h, e.bitbltbuf.dpsm);
+        texmissMix(h, e.trxpos.dsax);
+        texmissMix(h, e.trxpos.dsay);
+        texmissMix(h, e.trxreg.rrw);
+        texmissMix(h, e.trxreg.rrh);
+        if (g_texmissXferSeen.insert(h).second)
+        {
+            return true;
+        }
+        ++g_texmissFiltered;
+        return false;
+    }
+
+    void texmissEnsureInit(GS &gs)
+    {
+        if (g_texmissInitialized)
+        {
+            return;
+        }
+        g_texmissInitialized = true;
+
+        const char *path = std::getenv("PS2X_TEXMISS_LOG");
+        if (!path || !*path)
+        {
+            return;
+        }
+        g_texmissFile = std::fopen(path, "wb");
+        if (!g_texmissFile)
+        {
+            std::cerr << "[texmiss] FAILED to open path=" << path << std::endl;
+            return;
+        }
+        g_texmissStart = std::chrono::steady_clock::now();
+        if (const char *cap = std::getenv("PS2X_TEXMISS_MAX_MB"); cap && *cap)
+        {
+            g_texmissCapBytes = static_cast<uint64_t>(std::strtoull(cap, nullptr, 10)) << 20;
+        }
+        if (const char *all = std::getenv("PS2X_TEXMISS_ALL"); all && *all && all[0] != '0')
+        {
+            g_texmissLogAll = true;
+        }
+        gs.setDebugHistoryPaused(false);
+        // ring = GS::kDebugHistoryCapacity (ps2_gs_gpu.h).
+        std::fprintf(g_texmissFile, "{\"k\":\"H\",\"ver\":1,\"ring\":512}\n");
+        std::fflush(g_texmissFile);
+        std::cerr << "[texmiss] ACTIVE path=" << path << " ring=512" << std::endl;
+    }
+
+    void texmissResumeIfPaused(GS &gs)
+    {
+        if (!texmissActive() || !gs.isDebugHistoryPaused())
+        {
+            return;
+        }
+        gs.setDebugHistoryPaused(false);
+        std::fprintf(g_texmissFile, "{\"k\":\"PAUSED\",\"t\":%.3f}\n", texmissSeconds());
+        if (!g_texmissPauseReported)
+        {
+            g_texmissPauseReported = true;
+            std::cerr << "[texmiss] history was paused (F1 panel or GSHISTORY) -- resumed; events while paused are lost" << std::endl;
+        }
+    }
+
+    void texmissWriteBatch(const std::vector<GSDebugHistoryEntry> &batch)
+    {
+        std::FILE *f = g_texmissFile;
+        if (!f || batch.empty())
+        {
+            return;
+        }
+        const double t = texmissSeconds();
+
+        // seq restarts at 1 on every clearDebugHistory(), and filtered kinds
+        // never take a seq, so last seq > entries kept means the ring wrapped.
+        const uint64_t lastSeq = batch.back().seq;
+        if (lastSeq > batch.size())
+        {
+            const uint64_t dropped = lastSeq - batch.size();
+            g_texmissLostEvents += dropped;
+            std::fprintf(f, "{\"k\":\"LOSS\",\"v\":%llu,\"t\":%.3f,\"dropped\":%llu,\"total\":%llu}\n",
+                         static_cast<unsigned long long>(batch.back().vsyncTick), t,
+                         static_cast<unsigned long long>(dropped),
+                         static_cast<unsigned long long>(g_texmissLostEvents));
+        }
+
+        for (const GSDebugHistoryEntry &e : batch)
+        {
+            const unsigned long long seq = static_cast<unsigned long long>(e.seq);
+            const unsigned long long tick = static_cast<unsigned long long>(e.vsyncTick);
+            if (e.kind == GSDebugEventKind::Draw)
+            {
+                if (!texmissKeepDraw(e))
+                {
+                    continue;
+                }
+                const unsigned long long clamp =
+                    static_cast<unsigned long long>(e.gifSizeBytes) |
+                    (static_cast<unsigned long long>(e.gifNloop) << 32);
+                std::fprintf(f,
+                    "{\"k\":\"D\",\"s\":%llu,\"v\":%llu,\"t\":%.3f,"
+                    "\"prim\":%u,\"tme\":%u,\"ctxt\":%u,\"n\":%u,"
+                    "\"fbp\":%u,\"fbw\":%u,\"fpsm\":%u,\"fbmsk\":%u,"
+                    "\"x0\":%.4f,\"y0\":%.4f,\"x1\":%.4f,\"y1\":%.4f,"
+                    "\"sc\":[%u,%u,%u,%u],\"ofx\":%u,\"ofy\":%u,\"clamp\":%llu,"
+                    "\"tbp\":%u,\"tbw\":%u,\"psm\":%u,\"tw\":%u,\"th\":%u,"
+                    "\"cbp\":%u,\"cpsm\":%u,\"csm\":%u,\"csa\":%u,\"cld\":%u}\n",
+                    seq, tick, t,
+                    static_cast<unsigned>(e.prim.prim), e.prim.tme ? 1u : 0u, e.prim.ctxt ? 1u : 0u,
+                    static_cast<unsigned>(e.vertexCount),
+                    static_cast<unsigned>(e.frame.fbp), static_cast<unsigned>(e.frame.fbw),
+                    static_cast<unsigned>(e.frame.psm), static_cast<unsigned>(e.frame.fbmsk),
+                    static_cast<double>(e.xMin), static_cast<double>(e.yMin),
+                    static_cast<double>(e.xMax), static_cast<double>(e.yMax),
+                    static_cast<unsigned>(e.scissor.x0), static_cast<unsigned>(e.scissor.y0),
+                    static_cast<unsigned>(e.scissor.x1), static_cast<unsigned>(e.scissor.y1),
+                    static_cast<unsigned>(e.regValue & 0xFFFFull),
+                    static_cast<unsigned>((e.regValue >> 32) & 0xFFFFull),
+                    clamp,
+                    static_cast<unsigned>(e.tex0.tbp0), static_cast<unsigned>(e.tex0.tbw),
+                    static_cast<unsigned>(e.tex0.psm),
+                    static_cast<unsigned>(e.tex0.tw), static_cast<unsigned>(e.tex0.th),
+                    static_cast<unsigned>(e.tex0.cbp), static_cast<unsigned>(e.tex0.cpsm),
+                    static_cast<unsigned>(e.tex0.csm), static_cast<unsigned>(e.tex0.csa),
+                    static_cast<unsigned>(e.tex0.cld));
+            }
+            else if (e.kind == GSDebugEventKind::Transfer)
+            {
+                if (!texmissKeepTransfer(e))
+                {
+                    continue;
+                }
+                std::fprintf(f,
+                    "{\"k\":\"X\",\"s\":%llu,\"v\":%llu,\"t\":%.3f,\"xdir\":%u,"
+                    "\"sbp\":%u,\"sbw\":%u,\"spsm\":%u,\"sx\":%u,\"sy\":%u,"
+                    "\"dbp\":%u,\"dbw\":%u,\"dpsm\":%u,\"dx\":%u,\"dy\":%u,"
+                    "\"w\":%u,\"h\":%u,\"px\":%u}\n",
+                    seq, tick, t, static_cast<unsigned>(e.trxdir & 3u),
+                    static_cast<unsigned>(e.bitbltbuf.sbp), static_cast<unsigned>(e.bitbltbuf.sbw),
+                    static_cast<unsigned>(e.bitbltbuf.spsm),
+                    static_cast<unsigned>(e.trxpos.ssax), static_cast<unsigned>(e.trxpos.ssay),
+                    static_cast<unsigned>(e.bitbltbuf.dbp), static_cast<unsigned>(e.bitbltbuf.dbw),
+                    static_cast<unsigned>(e.bitbltbuf.dpsm),
+                    static_cast<unsigned>(e.trxpos.dsax), static_cast<unsigned>(e.trxpos.dsay),
+                    static_cast<unsigned>(e.trxreg.rrw), static_cast<unsigned>(e.trxreg.rrh),
+                    static_cast<unsigned>(e.transferPixels));
+            }
+            else if (e.kind == GSDebugEventKind::Present)
+            {
+                std::fprintf(f,
+                    "{\"k\":\"P\",\"s\":%llu,\"v\":%llu,\"t\":%.3f,"
+                    "\"dfbp\":%u,\"sfbp\":%u,\"w\":%u,\"h\":%u,\"pref\":%u}\n",
+                    seq, tick, t,
+                    static_cast<unsigned>(e.displayFbp), static_cast<unsigned>(e.sourceFbp),
+                    static_cast<unsigned>(e.width), static_cast<unsigned>(e.height),
+                    e.usedPreferred ? 1u : 0u);
+            }
+        }
+        std::fflush(f);
+
+        // Size cap, checked every 1024 batches (ftell is a CRT call).
+        if (g_texmissCapBytes && (++g_texmissBatches & 1023u) == 0)
+        {
+#ifdef _WIN32
+            const long long pos = _ftelli64(f);
+#else
+            const long long pos = ftello(f);
+#endif
+            if (pos >= 0 && static_cast<uint64_t>(pos) >= g_texmissCapBytes)
+            {
+                std::fprintf(f, "{\"k\":\"CAP\",\"t\":%.3f,\"bytes\":%lld,\"filtered\":%llu}\n", t, pos,
+                             static_cast<unsigned long long>(g_texmissFiltered));
+                std::fclose(f);
+                g_texmissFile = nullptr;
+                std::cerr << "[texmiss] size cap reached (" << pos << " bytes, PS2X_TEXMISS_MAX_MB) at t="
+                          << t << "s -- log closed; " << g_texmissFiltered << " repeat rows were not written"
+                          << std::endl;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Live-side counterpart to `gsdump_draws.py --emit-jsonl`. Stage 5.11 needs
     // to diff the live EE path's actual TEX0/CLUT/draw state against an
     // authentic PCSX2 dump; the debug-history ring (GSDebugHistoryEntry) already
@@ -1152,12 +1632,23 @@ namespace
             }
         }
 
-        if (!active || done)
+        texmissEnsureInit(gs);
+        const bool gsHistoryActive = active && !done;
+        if (!gsHistoryActive && !texmissActive())
         {
             return;
         }
 
-        for (GSDebugHistoryEntry e : gs.getDebugHistory())
+        texmissResumeIfPaused(gs);
+        const std::vector<GSDebugHistoryEntry> batch = gs.getDebugHistory();
+        texmissWriteBatch(batch);
+        if (!gsHistoryActive)
+        {
+            gs.clearDebugHistory();
+            return;
+        }
+
+        for (GSDebugHistoryEntry e : batch)
         {
             if (e.kind != GSDebugEventKind::Draw)
             {
@@ -1211,7 +1702,10 @@ namespace
             std::fclose(f);
         }
 
-        gs.setDebugHistoryPaused(true);
+        if (!texmissActive())
+        {
+            gs.setDebugHistoryPaused(true);
+        }
         done = true;
         accum.clear();
     }
@@ -1333,17 +1827,20 @@ GS::GS()
     reset();
 }
 
-void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs, PS2Runtime *runtime)
 {
+    ps2xGsRasterReset();
     m_vram = vram;
     m_vramSize = vramSize;
     m_privRegs = privRegs;
+    m_runtime = runtime;
     reset();
 }
 
 void GS::reset()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ps2xGsRasterReset();
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_pendingImageBytes = 0;
@@ -1364,6 +1861,7 @@ void GS::reset()
     m_debugNextSeq = 1;
     m_debugFrameIndex = 0;
     m_debugLastVsyncTick = UINT64_MAX;
+    m_registers.prmodecont.data = 1; // GS reset value (AC=1: PRIM sets the attributes)
 }
 
 GSContext &GS::activeContext()
@@ -1376,6 +1874,8 @@ void GS::snapshotVRAM()
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_vram || m_vramSize == 0)
         return;
+    g_gsmtWaitReason = 8;
+    ps2xGsRasterFlush();
     std::lock_guard<std::mutex> lock(m_snapshotMutex);
     m_displaySnapshot.resize(m_vramSize);
     std::memcpy(m_displaySnapshot.data(), m_vram, m_vramSize);
@@ -1493,7 +1993,15 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
         return;
     }
 
-    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    // [texmiss] keep the 512-entry ring for the kinds that log uses. Filtered
+    // before seq is taken, so texmiss's seq-based loss count stays exact.
+    if (texmissActive() &&
+        (entry.kind == GSDebugEventKind::GifTag || entry.kind == GSDebugEventKind::Register))
+    {
+        return;
+    }
+
+    const uint64_t tick = m_runtime ? ps2_syscalls::GetCurrentVSyncTick(m_runtime) : 0ull;
     if (m_debugLastVsyncTick == UINT64_MAX)
     {
         m_debugLastVsyncTick = tick;
@@ -1608,6 +2116,17 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
         entry.aMax = std::max(entry.aMax, v.a);
     }
 
+    // [texmiss] stash XYOFFSET / CLAMP in fields Draw rows don't use.
+    // See the texmiss block above gsHistoryDrainAndMaybeFlush.
+    if (texmissActive())
+    {
+        const uint32_t ci = m_registers.prim.ctxt ? 1u : 0u;
+        entry.regValue = m_registers.ctx[ci].xyoffset.data;
+        const uint64_t clamp = m_registers.ctx[ci].clamp.data;
+        entry.gifSizeBytes = static_cast<uint32_t>(clamp);
+        entry.gifNloop = static_cast<uint32_t>(clamp >> 32);
+    }
+
     recordDebugEventUnlocked(entry);
 }
 
@@ -1669,6 +2188,104 @@ void GS::refreshDisplaySnapshot()
     snapshotVRAM();
 }
 
+static bool latchCheckOn()
+{
+    static const bool on = []
+    {
+        const char *e = std::getenv("PS2X_LATCH_CHECK");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+// PS2X_LATCH_CHECK=1: the page-wise copy (fast) against the per-pixel reference.
+static void latchCheckCompare(const std::vector<uint8_t> &fast, const std::vector<uint8_t> &ref,
+                              uint32_t width, uint32_t height, uint32_t psm)
+{
+    if (fast.empty())
+        return;
+    static std::atomic<uint64_t> frames{0}, bad{0};
+    uint64_t badPx = 0;
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+            if (std::memcmp(&fast[(y * 640u + x) * 4u], &ref[(y * 640u + x) * 4u], 4) != 0)
+                ++badPx;
+    const uint64_t n = frames.fetch_add(1) + 1;
+    if (badPx)
+        bad.fetch_add(1);
+    if (badPx || (n % 600) == 0)
+        std::printf("[latchcheck] copies=%llu badCopies=%llu psm=0x%x w=%u h=%u badPx=%llu\n",(unsigned long long)n,
+                    (unsigned long long)bad.load(), psm, width, height, (unsigned long long)badPx);
+}
+
+// 10-09 P6: read a frame rect out of swizzled VRAM a page at a time instead of one
+// address lookup per pixel (the display latch was ~4 ms per frame on the GS thread
+// with the raster workers idle). Same page/block layout as the per-pixel readers
+// (ReadPixelCT32 / CT16 / CT16S): page = (y / pageH) * bw + x / 64, 32 blocks a page.
+// Returns false (output untouched) when a page lies past the end of VRAM; the
+// caller then takes the per-pixel path, which wraps.
+static bool copyRectPagewise(const uint8_t *vram, size_t vramSize, uint32_t psm, uint32_t base, uint32_t bw,
+                             uint32_t ox, uint32_t oy, uint32_t w, uint32_t h, uint8_t *out, uint32_t outPitch,
+                             bool preserveAlpha)
+{
+    const bool is32 = (psm == GS_PSM_CT32 || psm == GS_PSM_CT24);
+    const uint32_t pageH = is32 ? 32u : 64u;
+    const uint32_t bpp = is32 ? 4u : 2u;
+    const uint32_t pitch = 64u * bpp;
+    if (w == 0u || h == 0u)
+        return true;
+    const uint32_t px0 = ox / 64u, px1 = (ox + w - 1u) / 64u;
+    const uint32_t py0 = oy / pageH, py1 = (oy + h - 1u) / pageH;
+    const uint64_t lastBlock = static_cast<uint64_t>(base) + (static_cast<uint64_t>(py1) * bw + px1) * 32u + 31u;
+    if ((lastBlock + 1u) * 256u > vramSize)
+        return false;
+
+    alignas(64) uint8_t page[64u * 64u * 4u];
+    for (uint32_t py = py0; py <= py1; ++py)
+    {
+        for (uint32_t px = px0; px <= px1; ++px)
+        {
+            const uint32_t blk = base + (py * bw + px) * 32u;
+            if (is32)
+                GSMem::ReadPageToLinearBufferCT32(page, pitch, vram, blk);
+            else if (psm == GS_PSM_CT16S)
+                GSMem::ReadPageToLinearBufferCT16S(page, pitch, vram, blk);
+            else
+                GSMem::ReadPageToLinearBufferCT16(page, pitch, vram, blk);
+
+            const uint32_t x0 = std::max(ox, px * 64u), x1 = std::min(ox + w, px * 64u + 64u);
+            const uint32_t y0 = std::max(oy, py * pageH), y1 = std::min(oy + h, py * pageH + pageH);
+            for (uint32_t y = y0; y < y1; ++y)
+            {
+                const uint8_t *src = page + (y - py * pageH) * pitch + (x0 - px * 64u) * bpp;
+                uint8_t *dst = out + (y - oy) * outPitch + (x0 - ox) * 4u;
+                const uint32_t n = x1 - x0;
+                if (is32)
+                {
+                    std::memcpy(dst, src, static_cast<size_t>(n) * 4u);
+                    if (!preserveAlpha || psm == GS_PSM_CT24)
+                        for (uint32_t i = 0; i < n; ++i)
+                            dst[i * 4u + 3u] = 0xFFu;
+                }
+                else
+                {
+                    for (uint32_t i = 0; i < n; ++i)
+                    {
+                        uint16_t c;
+                        std::memcpy(&c, src + i * 2u, 2);
+                        const uint32_t r = c & 31u, g = (c >> 5) & 31u, b = (c >> 10) & 31u;
+                        dst[i * 4u + 0u] = static_cast<uint8_t>((r << 3) | (r >> 2));
+                        dst[i * 4u + 1u] = static_cast<uint8_t>((g << 3) | (g >> 2));
+                        dst[i * 4u + 2u] = static_cast<uint8_t>((b << 3) | (b >> 2));
+                        dst[i * 4u + 3u] = preserveAlpha ? ((c & 0x8000u) ? 0x80u : 0x00u) : 255u;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                                      uint32_t width,
                                      uint32_t height,
@@ -1683,6 +2300,8 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     {
         return false;
     }
+    g_gsmtWaitReason = 9;
+    ps2xGsRasterFlush();
 
     outPixels.resize(kHostFrameWidth * kHostFrameHeight * 4u);
     auto failCopy = [&outPixels]() -> bool
@@ -1702,6 +2321,15 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
         const uint32_t srcPixelBytes = (frame.psm == GS_PSM_CT24) ? 3u : 4u;
         if (useLocalMemoryLayout)
         {
+            std::vector<uint8_t> fastCopy;
+            if (width <= kHostFrameWidth && height <= kHostFrameHeight &&
+                copyRectPagewise(m_vram, m_vramSize, frame.psm, basePtr, fbwBlocks, sourceOriginX, sourceOriginY,
+                                 width, height, outPixels.data(), kHostFrameWidth * 4u, preserveAlpha))
+            {
+                if (!latchCheckOn())
+                    return true;
+                fastCopy = outPixels; // PS2X_LATCH_CHECK=1: also run the per-pixel path and compare
+            }
             for (uint32_t y = 0; y < height; ++y)
             {
                 uint8_t *dstRow = outPixels.data() + (y * kHostFrameWidth * 4u);
@@ -1728,6 +2356,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                     dstRow[x * 4u + 3u] = a;
                 }
             }
+            latchCheckCompare(fastCopy, outPixels, width, height, frame.psm);
             return true;
         }
 
@@ -1759,6 +2388,15 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     {
         if (useLocalMemoryLayout)
         {
+            std::vector<uint8_t> fastCopy;
+            if (width <= kHostFrameWidth && height <= kHostFrameHeight &&
+                copyRectPagewise(m_vram, m_vramSize, frame.psm, basePtr, fbwBlocks, sourceOriginX, sourceOriginY,
+                                 width, height, outPixels.data(), kHostFrameWidth * 4u, preserveAlpha))
+            {
+                if (!latchCheckOn())
+                    return true;
+                fastCopy = outPixels; // PS2X_LATCH_CHECK=1: also run the per-pixel path and compare
+            }
             for (uint32_t y = 0; y < height; ++y)
             {
                 const uint32_t dstOff = y * kHostFrameWidth * 4u;
@@ -1779,6 +2417,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
                     dst[x * 4u + 3u] = preserveAlpha ? ((c & 0x8000u) ? 0x80u : 0x00u) : 255u;
                 }
             }
+            latchCheckCompare(fastCopy, outPixels, width, height, frame.psm);
             return true;
         }
 
@@ -1817,10 +2456,29 @@ void GS::latchHostPresentationFrame()
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     latchHostPresentationFrameUnlocked();
+    // PS2X_FRAMEHASH=1: one FNV-1a per latched frame, for A/B runs (P5b). The latch
+    // count is the vblank marker count, so two deterministic runs line up by n.
+    static const bool hashOn = []
+    {
+        const char *e = std::getenv("PS2X_FRAMEHASH");
+        return e && *e && *e != '0';
+    }();
+    if (hashOn)
+    {
+        static uint64_t s_n = 0;
+        uint64_t h = 1469598103934665603ull;
+        for (const uint8_t b : m_hostPresentationFrame)
+            h = (h ^ b) * 1099511628211ull;
+        std::printf("[framehash] n=%llu has=%d w=%u h=%u hash=%016llx\n", (unsigned long long)s_n++,
+                    m_hasHostPresentationFrame ? 1 : 0, m_hostPresentationWidth, m_hostPresentationHeight,
+                    (unsigned long long)h);
+    }
 }
 
 void GS::latchHostPresentationFrameUnlocked()
 {
+    g_gsmtWaitReason = 10;
+    ps2xGsRasterFlush();
     // [present] probe (PS2X_DIAG=1). Stage 5.7: the rasterizer is demonstrably
     // busy (GSRasterizer::writePixel dominates the EE thread) yet the screen is
     // black, so the open question is whether DISPFB/DISPLAY point at the pages
@@ -4045,7 +4703,7 @@ void GS::latchHostPresentationFrameUnlocked()
     const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
     const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
     const bool applyFieldMode = smode2.interlaced && !smode2.frameMode;
-    const bool oddField = (ps2_syscalls::GetCurrentVSyncTick() & 1ull) != 0ull;
+    const bool oddField = m_runtime && ((ps2_syscalls::GetCurrentVSyncTick(m_runtime) & 1ull) != 0ull);
     const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
     const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);
@@ -4381,9 +5039,110 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         GS &gs;
         ~GsHistoryDrainGuard() { gsHistoryDrainAndMaybeFlush(gs); }
     } historyDrainGuard{*this};
+    // [texmiss] open the log before the first packet, so its uploads are kept.
+    texmissEnsureInit(*this);
 
     if (!data || sizeBytes == 0 || !m_vram)
         return;
+
+    // [gscap] see gsCap() above.
+    if (GsCap &cap = gsCap(); cap.wanted && !cap.done)
+    {
+        const uint64_t tk = m_runtime ? ps2_syscalls::GetCurrentVSyncTick(m_runtime) : 0ull;
+        if (!cap.active && tk >= cap.startTick)
+        {
+            // Start between transfers so the first recorded packet begins with
+            // a GIFtag; after 60 ticks of waiting start anyway and say so.
+            const bool idle = m_pendingImageBytes == 0 &&
+                              m_transferState.copied_pixels >= m_transferState.total_pixels;
+            if (idle || tk >= cap.startTick + 60ull)
+            {
+                if (cap.every != 0ull)
+                    cap.path = cap.base + "_t" + std::to_string(tk);
+                ps2xGsRasterFlush();
+                if (!gsCapWriteVram(cap, m_vram, m_vramSize))
+                {
+                    std::cerr << "[gscap] cannot write " << cap.path << ".vram" << std::endl;
+                    cap.done = true;
+                }
+                else
+                {
+                    // Privileged block in PCSX2's layout (PMODE@0, DISPFB1@0x70,
+                    // DISPLAY1@0x80, DISPFB2@0x90, DISPLAY2@0xA0) for the tools.
+                    cap.regs.assign(8192u, uint8_t{0});
+                    if (m_privRegs)
+                    {
+                        const uint64_t priv[5][2] = {{0x00u, m_privRegs->pmode},
+                                                     {0x70u, m_privRegs->dispfb1},
+                                                     {0x80u, m_privRegs->display1},
+                                                     {0x90u, m_privRegs->dispfb2},
+                                                     {0xA0u, m_privRegs->display2}};
+                        for (const auto &p : priv)
+                            std::memcpy(cap.regs.data() + p[0], &p[1], sizeof(uint64_t));
+                    }
+
+                    std::vector<uint64_t> ad; // {data, reg} pairs
+                    const auto put = [&ad](uint32_t reg, uint64_t value) {
+                        ad.push_back(value);
+                        ad.push_back(reg);
+                    };
+                    put(GS_REG_PRMODECONT, m_registers.prmodecont.data);
+                    put(GS_REG_PRMODE, m_registers.prmode.data);
+                    put(GS_REG_TEXCLUT, m_registers.texclut.data);
+                    put(GS_REG_SCANMSK, m_registers.scanmsk.data);
+                    put(GS_REG_TEXA, m_registers.texa.data);
+                    put(GS_REG_FOGCOL, m_registers.fogcol.data);
+                    put(GS_REG_DIMX, m_registers.dimx.data);
+                    put(GS_REG_DTHE, m_registers.dthe.data);
+                    put(GS_REG_COLCLAMP, m_registers.colclamp.data);
+                    put(GS_REG_PABE, m_registers.pabe.data);
+                    put(GS_REG_FOG, m_registers.fog.data);
+                    put(GS_REG_BITBLTBUF, m_registers.bitbltbuf.data);
+                    put(GS_REG_TRXPOS, m_registers.trxpos.data);
+                    put(GS_REG_TRXREG, m_registers.trxreg.data);
+                    for (uint8_t c = 0u; c < 2u; ++c)
+                    {
+                        const GSContext &x = m_registers.ctx[c];
+                        put(GS_REG_XYOFFSET_1 + c, x.xyoffset.data);
+                        put(GS_REG_TEX1_1 + c, x.tex1.data);
+                        put(GS_REG_CLAMP_1 + c, x.clamp.data);
+                        put(GS_REG_MIPTBP1_1 + c, x.miptbp1.data);
+                        put(GS_REG_MIPTBP2_1 + c, x.miptbp2.data);
+                        put(GS_REG_SCISSOR_1 + c, x.scissor.data);
+                        put(GS_REG_ALPHA_1 + c, x.alpha.data);
+                        put(GS_REG_TEST_1 + c, x.test.data);
+                        put(GS_REG_FBA_1 + c, x.fba.data);
+                        put(GS_REG_FRAME_1 + c, x.frame.data);
+                        put(GS_REG_ZBUF_1 + c, x.zbuf.data);
+                        put(GS_REG_TEX0_1 + c, x.tex0.data); // after TEXCLUT: reloads the CLUT
+                    }
+                    put(GS_REG_RGBAQ, m_registers.rgbaq.data);
+                    put(GS_REG_ST, m_registers.st.data);
+                    put(GS_REG_UV, m_registers.uv.data);
+                    put(GS_REG_PRIM, m_registers.prim.data);
+
+                    // PACKED, NREG=1, REGS=A+D, EOP.
+                    const uint64_t tag[2] = {(ad.size() / 2u) | (1ull << 15) | (1ull << 60), 0xEull};
+                    std::vector<uint8_t> init(sizeof(tag) + ad.size() * sizeof(uint64_t));
+                    std::memcpy(init.data(), tag, sizeof(tag));
+                    std::memcpy(init.data() + sizeof(tag), ad.data(), ad.size() * sizeof(uint64_t));
+                    gsCapAppend(cap, init.data(), static_cast<uint32_t>(init.size()));
+
+                    cap.active = true;
+                    cap.beginTick = tk;
+                    std::cerr << "[gscap] start tick=" << tk << " idle=" << (idle ? 1 : 0)
+                              << " pendingImage=" << m_pendingImageBytes << std::endl;
+                }
+            }
+        }
+        if (cap.active)
+        {
+            if (tk >= cap.beginTick + cap.frames || cap.payload.size() + sizeBytes > kGsCapMaxPayload)
+                gsCapFinish(cap, tk);
+            else
+                gsCapAppend(cap, data, sizeBytes);
+        }
+    }
 
     // Drain any IMAGE payload still owed from a previous packet before this
     // buffer is interpreted as GIFtags -- the leading qwords are raw pixel
@@ -4851,7 +5610,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     {
     case GS_REG_PRIM:
     {
-        m_registers.prim.data = value;
+        // PRMODECONT.AC=0: PRIM only sets the primitive type, the attributes
+        // come from PRMODE (PCSX2 ApplyPRIM; gsfeature unseen2_prmode).
+        if (m_registers.prmodecont.data & 1u)
+            m_registers.prim.data = value;
+        else
+            m_registers.prim.data = (m_registers.prim.data & ~7ull) | (value & 7ull);
         m_vtxCount = 0;
         m_vtxIndex = 0;
         break;
@@ -5067,6 +5831,8 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     case GS_REG_PRMODE:
         m_registers.prmode.data = value;
+        if ((m_registers.prmodecont.data & 1u) == 0u) // PCSX2: ignored while AC=1
+            m_registers.prim.data = (value & ~7ull) | (m_registers.prim.data & 7ull);
         break;
     case GS_REG_TEXCLUT:
         m_registers.texclut.data = value;
@@ -5180,8 +5946,11 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_FOGCOL:
         m_registers.fogcol.data = value;
         break;
-    case GS_REG_DIMX:
+    case GS_REG_DIMX: // used by the raster's dithering (16-bit frames); were dropped
+        m_registers.dimx.data = value;
+        break;
     case GS_REG_DTHE:
+        m_registers.dthe.data = value;
         break;
     case GS_REG_COLCLAMP:
         m_registers.colclamp.data = value;
@@ -5303,6 +6072,7 @@ void GS::performLocalToLocalTransfer()
 {
     if (!m_vram)
         return;
+    ps2xGsRasterReset(); // writes VRAM: wait, then drop cached texture pages
 
     const GSBitBltBufReg bitbltbuf = m_registers.bitbltbuf;
     const GSTrxReg trxreg = m_registers.trxreg;
@@ -5461,9 +6231,10 @@ void GS::vertexKick(bool drawing)
         }
     });
 
-    if (!drawing)
-        return;
-
+    // A non-drawing kick (ADC=1, XYZ3, XYZF3) must still store the vertex AND
+    // slide the window -- only the draw is suppressed. Returning here used to
+    // skip the rotation below, so the next vertex landed in slot 3, which the
+    // rasterizer never reads, and every strip boundary drew a stale triangle.
     const GSPrimReg prim = m_registers.prim;
 
     int needed = 0;
@@ -5497,39 +6268,139 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (ps2_diag::enabled())
+    if (drawing)
     {
-        // Draw-activity stats consumed by the [gs-activity] probe. Gated so
-        // the draw-dispatch hot path pays nothing (no locked RMW) when
-        // diagnostics are off; the reader on the run-loop thread accepts the
-        // relaxed-atomic staleness.
-        const GSContext &drawCtx = activeContext();
-        m_statPrims.fetch_add(1, std::memory_order_relaxed);
-        m_statLastDrawFbp.store(drawCtx.frame.fbp, std::memory_order_relaxed);
-
-        // [gs:frame-change]: unthrottled — FBP changes are rare and are the
-        // single most useful signal for spotting render-target thrash.
-        static uint32_t s_prevDrawFbp = 0xFFFFFFFFu;
-        if (drawCtx.frame.fbp != s_prevDrawFbp)
+        if (ps2_diag::enabled())
         {
-            const int ctxIndex = m_registers.prim.ctxt ? 1 : 0;
-            RUNTIME_LOG("[gs:frame-change] prim=" << static_cast<uint32_t>(prim.prim)
-                                                   << " ctx=" << ctxIndex
-                                                   << " frame.fbp=0x" << std::hex << drawCtx.frame.fbp
-                                                   << " frame.fbw=" << std::dec << drawCtx.frame.fbw
-                                                   << " frame.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.frame.psm)
-                                                   << " tex0.tbp=0x" << drawCtx.tex0.tbp0
-                                                   << " tex0.tbw=" << std::dec << static_cast<uint32_t>(drawCtx.tex0.tbw)
-                                                   << " tex0.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.tex0.psm)
-                                                   << std::dec
-                                                   << " tme=" << static_cast<uint32_t>(m_registers.prim.tme ? 1u : 0u)
-                                                   << " prmodecont=" << static_cast<uint32_t>(m_registers.prmodecont.ac ? 1u : 0u));
-            s_prevDrawFbp = drawCtx.frame.fbp;
-        }
-    }
+            // Draw-activity stats consumed by the [gs-activity] probe. Gated so
+            // the draw-dispatch hot path pays nothing (no locked RMW) when
+            // diagnostics are off; the reader on the run-loop thread accepts the
+            // relaxed-atomic staleness.
+            const GSContext &drawCtx = activeContext();
+            m_statPrims.fetch_add(1, std::memory_order_relaxed);
+            m_statLastDrawFbp.store(drawCtx.frame.fbp, std::memory_order_relaxed);
 
-    m_rasterizer.drawPrimitive(this);
-    recordDrawDebugEventUnlocked(needed);
+            // [gs:frame-change]: unthrottled — FBP changes are rare and are the
+            // single most useful signal for spotting render-target thrash.
+            static uint32_t s_prevDrawFbp = 0xFFFFFFFFu;
+            if (drawCtx.frame.fbp != s_prevDrawFbp)
+            {
+                const int ctxIndex = m_registers.prim.ctxt ? 1 : 0;
+                RUNTIME_LOG("[gs:frame-change] prim=" << static_cast<uint32_t>(prim.prim)
+                                                       << " ctx=" << ctxIndex
+                                                       << " frame.fbp=0x" << std::hex << drawCtx.frame.fbp
+                                                       << " frame.fbw=" << std::dec << drawCtx.frame.fbw
+                                                       << " frame.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.frame.psm)
+                                                       << " tex0.tbp=0x" << drawCtx.tex0.tbp0
+                                                       << " tex0.tbw=" << std::dec << static_cast<uint32_t>(drawCtx.tex0.tbw)
+                                                       << " tex0.psm=0x" << std::hex << static_cast<uint32_t>(drawCtx.tex0.psm)
+                                                       << std::dec
+                                                       << " tme=" << static_cast<uint32_t>(m_registers.prim.tme ? 1u : 0u)
+                                                       << " prmodecont=" << static_cast<uint32_t>(m_registers.prmodecont.ac ? 1u : 0u));
+                s_prevDrawFbp = drawCtx.frame.fbp;
+            }
+        }
+
+        // 2026-09-22 Part 158 [vflip] -- the captured gameplay frames
+        // (ps2x_rec_56940 / _57660) show the background AND the fighters
+        // mirrored about the screen's horizontal centre while the GAME OVER /
+        // RANKING text stays upright. Two hypotheses survive that picture:
+        //   (A) a vertex-Y mirror inside the VU1 3D transform
+        //   (B) a V-coordinate flip on the full-screen sprite that composites
+        //       the offscreen 3D target (fbp 0x70) onto the display buffer
+        // The image alone CANNOT separate them: if the fighters live inside
+        // the composited render target then (B) moves them too, so "their
+        // positions moved" does not rule out a texture flip.
+        //
+        // They differ in exactly one observable, on the 512x448 composite:
+        //   v rises as y rises   => texture sampled upright   => NOT (B) => (A)
+        //   v falls as y rises   => texture sampled inverted  => (B), and that
+        //                           IS the flip; no further search needed.
+        //
+        // Already eliminated from this run's own log, at zero cost: XYOFFSET
+        // (OFX=1792 OFY=1824, textbook PS2 centring) and SCISSOR (SCAY0=0
+        // SCAY1=447, upright). So the GS-side setup is not the flip.
+        //
+        // THREE separate caps, because triangles outnumber the composite
+        // sprite by ~10000:1 in a single frame -- one shared cap would fill
+        // with triangles before the composite was ever sampled, and would
+        // then read as "the composite never drew", which is the false
+        // negative this probe exists to avoid. Each cap announces itself:
+        // a saturated probe and a probe that never fired look identical.
+        if (s_vflipArmed.load(std::memory_order_relaxed))
+        {
+            const GSVertex &va = m_vtxQueue[0];
+            const GSVertex &vb = m_vtxQueue[needed - 1];
+            const bool isSprite = (prim.prim == GS_PRIM_SPRITE);
+            const float spanX = (va.x > vb.x) ? (va.x - vb.x) : (vb.x - va.x);
+            const bool isFull = isSprite && spanX >= 256.0f;
+            const uint32_t bucket = isFull ? 2u : (isSprite ? 1u : 0u);
+            VflipBucket &bk = s_vflipBucket[bucket];
+            const uint64_t seen = bk.seen++;
+            if (seen == bk.next && bk.taken < kVflipCap)
+            {
+                ++bk.taken;
+                if ((bk.taken % kVflipGrowEvery) == 0u && bk.stride < (1ull << 40))
+                {
+                    bk.stride *= 2ull;
+                }
+                bk.next = seen + bk.stride;
+                const GSContext &vc = activeContext();
+                // y/x are kept in GS 12.4 units (the value before the /16.0f at
+                // the XYZ2 decode) so the reader never has to guess a rounding.
+                // t is scaled by 4096 for the same reason. v is raw UV.
+                static const char *const vk[] = {
+                    "bucket", "prim", "tme", "fst", "fbp", "tbp0",
+                    "y0", "y1", "x0", "x1", "v0", "v1", "t0", "t1", "n",
+                    "ctxt", "ofx", "ofy", "scay0", "scay1"};
+                const uint64_t vv[] = {
+                    static_cast<uint64_t>(bucket),
+                    static_cast<uint64_t>(prim.prim),
+                    static_cast<uint64_t>(m_registers.prim.tme ? 1u : 0u),
+                    static_cast<uint64_t>(m_registers.prim.fst ? 1u : 0u),
+                    static_cast<uint64_t>(vc.frame.fbp),
+                    static_cast<uint64_t>(vc.tex0.tbp0),
+                    static_cast<uint64_t>(static_cast<int64_t>(va.y * 16.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(vb.y * 16.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(va.x * 16.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(vb.x * 16.0f)),
+                    static_cast<uint64_t>(va.v),
+                    static_cast<uint64_t>(vb.v),
+                    static_cast<uint64_t>(static_cast<int64_t>(va.t * 4096.0f)),
+                    static_cast<uint64_t>(static_cast<int64_t>(vb.t * 4096.0f)),
+                    static_cast<uint64_t>(seen),
+                    // The context is the gap in v1: "XYOFFSET eliminated" was
+                    // read off a FRAME_1 sample, i.e. context 1 only. If the 3D
+                    // layer draws through context 2 that never applied to it.
+                    static_cast<uint64_t>(m_registers.prim.ctxt ? 1u : 0u),
+                    static_cast<uint64_t>(vc.xyoffset.ofx),
+                    static_cast<uint64_t>(vc.xyoffset.ofy),
+                    static_cast<uint64_t>(vc.scissor.y0),
+                    static_cast<uint64_t>(vc.scissor.y1)};
+                ps2x_probe_kv("VFLIP", 20, vk, vv);
+            }
+            else if (bk.taken == kVflipCap && seen == bk.next)
+            {
+                // A saturated probe and a probe that never fired look identical
+                // in the output, so say so explicitly.
+                RUNTIME_LOG("[cap] tag=vflip bucket=" << bucket
+                                                      << " limit=" << kVflipCap);
+                bk.next = ~0ull;
+                if (s_vflipBucket[0].taken >= kVflipCap &&
+                    s_vflipBucket[1].taken >= kVflipCap &&
+                    s_vflipBucket[2].taken >= kVflipCap)
+                {
+                    // All three satisfied -- disarm so the hot path drops back
+                    // to a single relaxed load for the rest of the run.
+                    s_vflipArmed.store(false, std::memory_order_relaxed);
+                }
+            }
+        }
+
+        texPageCacheNewPrimitive();
+        m_rasterizer.drawPrimitive(this);
+        recordDrawDebugEventUnlocked(needed);
+    }
 
     switch (prim.prim)
     {
@@ -5558,8 +6429,545 @@ void GS::vertexKick(bool drawing)
     }
 }
 
+// [texhash] -- missing-graphics audit, layer L3. Opt-in: PS2X_TEXHASH_LOG=<path>.
+// One JSONL line per completed host->local image transfer: tick, destination,
+// size, and an FNV-1a 64 hash over exactly the transfer's pixel bytes (padding
+// past rrw*rrh pixels is excluded so PCSX2 dumps hash identically). Costs one
+// getenv when unset. Lives here so no header changes.
+namespace
+{
+    std::FILE *texhashFile()
+    {
+        static std::FILE *f = []() -> std::FILE *
+        {
+            const char *p = std::getenv("PS2X_TEXHASH_LOG");
+            if (!p || !*p)
+                return nullptr;
+            std::FILE *o = std::fopen(p, "wb");
+            if (o)
+                std::cerr << "[texhash] ACTIVE path=" << p << std::endl;
+            else
+                std::cerr << "[texhash] FAILED to open path=" << p << std::endl;
+            return o;
+        }();
+        return f;
+    }
+
+    uint32_t texhashBitsPerPixel(uint32_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT32:
+        case GS_PSM_Z32:
+            return 32;
+        case GS_PSM_CT24:
+        case GS_PSM_Z24:
+            return 24;
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            return 16;
+        case GS_PSM_T4:
+        case GS_PSM_T4HL:
+        case GS_PSM_T4HH:
+            return 4;
+        default: // T8, T8H
+            return 8;
+        }
+    }
+
+    struct TexhashScopeExit
+    {
+        std::function<void()> fn;
+        ~TexhashScopeExit() { fn(); }
+    };
+}
+
+// 10-09: processImageData's per-format write loops, unchanged, on an explicit
+// transfer state so a raster worker can run them for a deferred upload
+// (ps2xGsRasterDeferUpload). Returns true when the transfer completed (the
+// caller then runs EndTransfer()); consumed = payload bytes used.
+struct GsImgState
+{
+    uint32_t x, y, total_pixels, copied_pixels;
+};
+
+static bool gsImageWrite(uint8_t *vram, u32 dbp, u8 dbw, u8 dpsm, u32 rrw, u32 dsax, GsImgState &ts,
+                         const uint8_t *data, u32 sizeBytes, u32 &consumed)
+{
+    bool ended = false;
+    u32 data_offset = 0;
+    switch (dpsm)
+    {
+    case GS_PSM_CT32:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelCT32(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 4;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z32:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelZ32(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 4;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_CT24:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelCT24(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 3;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z24:
+        while (data_offset < sizeBytes)
+        {
+            u32 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u32));
+
+            GSMem::WritePixelZ24(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 3;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_CT16:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelCT16(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z16:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelZ16(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_CT16S:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelCT16S(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_Z16S:
+        while (data_offset < sizeBytes)
+        {
+            u16 c;
+            std::memcpy(&c, &data[data_offset], sizeof(u16));
+
+            GSMem::WritePixelZ16S(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 2;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_T8:
+        // Row-at-a-time: identical order of effects to the per-pixel loop
+        // (write, advance, wrap at the row end, EndTransfer at the total).
+        while (data_offset < sizeBytes)
+        {
+            const u32 rowLeft = rrw - (ts.copied_pixels % rrw);
+            const u32 totalLeft = ts.copied_pixels < ts.total_pixels
+                                        ? ts.total_pixels - ts.copied_pixels
+                                        : 1u;
+            const u32 n = std::min({rowLeft, sizeBytes - data_offset, totalLeft});
+
+            GSMem::WriteRowP8(vram, dbp, dbw, ts.x, ts.y, &data[data_offset], n);
+
+            ts.x += n;
+            ts.copied_pixels += n;
+            data_offset += n;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+
+    case GS_PSM_T8H:
+        while (data_offset < sizeBytes)
+        {
+            u8 c = data[data_offset];
+
+            GSMem::WritePixelP8H(vram, dbp, dbw, ts.x, ts.y, c);
+
+            ts.x++;
+            ts.copied_pixels++;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    case GS_PSM_T4:
+        while (data_offset < sizeBytes)
+        {
+            u8 c0 = data[data_offset] & 0xF;
+            u8 c1 = (data[data_offset] >> 4) & 0xF;
+
+            GSMem::WritePixelP4(vram, dbp, dbw, ts.x, ts.y, c0);
+            GSMem::WritePixelP4(vram, dbp, dbw, ts.x + 1, ts.y, c1);
+
+            ts.x += 2;
+            ts.copied_pixels += 2;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    case GS_PSM_T4HL:
+        while (data_offset < sizeBytes)
+        {
+            u8 c0 = data[data_offset] & 0xF;
+            u8 c1 = (data[data_offset] >> 4) & 0xF;
+
+            GSMem::WritePixelP4HL(vram, dbp, dbw, ts.x, ts.y, c0);
+            GSMem::WritePixelP4HL(vram, dbp, dbw, ts.x + 1, ts.y, c1);
+
+            ts.x += 2;
+            ts.copied_pixels += 2;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    case GS_PSM_T4HH:
+        while (data_offset < sizeBytes)
+        {
+            u8 c0 = data[data_offset] & 0xF;
+            u8 c1 = (data[data_offset] >> 4) & 0xF;
+
+            GSMem::WritePixelP4HH(vram, dbp, dbw, ts.x, ts.y, c0);
+            GSMem::WritePixelP4HH(vram, dbp, dbw, ts.x + 1, ts.y, c1);
+
+            ts.x += 2;
+            ts.copied_pixels += 2;
+            data_offset += 1;
+
+            if ((ts.copied_pixels % rrw) == 0)
+            {
+                ts.x = dsax;
+                ts.y++;
+            }
+
+            if (ts.copied_pixels >= ts.total_pixels)
+            {
+                ended = true;
+                break;
+            }
+        }
+        break;
+    }
+    consumed = data_offset;
+    return ended;
+}
+
+// The transfer-state effect of gsImageWrite without the VRAM writes: same
+// bytes and pixels per step, same row wrap (copied % rrw == 0, tracked as a
+// running column) and end test.
+static bool gsImageAdvance(u8 dpsm, u32 rrw, u32 dsax, GsImgState &ts, u32 sizeBytes)
+{
+    u32 b, p;
+    switch (dpsm)
+    {
+    case GS_PSM_CT32: case GS_PSM_Z32: b = 4; p = 1; break;
+    case GS_PSM_CT24: case GS_PSM_Z24: b = 3; p = 1; break;
+    case GS_PSM_CT16: case GS_PSM_Z16: case GS_PSM_CT16S: case GS_PSM_Z16S: b = 2; p = 1; break;
+    case GS_PSM_T8: case GS_PSM_T8H: b = 1; p = 1; break;
+    case GS_PSM_T4: case GS_PSM_T4HL: case GS_PSM_T4HH: b = 1; p = 2; break;
+    default: return false;
+    }
+    u32 steps = (sizeBytes + b - 1u) / b;
+    u32 col = ts.copied_pixels % rrw;
+    while (steps-- != 0u)
+    {
+        ts.x += p;
+        ts.copied_pixels += p;
+        col += p;
+        while (col >= rrw)
+            col -= rrw;
+        if (col == 0u)
+        {
+            ts.x = dsax;
+            ts.y++;
+        }
+        if (ts.copied_pixels >= ts.total_pixels)
+            return true;
+    }
+    return false;
+}
+
+struct GsDeferredUpload
+{
+    uint8_t *vram;
+    u32 dbp, rrw, dsax;
+    u8 dbw, dpsm;
+    GsImgState ts;
+    std::vector<uint8_t> data;
+};
+
+static void gsApplyDeferredUpload(void *p)
+{
+    GsDeferredUpload *up = static_cast<GsDeferredUpload *>(p);
+    u32 consumed = 0;
+    (void)gsImageWrite(up->vram, up->dbp, up->dbw, up->dpsm, up->rrw, up->dsax, up->ts,
+                       up->data.data(), static_cast<u32>(up->data.size()), consumed);
+    delete up;
+}
+
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    std::FILE *const thFile = texhashFile();
+    const bool thOn = thFile && data && m_registers.trxdir.xdir == 0;
+    const auto thBuf = m_registers.bitbltbuf;
+    const auto thReg = m_registers.trxreg;
+    const auto thPos = m_registers.trxpos;
+    static uint64_t s_thHash = 0;
+    static uint64_t s_thBytes = 0;
+    static uint64_t s_thWant = 0;
+    // Optional raw payload dump (PS2X_TEXHASH_DUMPDIR=<existing dir>): one
+    // .bin per unique hash so textures can be decoded and looked at offline.
+    static const char *const thDumpDir = []() -> const char *
+    {
+        const char *p = std::getenv("PS2X_TEXHASH_DUMPDIR");
+        return (p && *p) ? p : nullptr;
+    }();
+    static std::vector<uint8_t> s_thPayload;
+    static std::unordered_set<uint64_t> s_thDumped;
+    if (thOn)
+    {
+        if (m_transferState.copied_pixels == 0)
+        {
+            s_thHash = 1469598103934665603ull;
+            s_thBytes = 0;
+            s_thWant = (static_cast<uint64_t>(thReg.rrw) * thReg.rrh * texhashBitsPerPixel(thBuf.dpsm) + 7u) / 8u;
+        }
+        if (m_transferState.copied_pixels == 0)
+            s_thPayload.clear();
+        const uint64_t take = std::min<uint64_t>(sizeBytes, s_thWant > s_thBytes ? s_thWant - s_thBytes : 0ull);
+        for (uint64_t i = 0; i < take; ++i)
+            s_thHash = (s_thHash ^ data[i]) * 1099511628211ull;
+        if (thDumpDir)
+            s_thPayload.insert(s_thPayload.end(), data, data + take);
+        s_thBytes += take;
+    }
+    TexhashScopeExit thEnd{[&]()
+    {
+        if (!thOn || m_registers.trxdir.xdir != 3)
+            return;
+        const uint64_t tick = m_runtime ? ps2_syscalls::GetCurrentVSyncTick(m_runtime) : 0ull;
+        std::fprintf(thFile,
+                     "{\"k\":\"T\",\"v\":%llu,\"dbp\":%u,\"dbw\":%u,\"dpsm\":%u,\"x\":%u,\"y\":%u,"
+                     "\"w\":%u,\"h\":%u,\"bytes\":%llu,\"want\":%llu,\"h64\":\"%016llx\"}\n",
+                     static_cast<unsigned long long>(tick),
+                     static_cast<unsigned>(thBuf.dbp), static_cast<unsigned>(thBuf.dbw),
+                     static_cast<unsigned>(thBuf.dpsm),
+                     static_cast<unsigned>(thPos.dsax), static_cast<unsigned>(thPos.dsay),
+                     static_cast<unsigned>(thReg.rrw), static_cast<unsigned>(thReg.rrh),
+                     static_cast<unsigned long long>(s_thBytes),
+                     static_cast<unsigned long long>(s_thWant),
+                     static_cast<unsigned long long>(s_thHash));
+        std::fflush(thFile);
+        if (thDumpDir && s_thBytes == s_thWant && s_thDumped.insert(s_thHash).second)
+        {
+            char name[512];
+            std::snprintf(name, sizeof(name), "%s/%016llx_%ux%u_psm%u.bin", thDumpDir,
+                          static_cast<unsigned long long>(s_thHash),
+                          static_cast<unsigned>(thReg.rrw), static_cast<unsigned>(thReg.rrh),
+                          static_cast<unsigned>(thBuf.dpsm));
+            if (std::FILE *o = std::fopen(name, "wb"))
+            {
+                std::fwrite(s_thPayload.data(), 1, s_thPayload.size(), o);
+                std::fclose(o);
+            }
+        }
+        s_thBytes = 0;
+    }};
+
     if (ps2_diag::enabled())
     {
         // Image-transfer byte counter consumed by the [gs-activity] probe;
@@ -5619,289 +7027,56 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     {
         return;
     }
-
     if (rrw == 0 || rrh == 0)
     {
         return;
     }
 
-    u32 data_offset = 0;
+    GsImgState ts{m_transferState.x, m_transferState.y, m_transferState.total_pixels, m_transferState.copied_pixels};
 
-    // remove the format branching from the loops
-    // TODO: fixup copypasta
-    switch (dpsm)
+    // 10-09: with raster workers running, queue the writes behind the draws
+    // already queued instead of waiting for them (ps2xGsRasterDeferUpload).
+    // Only textures: a CLUT upload (<= 1 KB) is read back by the CLUT load
+    // right after it, which would then wait for the deferred write behind every
+    // queued draw (measured: 161 s of 320 in a fight). HWREG writes come 8
+    // bytes at a time and also keep the direct path; its SyncRect waits for any
+    // deferred upload to the same blocks.
+    const uint64_t transferBytes =
+        (static_cast<uint64_t>(ts.total_pixels) * GSMem::BitsPerPixel(static_cast<GSMem::PixelStorageMode>(dpsm))) / 8u;
+    if (transferBytes >= 4096u && sizeBytes >= 64u && !ps2_diag::enabled())
     {
-    case GS_PSM_CT32:
-        while (data_offset < sizeBytes)
+        GsImgState after = ts;
+        const bool ended = gsImageAdvance(dpsm, rrw, dsax, after, sizeBytes);
+        auto *up = new GsDeferredUpload{m_vram, dbp, rrw, dsax, dbw, dpsm, ts,
+                                        std::vector<uint8_t>(data, data + sizeBytes)};
+        if (ps2xGsRasterDeferUpload(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh, &gsApplyDeferredUpload, up))
         {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
-
-            GSMem::WritePixelCT32(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 4;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
+            if (ended)
                 EndTransfer();
-                break;
+            else
+            {
+                m_transferState.x = after.x;
+                m_transferState.y = after.y;
+                m_transferState.copied_pixels = after.copied_pixels;
             }
+            return;
         }
-        break;
+        delete up;
+    }
 
-    case GS_PSM_Z32:
-        while (data_offset < sizeBytes)
-        {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
+    ps2xGsRasterSyncRect(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, true);
 
-            GSMem::WritePixelZ32(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 4;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_CT24:
-        while (data_offset < sizeBytes)
-        {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
-
-            GSMem::WritePixelCT24(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 3;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_Z24:
-        while (data_offset < sizeBytes)
-        {
-            u32 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u32));
-
-            GSMem::WritePixelZ24(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 3;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_CT16:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelCT16(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_Z16:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelZ16(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_CT16S:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelCT16S(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_Z16S:
-        while (data_offset < sizeBytes)
-        {
-            u16 c;
-            std::memcpy(&c, &data[data_offset], sizeof(u16));
-
-            GSMem::WritePixelZ16S(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 2;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_T8:
-        while (data_offset < sizeBytes)
-        {
-            u8 c = data[data_offset];
-
-            GSMem::WritePixelP8(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-
-    case GS_PSM_T8H:
-        while (data_offset < sizeBytes)
-        {
-            u8 c = data[data_offset];
-
-            GSMem::WritePixelP8H(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c);
-
-            m_transferState.x++;
-            m_transferState.copied_pixels++;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-    case GS_PSM_T4:
+    uint64_t t4n = 0;
+    bool t4log = false;
+    u32 t4x0 = 0, t4y0 = 0;
+    if (dpsm == GS_PSM_T4)
     {
-        // [psmt4] Stage 5.9 probe. PSMT4 uploads to dbp=0x2b60/0x2b80 are demonstrably
-        // issued (434/440 of them, 32768 bytes each) yet the destination census reads
-        // back all-zero. The census is swizzle-blind but NOT zero-blind, so it cannot
-        // tell "never written" from "written all-zero nibbles". This logs the source
-        // bytes before the loop and reads the same texels back after it, which
-        // separates those two cases in a single run.
         static std::atomic<uint64_t> s_t4Count{0};
-        const uint64_t t4n = s_t4Count.fetch_add(1, std::memory_order_relaxed);
-        const bool t4log = ps2_diag::enabled() && ps2_diag::should_log(t4n, 8, 400);
+        t4n = s_t4Count.fetch_add(1, std::memory_order_relaxed);
+        t4log = ps2_diag::enabled() && ps2_diag::should_log(t4n, 8, 400);
 
-        const u32 t4x0 = m_transferState.x;
-        const u32 t4y0 = m_transferState.y;
+        t4x0 = m_transferState.x;
+        t4y0 = m_transferState.y;
 
         // Published by ps2_memory.cpp so the payload pointer can be resolved back to a
         // guest physical address. Block-scope extern: binds to the namespace-scope
@@ -5968,32 +7143,21 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                                          << " srcNonZero=" << srcNonZero
                                          << " head=" << head);
         }
+    }
 
-        while (data_offset < sizeBytes)
-        {
-            u8 c0 = data[data_offset] & 0xF;
-            u8 c1 = (data[data_offset] >> 4) & 0xF;
+    u32 t4consumed = 0;
+    const bool ended = gsImageWrite(m_vram, dbp, dbw, dpsm, rrw, dsax, ts, data, sizeBytes, t4consumed);
+    if (ended)
+        EndTransfer();
+    else
+    {
+        m_transferState.x = ts.x;
+        m_transferState.y = ts.y;
+        m_transferState.copied_pixels = ts.copied_pixels;
+    }
 
-            GSMem::WritePixelP4(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WritePixelP4(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
-
-            m_transferState.x += 2;
-            m_transferState.copied_pixels += 2;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-
+    if (dpsm == GS_PSM_T4)
+    {
         if (t4log)
         {
             static const char kHex[] = "0123456789abcdef";
@@ -6010,67 +7174,13 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
             RUNTIME_LOG("[psmt4] post n=" << std::dec << t4n
                                           << " addr0=0x" << std::hex << addr0
                                           << " vramBytes=" << std::dec << (m_vramSize)
-                                          << " consumed=" << data_offset
+                                          << " consumed=" << t4consumed
                                           << " x=" << m_transferState.x
                                           << " y=" << m_transferState.y
                                           << " copied=" << m_transferState.copied_pixels
                                           << " total=" << m_transferState.total_pixels
                                           << " readback=" << back);
         }
-        break;
-    }
-    case GS_PSM_T4HL:
-        while (data_offset < sizeBytes)
-        {
-            u8 c0 = data[data_offset] & 0xF;
-            u8 c1 = (data[data_offset] >> 4) & 0xF;
-
-            GSMem::WritePixelP4HL(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WritePixelP4HL(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
-
-            m_transferState.x += 2;
-            m_transferState.copied_pixels += 2;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
-    case GS_PSM_T4HH:
-        while (data_offset < sizeBytes)
-        {
-            u8 c0 = data[data_offset] & 0xF;
-            u8 c1 = (data[data_offset] >> 4) & 0xF;
-
-            GSMem::WritePixelP4HH(m_vram, dbp, dbw, m_transferState.x, m_transferState.y, c0);
-            GSMem::WritePixelP4HH(m_vram, dbp, dbw, m_transferState.x + 1, m_transferState.y, c1);
-
-            m_transferState.x += 2;
-            m_transferState.copied_pixels += 2;
-            data_offset += 1;
-
-            if ((m_transferState.copied_pixels % rrw) == 0)
-            {
-                m_transferState.x = dsax;
-                m_transferState.y++;
-            }
-
-            if (m_transferState.copied_pixels >= m_transferState.total_pixels)
-            {
-                EndTransfer();
-                break;
-            }
-        }
-        break;
     }
 }
 
@@ -6081,6 +7191,8 @@ void GS::performLocalToHostToBuffer()
 
     if (!m_vram)
         return;
+    g_gsmtWaitReason = 11;
+    ps2xGsRasterFlush();
 
     const auto bitbltbuf = m_registers.bitbltbuf;
     const auto trxreg = m_registers.trxreg;
@@ -6148,12 +7260,14 @@ void GS::performLocalToHostToBuffer()
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ps2xGsRasterReset();
     return clearFramebufferRect(this, m_registers.ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ps2xGsRasterReset();
     return clearFramebufferRect(this, activeContext(), rgba);
 }
 
@@ -6169,6 +7283,79 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
     std::memcpy(dst, m_localToHostBuffer.data() + m_localToHostReadPos, toCopy);
     m_localToHostReadPos += toCopy;
     return static_cast<uint32_t>(toCopy);
+}
+
+// ---- texture page cache slots (perf 09-27) --------------------------------
+// The GS object holds one cached page (m_texture_page_cache, in a header we
+// cannot touch). A triangle that spans a page edge, or a bilinear sample that
+// straddles one, switched pages per texel and re-decoded a whole 8-16 KB page
+// each time (ReadBlockToLinearBuffer8 in the fight profile).
+//
+// Page data now lives in kTexPageSlots slots here. Validity matches the old
+// single page at primitive boundaries:
+//   - the most recently used page (MRU) stays valid across primitives until
+//     TEXFLUSH clears m_texture_page_cache.valid, exactly as before;
+//   - any other slot is reused only inside the primitive that loaded it
+//     (epoch bumps at every drawPrimitive), where the old code would have
+//     reloaded the same VRAM bytes.
+// Only the GS thread (or the bench, single threaded) reads textures.
+namespace
+{
+constexpr uint32_t kTexPageSlots = 8u;
+struct TexPageSlot
+{
+    u32 block = 0;
+    u32 psm = 0;
+    uint64_t epoch = 0;
+    std::array<u8, 16 * 1024> buf{};
+};
+struct TexPageSlots
+{
+    const void *owner = nullptr;
+    uint64_t epoch = 1;
+    int mru = -1;
+    uint32_t nextVictim = 0;
+    TexPageSlot slot[kTexPageSlots];
+};
+TexPageSlots g_texPages;
+
+void loadTexturePage(u8 *dst, const u8 *vram, u32 psm, u32 base_block)
+{
+    switch (psm)
+    {
+    case GS_PSM_CT32:
+        GSMem::ReadPageToLinearBufferCT32(dst, 256, vram, base_block);
+        break;
+    case GS_PSM_Z32:
+        GSMem::ReadPageToLinearBufferZ32(dst, 256, vram, base_block);
+        break;
+    case GS_PSM_CT16:
+        GSMem::ReadPageToLinearBufferCT16(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_CT16S:
+        GSMem::ReadPageToLinearBufferCT16S(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_Z16:
+        GSMem::ReadPageToLinearBufferZ16(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_Z16S:
+        GSMem::ReadPageToLinearBufferZ16S(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_T8:
+        GSMem::ReadPageToLinearBufferP8(dst, 128, vram, base_block);
+        break;
+    case GS_PSM_T4:
+        GSMem::ReadPageToLinearBufferP4(dst, 128, vram, base_block);
+        break;
+    default:
+        break;
+    }
+}
+}
+
+static void texPageCacheNewPrimitive()
+{
+    ++g_texPages.epoch;
 }
 
 u32 GS::ReadTexturePageCache(u32 psm, u32 tbp0, u32 tbw, u32 u, u32 v)
@@ -6244,18 +7431,53 @@ u32 GS::ReadTexturePageCache(u32 psm, u32 tbp0, u32 tbw, u32 u, u32 v)
     const u32 page_id = (v >> page_height2) * pages_per_row + (u >> page_width2);
     const u32 block_id = (tbp0 + page_id * 32u) & 0x3FFF;
 
-    const bool needs_reload =
-        !m_texture_page_cache.valid ||
-        m_texture_page_cache.base_block != block_id ||
-        m_texture_page_cache.psm != psm;
-
-    if (needs_reload)
+    TexPageSlots &pages = g_texPages;
+    if (pages.owner != this)
     {
-        ReloadTexturePageCache(psm, block_id);
+        // Another GS (the bench builds one per replay): nothing cached is ours.
+        pages.owner = this;
+        pages.mru = -1;
+        ++pages.epoch;
+    }
+
+    const bool mruHit =
+        m_texture_page_cache.valid && pages.mru >= 0 &&
+        m_texture_page_cache.base_block == block_id &&
+        m_texture_page_cache.psm == psm;
+    if (!mruHit)
+    {
+        if (!m_texture_page_cache.valid)
+            pages.mru = -1; // TEXFLUSH: the MRU page is stale too
+        int hit = -1;
+        for (uint32_t i = 0; i < kTexPageSlots; ++i)
+        {
+            const TexPageSlot &s = pages.slot[i];
+            if (s.epoch == pages.epoch && s.block == block_id && s.psm == psm)
+            {
+                hit = static_cast<int>(i);
+                break;
+            }
+        }
+        if (hit < 0)
+        {
+            uint32_t victim = pages.nextVictim++ % kTexPageSlots;
+            if (static_cast<int>(victim) == pages.mru)
+                victim = pages.nextVictim++ % kTexPageSlots;
+            TexPageSlot &s = pages.slot[victim];
+            loadTexturePage(s.buf.data(), m_vram, psm, block_id);
+            s.block = block_id;
+            s.psm = psm;
+            s.epoch = pages.epoch;
+            hit = static_cast<int>(victim);
+        }
+        pages.mru = hit;
+        m_texture_page_cache.base_block = block_id;
+        m_texture_page_cache.psm = psm;
+        m_texture_page_cache.valid = true;
     }
 
     const u32 off = (v & (page_height - 1)) * pitch + (u & (page_width - 1)) * bytes_per_pixel;
-    const u8* ptr = &m_texture_page_cache.buffer[off];
+    const u8* ptr = &pages.slot[pages.mru].buf[off];
 
     switch (bytes_per_pixel)
     {
@@ -6512,14 +7734,37 @@ void GS::ReloadClutCache(u32 psm, u32 cpsm, u32 cbp, u8 csm, u8 csa, u8 cld)
         return;
     }
 
+    // CSM1 reads at most 16x16 entries at cbp (buffer width 1).
+    if (csm == 0)
+        ps2xGsRasterSyncRect(cbp, 1u, cpsm, 0u, 0u, 16u, 16u, false);
+    else
+        { g_gsmtWaitReason = 12; ps2xGsRasterFlush(); }
+    ps2xGsRasterClutChanged();
+
     switch (csm)
     {
     case 0:
         ReloadClutCacheCSM1(psm, cpsm, cbp, csa);
         break;
     case 1:
-        ReloadClutCacheCSM2(psm, cbp);
+    {
+        // CSM2, PCSX2 GSClut::WriteCLUT*_CSM2: entry i at (COU*16 + i, COV) of a
+        // CBW-wide buffer in the CLUT's own format, stored from CSA*16 (CT32:
+        // CSA & 15). ReloadClutCacheCSM2 always read CT16 and used COU*256
+        // (gsfeature unseen_clut_csm2_t8); its signature has no cpsm/csa.
+        const auto texclut = m_registers.texclut;
+        const u32 entries = 1u << GSMem::BitsPerPixel(static_cast<GSMem::PixelStorageMode>(psm));
+        const bool clut32 = cpsm == GS_PSM_CT32 || cpsm == GS_PSM_CT24;
+        const u32 bpp = clut32 ? 4u : 2u;
+        u32 cache_addr = ((clut32 ? (csa & 15u) : csa) * 16u) * bpp;
+        for (u32 i = 0; i < entries; ++i, cache_addr += bpp)
+        {
+            const u32 value = ReadVram(clut32 ? GS_PSM_CT32 : cpsm, cbp, texclut.cbw,
+                                       static_cast<u32>(texclut.cou) * 16u + i, texclut.cov);
+            memcpy(&m_clut_cache[cache_addr & 0x3FF], &value, bpp);
+        }
         break;
+    }
     default:
         break;
     }

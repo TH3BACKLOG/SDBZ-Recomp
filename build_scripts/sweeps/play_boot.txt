@@ -1,0 +1,11 @@
+# play_boot.txt - used by build_scripts/play.ps1 so manual play starts at the main menu:
+# dismisses the warning / memory-card screens by name, then ends. Scripted presses are
+# OR-ed with the keyboard / gamepad, so you have the pad the moment this finishes.
+# Same steps as the head of perf_fight.txt (VERIFIED to reach CAppMenuMain).
+
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+log play_boot: main menu reached - your turn

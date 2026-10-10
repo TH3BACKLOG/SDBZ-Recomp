@@ -47,8 +47,8 @@ namespace ps2recomp
             ss << "#include <stdexcept>\n";
             ss << "#include \"ps2_runtime_macros.h\"\n";
             ss << "#include \"ps2_runtime.h\"\n";
-            ss << "#include \"ps2_recompiled_functions.h\"\n";
-            ss << "#include \"ps2_recompiled_stubs.h\"\n\n";
+            ss << "#include <ps2_recompiled_functions.h>\n";
+            ss << "#include <ps2_recompiled_stubs.h>\n\n";
             ss << "#include \"ps2_syscalls.h\"\n";
             ss << "#include \"ps2_stubs.h\"\n\n";
             ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
@@ -261,7 +261,7 @@ namespace ps2recomp
             }
         }
 
-        // Fallthrough with no terminating branch: advance ctx->pc past the function so dispatchLoop doesn't re-call it forever.
+        // Fallthrough with no terminating branch: publish the next PC so the EE dispatcher does not re-enter this function.
         if (!instructions.empty() && !lastInstructionWasControlFlow)
         {
             ss << "    ctx->pc = 0x" << std::hex << function.end << "u;\n"

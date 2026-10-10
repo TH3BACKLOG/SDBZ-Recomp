@@ -1,0 +1,72 @@
+# stages_train.txt - EXPLORATORY stage sweep through TRAINING mode (one pad, CPU opponent): no pad 2.
+# Why: versus.txt needs pad 2 and pad 2 breaks scripted input (vs1, 10-06). Original mode goes
+# CAppSelectMain -> CAppFightMain with a story-fixed stage (fighters1/3 run_log: no stage screen), so the
+# stage cursor can only live in Versus/Training. 10-07 static search for the stage-id word: the 13 stage
+# descriptors (stg/sNN strings) are reached through per-stage class vtables (getter e.g. 0x2420F0 = s02,
+# 0x252880 = s00, 0x252C90 = s04, 0x287EA0 = s01); the id variable itself was NOT found, so no poke yet.
+# Run (first run = discovery, 15 min):
+#   .\build_scripts\gfx_tour.ps1 -Name stg1 -Script build_scripts\sweeps\stages_train.txt -Seconds 900 -Every 60
+# What to read afterwards: the [scene] / [padscript] lines in gsdump\stg1\run_log.txt:
+#   mode=4 + CAppSelectMain reached?  how many X presses until CAppFightMain?  does R before the last X
+#   change the stage (stg/sNN uploads in the captures)?  which pause entry returns to CAppMenuMain?
+# H (all UNVERIFIED): Training = third item of the left column (D D from Original, VERIFIED order
+#   Original/Z Survivor/Training in sweep3); char select = P1 X then P2/COM X; stage cursor remembers its
+#   place so one R per loop = next stage; pause quit = the Original sequence (S D D D X U X) may differ.
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+poke 0x5C7942 0
+poke 0x5C7943 0
+poke 0x5C7944 0
+log stages_train: unlock + stage select on
+wait ticks=120
+
+label loop
+wait app=CAppMenuMain timeout=3000
+wait ticks=90
+repeat 4
+  press U hold=6 gap=6
+  press L hold=6 gap=6
+end
+press D hold=6 gap=30
+press D hold=6 gap=30
+log menu path D D (expect mode=4 Training)
+press X hold=10 gap=60 until app=CAppSelectMain timeout=900
+goto lost if app!=CAppSelectMain
+wait ticks=150
+press X hold=10 gap=90
+log P1 confirmed
+wait ticks=90
+press X hold=10 gap=90
+log second X (P2 / COM / stage screen?)
+wait ticks=90
+press R hold=6 gap=30
+log R (stage cursor next?)
+press X hold=10 gap=120 until app=CAppFightMain timeout=600
+press X hold=10 gap=120 until app=CAppFightMain timeout=600
+press X hold=10 gap=120 until app=CAppFightMain timeout=600
+goto lost if app!=CAppFightMain
+log in fight: capture window
+wait ticks=900
+
+label quit
+press S hold=10 gap=90
+press D hold=6 gap=20
+press D hold=6 gap=20
+press D hold=6 gap=20
+press X hold=10 gap=90
+press U hold=6 gap=30
+press X hold=10 gap=300
+wait app=CAppMenuMain timeout=600
+goto quit 4 if app=CAppFightMain
+goto loop 6
+
+label lost
+log LOST: not where expected - backing out with T / S
+press T hold=10 gap=60 until app=CAppMenuMain timeout=300
+press S hold=10 gap=60
+goto loop 3

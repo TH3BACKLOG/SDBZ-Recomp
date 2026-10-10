@@ -1,8 +1,19 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include "ps2_log.h"
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cctype>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace
 {
@@ -125,6 +136,68 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_SELECT);
     }
 
+    // Unattended-run aid (default off): PS2X_PAD_AUTOPRESS=N pulses Cross, then
+    // Circle, then Start for a few frames every N pad frames, so "press a button"
+    // prompts do not park a run nobody is watching.
+    static const uint32_t s_autoPeriod = []() -> uint32_t
+    {
+        const char *s = std::getenv("PS2X_PAD_AUTOPRESS");
+        return (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 0u;
+    }();
+    // PS2X_PAD_AUTOPRESS_HOLD=N (default 6) sets how many pad frames each pulse
+    // is held. The game computes button edges once per GameUpdate, so when the
+    // guest renders several vblanks per update a 6-frame pulse can fall entirely
+    // between two updates and the press is never seen (Part 165: Auto-Save X
+    // took 179 s, title Start never landed).
+    static const uint32_t s_autoHold = []() -> uint32_t
+    {
+        const char *s = std::getenv("PS2X_PAD_AUTOPRESS_HOLD");
+        const uint32_t v = (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 6u;
+        return v == 0u ? 6u : v;
+    }();
+    // PS2X_PAD_AUTOPRESS_SECS=N (default 0 = never stop) ends the pulses N wall
+    // seconds after the first pad poll. Start in the pulse cycle opens the fight's
+    // pause menu, so perf runs stop it once the match has begun.
+    static const auto s_autoT0 = std::chrono::steady_clock::now();
+    static const uint32_t s_autoSecs = []() -> uint32_t
+    {
+        const char *s = std::getenv("PS2X_PAD_AUTOPRESS_SECS");
+        return (s && *s) ? static_cast<uint32_t>(std::strtoul(s, nullptr, 0)) : 0u;
+    }();
+    const bool autoExpired =
+        s_autoSecs != 0u &&
+        std::chrono::steady_clock::now() - s_autoT0 > std::chrono::seconds(s_autoSecs);
+    if (s_autoPeriod >= 16u && !autoExpired)
+    {
+        static std::atomic<uint32_t> s_autoFrame{0u};
+        const uint32_t frame = s_autoFrame.fetch_add(1u, std::memory_order_relaxed);
+        const uint32_t phase = frame % s_autoPeriod;
+        if (phase < std::min(s_autoHold, s_autoPeriod / 2u))
+        {
+            // PS2X_PAD_AUTOPRESS_BTNS=X|O|S letters pick the rotation (default "XOS");
+            // "X" alone keeps menus advancing without Start pausing a fight.
+            static const std::string s_cycle = []() -> std::string
+            {
+                const char *s = std::getenv("PS2X_PAD_AUTOPRESS_BTNS");
+                std::string r;
+                for (const char *p = (s && *s) ? s : "XOS"; *p; ++p)
+                    if (*p == 'X' || *p == 'O' || *p == 'S')
+                        r.push_back(*p);
+                return r.empty() ? std::string("XOS") : r;
+            }();
+            const char c = s_cycle[(frame / s_autoPeriod) % s_cycle.size()];
+            clearBit(c == 'X' ? PAD_CROSS : c == 'O' ? PAD_CIRCLE : PAD_START);
+        }
+    }
+
+    // Host-side edge log: proves keys/autopress reach readState even when PADMAN
+    // serves SIO2 polls (the [pad] change log in ps2x_pad_push_frame is then off).
+    {
+        static std::atomic<uint32_t> s_lastHostBtns{0xFFFFu};
+        const uint32_t prev = s_lastHostBtns.exchange(btns, std::memory_order_relaxed);
+        if (prev != btns)
+            std::printf("[pad] host change btns=0x%04x -> 0x%04x\n", prev, static_cast<unsigned>(btns));
+    }
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
     return true;
@@ -209,6 +282,17 @@ namespace
     constexpr int32_t kPadCounterWrap = 0x40000000;
 
     PSPadBackend g_padPushBackend; // PSPadBackend is stateless / default-constructible
+}
+
+// Defined in ps2xIOP/src/emulator/iop_emulator.cpp (SIO2 pad HLE).
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_buttons;
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_analog;
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad_served;
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad2_buttons;
+extern "C" std::atomic<uint32_t> g_ps2x_sio2_pad2_present;
+
+namespace
+{
 
     inline uint32_t padRead32(const uint8_t *rdram, uint32_t addr)
     {
@@ -233,6 +317,20 @@ namespace
     }
 }
 
+// ---------------------------------------------------------------------------
+// PS2X_PAD_SCRIPT engine (syntax + scene detection): padscript_engine.inl. It is
+// shared with PCSX2 (pcsx2/DebugTools/PadScript.cpp, branch sdbz-tools) so the
+// same sweep script drives both. This TU is the only runtime file including it.
+// ---------------------------------------------------------------------------
+#include "padscript_engine.inl"
+
+// Guest vsync tick for the pad script; the present loop calls this right before
+// ps2x_pad_push_frame (ps2_runtime.cpp).
+extern "C" void ps2x_pad_script_set_tick(uint64_t tick)
+{
+    padscript::g_tick.store(tick, std::memory_order_relaxed);
+}
+
 // Emulates one padman vsync push for every port/slot the guest has opened.
 // Called once per presented host frame from PS2Runtime's present loop -- the
 // same thread raylib polls input on, so IsKeyDown()/IsGamepadButtonDown() are
@@ -248,6 +346,68 @@ extern "C" void ps2x_pad_push_frame(uint8_t *rdram)
     static bool s_seenPort[kPadMaxPorts][kPadMaxSlots] = {};
     constexpr int kPushLogCap = 8;
     constexpr int kChangeLogCap = 64;
+
+    // Read the host pad once per frame (readState also advances the autopress
+    // cycle) and publish it to the IOP's SIO2 pad HLE (iop_emulator.cpp), which
+    // answers the disc PADMAN.IRX's DualShock2 polls. Once PADMAN is actually
+    // being served, it owns libpad's buffer (it SIF-DMAs each frame itself), so
+    // this direct push stands down instead of racing it (Part 165).
+    uint8_t hostStatus[32];
+    const bool hostOk = g_padPushBackend.readState(0, 0, hostStatus, sizeof(hostStatus));
+    static bool s_pad2 = false;
+    uint16_t pad2Buttons = 0xFFFFu; // active-low, libpad wire order
+    {
+        // Scripted presses (PS2X_PAD_SCRIPT) merge into the host pad, active-low,
+        // before it is published to both the SIO2 HLE and the direct push.
+        static padscript::Engine s_script;
+        static const bool s_pad2Env = [] { const char *e = std::getenv("PS2X_PAD2"); return e && *e == '1'; }();
+        const uint32_t press = s_script.frame(rdram, padscript::g_tick.load(std::memory_order_relaxed));
+        const uint16_t press1 = static_cast<uint16_t>(press & 0xFFFFu);
+        if (hostOk && press1)
+        {
+            hostStatus[2] &= static_cast<uint8_t>(~press1 & 0xFFu);
+            hostStatus[3] &= static_cast<uint8_t>(~press1 >> 8);
+        }
+        pad2Buttons = static_cast<uint16_t>(~(press >> 16) & 0xFFFFu);
+        if (!s_pad2 && (s_script.usesPad2 || s_pad2Env))
+        {
+            s_pad2 = true;
+            g_ps2x_sio2_pad2_present.store(1u, std::memory_order_relaxed);
+            RUNTIME_LOG("[pad] scripted pad 2 plugged into port 1\n");
+        }
+        g_ps2x_sio2_pad2_buttons.store(pad2Buttons, std::memory_order_relaxed);
+    }
+    if (hostOk)
+    {
+        g_ps2x_sio2_pad_buttons.store(static_cast<uint32_t>(hostStatus[2] | (hostStatus[3] << 8)),
+                                      std::memory_order_relaxed);
+        g_ps2x_sio2_pad_analog.store(static_cast<uint32_t>(hostStatus[4]) |
+                                         (static_cast<uint32_t>(hostStatus[5]) << 8) |
+                                         (static_cast<uint32_t>(hostStatus[6]) << 16) |
+                                         (static_cast<uint32_t>(hostStatus[7]) << 24),
+                                     std::memory_order_relaxed);
+    }
+    if (g_ps2x_sio2_pad_served.load(std::memory_order_relaxed) != 0u)
+    {
+        // 10-07 (pad2a probe, VERIFIED in gsdump/pad2a/run_log.txt): with port 1 plugged in, PADMAN reaches
+        // command 0x42 and this handoff disabled the direct push, but PADMAN then logged 109x "VBLANK
+        // OVERLAP" and no input reached the game (CAppWarning never advanced; scripted X was seen by the
+        // host side as btns 0xbfff). Without port 1 the game ran on the direct push all along. So keep the
+        // direct push whenever pad 2 is present (or PS2X_PAD_KEEP_DIRECT=1) until the SIO2 completion path
+        // is fixed. HYP: PADMAN's transfer-done event never fires in the SIO2 HLE.
+        static const bool s_keepDirect = [] { const char *e = std::getenv("PS2X_PAD_KEEP_DIRECT"); return e && *e == '1'; }();
+        static bool s_handoffLogged = false;
+        if (!s_handoffLogged)
+        {
+            s_handoffLogged = true;
+            if (s_pad2 || s_keepDirect)
+                RUNTIME_LOG("[pad] PADMAN is serving SIO2 pad polls -- direct buffer push KEPT (pad 2 present / PS2X_PAD_KEEP_DIRECT)\n");
+            else
+                RUNTIME_LOG("[pad] PADMAN is serving SIO2 pad polls -- direct buffer push disabled\n");
+        }
+        if (!s_pad2 && !s_keepDirect)
+            return;
+    }
 
     for (int port = 0; port < kPadMaxPorts; ++port)
     {
@@ -287,16 +447,18 @@ extern "C" void ps2x_pad_push_frame(uint8_t *rdram)
             const bool isHostPad = (port == 0 && slot == 0);
             if (isHostPad)
             {
-                if (!g_padPushBackend.readState(port, slot, status, sizeof(status)))
+                if (!hostOk)
                     continue;
+                std::memcpy(status, hostStatus, sizeof(status));
             }
             else
             {
                 std::memset(status, 0, sizeof(status));
                 status[0] = 0x00; // valid frame, nothing pressed
                 status[1] = kPadAnalogMarker;
-                status[2] = 0xFF;
-                status[3] = 0xFF;
+                const bool isPad2 = s_pad2 && port == 1 && slot == 0;
+                status[2] = isPad2 ? static_cast<uint8_t>(pad2Buttons & 0xFFu) : 0xFF;
+                status[3] = isPad2 ? static_cast<uint8_t>(pad2Buttons >> 8) : 0xFF;
                 status[4] = status[5] = status[6] = status[7] = kPadStickCenter;
             }
 

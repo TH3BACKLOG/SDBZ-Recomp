@@ -1,0 +1,35 @@
+# save_check.txt - NO pokes: boot with whatever save is on the memory card, then show what it unlocked.
+#   Original char select: walk the whole grid so [scene] logs every p1 id the cursor can reach
+#   (18 distinct = all fighters). Then enter Customize (CAppDMModeMain) to prove the card list loads.
+# Run: see build_scripts\save\README.txt (PS2X_PAD_SCRIPT + launch_recomp.ps1 -NoDebugger -RunSeconds 420)
+
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+wait ticks=120
+log save_check: main menu reached
+
+press X hold=10 gap=50 until app=CAppSelectMain timeout=1200
+wait ticks=200
+log save_check: grid walk start
+label col
+repeat 6
+  press D hold=6 gap=60
+end
+press R hold=6 gap=60
+goto col 7
+log save_check: grid walk done
+wait ticks=300
+press O hold=10 gap=60 until app=CAppMenuMain timeout=600
+wait ticks=60
+
+# main menu: Customize is the right panel's middle entry (R from Original -> Dragon Summoning, D -> Customize)
+press R hold=6 gap=60
+press D hold=6 gap=60
+press X hold=10 gap=50 until app!=CAppMenuMain timeout=600
+wait ticks=300
+log save_check: customize entered
+wait ticks=300
+log save_check: done

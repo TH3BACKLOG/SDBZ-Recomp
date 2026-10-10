@@ -1,0 +1,16 @@
+# pad2_probe.txt - 5 min discriminator for OPEN 1 (vs1: scripted input lost once pad 2 is plugged in).
+# Run WITH pad 2 present but NO scripted pad=2 press (the env var plugs port 1 in):
+#   $env:PS2X_PAD2='1'; .\build_scripts\gfx_tour.ps1 -Name pad2a -Script build_scripts\sweeps\pad2_probe.txt -Seconds 300 -Every 60
+# Control (same script, port 1 NOT plugged):
+#   Remove-Item Env:PS2X_PAD2 -ErrorAction SilentlyContinue; .\build_scripts\gfx_tour.ps1 -Name pad2b -Script build_scripts\sweeps\pad2_probe.txt -Seconds 300 -Every 60
+# Read: gsdump\pad2a\run_log.txt  [scene] lines + "[pad] PADMAN is serving SIO2 pad polls" + "VBLANK OVERLAP".
+#   pad2a reaches CAppMenuMain  => port 1 present is harmless; the fault is in a scripted pad=2 press.
+#   pad2a stays on CAppWarning  => port-1-present switches PADMAN to the SIO2 path where pad-1 input is lost
+#                                  (then log port-0 commands in iop_emulator.cpp sio2Transfer, one build).
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+log pad2_probe: reached the main menu
+wait ticks=600

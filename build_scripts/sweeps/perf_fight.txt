@@ -1,0 +1,43 @@
+# perf_fight.txt - reach a REAL Original-mode fight (Goku vs the story CPU) and keep it going, for
+# host CPU profiles. Unlike -Fight's X autopress (which ends up in the attract demo fight), this goes
+# through the menus. Long fight: Easy CPU, damage 1, no time limit, 5 rounds; mash so both sides act.
+# Run (no -Fight; it sets an autopress that would fight this script):
+#   $env:PS2X_PAD_SCRIPT = 'F:\SDBZ Recomp\build_scripts\sweeps\perf_fight.txt'
+#   $env:PS2X_PROFILE_GATE = '1'; $env:PS2X_PROFILE_START = '0'
+#   launch_recomp.ps1 -Exe ... -NoDebugger -HostProfile -RunSeconds 320
+# Option bytes and menu path: see original.txt (VERIFIED there).
+
+wait app=CAppWarning timeout=900
+press X hold=10 gap=50 until app!=CAppWarning timeout=3000
+label boot
+press S hold=10 gap=50 until app=CAppMenuMain timeout=1500
+goto boot 6 if app!=CAppMenuMain
+poke 0x5E6B30 0xFFF0 w=4
+poke 0x5EC2F0 0x7FE w=4
+poke 0x5C7940 1
+poke 0x5C7941 1
+poke 0x5C7942 4
+poke 0x5C7943 2
+log options poked: easy dmg1 notime 5rd
+wait ticks=120
+
+press X hold=10 gap=50 until app=CAppSelectMain timeout=1200
+wait ticks=200
+press D hold=6 gap=30 until p1=1 timeout=600
+log on Goku
+wait ticks=30
+press X hold=10 gap=120 until app=CAppFightMain timeout=3000
+log perf fight start
+
+label loop
+repeat 2
+  press R hold=12 gap=2
+  press Q hold=4 gap=6
+  press Q hold=4 gap=6
+  press T hold=4 gap=6
+  press Q hold=4 gap=6
+  press T hold=4 gap=6
+end
+press X hold=6 gap=20
+goto loop 5000
+log perf_fight done

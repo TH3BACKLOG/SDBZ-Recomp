@@ -11,10 +11,6 @@
 
 std::string translatePs2Path(const char *ps2Path);
 
-extern std::atomic<int> g_activeThreads;
-
-inline std::mutex g_sys_fd_mutex;
-
 namespace ps2_syscalls
 {
 #define PS2_DECLARE_SYSCALL(name) void name(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
@@ -29,18 +25,10 @@ namespace ps2_syscalls
 
     bool dispatchNumericSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
-    void initializeGuestKernelState(uint8_t *rdram);
+    void initializeGuestKernelState(uint8_t *rdram, PS2Runtime *runtime);
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId);
-    void notifyRuntimeStop();
-    void resetSoundDriverRpcState();
-    void setSoundDriverCompatLayout(const PS2SoundDriverCompatLayout &layout);
-    void clearSoundDriverCompatLayout();
-    void setDtxCompatLayout(const PS2DtxCompatLayout &layout);
-    void clearDtxCompatLayout();
-    void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
-    uint64_t GetCurrentVSyncTick();
-    uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
-    void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
+    uint64_t GetCurrentVSyncTick(PS2Runtime *runtime);
+    void WaitVSyncTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, int fixedResult = -1);
 }
 
 #endif // PS2_SYSCALLS_H
