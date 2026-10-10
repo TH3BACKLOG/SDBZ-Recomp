@@ -16,13 +16,14 @@ param(
     # (PS2X_GS_NEAREST=1): faster raster, slightly blockier textures. Not pixel-exact vs PCSX2.
     [switch]$Bilinear,
     [int]$RunSeconds = 0,
-    # Automatic controls (default ON): build_scripts\sweeps\play_boot.txt presses the
-    # right buttons to get past the warning / memory-card / title screens to the main
-    # menu, then ends; scripted presses are OR-ed with your keys. -NoAuto turns it off.
+    # Automatic controls (default OFF, you drive): -AutoBoot runs
+    # build_scripts\sweeps\play_boot.txt, which presses the buttons to get past the
+    # warning / memory-card / title screens to the main menu, then ends; scripted
+    # presses are OR-ed with your keys.
     # Keys: arrows/WASD, X/Space = Cross, C = Circle, Z = Square, V = Triangle,
     # Q/E = L1/R1, Shift = L2/R2, Enter = Start, Tab = Select (keyboard only when no
     # gamepad is plugged in).
-    [switch]$NoAuto,
+    [switch]$AutoBoot,
     # VU1 + VIF1 + GIF submission run on their own thread (PS2X_VU1_THREAD=1, P5b):
     # the EE thread no longer waits for VU1 microprograms. Default ON here (measured
     # 37 -> 41 vbl/s in a fight); -NoVuThread runs them inline on the EE thread.
@@ -38,7 +39,7 @@ foreach ($v in 'PS2X_PAD_AUTOPRESS', 'PS2X_PAD_AUTOPRESS_BTNS', 'PS2X_PAD_AUTOPR
 }
 $env:PS2X_DIAG = '0'
 if (-not $NoVuThread) { $env:PS2X_VU1_THREAD = '1' }
-if (-not $NoAuto) {
+if ($AutoBoot) {
     $env:PS2X_PAD_SCRIPT = Join-Path $root 'build_scripts\sweeps\play_boot.txt'
 }
 # ps2EntryRunner defaults an UNSET value to 1, so -Bilinear must say 0 explicitly.
@@ -51,7 +52,7 @@ if ($Texmiss) {
     Write-Host "[play] texmiss log -> $($env:PS2X_TEXMISS_LOG)" -ForegroundColor Cyan
 }
 
-Write-Host "[play] DIAG=0 quantum=$Quantum nearest=$(-not $Bilinear) auto-boot=$(if ($NoAuto) { 'off' } else { 'on' }) vu-thread=$(-not $NoVuThread)  (close the window to stop)" -ForegroundColor Cyan
+Write-Host "[play] DIAG=0 quantum=$Quantum nearest=$(-not $Bilinear) auto-boot=$(if ($AutoBoot) { 'on' } else { 'off' }) vu-thread=$(-not $NoVuThread)  (close the window to stop)" -ForegroundColor Cyan
 
 $args2 = @{ Exe = $Exe; NoDebugger = $true; RunSeconds = $RunSeconds }
 if ($HostProfile) { $args2['HostProfile'] = $true }
